@@ -1,0 +1,72 @@
+{
+  "version": 1,
+  "name": "Issue 70 legacy null bounds",
+  "metrics": {
+    "width": 2,
+    "height": 2,
+    "world_size_x": 2.0,
+    "world_size_z": 2.0,
+    "tile_size": 256,
+    "halo": 2
+  },
+  "preview_resolution": 2,
+  "export_resolution": 2,
+  "stack": {
+    "nodes": [
+      {
+        "Layer": {
+          "common": {
+            "id": "034d4613-2595-4708-a5f2-fd2347f4fb7b",
+            "name": "Legacy Materials",
+            "enabled": true,
+            "opacity": 1.0,
+            "blend": "Normal"
+          },
+          "kind": {
+            "Materials": {
+              "rules": [
+                {
+                  "name": "Legacy Material",
+                  "id": 1,
+                  "min_slope_deg": 0.0,
+                  "max_slope_deg": 90.0,
+                  "min_height": null,
+                  "max_height": null,
+                  "mask": "None"
+                }
+              ]
+            }
+          }
+        }
+      },
+      {
+        "Layer": {
+          "common": {
+            "id": "84020620-a871-48c9-90c7-127682e1f4ac",
+            "name": "Legacy Biomes",
+            "enabled": true,
+            "opacity": 1.0,
+            "blend": "Normal"
+          },
+          "kind": {
+            "Biomes": {
+              "bands": [
+                {
+                  "name": "Legacy Biome",
+                  "id": 1,
+                  "min_height": null,
+                  "max_height": null,
+                  "min_wetness": 0.0,
+                  "max_wetness": 1.0
+                }
+              ]
+            }
+          }
+        }
+      }
+    ]
+  },
+  "masks": [],
+  "selected": null,
+  "presets_used": []
+}

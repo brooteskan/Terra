@@ -18,10 +18,10 @@
 //! deposition). Fine channels nest inside broader drainage organisation.
 
 use crate::geomorph::{
-    gradient_components, mean_curvature, ridge_valley_likelihood, slope_magnitude,
+    accumulate_drainage_area, build_flow_graph, gradient_components, mean_curvature,
+    priority_flood_fill, ridge_valley_likelihood, slope_magnitude, FlowModel, Precipitation,
 };
 use crate::heightfield::{Heightfield, HeightfieldMetrics};
-use crate::hydro;
 use crate::mask::MaskField;
 use crate::noise::value_noise2;
 
@@ -408,8 +408,8 @@ fn apply_cascade_band(
             let ff = fine_flow.get(i, j);
             let hard = hardness.map(|h| h.get(i, j)).unwrap_or(0.0).clamp(0.0, 1.0);
             let curv = curvature.get(i, j); // ~[0,1] mean curvature map
-            // Convex ridges sit toward high curvature in Terra's normalised map;
-            // use ridge/valley fields as primary organisers.
+                                            // Convex ridges sit toward high curvature in Terra's normalised map;
+                                            // use ridge/valley fields as primary organisers.
 
             // Geomorphological gates (anti-soup).
             let drain_suppress = 1.0 - (f * preserve).clamp(0.0, 1.0);
@@ -422,7 +422,10 @@ fn apply_cascade_band(
                 * (0.25 + 0.75 * gate)
                 * p.gully_strength.clamp(0.0, 1.0))
             .clamp(0.0, 1.0);
-            let rock_gate = gate * hard.max(0.15) * (1.0 - valley * 0.7) * (1.0 - f * 0.4)
+            let rock_gate = gate
+                * hard.max(0.15)
+                * (1.0 - valley * 0.7)
+                * (1.0 - f * 0.4)
                 * p.rock_roughness.clamp(0.0, 1.0);
             // Soft depositional texture only on low-slope, high-flow flats.
             let deposit_gate = ((0.18 - s) / 0.18).clamp(0.0, 1.0) * f * (1.0 - hard);
@@ -550,9 +553,9 @@ fn build_fine_flow(flow: &MaskField, valley: &MaskField, slope: &MaskField) -> M
 }
 
 fn compute_flow_norm(input: &Heightfield) -> MaskField {
-    let filled = hydro::fill_depressions(input);
-    let (dirs, _) = hydro::flow_direction_d8(&filled);
-    let acc = hydro::flow_accumulation_d8(&filled, &dirs);
+    let filled = priority_flood_fill(input);
+    let graph = build_flow_graph(&filled, FlowModel::D8);
+    let acc = accumulate_drainage_area(&graph, &Precipitation::uniform(1.0));
     let m = input.metrics;
     let mut field = MaskField::zeros(m);
     for j in 0..m.height {
@@ -682,7 +685,10 @@ mod tests {
                 changed += 1;
             }
         }
-        assert!(changed > 64, "expected structured detail, changed={changed}");
+        assert!(
+            changed > 64,
+            "expected structured detail, changed={changed}"
+        );
         assert!(mask_any_above(&a.fine_flow, 0.01), "fine flow organisation");
         assert!(
             mask_any_above(&a.micro_channel, 0.01)

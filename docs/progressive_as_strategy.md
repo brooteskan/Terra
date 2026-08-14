@@ -11,7 +11,7 @@ Presentation is owned by a **frame graph** + **presentation backends**, not a si
 | Fast / Raster | `RasterLit` (shadows + lit mesh / crack-free clipmap) |
 | ProgressiveRayTraced / Final | `ProgressivePt` + `ProgressivePost` |
 
-`ViewportOrchestrator` (`TerrainRenderer` during the strangler) schedules:
+`TerrainRenderer` schedules:
 
 `Begin → optional Shadow → PresentBackend → optional ProgressivePost → Overlays → timestamps`
 

@@ -1,10 +1,9 @@
 //! Phase E hydrology fixtures: SPE + drainage coherence vs noise+carve.
 
 use terra_core::generators::{fbm_field, uplift};
+use terra_core::geomorph::{accumulate_drainage_area, build_flow_graph, FlowModel, Precipitation};
 use terra_core::heightfield::{Heightfield, HeightfieldMetrics};
-use terra_core::hydro::{
-    carve_rivers, fill_depressions, flow_accumulation_d8, flow_direction_d8, stream_power_erode,
-};
+use terra_core::hydro::{carve_rivers, fill_depressions, stream_power_erode};
 use terra_core::layer::{
     FbmParams, FractalNoiseType, NoiseParams, RiverCarveParams, StreamPowerParams, UpliftParams,
 };
@@ -149,13 +148,13 @@ fn uplift_spe_aligns_valleys_better_than_noise_carve() {
     );
 
     let filled_spe = fill_depressions(&spe.height);
-    let (dirs_spe, _) = flow_direction_d8(&filled_spe);
-    let acc_spe = flow_accumulation_d8(&filled_spe, &dirs_spe);
+    let graph_spe = build_flow_graph(&filled_spe, FlowModel::D8);
+    let acc_spe = accumulate_drainage_area(&graph_spe, &Precipitation::uniform(1.0));
     let score_spe = valley_accumulation_score(&spe.height, &acc_spe);
 
     let filled_carve = fill_depressions(&carved);
-    let (dirs_carve, _) = flow_direction_d8(&filled_carve);
-    let acc_carve = flow_accumulation_d8(&filled_carve, &dirs_carve);
+    let graph_carve = build_flow_graph(&filled_carve, FlowModel::D8);
+    let acc_carve = accumulate_drainage_area(&graph_carve, &Precipitation::uniform(1.0));
     let score_carve = valley_accumulation_score(&carved, &acc_carve);
 
     assert!(

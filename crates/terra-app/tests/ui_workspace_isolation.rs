@@ -1,8 +1,8 @@
 //! Workspace switch isolation: presentation must not mutate project or selection.
 
+use terra_app::ui::{AppWorkspace, UiState, WorkspaceMode, WorkspaceState};
 use terra_core::document::TerrainDocument;
 use terra_core::eval::EvalScheduler;
-use terra_app::ui::{AppWorkspace, UiState, WorkspaceMode, WorkspaceState};
 
 fn selection_snapshot(
     doc: &TerrainDocument,
@@ -96,15 +96,49 @@ fn workspace_state_round_trip_preserves_presentation() {
     ui.switch_workspace_mode(WorkspaceMode::Simulation);
     ui.sculpt_radius = 0.12;
     ui.inspector_advanced = true;
+    ui.lighting_customized = true;
     let snap = ui.workspace_state();
     assert_eq!(snap.mode, WorkspaceMode::Simulation);
     assert_eq!(snap.app_workspace, AppWorkspace::Hydrology);
+    assert!(snap.lighting_customized);
 
     let mut ui2 = UiState::default();
+    assert!(!ui2.lighting_customized);
     ui2.apply_workspace_state(&snap);
     assert_eq!(ui2.workspace_mode, WorkspaceMode::Simulation);
     assert_eq!(ui2.sculpt_radius, 0.12);
     assert!(ui2.inspector_advanced);
+    // Applying a customized snapshot must keep the custom flag, not reset it.
+    assert!(ui2.lighting_customized);
+}
+
+#[test]
+fn custom_lighting_survives_workspace_switch() {
+    let mut ui = UiState::default();
+
+    // Simulate the user editing a lighting control: the live values detach from
+    // the named preset (viewport_gui sets this flag on any lighting edit).
+    ui.lighting_customized = true;
+    let preset_before = ui.lighting_preset;
+
+    // Entering any workspace — rail button, command palette, or create-and-focus
+    // into Sculpt — must not silently revert the custom look to the preset. This
+    // is the "choosing Sculpt resets lighting to Studio" regression: the switch
+    // used to clear `lighting_customized`, and the next redraw re-seeded the
+    // viewport from the preset.
+    for mode in WorkspaceMode::ALL {
+        ui.switch_workspace_mode(mode);
+        assert!(
+            ui.lighting_customized,
+            "custom lighting must survive switch to {:?}",
+            mode
+        );
+        assert_eq!(
+            ui.lighting_preset, preset_before,
+            "lighting preset must be preserved across switch to {:?}",
+            mode
+        );
+    }
 }
 
 #[test]

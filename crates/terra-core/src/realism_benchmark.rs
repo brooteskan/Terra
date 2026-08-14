@@ -157,17 +157,20 @@ pub fn measure_document(doc: &TerrainDocument) -> Result<(Heightfield, TerrainSt
 }
 
 /// Soft structural checks for a benchmark (CI-friendly, low resolution).
-pub fn validate_benchmark_structure(bench: RealismBenchmark, preview_res: u32) -> Result<(), String> {
+pub fn validate_benchmark_structure(
+    bench: RealismBenchmark,
+    preview_res: u32,
+) -> Result<(), String> {
     let doc = bench.document(8_000.0, preview_res);
     let layers = doc.stack.flatten_layers();
     if layers.is_empty() {
         return Err(format!("{}: empty stack", bench.id()));
     }
     let has_macro = layers.iter().any(|l| {
-                matches!(
-                    l.kind.scale_band(),
-                    crate::layer::ScaleBand::Macro | crate::layer::ScaleBand::MultiScale
-                )
+        matches!(
+            l.kind.scale_band(),
+            crate::layer::ScaleBand::Macro | crate::layer::ScaleBand::MultiScale
+        )
     });
     if !has_macro {
         return Err(format!("{}: missing macro / multi-scale stage", bench.id()));

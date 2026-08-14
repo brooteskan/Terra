@@ -1,12 +1,12 @@
-﻿use std::sync::Arc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::ui::{resolve_shortcut_for_input, PanelAction, ShortcutChord, ShortcutModifiers};
 use terra_core::command::EditorCommand;
 use terra_core::eval::PreviewQuality;
 use terra_gpu::{GpuTerrainEngine, GpuTileAtlas};
 use terra_gui::GuiRenderer;
 use terra_render::TerrainRenderer;
-use crate::ui::{CommandId, PanelAction};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
@@ -35,26 +35,24 @@ impl ApplicationHandler for TerraApp {
                 )
                 .expect("window"),
         );
-        let renderer = pollster::block_on(TerrainRenderer::new(window.clone())).expect("renderer");
+        let (gpu, target) =
+            pollster::block_on(terra_render::init_gpu(window.clone())).expect("gpu init");
+        let renderer = TerrainRenderer::new(&gpu, target);
         let tile_config = self.terrain_runtime.pyramid.config;
-        let tile_atlas = match GpuTileAtlas::new(
-            &renderer.device,
-            tile_config.tile_size,
-            tile_config.halo,
-            128,
-        ) {
-            Ok(atlas) => Some(atlas),
-            Err(error) => {
-                log::warn!("GPU tile atlas disabled: {error}");
-                None
-            }
-        };
+        let tile_atlas =
+            match GpuTileAtlas::new(&gpu.device, tile_config.tile_size, tile_config.halo, 128) {
+                Ok(atlas) => Some(atlas),
+                Err(error) => {
+                    log::warn!("GPU tile atlas disabled: {error}");
+                    None
+                }
+            };
 
-        let gpu_engine = GpuTerrainEngine::new(&renderer.device, 256);
-        let gui_renderer =
-            GuiRenderer::new(&renderer.device, &renderer.queue, renderer.config.format);
+        let gpu_engine = GpuTerrainEngine::new(&gpu.device, 256);
+        let gui_renderer = GuiRenderer::new(&gpu.device, &gpu.queue, gpu.surface_format);
         self.window = Some(window);
         self.renderer = Some(renderer);
+        self.gpu = Some(gpu);
         self.gpu_engine = Some(gpu_engine);
         self.tile_atlas = tile_atlas;
         self.gui_renderer = Some(gui_renderer);
@@ -85,6 +83,11 @@ impl ApplicationHandler for TerraApp {
                 }
                 if event.state == ElementState::Pressed {
                     if let PhysicalKey::Code(code) = event.physical_key {
+                        let wants_chars = self.gui_state.wants_text_input()
+                            || self.ui_state.show_quick_add
+                            || self.ui_state.show_command_palette
+                            || self.inspector_gui.rename_buffer.is_some()
+                            || ui_tool_search_focused(&self.ui_state, &self.gui_state);
                         let bookmark = match code {
                             KeyCode::Digit1 => Some(0usize),
                             KeyCode::Digit2 => Some(1),
@@ -103,78 +106,22 @@ impl ApplicationHandler for TerraApp {
                                     self.save_camera_bookmark(index);
                                 } else if self.modifiers_alt {
                                     self.recall_camera_bookmark(index);
-                                } else if index < 9 {
-                                    // Workspace focus shortcuts 1â€“9 (not workflow steps).
-                                    let d = index as u8 + 1;
-                                    if let Some(id) = crate::ui::WorkspaceId::from_digit(d) {
-                                        // Presentation only â€” must not mutate project or rebuild.
-                                        let prev_preview = self.ui_state.biome_color_preview;
-                                        let cam = (
-                                            self.ui_state.camera_xz,
-                                            self.ui_state.camera_yaw,
-                                            self.ui_state.camera_pitch,
-                                        );
-                                        self.ui_state.switch_workspace(id);
-                                        // Camera must survive workspace switch.
-                                        debug_assert_eq!(self.ui_state.camera_xz, cam.0);
-                                        let _ = cam;
-                                        if self.ui_state.biome_color_preview != prev_preview
-                                            || id == crate::ui::WorkspaceId::Biomes
-                                        {
-                                            self.placement_tint_dirty = true;
-                                            self.preview_dirty = true;
-                                        }
-                                    }
                                 }
                             }
                         }
+                        let chord = ShortcutChord::new(
+                            code,
+                            ShortcutModifiers {
+                                ctrl: self.modifiers_ctrl,
+                                shift: self.modifiers_shift,
+                                alt: self.modifiers_alt,
+                                super_key: self.modifiers_super,
+                            },
+                        );
+                        if let Some(command) = resolve_shortcut_for_input(chord, wants_chars) {
+                            self.dispatch_command(command);
+                        }
                         match code {
-                            KeyCode::KeyP if self.modifiers_ctrl => {
-                                if self.screen == AppScreen::Editor {
-                                    self.dispatch_shortcut(CommandId::OPEN_COMMAND_PALETTE);
-                                }
-                            }
-                            KeyCode::KeyL if self.modifiers_ctrl => {
-                                if self.screen == AppScreen::Editor {
-                                    self.dispatch_shortcut(CommandId::OPEN_QUICK_ADD);
-                                }
-                            }
-                            KeyCode::Insert if self.screen == AppScreen::Editor => {
-                                self.dispatch_shortcut(CommandId::OPEN_QUICK_ADD)
-                            }
-                            KeyCode::KeyZ
-                                if self.modifiers_shift && self.screen == AppScreen::Editor =>
-                            {
-                                self.dispatch_shortcut(CommandId::REDO)
-                            }
-                            // Keep the original bare-key bindings while supporting standard Ctrl forms.
-                            KeyCode::KeyZ if self.screen == AppScreen::Editor => {
-                                self.dispatch_shortcut(CommandId::UNDO)
-                            }
-                            KeyCode::KeyY if self.screen == AppScreen::Editor => {
-                                self.dispatch_shortcut(CommandId::REDO)
-                            }
-                            KeyCode::KeyN if self.modifiers_ctrl => {
-                                self.dispatch_shortcut(CommandId::NEW_PROJECT);
-                            }
-                            KeyCode::KeyO if self.modifiers_ctrl => {
-                                self.dispatch_shortcut(CommandId::OPEN_PROJECT);
-                            }
-                            KeyCode::KeyS if self.modifiers_ctrl && self.modifiers_shift => {
-                                if self.screen == AppScreen::Editor {
-                                    self.dispatch_shortcut(CommandId::SAVE_AS);
-                                }
-                            }
-                            KeyCode::KeyS if self.modifiers_ctrl => {
-                                if self.screen == AppScreen::Editor {
-                                    self.dispatch_shortcut(CommandId::SAVE);
-                                }
-                            }
-                            KeyCode::KeyW if self.modifiers_ctrl => {
-                                if self.screen == AppScreen::Editor {
-                                    self.dispatch_shortcut(CommandId::CLOSE_PROJECT);
-                                }
-                            }
                             KeyCode::Backspace
                                 if self.gui_state.wants_text_input()
                                     || self.ui_state.show_quick_add
@@ -216,11 +163,6 @@ impl ApplicationHandler for TerraApp {
                             }
                             _ => {}
                         }
-                        let wants_chars = self.gui_state.wants_text_input()
-                            || self.ui_state.show_quick_add
-                            || self.ui_state.show_command_palette
-                            || self.inspector_gui.rename_buffer.is_some()
-                            || ui_tool_search_focused(&self.ui_state, &self.gui_state);
                         if !self.modifiers_ctrl && wants_chars {
                             if let Some(ch) = search_character(code, self.modifiers_shift) {
                                 self.gui_text.push(ch);
@@ -234,6 +176,7 @@ impl ApplicationHandler for TerraApp {
                 self.modifiers_shift = m.state().shift_key();
                 self.modifiers_alt = m.state().alt_key();
                 self.modifiers_ctrl = m.state().control_key();
+                self.modifiers_super = m.state().super_key();
                 self.ui_state.shift_context = self.modifiers_shift;
             }
             WindowEvent::MouseInput { state, button, .. } => {
@@ -286,14 +229,15 @@ impl ApplicationHandler for TerraApp {
                     {
                         let (sx, sy) = self.cursor_logical().unwrap_or((0.0, 0.0));
                         let uv = self.pick_paint_uv();
-                        self.ui_state.viewport_context_menu = Some(crate::ui::ViewportContextMenu {
-                            x: sx,
-                            y: sy,
-                            uv,
-                            locked_owner: None,
-                            picking_owner_for: None,
-                            owner_override: None,
-                        });
+                        self.ui_state.viewport_context_menu =
+                            Some(crate::ui::ViewportContextMenu {
+                                x: sx,
+                                y: sy,
+                                uv,
+                                locked_owner: None,
+                                picking_owner_for: None,
+                                owner_override: None,
+                            });
                         let _ = press_pos;
                     }
                     if button == MouseButton::Left {
@@ -307,8 +251,7 @@ impl ApplicationHandler for TerraApp {
                             self.apply_actions(vec![PanelAction::EndBiomePaintStroke]);
                         }
                         // Mask paint: commit stroke undo; defer/coalesce terrain rebuild.
-                        if self.ui_state.editor_tool == crate::ui::EditorTool::PaintMask
-                        {
+                        if self.ui_state.editor_tool == crate::ui::EditorTool::PaintMask {
                             self.commit_mask_paint_stroke();
                         }
                         if self.sculpt_stroke_active {
@@ -524,10 +467,6 @@ impl ApplicationHandler for TerraApp {
                         .simulation_iteration_cap(),
                 );
             }
-            self.ui_state
-                .profile
-                .update_terrain_runtime(self.terrain_runtime.stats());
-
             // The worker is never awaited: consume its newest matching result, if available.
             if let Some(result) = self.eval_worker.try_recv_matching(self.eval_token) {
                 let quality = result.quality;
@@ -543,9 +482,7 @@ impl ApplicationHandler for TerraApp {
                 self.last_height = Some((*height).clone());
                 // Ingest every CPU layer checkpoint so GPU can bake unsupported shapes
                 // and keep EffectFilters live on the next edit.
-                if let (Some(engine), Some(renderer)) =
-                    (self.gpu_engine.as_mut(), self.renderer.as_ref())
-                {
+                if let (Some(engine), Some(gpu)) = (self.gpu_engine.as_mut(), self.gpu.as_ref()) {
                     let preview = self.session.document.preview_eval_stack();
                     for layer in preview.flatten_layers() {
                         if let Some(cached) = self.scheduler.evaluator.cache.get(layer.id()) {
@@ -557,8 +494,8 @@ impl ApplicationHandler for TerraApp {
                             }
                             let (lo, hi) = cached.height.min_max();
                             engine.ingest_height(
-                                &renderer.device,
-                                &renderer.queue,
+                                &gpu.device,
+                                &gpu.queue,
                                 layer.id(),
                                 &cached.height,
                                 (lo, hi),
@@ -566,13 +503,7 @@ impl ApplicationHandler for TerraApp {
                         }
                     }
                 }
-                let runtime_frame = self.runtime_started.elapsed().as_millis() as u64;
-                self.terrain_runtime
-                    .publish_fallback_result(self.eval_token, runtime_frame);
                 self.queue_final_tile_uploads();
-                self.ui_state
-                    .profile
-                    .update_terrain_runtime(self.terrain_runtime.stats());
                 self.preview_dirty = true;
                 self.needs_height_upload = true;
                 self.worker_refine_pending = false;
@@ -824,4 +755,3 @@ impl TerraApp {
         true
     }
 }
-

@@ -275,7 +275,8 @@ impl AeolianState {
                 continue;
             }
             let shadow = self.sheltering[idx];
-            let slow = (1.0 - (self.wind_speed[idx] / p.wind_speed.max(1e-3)).clamp(0.0, 1.5)).clamp(0.0, 1.0);
+            let slow = (1.0 - (self.wind_speed[idx] / p.wind_speed.max(1e-3)).clamp(0.0, 1.5))
+                .clamp(0.0, 1.0);
             // Capacity decreases in shadow and on the lee — deposit fraction rises.
             let dep_p = (0.18 + 0.72 * shadow + 0.25 * slow).clamp(0.05, 0.95);
             let deposited = carried * dep_p;
@@ -326,7 +327,8 @@ impl AeolianState {
                     let dist = ((di * di + dj * dj) as f32).sqrt();
                     let d = (self.surface_at(nidx) - self.surface_at(idx)) / (cell * dist);
                     // Move sand downslope proportional to slope (Nilles reptation fix).
-                    let sm = kr * d.abs() * 0.5 * (self.sand_flux[idx] + self.sand_flux[nidx] + 0.05);
+                    let sm =
+                        kr * d.abs() * 0.5 * (self.sand_flux[idx] + self.sand_flux[nidx] + 0.05);
                     let transfer = if d >= 0.0 {
                         // Neighbor higher → receive from neighbor limited by neighbor sand.
                         sm.min(self.sand[nidx])

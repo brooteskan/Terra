@@ -2737,7 +2737,7 @@ dependencies = [
 
 [[package]]
 name = "terra-app"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 dependencies = [
  "directories",
  "env_logger",
@@ -2754,13 +2754,14 @@ dependencies = [
  "terra-gui",
  "terra-io",
  "terra-render",
+ "terra-test-gpu",
  "wgpu",
  "winit",
 ]
 
 [[package]]
 name = "terra-core"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 dependencies = [
  "approx",
  "glam",
@@ -2776,21 +2777,21 @@ dependencies = [
 
 [[package]]
 name = "terra-gpu"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 dependencies = [
  "bytemuck",
  "glam",
  "log",
- "pollster",
  "profiling",
  "terra-core",
+ "terra-test-gpu",
  "thiserror 2.0.19",
  "wgpu",
 ]
 
 [[package]]
 name = "terra-gui"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 dependencies = [
  "bytemuck",
  "fontdue",
@@ -2798,12 +2799,14 @@ dependencies = [
  "log",
  "lucide-icons",
  "serde",
+ "serde_json",
+ "terra-test-gpu",
  "wgpu",
 ]
 
 [[package]]
 name = "terra-io"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 dependencies = [
  "image",
  "log",
@@ -2816,7 +2819,7 @@ dependencies = [
 
 [[package]]
 name = "terra-render"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 dependencies = [
  "bytemuck",
  "glam",
@@ -2826,9 +2829,18 @@ dependencies = [
  "pollster",
  "profiling",
  "terra-core",
+ "terra-test-gpu",
  "thiserror 2.0.19",
  "wgpu",
  "winit",
+]
+
+[[package]]
+name = "terra-test-gpu"
+version = "0.1.0-beta.1"
+dependencies = [
+ "pollster",
+ "wgpu",
 ]
 
 [[package]]

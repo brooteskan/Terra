@@ -638,7 +638,7 @@ pub fn apply_sculpt_strokes(input: &Heightfield, p: &SculptStrokeParams) -> Auth
         .field(keys::SCULPT_PROTECTION, MaskField::from_raw(m, &protect))
         .field(keys::UPLIFT_RATE, MaskField::from_raw(m, &uplift))
         .field(keys::HARDNESS, MaskField::from_raw(m, &hardness))
-        .field(keys::SEDIMENT_DEPTH, MaskField::from_raw(m, &sediment))
+        .field(keys::SEDIMENT_THICKNESS, MaskField::from_raw(m, &sediment))
         .field(keys::EDIT_REGION, MaskField::from_raw(m, &edited))
 }
 

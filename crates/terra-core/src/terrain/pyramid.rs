@@ -1,50 +1,23 @@
-use super::{InvalidationSet, TerrainTileKey};
+use super::{TerrainTileKey, TilePageHandle};
 use crate::fields::FieldId;
 use crate::heightfield::{HeightfieldMetrics, TileId, DEFAULT_HALO, DEFAULT_TILE_SIZE};
 use crate::layer::LayerId;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TileState {
-    Missing,
-    Dirty,
-    Queued,
-    Computing,
-    Resident,
-    Stale,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TileRecord {
-    pub state: TileState,
+    /// Backend payload backing this residency record.
+    pub handle: TilePageHandle,
     pub revision: u64,
     pub input_revision_hash: u64,
     /// Min height in metres for resident payload (0 when unknown).
-    #[serde(default)]
     pub height_min: f32,
     /// Max height in metres for resident payload (0 when unknown).
-    #[serde(default)]
     pub height_max: f32,
     /// World-space geometric error at this pyramid level (metres).
-    #[serde(default)]
     pub geometric_error: f32,
-    #[serde(default)]
     pub last_used_frame: u64,
-}
-
-impl Default for TileRecord {
-    fn default() -> Self {
-        Self {
-            state: TileState::Missing,
-            revision: 0,
-            input_revision_hash: 0,
-            height_min: 0.0,
-            height_max: 0.0,
-            geometric_error: 0.0,
-            last_used_frame: 0,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -75,8 +48,7 @@ pub struct TerrainLevel {
     pub metrics: HeightfieldMetrics,
 }
 
-/// Sparse metadata pyramid. GPU/CPU payload ownership is backend-specific; this structure
-/// supplies canonical levels, tile identities, revisions, and coarse fallback.
+/// Sparse, payload-backed residency pyramid for viewport terrain tiles.
 #[derive(Debug, Clone)]
 pub struct TerrainPyramid {
     pub config: PyramidConfig,
@@ -133,30 +105,20 @@ impl TerrainPyramid {
         self.records.get(key)
     }
 
-    pub fn record_mut(&mut self, key: TerrainTileKey) -> &mut TileRecord {
-        self.records.entry(key).or_default()
+    /// Forget all residency metadata when a new final-output revision begins.
+    pub fn clear_residency(&mut self) {
+        self.records.clear();
     }
 
-    pub fn mark_invalid(&mut self, invalidation: &InvalidationSet) {
-        for key in invalidation.keys() {
-            let tile_key = TerrainTileKey {
-                layer: Some(key.layer),
-                field: key.field.clone(),
-                level: key.level,
-                tile: key.tile,
-            };
-            let record = self.records.entry(tile_key).or_default();
-            record.state = if record.state == TileState::Resident {
-                TileState::Stale
-            } else {
-                TileState::Dirty
-            };
-        }
+    pub fn remove_resident(&mut self, key: &TerrainTileKey) -> bool {
+        self.records.remove(key).is_some()
     }
 
-    pub fn publish(
+    /// Publish metadata only after a backend has stored the corresponding payload.
+    pub fn publish_resident(
         &mut self,
         key: TerrainTileKey,
+        handle: TilePageHandle,
         revision: u64,
         input_revision_hash: u64,
         frame: u64,
@@ -164,7 +126,7 @@ impl TerrainPyramid {
         self.records.insert(
             key,
             TileRecord {
-                state: TileState::Resident,
+                handle,
                 revision,
                 input_revision_hash,
                 height_min: 0.0,
@@ -203,11 +165,7 @@ impl TerrainPyramid {
                     tz: sz / level.metrics.tile_size,
                 },
             };
-            if self
-                .records
-                .get(&key)
-                .is_some_and(|record| record.state == TileState::Resident)
-            {
+            if self.records.contains_key(&key) {
                 return Some(key);
             }
         }
@@ -238,7 +196,12 @@ mod tests {
             level: 0,
             tile: TileId { tx: 0, tz: 0 },
         };
-        pyramid.publish(coarse.clone(), 1, 1, 0);
+        let handle = TilePageHandle {
+            slot: 4,
+            generation: 2,
+        };
+        pyramid.publish_resident(coarse.clone(), handle, 1, 1, 0);
+        assert_eq!(pyramid.record(&coarse).unwrap().handle, handle);
         let found = pyramid.best_resident_ancestor(
             None,
             &FieldId::Height,
@@ -246,5 +209,28 @@ mod tests {
             TileId { tx: 3, tz: 2 },
         );
         assert_eq!(found, Some(coarse));
+    }
+
+    #[test]
+    fn evicted_payload_is_not_reported_resident() {
+        let mut pyramid = TerrainPyramid::new(PyramidConfig::new(256, 1024.0, 1024.0));
+        let key = TerrainTileKey {
+            layer: Some(LayerId::new()),
+            field: FieldId::Height,
+            level: 0,
+            tile: TileId { tx: 0, tz: 0 },
+        };
+        pyramid.publish_resident(
+            key.clone(),
+            TilePageHandle {
+                slot: 1,
+                generation: 1,
+            },
+            1,
+            1,
+            0,
+        );
+        assert!(pyramid.remove_resident(&key));
+        assert!(pyramid.record(&key).is_none());
     }
 }

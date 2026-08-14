@@ -1,8 +1,8 @@
 //! Shared free helpers for the app shell.
 
+use crate::ui::UiState;
 use terra_core::layer::{LayerId, LayerKind};
 use terra_gui::GuiState;
-use crate::ui::UiState;
 use winit::keyboard::KeyCode;
 
 pub(crate) fn ui_tool_search_focused(ui_state: &UiState, gui_state: &GuiState) -> bool {
@@ -125,7 +125,9 @@ pub(crate) fn coalesce_layer_id(id: LayerId) -> u64 {
 }
 
 /// Scale/yaw for viewport plant instances from the selected or first Vegetation layer.
-pub(crate) fn vegetation_instance_params(doc: &terra_core::document::TerrainDocument) -> (f32, f32, f32) {
+pub(crate) fn vegetation_instance_params(
+    doc: &terra_core::document::TerrainDocument,
+) -> (f32, f32, f32) {
     let pick = |layer: &terra_core::layer::Layer| -> Option<(f32, f32, f32)> {
         match &layer.kind {
             LayerKind::Vegetation(p) => Some((p.scale_min, p.scale_max, p.yaw_variation_deg)),
@@ -146,5 +148,3 @@ pub(crate) fn vegetation_instance_params(doc: &terra_core::document::TerrainDocu
     }
     (0.5, 1.5, 180.0)
 }
-
-

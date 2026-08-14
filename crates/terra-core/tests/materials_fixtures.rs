@@ -7,7 +7,10 @@ use terra_core::fields::{
 };
 use terra_core::heightfield::{Heightfield, HeightfieldMetrics};
 use terra_core::hydro::stream_power_erode_with_strata;
-use terra_core::layer::{MaterialsParams, Stratum, StreamPowerParams, ThermalErosionParams};
+use terra_core::layer::{
+    MaterialsParams, Stratum, StreamPowerParams, ThermalErosionParams, OPEN_HEIGHT_MAX,
+    OPEN_HEIGHT_MIN,
+};
 use terra_core::mask::MaskField;
 use terra_core::surface::{bake_materials, material_weights};
 
@@ -36,6 +39,28 @@ fn materials_bake_deterministic() {
     let b = bake_materials(&hf, &mats, None, &HashMap::new(), &[], None);
     assert_eq!(a.0.data(), b.0.data());
     assert_eq!(a.1.data(), b.1.data());
+}
+
+#[test]
+fn finite_open_material_bounds_match_infinite_reference_at_supported_extremes() {
+    let finite = MaterialsParams::default();
+    let mut infinite = finite.clone();
+    for rule in &mut infinite.rules {
+        if rule.min_height == OPEN_HEIGHT_MIN {
+            rule.min_height = f32::NEG_INFINITY;
+        }
+        if rule.max_height == OPEN_HEIGHT_MAX {
+            rule.max_height = f32::INFINITY;
+        }
+    }
+
+    for height in [-200_000.0, 0.0, 200_000.0] {
+        let metrics = HeightfieldMetrics::new(4, 4, 4.0, 4.0);
+        let hf = Heightfield::filled(metrics, height);
+        let finite_ids = material_weights(&hf, &finite, None, &HashMap::new(), &[]);
+        let infinite_ids = material_weights(&hf, &infinite, None, &HashMap::new(), &[]);
+        assert_eq!(finite_ids.data(), infinite_ids.data(), "height={height}");
+    }
 }
 
 #[test]

@@ -10,7 +10,7 @@
 //! - Werner / Nishimori-class aeolian dune & saltation models
 
 use crate::heightfield::Heightfield;
-use crate::noise::{self, hash2};
+use crate::noise::{self, canonical_seed32, hash2};
 
 const SQRT2: f32 = std::f32::consts::SQRT_2;
 const PI: f32 = std::f32::consts::PI;
@@ -109,10 +109,7 @@ pub fn flow_accumulation_dinf(hf: &Heightfield, passes: u32) -> Vec<f32> {
 
 pub fn normalize_field(values: &[f32]) -> Vec<f32> {
     let max_f = values.iter().copied().fold(1e-6f32, f32::max);
-    values
-        .iter()
-        .map(|v| (v / max_f).clamp(0.0, 1.0))
-        .collect()
+    values.iter().map(|v| (v / max_f).clamp(0.0, 1.0)).collect()
 }
 
 /// Box blur helper used by several filters.
@@ -140,7 +137,12 @@ pub fn box_blur(input: &Heightfield, radius: u32) -> Heightfield {
 }
 
 /// Bilateral (edge-aware) filter — Tomasi & Manduchi style on heightfields.
-pub fn bilateral(input: &Heightfield, radius: u32, sigma_space: f32, sigma_range: f32) -> Heightfield {
+pub fn bilateral(
+    input: &Heightfield,
+    radius: u32,
+    sigma_space: f32,
+    sigma_range: f32,
+) -> Heightfield {
     let r = radius.max(1) as i32;
     let w = input.metrics.width as i32;
     let h = input.metrics.height as i32;
@@ -172,12 +174,7 @@ pub fn bilateral(input: &Heightfield, radius: u32, sigma_space: f32, sigma_range
 }
 
 /// Directional Gaussian blur along unit direction `(dir_x, dir_z)` in texel steps.
-pub fn anisotropic_blur(
-    input: &Heightfield,
-    radius: u32,
-    dir_x: f32,
-    dir_z: f32,
-) -> Heightfield {
+pub fn anisotropic_blur(input: &Heightfield, radius: u32, dir_x: f32, dir_z: f32) -> Heightfield {
     let r = radius.max(1) as i32;
     let w = input.metrics.width as i32;
     let h = input.metrics.height as i32;
@@ -240,7 +237,12 @@ fn morph_extremum(input: &Heightfield, radius: u32, maximize: bool) -> Heightfie
 /// Angle-of-repose thermal weathering (Musgrave-style talus).
 ///
 /// Thin wrapper around the layered mass-wasting apron for filter kernels.
-pub fn thermal_talus(input: &Heightfield, repose_deg: f32, amount: f32, iterations: u32) -> Heightfield {
+pub fn thermal_talus(
+    input: &Heightfield,
+    repose_deg: f32,
+    amount: f32,
+    iterations: u32,
+) -> Heightfield {
     crate::analyze::talus_apron(input, repose_deg, amount.max(0.5), 0.85, iterations, None).height
 }
 
@@ -354,7 +356,7 @@ fn sparse_gabor_raw(x: f32, z: f32, frequency: f32, seed: u64) -> f32 {
     let pz = z / cell;
     let ix = px.floor() as i32;
     let iz = pz.floor() as i32;
-    let seed_u = seed as u32;
+    let seed_u = canonical_seed32(seed);
     let mut sum = 0.0f32;
     let mut wsum = 0.0f32;
     // 3×3 neighborhood of impulse cells.
@@ -464,7 +466,7 @@ fn phasor_noise_raw(x: f32, z: f32, frequency: f32, seed: u64) -> f32 {
     for k in 0..4 {
         let sk = seed.wrapping_add(k as u64 * 9173);
         let theta = noise::sample_noise(
-            crate::layer::FractalNoiseType::OpenSimplex,
+            crate::noise::FractalNoiseType::OpenSimplex,
             x * freq * 0.15 + k as f32 * 3.1,
             z * freq * 0.15 - k as f32 * 1.7,
             sk,
@@ -472,7 +474,7 @@ fn phasor_noise_raw(x: f32, z: f32, frequency: f32, seed: u64) -> f32 {
         let (st, ct) = theta.sin_cos();
         let phase = (x * ct + z * st) * freq * TAU
             + noise::sample_noise(
-                crate::layer::FractalNoiseType::OpenSimplex,
+                crate::noise::FractalNoiseType::OpenSimplex,
                 x * freq * 0.07,
                 z * freq * 0.07,
                 sk ^ 0x51AF,
@@ -480,7 +482,7 @@ fn phasor_noise_raw(x: f32, z: f32, frequency: f32, seed: u64) -> f32 {
         let amp = 0.55
             + 0.45
                 * noise::sample_noise(
-                    crate::layer::FractalNoiseType::Value,
+                    crate::noise::FractalNoiseType::Value,
                     x * freq * 0.2,
                     z * freq * 0.2,
                     sk ^ 0xC0DE,
@@ -554,12 +556,18 @@ pub fn directional_phasor(
 
     let mut re = 0.0f32;
     let mut im = 0.0f32;
-    let lobes = if lin > 0.75 { 2 } else if lin > 0.4 { 3 } else { 4 };
+    let lobes = if lin > 0.75 {
+        2
+    } else if lin > 0.4 {
+        3
+    } else {
+        4
+    };
     for k in 0..lobes {
         let sk = seed.wrapping_add(k as u64 * 9173);
         let spread = (1.0 - lin) * 0.55;
         let yaw = noise::sample_noise(
-            crate::layer::FractalNoiseType::OpenSimplex,
+            crate::noise::FractalNoiseType::OpenSimplex,
             across * freq * 0.12 + k as f32 * 2.7,
             along * freq * 0.05,
             sk,
@@ -567,27 +575,24 @@ pub fn directional_phasor(
             * spread;
         let (st, ct) = (direction_rad + yaw).sin_cos();
         let warp = noise::sample_noise(
-            crate::layer::FractalNoiseType::OpenSimplex,
+            crate::noise::FractalNoiseType::OpenSimplex,
             x * freq * 0.08,
             z * freq * 0.08,
             sk ^ 0x51AF,
         ) * PI
             * (0.35 + 0.65 * (1.0 - lin));
         let phase = (x * ct + z * st) * freq * TAU + warp;
-        let amp = 0.6 + 0.4
-            * noise::sample_noise(
-                crate::layer::FractalNoiseType::Value,
-                across * freq * 0.18,
-                along * freq * 0.11,
-                sk ^ 0xC0DE,
-            )
-            .abs();
+        let amp = 0.6
+            + 0.4
+                * noise::sample_noise(
+                    crate::noise::FractalNoiseType::Value,
+                    across * freq * 0.18,
+                    along * freq * 0.11,
+                    sk ^ 0xC0DE,
+                )
+                .abs();
         // Prefer the primary wind-aligned lobe when linearity is high.
-        let w = if k == 0 {
-            1.0
-        } else {
-            (1.0 - lin).powf(0.65)
-        };
+        let w = if k == 0 { 1.0 } else { (1.0 - lin).powf(0.65) };
         re += amp * w * phase.cos();
         im += amp * w * phase.sin();
     }
@@ -596,14 +601,14 @@ pub fn directional_phasor(
 }
 
 /// Musgrave-style billow: absolute-value FBM centered to [-1, 1].
-pub fn billow_mf(x: f32, z: f32, params: &crate::layer::NoiseParams) -> f32 {
+pub fn billow_mf(x: f32, z: f32, params: &crate::noise::NoiseParams) -> f32 {
     let mut amp = 1.0f32;
     let mut freq = params.frequency;
     let mut sum = 0.0f32;
     let mut norm = 0.0f32;
     for o in 0..params.octaves.max(1) {
         let n = noise::sample_noise(
-            crate::layer::FractalNoiseType::Perlin,
+            crate::noise::FractalNoiseType::Perlin,
             (x + params.offset_x) * freq,
             (z + params.offset_z) * freq,
             params.seed.wrapping_add(o as u64 * 1301),
@@ -621,7 +626,7 @@ pub fn billow_mf(x: f32, z: f32, params: &crate::layer::NoiseParams) -> f32 {
 
 /// Deterministic white noise in [-1, 1] from grid indices.
 pub fn white_noise(i: u32, j: u32, seed: u64) -> f32 {
-    let h = hash2(i as i32, j as i32, seed as u32);
+    let h = hash2(i as i32, j as i32, canonical_seed32(seed));
     (h as f32 / 4294967295.0) * 2.0 - 1.0
 }
 
@@ -642,6 +647,28 @@ mod tests {
         let d = directional_phasor(3.0, 7.0, 0.05, 0.3, 0.8, 7);
         assert!(d.is_finite());
         assert_eq!(d, directional_phasor(3.0, 7.0, 0.05, 0.3, 0.8, 7));
+    }
+
+    #[test]
+    fn high_seed_bits_change_hash_backed_filter_kernels() {
+        let low = 7;
+        let high = low + (1u64 << 32);
+        let points = [(1.25, 3.5), (12.5, 8.25), (-3.75, 19.125)];
+        let gabor = |seed| {
+            points
+                .iter()
+                .map(|&(x, z)| sparse_gabor(x, z, 0.04, seed).to_bits())
+                .collect::<Vec<_>>()
+        };
+        let white = |seed| {
+            [(1, 3), (12, 8), (37, 19)]
+                .iter()
+                .map(|&(i, j)| white_noise(i, j, seed).to_bits())
+                .collect::<Vec<_>>()
+        };
+
+        assert_ne!(gabor(low), gabor(high));
+        assert_ne!(white(low), white(high));
     }
 
     #[test]

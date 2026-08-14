@@ -32,13 +32,12 @@ pub use level_step::{
     thermal_erode_leveled_with_hardness, AmplifyResult, SimLevel,
 };
 pub use mass_wasting::{
-    debris_flow_erode, mud_settle_mass, sediment_fill_soft_mass, talus_apron, thermal_erode_layered,
-    thermal_erode_mass, DebrisFlowResult, MassWastingState, ThermalResult,
+    debris_flow_erode, mud_settle_mass, sediment_fill_soft_mass, talus_apron,
+    thermal_erode_layered, thermal_erode_mass, DebrisFlowMassLedger, DebrisFlowResult,
+    MassWastingState, ThermalResult,
 };
 pub use metrics::*;
 pub use terrain_amplification::{
     amplify_terrain, AmplificationBands, TerrainAmplificationParams, TerrainAmplificationResult,
 };
-pub use terrain_stats::{
-    Histogram, HypsometricCurve, StreamOrderDistribution, TerrainStatistics,
-};
+pub use terrain_stats::{Histogram, HypsometricCurve, StreamOrderDistribution, TerrainStatistics};

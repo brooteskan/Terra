@@ -3,6 +3,7 @@
 **/*.rs.bk
 .idea/
 .vscode/
+.vs/
 *.pdb
 
 # Local editor runtime / saves (rewritten next to the binary cwd)

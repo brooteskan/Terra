@@ -4,11 +4,11 @@
 //! closed depression.
 
 use terra_core::geomorph::{
-    accumulate_drainage_area, analyze_terrain, build_flow_graph, closed_depression, cone,
-    extract_streams, gradient_components, handle_depressions, noisy_mountain, plane,
-    single_basin, single_valley, slope_magnitude, two_basins, watersheds_from_graph, BreachParams,
-    DepressionMode, FlowModel, GeomorphOptions, Precipitation, PreserveBasinsParams,
-    StreamExtractParams, WatershedOptions,
+    accumulate_drainage_area, accumulate_drainage_area_d8, analyze_terrain, build_flow_graph,
+    closed_depression, cone, extract_streams, gradient_components, handle_depressions,
+    noisy_mountain, plane, single_basin, single_valley, slope_magnitude, two_basins,
+    watersheds_from_graph, BreachParams, D8Drainage, DepressionMode, FlowModel, GeomorphOptions,
+    Precipitation, PreserveBasinsParams, StreamExtractParams, WatershedOptions,
 };
 use terra_core::heightfield::{Heightfield, HeightfieldMetrics};
 use terra_core::mask::MaskField;
@@ -92,13 +92,123 @@ fn watershed_boundaries_follow_divides() {
 fn routing_is_deterministic() {
     let hf = noisy_mountain(metrics(32));
     let filled = handle_depressions(&hf, DepressionMode::Fill).height;
-    let a = build_flow_graph(&filled, FlowModel::D8);
-    let b = build_flow_graph(&filled, FlowModel::D8);
-    assert_eq!(a.d8_dir, b.d8_dir);
-    assert_eq!(a.topo_order, b.topo_order);
-    let acc_a = accumulate_drainage_area(&a, &Precipitation::uniform(1.0));
-    let acc_b = accumulate_drainage_area(&b, &Precipitation::uniform(1.0));
-    assert_eq!(acc_a, acc_b);
+    // A fixed (terrain, model) must yield bit-identical routing products so a
+    // project re-run reproduces its f32 drainage exactly. This determinism is
+    // what lets the single routing lineage (B2-D3 / #24) replace hydro's second
+    // copy without pinning a golden per call site; the D8 tie-break itself is
+    // pinned by geomorph::routing::tests::d8_deterministic_ties.
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    for model in [FlowModel::D8, FlowModel::DInfinity] {
+        let a = build_flow_graph(&filled, model);
+        let b = build_flow_graph(&filled, model);
+        assert_eq!(a.d8_dir, b.d8_dir, "d8_dir differs for {model:?}");
+        assert_eq!(
+            a.topo_order, b.topo_order,
+            "topo_order differs for {model:?}"
+        );
+        let acc_a = accumulate_drainage_area(&a, &Precipitation::uniform(1.0));
+        let acc_b = accumulate_drainage_area(&b, &Precipitation::uniform(1.0));
+        assert_eq!(
+            bits(&acc_a),
+            bits(&acc_b),
+            "accumulation not bit-identical for {model:?}"
+        );
+    }
+}
+
+#[test]
+fn flat_d8_drainage_matches_flow_graph() {
+    // #27 lean flat-D8 path must produce bit-identical routing products to the
+    // general `build_flow_graph(D8)` the SPE oracle previously routed through:
+    // same receivers, same topo order, bit-identical accumulation, same
+    // direction mask. SPE consumes only (d8_dir, accumulation, direction_mask),
+    // so pinning all three identical proves SPE output is unchanged.
+    let precip = Precipitation::uniform(1.0);
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+
+    // Square and non-square, raw and depression-filled.
+    let cases: &[HeightfieldMetrics] = &[
+        HeightfieldMetrics::new(3, 3, 30.0, 30.0),
+        HeightfieldMetrics::new(32, 32, 320.0, 320.0),
+        HeightfieldMetrics::new(40, 24, 400.0, 240.0),
+    ];
+    let builders: &[(&str, fn(HeightfieldMetrics) -> Heightfield)] = &[
+        ("plane", plane),
+        ("cone", cone),
+        ("single_valley", single_valley),
+        ("single_basin", single_basin),
+        ("two_basins", two_basins),
+        ("noisy_mountain", noisy_mountain),
+        ("closed_depression", closed_depression),
+    ];
+
+    for &m in cases {
+        for &(name, build) in builders {
+            for filled in [false, true] {
+                let raw = build(m);
+                let hf = if filled {
+                    handle_depressions(&raw, DepressionMode::Fill).height
+                } else {
+                    raw
+                };
+                let tag = format!("{name} {}x{} filled={filled}", m.width, m.height);
+
+                let g = build_flow_graph(&hf, FlowModel::D8);
+                let d = D8Drainage::build(&hf);
+
+                assert_eq!(d.d8_dir, g.d8_dir, "d8_dir differs: {tag}");
+                assert_eq!(d.topo_order, g.topo_order, "topo_order differs: {tag}");
+
+                let n = g.width * g.height;
+                for idx in 0..n {
+                    let expect = g.d8_receiver_index(idx);
+                    let got = (d.receiver[idx] != usize::MAX).then_some(d.receiver[idx]);
+                    assert_eq!(got, expect, "receiver differs at {idx}: {tag}");
+                }
+
+                let acc_g = accumulate_drainage_area(&g, &precip);
+                let acc_d = accumulate_drainage_area_d8(&d, &precip);
+                assert_eq!(
+                    bits(&acc_g),
+                    bits(&acc_d),
+                    "accumulation not bit-identical: {tag}"
+                );
+
+                for j in 0..m.height {
+                    for i in 0..m.width {
+                        assert_eq!(
+                            d.direction_mask.get(i, j).to_bits(),
+                            g.direction_mask.get(i, j).to_bits(),
+                            "direction_mask differs at ({i},{j}): {tag}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn flat_d8_rebuild_matches_fresh_build() {
+    // Buffer reuse across SPE iterations must not leave stale state: rebuilding
+    // an existing cache onto a new surface equals a fresh build of that surface.
+    let m = HeightfieldMetrics::new(48, 32, 480.0, 320.0);
+    let a = handle_depressions(&noisy_mountain(m), DepressionMode::Fill).height;
+    let b = handle_depressions(&cone(m), DepressionMode::Fill).height;
+    let precip = Precipitation::uniform(1.0);
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+
+    let mut reused = D8Drainage::build(&a);
+    reused.rebuild(&b);
+    let fresh = D8Drainage::build(&b);
+
+    assert_eq!(reused.d8_dir, fresh.d8_dir);
+    assert_eq!(reused.receiver, fresh.receiver);
+    assert_eq!(reused.topo_order, fresh.topo_order);
+    assert_eq!(
+        bits(&accumulate_drainage_area_d8(&reused, &precip)),
+        bits(&accumulate_drainage_area_d8(&fresh, &precip)),
+    );
 }
 
 #[test]
@@ -119,7 +229,12 @@ fn tiled_derivative_halo_has_no_interior_seams() {
             let j1 = (tj + tile + halo).min(hf.metrics.height);
             let tw = i1 - i0;
             let th = j1 - j0;
-            let tm = HeightfieldMetrics::new(tw, th, tw as f32 * hf.metrics.dx(), th as f32 * hf.metrics.dz());
+            let tm = HeightfieldMetrics::new(
+                tw,
+                th,
+                tw as f32 * hf.metrics.dx(),
+                th as f32 * hf.metrics.dz(),
+            );
             let mut patch = Heightfield::zeros(tm);
             for j in 0..th {
                 for i in 0..tw {

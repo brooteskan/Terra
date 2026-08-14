@@ -12,6 +12,7 @@ use super::analytical::evolve_analytical;
 use super::iterative::evolve_iterative;
 use super::params::{BoundaryMode, EvolutionSolverMode, LandscapeEvolutionParams};
 use super::uplift::synthesise_uplift;
+use super::BoundaryMasks;
 
 /// Inputs consumed by the landscape evolution operator.
 #[derive(Debug, Clone)]
@@ -54,7 +55,7 @@ impl LandscapeEvolutionOutput {
         fields.insert(keys::WATER_DISCHARGE, self.discharge);
         if let Some(d) = self.deposition {
             fields.insert(keys::DEPOSITION, d.clone());
-            fields.insert(keys::SEDIMENT_DEPTH, d);
+            fields.insert(keys::SEDIMENT_THICKNESS, d);
         }
         (self.elevation, fields)
     }
@@ -82,30 +83,29 @@ impl LandscapeEvolutionOperator {
         let mut hardness = input
             .lithology_hardness
             .cloned()
-            .unwrap_or_else(|| MaskField::filled(m, p.terrain_resistance.clamp(0.0, 1.0)));
+            .unwrap_or_else(|| MaskField::zeros(m));
         if let Some(ero) = input.erodibility {
             for j in 0..m.height {
                 for i in 0..m.width {
                     let soft = ero.get(i, j).clamp(0.0, 1.0);
-                    let h = (hardness.get(i, j) * (1.0 - soft * 0.85)
-                        + p.terrain_resistance * 0.15)
-                        .clamp(0.0, 1.0);
+                    let h = (hardness.get(i, j) * (1.0 - soft * 0.85)).clamp(0.0, 1.0);
                     hardness.set(i, j, h);
                 }
             }
         }
 
         // ── Uplift field (tectonic) ──────────────────────────────────────
-        let uplift = synthesise_uplift(m, p, input.painted_uplift);
+        let boundaries = build_boundary_masks(input.elevation, p, input.outlet_mask);
+        let mut uplift = synthesise_uplift(m, p, input.painted_uplift);
+        zero_locked_mask_values(&mut uplift, &boundaries.elevation_locks);
         // Rainfall field modulates local uplift-driven discharge later via params.rainfall;
         // optional precip map scales rainfall spatially into a discharge weight.
-        let rain_weight = input.precipitation.cloned().unwrap_or_else(|| {
-            MaskField::filled(m, p.rainfall.max(0.0))
-        });
+        let rain_weight = input
+            .precipitation
+            .cloned()
+            .unwrap_or_else(|| MaskField::filled(m, p.rainfall.max(0.0)));
 
         // ── Boundary / outlet mask ───────────────────────────────────────
-        let boundary = build_boundary_mask(input.elevation, p, input.outlet_mask);
-
         // ── Tectonic base structure (preserved large forms) ──────────────
         // Seed tectonic base from input + a short uplift impulse so large forms
         // exist before fluvial organisation — erosion cannot freely destroy this.
@@ -113,7 +113,7 @@ impl LandscapeEvolutionOperator {
         let seed_time = (p.evolution_time() * 0.15).max(p.dt);
         for j in 0..m.height {
             for i in 0..m.width {
-                if boundary.get(i, j) > 0.5 {
+                if boundaries.elevation_locks.get(i, j) > 0.5 {
                     continue;
                 }
                 let u = uplift.get(i, j) * seed_time;
@@ -128,15 +128,11 @@ impl LandscapeEvolutionOperator {
         let seed_blend = (0.2 + 0.55 * age) * p.uplift.clamp(0.0, 2.0).min(1.0);
         for j in 0..m.height {
             for i in 0..m.width {
-                if boundary.get(i, j) > 0.5 {
+                if boundaries.elevation_locks.get(i, j) > 0.5 {
                     continue;
                 }
                 let a = seed_blend.clamp(0.0, 1.0);
-                working.set(
-                    i,
-                    j,
-                    working.get(i, j) * (1.0 - a) + tectonic.get(i, j) * a,
-                );
+                working.set(i, j, working.get(i, j) * (1.0 - a) + tectonic.get(i, j) * a);
             }
         }
 
@@ -154,11 +150,30 @@ impl LandscapeEvolutionOperator {
             }
         }
 
+        // Artist resistance is a global hardness floor and is applied after
+        // all spatial softening. The union form leaves lithology unchanged at
+        // zero and makes resistance=1 an exact no-incision limit.
+        let global_resistance = p.terrain_resistance.clamp(0.0, 1.0);
+        if global_resistance > 0.0 {
+            for j in 0..m.height {
+                for i in 0..m.width {
+                    let local = hardness.get(i, j).clamp(0.0, 1.0);
+                    let combined = 1.0 - (1.0 - local) * (1.0 - global_resistance);
+                    hardness.set(i, j, combined.clamp(0.0, 1.0));
+                }
+            }
+        }
+
         // Light Dendry-inspired valley prime so Fast analytical has immature
         // drainage seeds (Cordonnier networks need an initial flow direction).
         let prime = 0.08 + 0.12 * (1.0 - age);
         if prime > 1e-4 {
-            working = crate::hydro::ridge_distance_valley_seed(&working, prime);
+            working = crate::hydro::ridge_distance_valley_seed_with_locks(
+                &working,
+                prime,
+                &boundaries.elevation_locks,
+            );
+            restore_locked_height(&mut working, input.elevation, &boundaries.elevation_locks);
         }
 
         let (mut evolved, cache, incision_raw, erosion_raw) = match p.solver {
@@ -169,7 +184,7 @@ impl LandscapeEvolutionOperator {
                     &tectonic,
                     &uplift,
                     &hardness,
-                    &boundary,
+                    &boundaries,
                     p,
                     passes,
                 );
@@ -182,7 +197,7 @@ impl LandscapeEvolutionOperator {
             EvolutionSolverMode::Accurate => {
                 let steps = p.accurate_steps();
                 let (z, cache, incision, erosion) =
-                    evolve_iterative(&working, &uplift, &hardness, &boundary, p, steps);
+                    evolve_iterative(&working, &uplift, &hardness, &boundaries, p, steps);
                 (z, cache, incision, erosion)
             }
         };
@@ -198,10 +213,12 @@ impl LandscapeEvolutionOperator {
                 layered_materials: false,
                 ..ThermalErosionParams::default()
             };
+            let hillslope_hardness = hardness_with_locks(&hardness, &boundaries.elevation_locks);
             let (hillslope, _e, deposit) =
-                analyze::thermal_erode_with_hardness(&evolved, &thermal, &hardness);
+                analyze::thermal_erode_with_hardness(&evolved, &thermal, &hillslope_hardness);
             let transport = p.sediment_transport.clamp(0.0, 1.0);
             evolved = hillslope;
+            restore_locked_height(&mut evolved, input.elevation, &boundaries.elevation_locks);
             let deposition = if transport > 1e-4 || p.deposition_coeff > 1e-6 {
                 let data: Vec<f32> = deposit
                     .data()
@@ -218,6 +235,7 @@ impl LandscapeEvolutionOperator {
                 &mut evolved,
                 &tectonic,
                 input.protection,
+                &boundaries.elevation_locks,
                 p.constraint_preservation,
             );
 
@@ -231,6 +249,8 @@ impl LandscapeEvolutionOperator {
                 deposition,
                 m,
                 p,
+                input.elevation,
+                &boundaries.elevation_locks,
             );
         }
 
@@ -238,6 +258,7 @@ impl LandscapeEvolutionOperator {
             &mut evolved,
             &tectonic,
             input.protection,
+            &boundaries.elevation_locks,
             p.constraint_preservation,
         );
 
@@ -251,21 +272,30 @@ impl LandscapeEvolutionOperator {
             None,
             m,
             p,
+            input.elevation,
+            &boundaries.elevation_locks,
         )
     }
 }
 
 fn finalize(
-    evolved: Heightfield,
-    tectonic: Heightfield,
+    mut evolved: Heightfield,
+    mut tectonic: Heightfield,
     cache: super::cache::DrainageCache,
     incision_raw: &[f32],
     erosion_raw: &[f32],
     uplift: MaskField,
-    deposition: Option<MaskField>,
+    mut deposition: Option<MaskField>,
     m: crate::heightfield::HeightfieldMetrics,
     p: &LandscapeEvolutionParams,
+    original: &Heightfield,
+    elevation_locks: &MaskField,
 ) -> LandscapeEvolutionOutput {
+    restore_locked_height(&mut evolved, original, elevation_locks);
+    restore_locked_height(&mut tectonic, original, elevation_locks);
+    if let Some(field) = deposition.as_mut() {
+        zero_locked_mask_values(field, elevation_locks);
+    }
     let w = m.width as usize;
     let h = m.height as usize;
     let max_acc = cache
@@ -284,7 +314,7 @@ fn finalize(
             discharge.set(i as u32, j as u32, a * rain);
         }
     }
-    let order = hydro::stream_order(
+    let order = hydro::stream_order_log2(
         &cache.accumulation,
         w,
         h,
@@ -298,8 +328,10 @@ fn finalize(
         for i in 0..w {
             let idx = j * w + i;
             order_mask.set(i as u32, j as u32, order[idx] as f32 / max_order);
-            incision.set(i as u32, j as u32, incision_raw[idx]);
-            erosion_rate.set(i as u32, j as u32, erosion_raw[idx]);
+            if elevation_locks.get(i as u32, j as u32) <= 0.5 {
+                incision.set(i as u32, j as u32, incision_raw[idx]);
+                erosion_rate.set(i as u32, j as u32, erosion_raw[idx]);
+            }
         }
     }
 
@@ -321,13 +353,20 @@ fn apply_tectonic_preservation(
     evolved: &mut Heightfield,
     tectonic: &Heightfield,
     protection: Option<&MaskField>,
+    elevation_locks: &MaskField,
     preservation: f32,
 ) {
     let m = evolved.metrics;
     let base_lock = (preservation.clamp(0.0, 1.0) * 0.35).clamp(0.0, 1.0);
     for j in 0..m.height {
         for i in 0..m.width {
-            let painted = protection.map(|f| f.get(i, j)).unwrap_or(0.0).clamp(0.0, 1.0);
+            if elevation_locks.get(i, j) > 0.5 {
+                continue;
+            }
+            let painted = protection
+                .map(|f| f.get(i, j))
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0);
             let a = (base_lock + painted * preservation.clamp(0.0, 1.0)).clamp(0.0, 1.0);
             if a <= 1e-5 {
                 continue;
@@ -342,56 +381,68 @@ fn apply_tectonic_preservation(
     }
 }
 
-fn build_boundary_mask(
+fn build_boundary_masks(
     elevation: &Heightfield,
     p: &LandscapeEvolutionParams,
     outlet_mask: Option<&MaskField>,
-) -> MaskField {
+) -> BoundaryMasks {
     let m = elevation.metrics;
-    let mut boundary = MaskField::zeros(m);
+    let mut routing_outlets = MaskField::zeros(m);
+    let mut elevation_locks = MaskField::zeros(m);
     match p.boundary {
         BoundaryMode::OutletMask => {
             if let Some(mask) = outlet_mask {
-                for j in 0..m.height {
-                    for i in 0..m.width {
-                        if mask.get(i, j) > 0.5 {
-                            boundary.set(i, j, 1.0);
-                        }
-                    }
-                }
+                copy_thresholded_mask(mask, &mut routing_outlets);
+                copy_thresholded_mask(mask, &mut elevation_locks);
             } else {
-                mark_sea_level(elevation, &mut boundary, p.base_level);
-                mark_border(&mut boundary, 1);
+                mark_sea_level(elevation, &mut elevation_locks, p.base_level);
+                union_mask(&elevation_locks, &mut routing_outlets);
+                mark_border(&mut routing_outlets, 1);
             }
         }
         BoundaryMode::SeaLevel => {
-            mark_sea_level(elevation, &mut boundary, p.base_level);
-            mark_border(&mut boundary, 1);
+            mark_sea_level(elevation, &mut elevation_locks, p.base_level);
+            union_mask(&elevation_locks, &mut routing_outlets);
+            mark_border(&mut routing_outlets, 1);
         }
         BoundaryMode::Fixed => {
-            mark_border(&mut boundary, 2);
+            mark_border(&mut routing_outlets, 1);
+            mark_border(&mut elevation_locks, 1);
         }
         BoundaryMode::OpenDrainage => {
-            mark_border(&mut boundary, 1);
+            mark_border(&mut routing_outlets, 1);
         }
     }
-    // Ensure at least one outlet exists.
-    let mut any = false;
+
+    // A missing routing outlet gets an explicit open-rim fallback. It never
+    // silently becomes an elevation lock.
+    if !has_marked_cells(&routing_outlets) {
+        mark_border(&mut routing_outlets, 1);
+    }
+
+    BoundaryMasks {
+        routing_outlets,
+        elevation_locks,
+    }
+}
+
+fn copy_thresholded_mask(source: &MaskField, target: &mut MaskField) {
+    let m = target.metrics;
     for j in 0..m.height {
         for i in 0..m.width {
-            if boundary.get(i, j) > 0.5 {
-                any = true;
-                break;
+            if source.get(i, j) > 0.5 {
+                target.set(i, j, 1.0);
             }
         }
-        if any {
-            break;
-        }
     }
-    if !any {
-        mark_border(&mut boundary, 1);
-    }
-    boundary
+}
+
+fn union_mask(source: &MaskField, target: &mut MaskField) {
+    copy_thresholded_mask(source, target);
+}
+
+fn has_marked_cells(mask: &MaskField) -> bool {
+    mask.data().iter().any(|&v| v > 0.5)
 }
 
 fn mark_sea_level(elevation: &Heightfield, boundary: &mut MaskField, base: f32) {
@@ -414,6 +465,45 @@ fn mark_border(boundary: &mut MaskField, margin: u32) {
             }
         }
     }
+}
+
+fn restore_locked_height(
+    target: &mut Heightfield,
+    original: &Heightfield,
+    elevation_locks: &MaskField,
+) {
+    let m = target.metrics;
+    for j in 0..m.height {
+        for i in 0..m.width {
+            if elevation_locks.get(i, j) > 0.5 {
+                target.set(i, j, original.get(i, j));
+            }
+        }
+    }
+}
+
+fn zero_locked_mask_values(target: &mut MaskField, elevation_locks: &MaskField) {
+    let m = target.metrics;
+    for j in 0..m.height {
+        for i in 0..m.width {
+            if elevation_locks.get(i, j) > 0.5 {
+                target.set(i, j, 0.0);
+            }
+        }
+    }
+}
+
+fn hardness_with_locks(hardness: &MaskField, elevation_locks: &MaskField) -> MaskField {
+    let mut out = hardness.clone();
+    let m = out.metrics;
+    for j in 0..m.height {
+        for i in 0..m.width {
+            if elevation_locks.get(i, j) > 0.5 {
+                out.set(i, j, 1.0);
+            }
+        }
+    }
+    out
 }
 
 fn mean_mask(field: &MaskField) -> f32 {

@@ -3,7 +3,7 @@
 use crate::heightfield::Heightfield;
 use crate::mask::MaskField;
 
-use super::routing::{FlowGraph, NO_FLOW, D8_OFFSETS};
+use super::routing::{FlowGraph, D8_OFFSETS, NO_FLOW};
 
 /// Watershed extraction options.
 #[derive(Debug, Clone)]
@@ -133,7 +133,11 @@ pub fn watersheds_from_graph(
     // If auto boundary outlets requested, keep outlets that sit on the border.
     if opts.auto_boundary_outlets {
         outlets.retain(|&(i, j, _)| {
-            i == 0 || j == 0 || i + 1 == w as u32 || j + 1 == h as u32 || opts.outlet == Some((i, j))
+            i == 0
+                || j == 0
+                || i + 1 == w as u32
+                || j + 1 == h as u32
+                || opts.outlet == Some((i, j))
         });
     }
 

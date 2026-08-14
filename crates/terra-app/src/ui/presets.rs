@@ -1183,7 +1183,7 @@ pub fn builtin_presets() -> Vec<LayerPreset> {
                                 min_slope_deg: 28.0,
                                 max_slope_deg: 90.0,
                                 min_height: 0.0,
-                                max_height: f32::INFINITY,
+                                max_height: OPEN_HEIGHT_MAX,
                                 mask: terra_core::mask::MaskSource::None,
                                 hardness: 0.78,
                                 tint: [0.16, 0.18, 0.17],
@@ -1197,7 +1197,7 @@ pub fn builtin_presets() -> Vec<LayerPreset> {
                                 min_slope_deg: 0.0,
                                 max_slope_deg: 31.0,
                                 min_height: 2.0,
-                                max_height: f32::INFINITY,
+                                max_height: OPEN_HEIGHT_MAX,
                                 mask: terra_core::mask::MaskSource::None,
                                 hardness: 0.17,
                                 tint: [0.16, 0.27, 0.08],
@@ -1221,7 +1221,7 @@ pub fn builtin_presets() -> Vec<LayerPreset> {
                         talus_angle_deg: 33.0,
                         sediment_transport: 0.48,
                         constraint_preservation: 0.82,
-                        base_level: -240.0,
+                        base_level: 0.0,
                         use_dinfinity: true,
                         geological_age: 0.55,
                         rainfall: 1.8,
@@ -1302,7 +1302,7 @@ pub fn builtin_presets() -> Vec<LayerPreset> {
                                 min_slope_deg: 0.0,
                                 max_slope_deg: 30.0,
                                 min_height: 4.0,
-                                max_height: f32::INFINITY,
+                                max_height: OPEN_HEIGHT_MAX,
                                 mask: terra_core::mask::MaskSource::None,
                                 hardness: 0.2,
                                 tint: [0.12, 0.30, 0.09],
@@ -1329,8 +1329,8 @@ pub fn builtin_presets() -> Vec<LayerPreset> {
                                 id: 1,
                                 min_slope_deg: 22.0,
                                 max_slope_deg: 90.0,
-                                min_height: f32::NEG_INFINITY,
-                                max_height: f32::INFINITY,
+                                min_height: OPEN_HEIGHT_MIN,
+                                max_height: OPEN_HEIGHT_MAX,
                                 mask: terra_core::mask::MaskSource::None,
                                 hardness: 0.8,
                                 tint: [0.18, 0.20, 0.19],
@@ -1343,7 +1343,7 @@ pub fn builtin_presets() -> Vec<LayerPreset> {
                                 id: 5,
                                 min_slope_deg: 91.0,
                                 max_slope_deg: 90.0,
-                                min_height: f32::NEG_INFINITY,
+                                min_height: OPEN_HEIGHT_MIN,
                                 max_height: 0.0,
                                 mask: terra_core::mask::MaskSource::Named(terra_core::fields::keys::REEF.into()),
                                 hardness: 0.72,
@@ -1819,6 +1819,50 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
+    fn authored_material_and_biome_preset_bounds_are_finite() {
+        for preset in builtin_presets() {
+            for (_, kind) in preset.layers {
+                match kind {
+                    LayerKind::Materials(params) => {
+                        assert!(
+                            params.rules.iter().all(|rule| {
+                                rule.min_height.is_finite() && rule.max_height.is_finite()
+                            }),
+                            "{} has non-finite material bounds",
+                            preset.name
+                        );
+                    }
+                    LayerKind::Biomes(params) => {
+                        assert!(
+                            params.bands.iter().all(|band| {
+                                band.min_height.is_finite() && band.max_height.is_finite()
+                            }),
+                            "{} has non-finite biome bounds",
+                            preset.name
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn representative_surface_presets_round_trip_as_documents() {
+        for name in ["Alpine Range", "Tropical Island"] {
+            let layers = layers_from_preset(name).unwrap_or_else(|| panic!("missing {name}"));
+            let doc = terra_core::document::TerrainDocument::from_flat_layers(layers);
+            let json = doc
+                .to_json()
+                .unwrap_or_else(|error| panic!("{name} must serialize: {error}"));
+            assert!(!json.contains("\"min_height\":null"), "{name}");
+            assert!(!json.contains("\"max_height\":null"), "{name}");
+            terra_core::document::TerrainDocument::from_json(&json)
+                .unwrap_or_else(|error| panic!("{name} must reload: {error}"));
+        }
+    }
+
+    #[test]
     fn fidelity_showcases_keep_required_stages() {
         for name in [
             "Alpine Range",
@@ -2023,7 +2067,7 @@ mod tests {
             terra_core::fields::keys::REPAIR_REGION,
             terra_core::fields::keys::DETAIL_MASK,
             terra_core::fields::keys::ROOT_COHESION,
-            terra_core::fields::keys::SEDIMENT_DEPTH,
+            terra_core::fields::keys::SEDIMENT_THICKNESS,
         ] {
             assert!(
                 context.aux_maps.get(key).is_some(),

@@ -170,10 +170,7 @@ pub fn expose_strata_height(
 }
 
 /// Look up an authored [`Stratum`] stack at stratigraphic depth (meters into subsurface).
-pub fn stratum_at_depth<'a>(
-    strata: &'a [Stratum],
-    depth: f32,
-) -> Option<&'a Stratum> {
+pub fn stratum_at_depth<'a>(strata: &'a [Stratum], depth: f32) -> Option<&'a Stratum> {
     if strata.is_empty() {
         return None;
     }
@@ -189,13 +186,7 @@ pub fn stratum_at_depth<'a>(
 }
 
 /// Depth below Materials reference, warped by bed geometry.
-pub fn strata_depth_m(
-    h_ref: f32,
-    h: f32,
-    x: f32,
-    z: f32,
-    geom: &BedGeometry,
-) -> f32 {
+pub fn strata_depth_m(h_ref: f32, h: f32, x: f32, z: f32, geom: &BedGeometry) -> f32 {
     let warp = geom.depth_warp(x, z);
     (h_ref - h + warp).max(0.0)
 }

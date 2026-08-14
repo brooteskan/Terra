@@ -3,6 +3,7 @@
 use terra_core::fields::{
     erodibility_at_strata_depth, hardness_at_strata_depth, stability_at_strata_depth,
 };
+use terra_core::generators;
 use terra_core::generators::geology::{
     strata_depth_m, terrace_irregular, terrace_simple, terrace_steep, TerraceControls,
 };
@@ -10,7 +11,6 @@ use terra_core::heightfield::{Heightfield, HeightfieldMetrics};
 use terra_core::layer::{
     BedGeometry, EffectFilterParams, MaterialsParams, Stratum, StratumMaterial,
 };
-use terra_core::generators;
 
 fn ramp(res: u32) -> Heightfield {
     let m = HeightfieldMetrics::new(res, res, res as f32 * 4.0, res as f32 * 4.0);
@@ -96,9 +96,7 @@ fn steep_terrace_prefers_slopes() {
         ..TerraceControls::default()
     };
     let out = terrace_steep(&hf, &c);
-    let flat_delta: f32 = (0..32)
-        .map(|j| (out.get(4, j) - hf.get(4, j)).abs())
-        .sum();
+    let flat_delta: f32 = (0..32).map(|j| (out.get(4, j) - hf.get(4, j)).abs()).sum();
     let steep_delta: f32 = (0..32)
         .map(|j| (out.get(28, j) - hf.get(28, j)).abs())
         .sum();
@@ -128,7 +126,10 @@ fn stratum_erodibility_and_stability() {
     assert!(soft.effective_erodibility() > hard.effective_erodibility());
     assert!(hard.material_stability() > soft.material_stability());
     let strata = MaterialsParams::soft_over_hard(5.0).strata;
-    assert!((erodibility_at_strata_depth(&strata, 0.0, 0.5) - soft.effective_erodibility()).abs() < 1e-5);
+    assert!(
+        (erodibility_at_strata_depth(&strata, 0.0, 0.5) - soft.effective_erodibility()).abs()
+            < 1e-5
+    );
     assert!(stability_at_strata_depth(&strata, 6.0, 0.5) > 0.7);
     assert!((hardness_at_strata_depth(&strata, 6.0, 0.5) - 0.92).abs() < 1e-5);
 }

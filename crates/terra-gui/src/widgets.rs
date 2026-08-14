@@ -77,12 +77,7 @@ pub fn label_dim(ui: &mut GuiContext<'_>, text: &str) {
 pub fn section_header(ui: &mut GuiContext<'_>, text: &str) {
     ui.gap(style::SPACE_3);
     let rect = ui.allocate(style::INSP_SECTION_H);
-    ui.label_in_rect(
-        rect,
-        text,
-        style::TEXT_MUTED,
-        FONT_SCALE * TYPE_CAPTION,
-    );
+    ui.label_in_rect(rect, text, style::TEXT_MUTED, FONT_SCALE * TYPE_CAPTION);
     ui.gap(style::SPACE_1);
 }
 
@@ -973,7 +968,7 @@ pub fn combo(ui: &mut GuiContext<'_>, text: &str, selected: &mut usize, items: &
                 menu_h,
             )
         };
-        ui.queue_combo_menu(id, menu, items, *selected);
+        ui.queue_combo_menu(id, menu, field, items, *selected);
     }
 
     changed
@@ -1052,7 +1047,7 @@ pub fn combo_in_rect(
                 menu_h,
             )
         };
-        ui.queue_combo_menu(id, menu, items, *selected);
+        ui.queue_combo_menu(id, menu, field, items, *selected);
     }
 
     changed

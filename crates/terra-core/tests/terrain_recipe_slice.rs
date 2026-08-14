@@ -12,14 +12,10 @@ fn flat(name: &str, h: f32) -> Layer {
 #[test]
 fn recipe_mirrors_terrain_stack() {
     let mut stack = LayerStack::new();
-    stack
-        .nodes
-        .push(StackNode::Layer(flat("Foundation", 0.0)));
+    stack.nodes.push(StackNode::Layer(flat("Foundation", 0.0)));
     stack.nodes.push(StackNode::Layer(flat("Climate", 1.0)));
     stack.nodes.push(StackNode::Layer(flat("Sea", 2.0)));
-    stack
-        .nodes
-        .push(StackNode::Layer(flat("Hydrology", 3.0)));
+    stack.nodes.push(StackNode::Layer(flat("Hydrology", 3.0)));
 
     let recipe = build_terrain_recipe_from_stack(&stack);
     assert!(recipe_matches_stack(&recipe, &stack));
@@ -28,12 +24,13 @@ fn recipe_mirrors_terrain_stack() {
     assert_eq!(names[0], "TERRAIN");
     assert!(names.windows(2).any(|w| w == ["Foundation", "Climate"]));
     assert!(!names.contains(&"REGIONS"));
-    assert!(recipe
-        .iter()
-        .all(|i| matches!(
-            i.kind,
-            RecipeItemKind::GlobalSection | RecipeItemKind::Layer | RecipeItemKind::Group | RecipeItemKind::FlowArrow
-        )));
+    assert!(recipe.iter().all(|i| matches!(
+        i.kind,
+        RecipeItemKind::GlobalSection
+            | RecipeItemKind::Layer
+            | RecipeItemKind::Group
+            | RecipeItemKind::FlowArrow
+    )));
 }
 
 #[test]

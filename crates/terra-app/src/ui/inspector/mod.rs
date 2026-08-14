@@ -2,18 +2,17 @@
 
 mod edit_kind;
 
+use self::edit_kind::{edit_kind, kind_display_name, KindEditPane};
 use crate::ui::actions::PanelAction;
 use crate::ui::dist_kinds::{dist_base_kinds, dist_effect_kinds};
-use self::edit_kind::{edit_kind, kind_display_name, KindEditPane};
 use crate::ui::presets::contextual_presets;
+use crate::ui::style::{self, FONT_SCALE, INSP_PAD, PAD, ROW_H, TYPE_CAPTION, TYPE_LABEL};
 use crate::ui::{hierarchy, EditorTool, InspectorSection, UiState};
 use terra_core::document::TerrainDocument;
 use terra_core::layer::*;
-use crate::ui::style::{self, FONT_SCALE, INSP_PAD, PAD, ROW_H, TYPE_CAPTION, TYPE_LABEL};
 use terra_gui::{
     button_id, checkbox, collapsible_section, combo, icon_button, icon_toggle, inspector_tab_bar,
-    label, label_dim, radio_toggle, section_header, slider_f32, Color, GuiContext, Icon,
-    Id, Rect,
+    label, label_dim, radio_toggle, section_header, slider_f32, Color, GuiContext, Icon, Id, Rect,
 };
 
 /// Lay out a compact wrapping grid of small buttons; returns the clicked index (if any).
@@ -78,7 +77,9 @@ fn draw_project_mask_binds(
         for (index, mask) in doc.masks.iter().enumerate() {
             if button_id(
                 ui,
-                Id::new("insp_project_mask").with(index as u64).child(&target_key),
+                Id::new("insp_project_mask")
+                    .with(index as u64)
+                    .child(&target_key),
                 &format!("Use {}", mask.name),
             ) {
                 actions.push(PanelAction::BindMaskToLayer {
@@ -159,7 +160,11 @@ fn draw_layer_masks_chrome(
         "Combine with biome Distribution when this layer lives under a biome.",
     );
     draw_project_mask_binds(ui, doc, actions, id);
-    if button_id(ui, Id::new("insp_open_advanced_mask"), "Open Advanced Mask Stack") {
+    if button_id(
+        ui,
+        Id::new("insp_open_advanced_mask"),
+        "Open Advanced Mask Stack",
+    ) {
         actions.push(PanelAction::OpenLayerAdvancedMask(id));
     }
 }
@@ -318,7 +323,12 @@ pub fn draw_inspector_gui(
 
     // Rule under the chrome header so body content starts cleanly.
     ui.panel(
-        Rect::from_pos_size(panel.min_x + PAD, header.max_y - 1.0, panel.width() - PAD * 2.0, 1.0),
+        Rect::from_pos_size(
+            panel.min_x + PAD,
+            header.max_y - 1.0,
+            panel.width() - PAD * 2.0,
+            1.0,
+        ),
         style::BORDER,
     );
 
@@ -390,14 +400,8 @@ pub fn draw_inspector_gui(
         ui.separator();
         section_header(ui, "GENERAL");
         label(ui, &format!("Kind: {}", group.group_kind.label()));
-        label(
-            ui,
-            &format!("Eval mode: {}", group.eval_mode.label()),
-        );
-        label(
-            ui,
-            &format!("Input mode: {}", group.input_mode.label()),
-        );
+        label(ui, &format!("Eval mode: {}", group.eval_mode.label()));
+        label(ui, &format!("Input mode: {}", group.input_mode.label()));
         let mut opacity = group.opacity;
         if slider_f32(ui, "Opacity", &mut opacity, 0.0, 1.0) {
             actions.push(PanelAction::SetOpacity { id, opacity });
@@ -421,7 +425,9 @@ pub fn draw_inspector_gui(
             if button_id(ui, Id::new("insp_biome_paint"), "Paint This Biome") {
                 actions.push(PanelAction::SetActiveBiome(id));
                 actions.push(PanelAction::EnsureBiomePaintLayer);
-                actions.push(PanelAction::SetEditorTool(crate::ui::EditorTool::PaintBiome));
+                actions.push(PanelAction::SetEditorTool(
+                    crate::ui::EditorTool::PaintBiome,
+                ));
             }
             let show_colors = ui_state.biome_color_preview;
             label(
@@ -509,7 +515,10 @@ pub fn draw_inspector_gui(
             label(ui, "(none)");
         } else {
             for out in &group.outputs {
-                label(ui, &format!("â€¢ {} [{}]", out.name, out.field.display_name()));
+                label(
+                    ui,
+                    &format!("â€¢ {} [{}]", out.name, out.field.display_name()),
+                );
             }
         }
         ui.separator();
@@ -770,8 +779,8 @@ pub fn draw_inspector_gui(
     state.active_tab = active;
 
     // Primary noise split: kinds that expose a separate Noise pane under Shape.
-    let split_noise = has_separate_noise_tab(&layer.kind)
-        && !matches!(primary, InspectorSection::Noise);
+    let split_noise =
+        has_separate_noise_tab(&layer.kind) && !matches!(primary, InspectorSection::Noise);
 
     match active {
         InspectorSection::General => {
@@ -976,12 +985,7 @@ fn draw_inspector_more_menu_inner(
     ];
     let w = 170.0;
     let h = items.len() as f32 * 26.0 + 8.0;
-    let menu = Rect::from_pos_size(
-        (anchor.max_x - w).max(8.0),
-        anchor.max_y + 4.0,
-        w,
-        h,
-    );
+    let menu = Rect::from_pos_size((anchor.max_x - w).max(8.0), anchor.max_y + 4.0, w, h);
     ui.begin_overlay();
     ui.panel_rounded(menu, style::POPUP_BG, style::RADIUS_SM);
     if ui.pointer_in(menu) {
@@ -1221,7 +1225,10 @@ fn draw_tool_inspector(ui: &mut GuiContext<'_>, doc: &TerrainDocument, ui_state:
         _ => "Sculpt",
     };
     label(ui, &format!("Sculpt Â· {tool_name}"));
-    label(ui, "Drag to author Base heights or semantic world-space strokes.");
+    label(
+        ui,
+        "Drag to author Base heights or semantic world-space strokes.",
+    );
     slider_f32(ui, "Radius", &mut ui_state.sculpt_radius, 0.01, 0.2);
     if ui_state.editor_tool == EditorTool::Smooth {
         let mut s = (ui_state.sculpt_strength / 10.0).clamp(0.05, 1.0);
@@ -1251,7 +1258,10 @@ fn draw_mask_tool_inspector(
     use terra_core::mask::MaskPaintTool;
 
     section_header(ui, "MASK");
-    label(ui, "Paint coverage for biomes, filters, materials, or masks.");
+    label(
+        ui,
+        "Paint coverage for biomes, filters, materials, or masks.",
+    );
     ui.separator();
 
     section_header(ui, "BRUSH");
@@ -1281,10 +1291,14 @@ fn draw_mask_tool_inspector(
     ui.separator();
     section_header(ui, "TARGET");
     if doc.masks.is_empty() {
-        label_dim(ui, "No project masks yet — use + on Mask Layers (or the mask button) to pick a type.");
+        label_dim(
+            ui,
+            "No project masks yet — use + on Mask Layers (or the mask button) to pick a type.",
+        );
     } else {
         for (i, mask) in doc.masks.iter().enumerate() {
-            let sel = ui_state.paint_mask == Some(mask.id) || ui_state.selected_mask == Some(mask.id);
+            let sel =
+                ui_state.paint_mask == Some(mask.id) || ui_state.selected_mask == Some(mask.id);
             let text = if sel {
                 format!("â€¢ {}", mask.name)
             } else {
@@ -1307,7 +1321,6 @@ fn draw_mask_tool_inspector(
         ui_state.enter_mask_view();
     }
 }
-
 
 fn draw_operation_apply_where(
     ui: &mut GuiContext<'_>,
@@ -1334,10 +1347,7 @@ fn draw_operation_apply_where(
 
     let modes = ApplyWhere::all();
     let labels: Vec<&str> = modes.iter().map(|m| m.label()).collect();
-    let mut idx = modes
-        .iter()
-        .position(|m| *m == op.apply_where)
-        .unwrap_or(0);
+    let mut idx = modes.iter().position(|m| *m == op.apply_where).unwrap_or(0);
     if combo(ui, "Apply Where", &mut idx, &labels) {
         actions.push(PanelAction::SetOperationApplyWhere {
             id,
@@ -1403,7 +1413,11 @@ fn draw_operation_apply_where(
         }
         ApplyWhere::AdvancedMask => {
             label_dim(ui, "Edit the Mask Stack below for full DistNode control.");
-            if button_id(ui, Id::new("insp_apply_adv_mask"), "Open Advanced Mask Stack") {
+            if button_id(
+                ui,
+                Id::new("insp_apply_adv_mask"),
+                "Open Advanced Mask Stack",
+            ) {
                 actions.push(PanelAction::OpenLayerAdvancedMask(id));
             }
         }
@@ -1417,9 +1431,7 @@ fn draw_biome_focus_inspector(
     ui_state: &mut UiState,
     actions: &mut Vec<PanelAction>,
 ) {
-    let focus_id = ui_state
-        .biome_focus
-        .or(doc.biome_library.selected);
+    let focus_id = ui_state.biome_focus.or(doc.biome_library.selected);
     let Some(def_id) = focus_id else {
         label(ui, "Select a biome from the palette to paint.");
         return;
@@ -1432,8 +1444,15 @@ fn draw_biome_focus_inspector(
     label(ui, &def.name);
     label(ui, "Ownership â€” where this biome applies.");
     ui.separator();
-    label(ui, &format!("Mode: {}", def.placement.combine.artist_label()));
-    if button_id(ui, Id::new("biome_focus_combine"), "Toggle Paint owns / Guided") {
+    label(
+        ui,
+        &format!("Mode: {}", def.placement.combine.artist_label()),
+    );
+    if button_id(
+        ui,
+        Id::new("biome_focus_combine"),
+        "Toggle Paint owns / Guided",
+    ) {
         actions.push(PanelAction::SetBiomePlacementCombine {
             definition: def_id,
             combine: def.placement.combine.cycle_artist(),
@@ -1443,10 +1462,7 @@ fn draw_biome_focus_inspector(
         def.placement.combine,
         terra_core::biome_definition::PlacementCombineMode::PaintMulRules
     ) {
-        label(
-            ui,
-            "Guided mode can zero strokes where rules are empty.",
-        );
+        label(ui, "Guided mode can zero strokes where rules are empty.");
     }
     ui.separator();
     section_header(ui, "PLACEMENT");
@@ -1477,16 +1493,12 @@ fn draw_biome_focus_inspector(
             label(ui, "Source: Custom Mask Stack");
             label(ui, "Rules are frozen until Reset to Rules.");
             if button_id(ui, Id::new("biome_focus_reset_rules"), "Reset to Rules") {
-                actions.push(PanelAction::ResetBiomePlacementToRules {
-                    definition: def_id,
-                });
+                actions.push(PanelAction::ResetBiomePlacementToRules { definition: def_id });
             }
         }
     }
     if button_id(ui, Id::new("biome_focus_edit_stack"), "Edit Mask Stack") {
-        actions.push(PanelAction::MarkBiomePlacementCustom {
-            definition: def_id,
-        });
+        actions.push(PanelAction::MarkBiomePlacementCustom { definition: def_id });
         if let Some(gid) = def.group_id {
             actions.push(PanelAction::Select(gid));
         }
@@ -1500,19 +1512,22 @@ fn draw_biome_focus_inspector(
         ));
         actions.push(PanelAction::EnsureBiomePaintLayer);
         actions.push(PanelAction::SetBiomeColorPreview(true));
-        actions.push(PanelAction::SetEditorTool(crate::ui::EditorTool::PaintBiome));
+        actions.push(PanelAction::SetEditorTool(
+            crate::ui::EditorTool::PaintBiome,
+        ));
     }
     let filters = def.terrain_layers.len();
     let mats = def.material_layers.len();
-    label(ui, &format!("Local WHAT â€” {filters} filters Â· {mats} materials"));
+    label(
+        ui,
+        &format!("Local WHAT â€” {filters} filters Â· {mats} materials"),
+    );
     if let Some(gid) = def.group_id {
         label(ui, "Linked to implementation group.");
         section_header(ui, "MASK STACK");
         draw_distribution_add_buttons(ui, doc, actions, gid);
         if button_id(ui, Id::new("biome_focus_advanced"), "Open in Advanced") {
-            actions.push(PanelAction::MarkBiomePlacementCustom {
-                definition: def_id,
-            });
+            actions.push(PanelAction::MarkBiomePlacementCustom { definition: def_id });
             actions.push(PanelAction::Select(gid));
             ui_state.app_workspace = crate::ui::AppWorkspace::Advanced;
             ui_state.inspector_advanced = true;
@@ -1524,7 +1539,6 @@ fn draw_biome_focus_inspector(
         ui_state.biome_focus = None;
     }
 }
-
 
 fn draw_blueprint_inspector(
     ui: &mut GuiContext<'_>,

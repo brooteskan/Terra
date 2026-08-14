@@ -1,7 +1,26 @@
-﻿//! Layer parameter kinds (split by family).
+//! Layer parameter kinds (split by family).
 
 use crate::mask::MaskSource;
 use serde::{Deserialize, Serialize};
+
+/// JSON-safe lower sentinel for an effectively open material/biome height range.
+pub const OPEN_HEIGHT_MIN: f32 = -1_000_000.0;
+/// JSON-safe upper sentinel for an effectively open material/biome height range.
+pub const OPEN_HEIGHT_MAX: f32 = 1_000_000.0;
+
+fn deserialize_open_height_min<'de, D>(deserializer: D) -> Result<f32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<f32>::deserialize(deserializer)?.unwrap_or(OPEN_HEIGHT_MIN))
+}
+
+fn deserialize_open_height_max<'de, D>(deserializer: D) -> Result<f32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<f32>::deserialize(deserializer)?.unwrap_or(OPEN_HEIGHT_MAX))
+}
 
 /// Lithology class for a geological stratum — drives thermal stability defaults.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -59,10 +78,7 @@ pub enum BedGeometry {
     #[default]
     Horizontal,
     /// Planar dip. `dip_deg` from horizontal; `azimuth_deg` is dip direction.
-    Tilted {
-        dip_deg: f32,
-        azimuth_deg: f32,
-    },
+    Tilted { dip_deg: f32, azimuth_deg: f32 },
     /// Sinusoidal fold + mild coherent noise.
     Folded {
         amplitude_m: f32,
@@ -253,8 +269,8 @@ impl Default for MaterialsParams {
                     id: 1,
                     min_slope_deg: 35.0,
                     max_slope_deg: 90.0,
-                    min_height: f32::NEG_INFINITY,
-                    max_height: f32::INFINITY,
+                    min_height: OPEN_HEIGHT_MIN,
+                    max_height: OPEN_HEIGHT_MAX,
                     mask: MaskSource::None,
                     hardness: 0.85,
                     tint: [0.45, 0.42, 0.38],
@@ -268,7 +284,7 @@ impl Default for MaterialsParams {
                     min_slope_deg: 0.0,
                     max_slope_deg: 35.0,
                     min_height: 5.0,
-                    max_height: f32::INFINITY,
+                    max_height: OPEN_HEIGHT_MAX,
                     mask: MaskSource::None,
                     hardness: 0.2,
                     tint: [0.28, 0.48, 0.22],
@@ -309,8 +325,8 @@ impl MaterialsParams {
                     id: 1,
                     min_slope_deg: 42.0,
                     max_slope_deg: 90.0,
-                    min_height: f32::NEG_INFINITY,
-                    max_height: f32::INFINITY,
+                    min_height: OPEN_HEIGHT_MIN,
+                    max_height: OPEN_HEIGHT_MAX,
                     mask: MaskSource::None,
                     hardness: 0.92,
                     tint: [0.31, 0.29, 0.27],
@@ -324,7 +340,7 @@ impl MaterialsParams {
                     min_slope_deg: 0.0,
                     max_slope_deg: 48.0,
                     min_height: 220.0,
-                    max_height: f32::INFINITY,
+                    max_height: OPEN_HEIGHT_MAX,
                     mask: MaskSource::None,
                     hardness: 0.12,
                     tint: [0.86, 0.89, 0.93],
@@ -337,8 +353,8 @@ impl MaterialsParams {
                     id: 3,
                     min_slope_deg: 18.0,
                     max_slope_deg: 42.0,
-                    min_height: f32::NEG_INFINITY,
-                    max_height: f32::INFINITY,
+                    min_height: OPEN_HEIGHT_MIN,
+                    max_height: OPEN_HEIGHT_MAX,
                     mask: MaskSource::None,
                     hardness: 0.28,
                     tint: [0.43, 0.38, 0.32],
@@ -385,7 +401,9 @@ pub struct MaterialRule {
     pub id: u32,
     pub min_slope_deg: f32,
     pub max_slope_deg: f32,
+    #[serde(deserialize_with = "deserialize_open_height_min")]
     pub min_height: f32,
+    #[serde(deserialize_with = "deserialize_open_height_max")]
     pub max_height: f32,
     /// Optional painted / procedural mask; cells above 0.5 force this rule's ID.
     pub mask: MaskSource,
@@ -565,7 +583,7 @@ impl BiomesParams {
                     name: "Alpine".into(),
                     id: 1,
                     min_height: 200.0,
-                    max_height: f32::INFINITY,
+                    max_height: OPEN_HEIGHT_MAX,
                     min_wetness: 0.0,
                     max_wetness: 1.0,
                     ..BiomeBand::all_climate()
@@ -582,7 +600,7 @@ impl BiomesParams {
                 BiomeBand {
                     name: "Coast".into(),
                     id: 3,
-                    min_height: f32::NEG_INFINITY,
+                    min_height: OPEN_HEIGHT_MIN,
                     max_height: 20.0,
                     min_wetness: 0.0,
                     max_wetness: 1.0,
@@ -597,7 +615,9 @@ impl BiomesParams {
 pub struct BiomeBand {
     pub name: String,
     pub id: u32,
+    #[serde(deserialize_with = "deserialize_open_height_min")]
     pub min_height: f32,
+    #[serde(deserialize_with = "deserialize_open_height_max")]
     pub max_height: f32,
     pub min_wetness: f32,
     pub max_wetness: f32,
@@ -635,8 +655,8 @@ impl BiomeBand {
         Self {
             name: String::new(),
             id: 0,
-            min_height: f32::NEG_INFINITY,
-            max_height: f32::INFINITY,
+            min_height: OPEN_HEIGHT_MIN,
+            max_height: OPEN_HEIGHT_MAX,
             min_wetness: 0.0,
             max_wetness: 1.0,
             min_temp: 0.0,
@@ -650,4 +670,3 @@ impl BiomeBand {
         }
     }
 }
-

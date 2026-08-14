@@ -27,9 +27,7 @@ fn scope_entire_world_and_selected_biomes() {
     assert!(!scope.includes_biome(other));
     assert!(WorldRuleScope::EntireWorld.includes_biome(bid));
 
-    let excl = WorldRuleScope::Excluding {
-        biomes: vec![bid],
-    };
+    let excl = WorldRuleScope::Excluding { biomes: vec![bid] };
     assert!(!excl.includes_biome(bid));
     assert!(excl.includes_biome(other));
 }

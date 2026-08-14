@@ -1,18 +1,17 @@
-﻿use std::time::Instant;
+use std::time::Instant;
 
-use terra_core::eval::PreviewQuality;
-use terra_core::layer::LayerKind;
-use terra_gui::{GuiContext, GuiInput};
 use crate::ui::{
     draw_discard_confirm, draw_editor_gui, draw_new_project_templates, draw_project_home,
     DiscardConfirmChoice, NewProjectTemplateChoice,
 };
+use terra_core::eval::PreviewQuality;
+use terra_core::layer::LayerKind;
+use terra_gui::{GuiContext, GuiInput};
 use winit::event::MouseButton;
 
-use super::helpers::{
-    aux_maps_fingerprint, mask_field_fingerprint, vegetation_instance_params,
-};
-use super::{save_layout_prefs, AppScreen, PendingProjectAction, TerraApp};
+use super::helpers::{aux_maps_fingerprint, mask_field_fingerprint, vegetation_instance_params};
+use super::prefs::{save_editor_prefs, EditorPrefs};
+use super::{AppScreen, PendingProjectAction, TerraApp};
 impl TerraApp {
     pub(crate) fn redraw(&mut self) {
         let frame_t0 = Instant::now();
@@ -186,27 +185,70 @@ impl TerraApp {
             let Some(gui_renderer) = self.gui_renderer.as_mut() else {
                 return;
             };
+            let Some(gpu) = self.gpu.as_ref() else {
+                return;
+            };
 
             // Terrain pass — always draws last-good GPU textures (never waits on eval).
             let render_t0 = Instant::now();
             {
+                // (Re)seed the editable lighting when a preset is selected: either a
+                // different preset, or the same one re-picked to clear a customized
+                // (blank) state. Editing any control sets `lighting_customized`, which
+                // blanks the preset field and suppresses re-seeding so the edit sticks.
+                let preset = self.ui_state.lighting_preset;
+                let customized = self.ui_state.lighting_customized;
+                if !customized
+                    && (preset != self.last_lighting_preset || self.last_lighting_customized)
+                {
+                    renderer.notify_invalidation(terra_render::InvalidationReason::LightingChanged);
+                    // Keep the render mode consistent with the chosen preset in both
+                    // directions: Progressive RT selects the path tracer, every other
+                    // preset returns to Raster.
+                    self.ui_state.viewport_render.mode = preset.suggested_renderer_mode();
+                    let (preset_dir, preset_exposure, preset_clear) = preset.params();
+                    let (az, el) = crate::ui::sun_az_el_from_dir([
+                        preset_dir[0],
+                        preset_dir[1],
+                        preset_dir[2],
+                    ]);
+                    let vr = &mut self.ui_state.viewport_render;
+                    vr.sun_azimuth_deg = az;
+                    vr.sun_elevation_deg = el;
+                    vr.sun_intensity = preset_dir[3];
+                    vr.exposure = preset_exposure;
+                    vr.sky_color = preset_clear;
+                    // Raster shading is not yet preset-defined; reset to neutral so a
+                    // preset restores a known, full lighting state.
+                    vr.ambient_strength = 1.0;
+                    vr.shadow_strength = 0.0;
+                    vr.fog_strength = 1.0;
+                }
+                self.last_lighting_preset = preset;
+                self.last_lighting_customized = customized;
+
+                // All viewport lighting is driven by the editable values (seeded from the
+                // preset above); the Home splash keeps its fixed look.
                 let (light_dir, exposure, clear) = if self.screen == AppScreen::Home {
                     ([-0.35, -0.90, -0.20, 1.00], 1.0, [0.071, 0.082, 0.102])
                 } else {
-                    self.ui_state.lighting_preset.params()
+                    let vr = &self.ui_state.viewport_render;
+                    let dir =
+                        crate::ui::sun_dir_from_az_el(vr.sun_azimuth_deg, vr.sun_elevation_deg);
+                    (
+                        [dir[0], dir[1], dir[2], vr.sun_intensity],
+                        vr.exposure,
+                        vr.sky_color,
+                    )
                 };
                 renderer.lighting.light_dir = light_dir;
                 renderer.lighting.exposure = exposure;
                 renderer.lighting.clear = clear;
-
-                if self.ui_state.lighting_preset != self.last_lighting_preset {
-                    self.last_lighting_preset = self.ui_state.lighting_preset;
-                    renderer.notify_invalidation(terra_render::InvalidationReason::LightingChanged);
-                    if self.ui_state.lighting_preset.is_progressive() {
-                        self.ui_state.viewport_render.mode =
-                            terra_render::ViewportRendererMode::ProgressiveRayTraced;
-                    }
-                }
+                // Raster shading controls are independent of the preset (not seeded),
+                // so push them straight from the editable state every frame.
+                renderer.lighting.ambient_strength = self.ui_state.viewport_render.ambient_strength;
+                renderer.lighting.shadow_strength = self.ui_state.viewport_render.shadow_strength;
+                renderer.lighting.fog_strength = self.ui_state.viewport_render.fog_strength;
 
                 let vr = &mut self.ui_state.viewport_render;
                 renderer.set_renderer_mode(vr.mode);
@@ -231,15 +273,17 @@ impl TerraApp {
                 let debug_viz = vr.debug_viz_mode;
                 renderer.set_debug_viz_mode(debug_viz);
                 // Mode alone selects the presentation backend (no dual progressive flag).
-                let progressive_active = self.screen == AppScreen::Editor
-                    && vr.mode.uses_progressive_path_tracer();
+                let progressive_active =
+                    self.screen == AppScreen::Editor && vr.mode.uses_progressive_path_tracer();
                 self.ui_state.progressive_renderer_active = progressive_active;
 
                 let shading = if self.ui_state.is_mask_view() {
                     terra_render::ViewportShadingMode::Lit
                 } else {
                     match self.ui_state.preview_mode {
-                        crate::ui::Preview2dMode::Height => terra_render::ViewportShadingMode::Height,
+                        crate::ui::Preview2dMode::Height => {
+                            terra_render::ViewportShadingMode::Height
+                        }
                         crate::ui::Preview2dMode::Slope => terra_render::ViewportShadingMode::Slope,
                         crate::ui::Preview2dMode::Flow => terra_render::ViewportShadingMode::Flow,
                         _ => terra_render::ViewportShadingMode::Lit,
@@ -255,9 +299,44 @@ impl TerraApp {
                 });
                 renderer.update_visible_tile_plan(&self.terrain_runtime.pyramid);
             }
+            // Frame seam (see TerrainRenderer::render_terrain's contract): this
+            // acquires + submits terrain and returns the un-presented frame. The
+            // block below must keep that order — build the GUI view from *this*
+            // frame, submit exactly one GUI pass (LoadOp::Load) over it, and
+            // present only after that submit. Reordering present before the GUI
+            // submit shows a stale frame; the compositing tests guard the rest.
             let frame = match renderer.render_terrain() {
                 Ok(f) => f,
-                Err(e) => {
+                // Exhaustive by design (A1-G2): no `_` arm, so a future
+                // wgpu::SurfaceError variant — or collapsing RenderError — fails
+                // to compile here instead of silently dropping frames forever.
+                Err(terra_render::RenderError::Surface(e)) => {
+                    match e {
+                        wgpu::SurfaceError::Timeout => {
+                            // Expected transient stall; present nothing this frame.
+                            log::debug!("render: surface acquire timeout; frame skipped");
+                        }
+                        wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost => {
+                            // Swap chain invalid (display re-plug, driver reset,
+                            // DPI/fullscreen change without a Resized event).
+                            // Reconfigure and schedule the recovery frame — the
+                            // on-demand loop won't repaint on its own.
+                            log::warn!("render: {e}; reconfiguring surface");
+                            renderer.reconfigure();
+                            window.request_redraw();
+                        }
+                        wgpu::SurfaceError::OutOfMemory => {
+                            // Unrecoverable; exit cleanly via about_to_wait.
+                            log::error!("render: {e}; exiting");
+                            self.pending_exit = true;
+                        }
+                        wgpu::SurfaceError::Other => {
+                            log::warn!("render: {e}; frame skipped");
+                        }
+                    }
+                    return;
+                }
+                Err(e @ terra_render::RenderError::Msg(_)) => {
                     log::warn!("render: {e}");
                     return;
                 }
@@ -274,8 +353,8 @@ impl TerraApp {
             );
             let progressive_samples = renderer.progressive_samples();
             self.ui_state.progressive_samples = progressive_samples;
-            let render_converged = progressive_samples
-                >= renderer.quality().config.max_accumulated_spp;
+            let render_converged =
+                progressive_samples >= renderer.quality().config.max_accumulated_spp;
             self.terrain_runtime
                 .refinement
                 .set_render_converged(render_converged);
@@ -300,8 +379,9 @@ impl TerraApp {
                 .texture
                 .create_view(&wgpu::TextureViewDescriptor::default());
 
-            let screen_w = renderer.config.width as f32 / pixels_per_point;
-            let screen_h = renderer.config.height as f32 / pixels_per_point;
+            let (surface_w, surface_h) = renderer.size();
+            let screen_w = surface_w as f32 / pixels_per_point;
+            let screen_h = surface_h as f32 / pixels_per_point;
 
             let ui_t0 = Instant::now();
             let hist_fp = self.session.history.ui_fingerprint();
@@ -321,8 +401,11 @@ impl TerraApp {
                 ^ ((self.session.document.biome_library.definitions.len() as u64) << 16);
             if diag_fp != self.ui_soft_diag_fp {
                 self.ui_soft_diag_fp = diag_fp;
-                let diags =
-                    terra_core::domain::incomplete_project_diagnostics(&self.session.document);
+                let diags = terra_core::domain::incomplete_project_diagnostics(
+                    &self.session.document.stack,
+                    &self.session.document.biome_library,
+                    &self.session.document.biome_layers,
+                );
                 self.ui_state.soft_project_diag = diags.first().map(|d| d.message.clone());
             }
             self.gui_state.layout = self.ui_state.layout.clone();
@@ -362,7 +445,7 @@ impl TerraApp {
             } else {
                 draw_editor_gui(
                     &mut gui,
-                    &mut self.session.document,
+                    &self.session.document,
                     &mut self.ui_state,
                     &mut self.chrome_gui,
                     &mut self.tools_gui,
@@ -402,13 +485,14 @@ impl TerraApp {
                 || self.layers_gui.drag_from.is_some();
             self.ui_state.profile.ui_us = ui_t0.elapsed().as_micros() as u64;
 
+            let (surface_w, surface_h) = renderer.size();
             gui_renderer.render(
-                &renderer.device,
-                &renderer.queue,
+                &gpu.device,
+                &gpu.queue,
                 &view,
                 &mut gui,
-                renderer.config.width,
-                renderer.config.height,
+                surface_w,
+                surface_h,
             );
             frame.present();
             (ui_out, home_actions, discard_choice, template_choice)
@@ -487,11 +571,7 @@ impl TerraApp {
                     world_size_m,
                     sea_level,
                 } => {
-                    self.new_project_with_template(
-                        &template_id,
-                        world_size_m,
-                        sea_level,
-                    );
+                    self.new_project_with_template(&template_id, world_size_m, sea_level);
                 }
             }
         }
@@ -528,10 +608,7 @@ impl TerraApp {
                 self.start_export();
             }
             if ui_out.camera_reset {
-                if let Some(r) = self.renderer.as_mut() {
-                    r.request_camera_reframe();
-                    r.frame_camera_to_terrain();
-                }
+                self.frame_terrain();
             }
             if ui_out.camera_top_view {
                 if let Some(r) = self.renderer.as_mut() {
@@ -558,12 +635,6 @@ impl TerraApp {
                 self.ui_state.refining_layer_name = None;
                 self.ui_state.status = "Build cancelled".into();
             }
-            if let Some(res) = self.ui_state.pending_preview_resolution.take() {
-                if self.session.document.preview_resolution != res {
-                    self.session.document.preview_resolution = res;
-                    self.request_rebuild();
-                }
-            }
             if ui_out.request_save_bookmark {
                 let slot = self
                     .ui_state
@@ -582,8 +653,13 @@ impl TerraApp {
         }
         if self.ui_state.layout_dirty {
             self.ui_state.layout.clamp_mut();
-            self.ui_state.layout.viewport_render = self.ui_state.viewport_render.to_prefs();
-            save_layout_prefs(&self.ui_state.layout);
+            let prefs = EditorPrefs {
+                layout: self.ui_state.layout.clone(),
+                preferred_workspace: self.ui_state.preferred_workspace.clone(),
+                auto_switch_workspace_on_create: self.ui_state.auto_switch_workspace_on_create,
+                viewport_render: self.ui_state.viewport_render.to_prefs(),
+            };
+            save_editor_prefs(&prefs);
             self.ui_state.layout_dirty = false;
             self.refresh_viewport_rect();
         }

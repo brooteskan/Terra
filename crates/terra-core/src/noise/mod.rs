@@ -1,16 +1,16 @@
 //! Deterministic CPU noise primitives.
 
+mod params;
 mod perlin;
 mod simplex;
 mod value;
 mod worley;
 
+pub use params::{FractalNoiseType, NoiseParams, WorleyFeature, WorleyMetric, WorleyParams};
 pub use perlin::perlin2;
 pub use simplex::open_simplex2;
 pub use value::value_noise2;
 pub use worley::{worley2, WorleyResult};
-
-use crate::layer::{FractalNoiseType, NoiseParams, WorleyFeature, WorleyParams};
 
 fn hash_u32(mut x: u32) -> u32 {
     x ^= x >> 16;
@@ -19,6 +19,17 @@ fn hash_u32(mut x: u32) -> u32 {
     x = x.wrapping_mul(0x846ca68b);
     x ^= x >> 16;
     x
+}
+
+/// Canonicalize a serialized 64-bit procedural seed for the existing 32-bit hashes.
+///
+/// Seeds that already fit in 32 bits retain their historical value exactly. For larger
+/// seeds, the upper half is mixed before it enters the current hash path so values separated
+/// by `2^32` no longer alias systematically.
+pub(crate) fn canonical_seed32(seed: u64) -> u32 {
+    let lower = seed as u32;
+    let upper = (seed >> 32) as u32;
+    lower ^ hash_u32(upper)
 }
 
 pub(crate) fn hash2(ix: i32, iz: i32, seed: u32) -> u32 {
@@ -142,6 +153,58 @@ pub fn sample_worley(x: f32, z: f32, params: &WorleyParams) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SAMPLE_POINTS: [(f32, f32); 4] = [
+        (0.125, 0.375),
+        (1.25, 3.5),
+        (-7.75, 11.125),
+        (93.625, -41.875),
+    ];
+
+    fn sample_bits(sample: impl Fn(f32, f32, u64) -> f32, seed: u64) -> Vec<u32> {
+        SAMPLE_POINTS
+            .iter()
+            .map(|&(x, z)| sample(x, z, seed).to_bits())
+            .collect()
+    }
+
+    #[test]
+    fn canonical_seed_preserves_representative_low_seed_bits_and_boundaries() {
+        for seed in [0, 1, 7, 42, 0x00FF_FFFF, u32::MAX] {
+            assert_eq!(canonical_seed32(u64::from(seed)), seed);
+        }
+        assert_ne!(canonical_seed32(7), canonical_seed32(7 + (1u64 << 32)));
+    }
+
+    #[test]
+    fn high_seed_bits_change_all_cpu_noise_primitives() {
+        let low = 7;
+        let high = low + (1u64 << 32);
+
+        for (name, sample) in [
+            ("value", value_noise2 as fn(f32, f32, u64) -> f32),
+            ("perlin", perlin2 as fn(f32, f32, u64) -> f32),
+            ("open_simplex", open_simplex2 as fn(f32, f32, u64) -> f32),
+        ] {
+            assert_ne!(
+                sample_bits(sample, low),
+                sample_bits(sample, high),
+                "{name} still aliases seeds separated by 2^32"
+            );
+        }
+
+        let worley_bits = |seed| {
+            SAMPLE_POINTS
+                .iter()
+                .map(|&(x, z)| worley2(x, z, seed, WorleyMetric::Euclidean).f1.to_bits())
+                .collect::<Vec<_>>()
+        };
+        assert_ne!(
+            worley_bits(low),
+            worley_bits(high),
+            "Worley F1 still aliases seeds separated by 2^32"
+        );
+    }
 
     #[test]
     fn deterministic_value_noise() {

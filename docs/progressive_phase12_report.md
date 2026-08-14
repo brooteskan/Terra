@@ -10,7 +10,6 @@ Supersedes the Phase 1–12 “extend TerrainRenderer” milestone with the long
 | `backends/raster_lit` | Lit present planning (single grid / crack-free clipmap) |
 | `backends/progressive_pt` | Typed PT HDR/GBuffer outputs |
 | `backends/progressive_post` | Temporal / à-trous / composite from explicit HDR+depth |
-| `orchestrator` | Mode → backend map; `ViewportOrchestrator` façade |
 | `terra-app` redraw/eval | One mode sync; tile-stream enable with monolithic fallback |
 
 ## Mode → backend

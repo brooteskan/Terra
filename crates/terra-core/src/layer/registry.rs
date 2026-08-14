@@ -1,8 +1,9 @@
 //! Layer type registry / factory — UI discovers types via metadata.
 //!
-//! This registry is the **single source of truth** for creatable layer types:
-//! display names, icons, workflow stage, capabilities, and default factories.
-//! UI catalogs (`terra-app` tool rail / add-layer menu) should derive entries from
+//! [`LayerKind`] is the single source of truth for core type identity (stable id,
+//! display name, and workflow stage). This registry derives those fields from its
+//! factories and adds discoverable metadata such as icons and capabilities. UI
+//! catalogs (`terra-app` tool rail / add-layer menu) should derive entries from
 //! [`LayerTypeRegistry`] rather than maintaining parallel hand-synced lists.
 
 use super::metadata::{
@@ -111,17 +112,18 @@ impl LayerTypeRegistry {
         // Helpers shrink boilerplate.
         macro_rules! entry {
             (
-                $id:literal, $name:literal, $stage:expr, $icon:literal, $desc:literal,
-                $factory:expr, $creatable:expr, $sections:expr, $next:expr
+                $icon:literal, $desc:literal, $factory:expr, $creatable:expr,
+                $sections:expr, $next:expr
             ) => {{
-                let kind = ($factory)();
+                let factory: fn() -> LayerKind = $factory;
+                let kind = factory();
                 let contract = FieldContract::from_kind(&kind);
                 let op = kind.category();
-                let stage: WorkflowStage = $stage;
+                let stage = kind.workflow_stage();
                 self.push(
                     LayerTypeMeta {
-                        type_id: $id,
-                        display_name: $name,
+                        type_id: kind.type_id(),
+                        display_name: kind.type_display_name(),
                         workflow_stage: stage,
                         icon_key: $icon,
                         accent: AccentCategory::from_workflow(stage),
@@ -131,23 +133,23 @@ impl LayerTypeRegistry {
                         mask_compatibility: MaskCompatibility::SupportsMasks,
                         capabilities: LayerCapabilities {
                             supports_thumbnails: true,
-                            supports_duplication: $creatable,
-                            can_reorder: $creatable,
+                            // Compatibility-only kinds may be hidden from create
+                            // surfaces while remaining fully editable in projects
+                            // that already contain them.
+                            supports_duplication: !kind.is_sculpt_base(),
+                            can_reorder: !kind.is_sculpt_base(),
                             can_contain_children: false,
                             user_creatable: $creatable,
                         },
                         inspector_sections: $sections,
                         suggested_next: $next,
                     },
-                    $factory,
+                    factory,
                 );
             }};
         }
 
         entry!(
-            "sculpt_base",
-            "Base",
-            WorkflowStage::Foundation,
             "pencil",
             "Paintable foundation height buffer.",
             || LayerKind::SculptBase(SculptParams::default()),
@@ -156,9 +158,6 @@ impl LayerTypeRegistry {
             &[] as &[&str]
         );
         entry!(
-            "import_heightmap",
-            "Import Heightmap",
-            WorkflowStage::Foundation,
             "image",
             "Import an external heightmap.",
             || LayerKind::ImportHeightmap(ImportHeightmapParams::default()),
@@ -167,9 +166,6 @@ impl LayerTypeRegistry {
             &[]
         );
         entry!(
-            "sculpt_strokes",
-            "Semantic Sculpt",
-            WorkflowStage::Foundation,
             "pencil",
             "Resolution-independent editable sculpt strokes.",
             || LayerKind::SculptStrokes(SculptStrokeParams::default()),
@@ -178,9 +174,6 @@ impl LayerTypeRegistry {
             &["terrain_constraints"]
         );
         entry!(
-            "terrain_constraints",
-            "Terrain Constraints",
-            WorkflowStage::Foundation,
             "activity",
             "Author elevations, ridges, valleys, rivers, coasts and protected shapes.",
             || LayerKind::TerrainConstraints(TerrainConstraintParams::default()),
@@ -189,9 +182,6 @@ impl LayerTypeRegistry {
             &["gradient_reconstruct"]
         );
         entry!(
-            "gradient_reconstruct",
-            "Gradient Reconstruct",
-            WorkflowStage::Generation,
             "activity",
             "Screened-Poisson reconstruction for seamless authored edits.",
             || LayerKind::GradientReconstruct(GradientReconstructParams::default()),
@@ -201,9 +191,6 @@ impl LayerTypeRegistry {
         );
 
         entry!(
-            "flat",
-            "Flat",
-            WorkflowStage::Generation,
             "mountain",
             "Constant height contribution.",
             || LayerKind::Flat(FlatParams::default()),
@@ -212,9 +199,6 @@ impl LayerTypeRegistry {
             &[]
         );
         entry!(
-            "ramp",
-            "Ramp",
-            WorkflowStage::Generation,
             "mountain",
             "Linear height ramp.",
             || LayerKind::Ramp(RampParams::default()),
@@ -223,9 +207,6 @@ impl LayerTypeRegistry {
             &[]
         );
         entry!(
-            "noise_value",
-            "Value Noise",
-            WorkflowStage::Generation,
             "mountain",
             "Value noise height contribution.",
             || LayerKind::NoiseValue(NoiseParams::default()),
@@ -234,9 +215,6 @@ impl LayerTypeRegistry {
             &[]
         );
         entry!(
-            "noise_perlin",
-            "Perlin Noise",
-            WorkflowStage::Generation,
             "mountain",
             "Perlin noise height contribution.",
             || LayerKind::NoisePerlin(NoiseParams::default()),
@@ -245,9 +223,6 @@ impl LayerTypeRegistry {
             &[]
         );
         entry!(
-            "noise_open_simplex",
-            "OpenSimplex Noise",
-            WorkflowStage::Generation,
             "mountain",
             "OpenSimplex noise height contribution.",
             || LayerKind::NoiseOpenSimplex(NoiseParams::default()),
@@ -256,9 +231,6 @@ impl LayerTypeRegistry {
             &[]
         );
         entry!(
-            "noise_worley",
-            "Worley Noise",
-            WorkflowStage::Generation,
             "mountain",
             "Cellular / Worley noise.",
             || LayerKind::NoiseWorley(WorleyParams::default()),
@@ -267,9 +239,6 @@ impl LayerTypeRegistry {
             &[]
         );
         entry!(
-            "fbm",
-            "FBM",
-            WorkflowStage::Generation,
             "mountain",
             "Fractal Brownian motion noise.",
             || LayerKind::Fbm(FbmParams::default()),
@@ -278,9 +247,6 @@ impl LayerTypeRegistry {
             &["thermal_erosion"]
         );
         entry!(
-            "ridged",
-            "Ridged",
-            WorkflowStage::Generation,
             "mountain",
             "Ridged multifractal detail.",
             || LayerKind::Ridged(FbmParams::default()),
@@ -289,9 +255,6 @@ impl LayerTypeRegistry {
             &[]
         );
         entry!(
-            "domain_warp",
-            "Domain Warp",
-            WorkflowStage::Generation,
             "mountain",
             "Warped noise domain.",
             || LayerKind::DomainWarp(DomainWarpParams::default()),
@@ -301,9 +264,6 @@ impl LayerTypeRegistry {
         );
         entry!(
             "mountain",
-            "Mountains",
-            WorkflowStage::Generation,
-            "mountain",
             "Ridged mountain range.",
             || LayerKind::Mountains(MountainParams::default()),
             true,
@@ -311,9 +271,6 @@ impl LayerTypeRegistry {
             &["hydraulic_erosion", "thermal_erosion"]
         );
         entry!(
-            "volcano",
-            "Volcano",
-            WorkflowStage::Generation,
             "mountain",
             "Volcanic cone with optional crater.",
             || LayerKind::Volcano(VolcanoParams::default()),
@@ -322,9 +279,6 @@ impl LayerTypeRegistry {
             &[]
         );
         entry!(
-            "mesa",
-            "Mesa",
-            WorkflowStage::Generation,
             "mountain",
             "Hard-cap mesa / butte.",
             || LayerKind::Mesa(MesaParams::default()),
@@ -333,9 +287,6 @@ impl LayerTypeRegistry {
             &[]
         );
         entry!(
-            "island",
-            "Island",
-            WorkflowStage::Generation,
             "waves",
             "Closed island landmass with coastal zones and bathymetry.",
             || LayerKind::Island(IslandParams::default()),
@@ -344,20 +295,14 @@ impl LayerTypeRegistry {
             &["coastal", "hydraulic_erosion"]
         );
         entry!(
-            "uplift",
-            "Uplift",
-            WorkflowStage::Generation,
             "mountain",
             "Large-scale ridge / corridor uplift.",
             || LayerKind::Uplift(UpliftParams::default()),
-            true,
+            false,
             &["shape"],
-            &["stream_power"]
+            &["landscape_evolution"]
         );
         entry!(
-            "dunes",
-            "Dunes",
-            WorkflowStage::Generation,
             "mountain",
             "Wind dune fields.",
             || LayerKind::Dunes(DuneParams::default()),
@@ -366,9 +311,6 @@ impl LayerTypeRegistry {
             &["sand_simulation"]
         );
         entry!(
-            "canyon",
-            "Canyons",
-            WorkflowStage::Generation,
             "mountain",
             "Canyon network.",
             || LayerKind::Canyons(CanyonParams::default()),
@@ -377,9 +319,6 @@ impl LayerTypeRegistry {
             &["river_carve"]
         );
         entry!(
-            "plateau",
-            "Plateau",
-            WorkflowStage::Generation,
             "mountain",
             "Tableland plateau.",
             || LayerKind::Plateau(PlateauParams::default()),
@@ -388,9 +327,6 @@ impl LayerTypeRegistry {
             &[]
         );
         entry!(
-            "terrace",
-            "Terrace",
-            WorkflowStage::Generation,
             "mountain",
             "Terraced height quantisation.",
             || LayerKind::Terrace(TerraceParams::default()),
@@ -399,9 +335,6 @@ impl LayerTypeRegistry {
             &[]
         );
         entry!(
-            "voronoi",
-            "Voronoi Regions",
-            WorkflowStage::Generation,
             "mountain",
             "Cellular region heights.",
             || LayerKind::VoronoiRegions(VoronoiParams::default()),
@@ -410,9 +343,6 @@ impl LayerTypeRegistry {
             &[]
         );
         entry!(
-            "blur",
-            "Blur",
-            WorkflowStage::Generation,
             "blend",
             "Gaussian-like height blur.",
             || LayerKind::Blur(BlurParams::default()),
@@ -421,9 +351,6 @@ impl LayerTypeRegistry {
             &[]
         );
         entry!(
-            "effect_filter",
-            "Effect Filter",
-            WorkflowStage::Generation,
             "sparkles",
             "WC-style effect filters (smooth, distortion, shore, strata, …).",
             || LayerKind::EffectFilter(EffectFilterParams::default()),
@@ -432,9 +359,6 @@ impl LayerTypeRegistry {
             &[]
         );
         entry!(
-            "path",
-            "Path",
-            WorkflowStage::Generation,
             "activity",
             "Drawn spline path (road / ridge / valley).",
             || LayerKind::Path(PathParams::default()),
@@ -443,9 +367,6 @@ impl LayerTypeRegistry {
             &[]
         );
         entry!(
-            "procedural_shape",
-            "Procedural Shape",
-            WorkflowStage::Generation,
             "mountain",
             "Procedural landscape shape with a swappable generator.",
             || LayerKind::ProceduralShape(ProceduralShapeParams::default()),
@@ -454,9 +375,6 @@ impl LayerTypeRegistry {
             &["hydraulic_erosion", "thermal_erosion"]
         );
         entry!(
-            "stamp_2d",
-            "2D Stamp",
-            WorkflowStage::Foundation,
             "image",
             "2D heightmap stamp.",
             || LayerKind::Stamp2d(Stamp2dParams::default()),
@@ -465,9 +383,6 @@ impl LayerTypeRegistry {
             &[]
         );
         entry!(
-            "stamp_3d",
-            "3D Stamp",
-            WorkflowStage::Foundation,
             "box",
             "3D mesh stamp — samples an OBJ or height image into the heightfield.",
             || LayerKind::Stamp3d(Stamp3dParams::default()),
@@ -476,9 +391,6 @@ impl LayerTypeRegistry {
             &[]
         );
         entry!(
-            "polygon_height",
-            "Polygon",
-            WorkflowStage::Generation,
             "activity",
             "Closed polygon raise / carve.",
             || LayerKind::PolygonHeight(PolygonHeightParams::default()),
@@ -487,9 +399,6 @@ impl LayerTypeRegistry {
             &[]
         );
         entry!(
-            "overhang_stamp",
-            "Overhang Stamp",
-            WorkflowStage::Generation,
             "box",
             "Cliff undercut / shelf via dual-height.",
             || LayerKind::OverhangStamp(OverhangStampParams::default()),
@@ -498,9 +407,6 @@ impl LayerTypeRegistry {
             &[]
         );
         entry!(
-            "local_sdf",
-            "Local SDF",
-            WorkflowStage::Generation,
             "box",
             "Local analytic SDF cave pocket.",
             || LayerKind::LocalSdf(LocalSdfParams::default()),
@@ -509,9 +415,6 @@ impl LayerTypeRegistry {
             &[]
         );
         entry!(
-            "geomorphic_detail",
-            "Geomorphic Detail",
-            WorkflowStage::Generation,
             "mountain",
             "Drainage-conditioned multi-scale amplification (meso ridges / micro gullies).",
             || LayerKind::GeomorphicDetail(GeomorphicDetailParams::default()),
@@ -522,9 +425,6 @@ impl LayerTypeRegistry {
 
         // Simulations
         entry!(
-            "thermal_erosion",
-            "Thermal Erosion",
-            WorkflowStage::Simulation,
             "activity",
             "Talus / thermal weathering with layered debris.",
             || LayerKind::ThermalErosion(ThermalErosionParams::default()),
@@ -533,9 +433,6 @@ impl LayerTypeRegistry {
             &["debris_flow"]
         );
         entry!(
-            "debris_flow",
-            "Debris Flow",
-            WorkflowStage::Simulation,
             "activity",
             "Jain et al. 2024 debris-flow erosion, scars and deposit cones.",
             || LayerKind::DebrisFlow(crate::layer::DebrisFlowParams::default()),
@@ -544,9 +441,6 @@ impl LayerTypeRegistry {
             &["thermal_erosion"]
         );
         entry!(
-            "hydraulic_erosion",
-            "Hydraulic Erosion",
-            WorkflowStage::Simulation,
             "droplets",
             "Particle / outflow hydraulic erosion.",
             || LayerKind::HydraulicErosion(HydraulicErosionParams::default()),
@@ -555,9 +449,6 @@ impl LayerTypeRegistry {
             &["debris_flow", "thermal_erosion"]
         );
         entry!(
-            "stream_power",
-            "Stream Power",
-            WorkflowStage::Simulation,
             "waves",
             "Stream-power incision (fluvial SPE).",
             || LayerKind::StreamPowerErosion(StreamPowerParams::default()),
@@ -566,9 +457,6 @@ impl LayerTypeRegistry {
             &["hydraulic_erosion"]
         );
         entry!(
-            "multi_scale_amplify",
-            "Multi-Scale Amplify",
-            WorkflowStage::Simulation,
             "activity",
             "Wavelength-aware multi-scale amplify.",
             || LayerKind::MultiScaleAmplify(MultiScaleAmplifyParams::default()),
@@ -577,9 +465,6 @@ impl LayerTypeRegistry {
             &[]
         );
         entry!(
-            "river_carve",
-            "River Carve",
-            WorkflowStage::Simulation,
             "waves",
             "Carve river channels into height.",
             || LayerKind::RiverCarve(RiverCarveParams::default()),
@@ -588,9 +473,6 @@ impl LayerTypeRegistry {
             &[]
         );
         entry!(
-            "river_network",
-            "River Network",
-            WorkflowStage::Simulation,
             "waves",
             "Interactive river network (springs / auto-flow).",
             || LayerKind::RiverNetwork(RiverNetworkParams::default()),
@@ -599,9 +481,6 @@ impl LayerTypeRegistry {
             &["river_carve"]
         );
         entry!(
-            "coastal",
-            "Coastal",
-            WorkflowStage::Simulation,
             "waves",
             "Coastal erosion and shelf shaping.",
             || LayerKind::Coastal(CoastalParams::default()),
@@ -610,9 +489,6 @@ impl LayerTypeRegistry {
             &[]
         );
         entry!(
-            "landscape_evolution",
-            "Landscape Evolution",
-            WorkflowStage::Simulation,
             "activity",
             "Coupled uplift, SPE incision, hillslope diffusion and sediment.",
             || LayerKind::LandscapeEvolution(LandscapeEvolutionParams::default()),
@@ -621,9 +497,6 @@ impl LayerTypeRegistry {
             &["hydrology_repair"]
         );
         entry!(
-            "hydrology_repair",
-            "Hydrology Repair",
-            WorkflowStage::Simulation,
             "droplets",
             "Re-establish connected drainage after local edits.",
             || LayerKind::HydrologyRepair(HydrologyRepairParams::default()),
@@ -632,9 +505,6 @@ impl LayerTypeRegistry {
             &[]
         );
         entry!(
-            "ecosystem_feedback",
-            "Ecosystem Feedback",
-            WorkflowStage::Simulation,
             "sparkles",
             "Bounded vegetation/root/soil feedback into terrain evolution.",
             || LayerKind::EcosystemFeedback(EcosystemFeedbackParams::default()),
@@ -645,9 +515,6 @@ impl LayerTypeRegistry {
 
         // Surface / scatter / objects
         entry!(
-            "climate_biomes",
-            "Climate Classification",
-            WorkflowStage::BiomePlacement,
             "layers",
             "Climate / biome classification filter (not a biome container).",
             || LayerKind::Biomes(BiomesParams::default()),
@@ -656,9 +523,6 @@ impl LayerTypeRegistry {
             &["materials", "vegetation"]
         );
         entry!(
-            "materials",
-            "Materials",
-            WorkflowStage::Materials,
             "blend",
             "Surface material / hardness rules.",
             || LayerKind::Materials(MaterialsParams::default()),
@@ -667,9 +531,6 @@ impl LayerTypeRegistry {
             &["vegetation"]
         );
         entry!(
-            "vegetation",
-            "Vegetation",
-            WorkflowStage::Scatter,
             "sparkles",
             "Vegetation density / scatter weights.",
             || LayerKind::Vegetation(VegetationParams::default()),
@@ -678,9 +539,6 @@ impl LayerTypeRegistry {
             &[]
         );
         entry!(
-            "sand_simulation",
-            "Sand Simulation",
-            WorkflowStage::Objects,
             "mountain",
             "Granular sand local simulation.",
             || LayerKind::SandSimulation(SandSimParams::default()),
@@ -689,9 +547,6 @@ impl LayerTypeRegistry {
             &[]
         );
         entry!(
-            "fluid_simulation",
-            "Fluid Simulation",
-            WorkflowStage::Objects,
             "droplets",
             "Fluid / lake local simulation.",
             || LayerKind::FluidSimulation(FluidSimParams::default()),
@@ -713,7 +568,7 @@ mod tests {
         for m in reg.all() {
             assert!(seen.insert(m.type_id), "duplicate type_id {}", m.type_id);
         }
-        assert!(reg.all().len() >= 40);
+        assert_eq!(reg.entries.len(), reg.factories.len());
     }
 
     #[test]
@@ -734,6 +589,17 @@ mod tests {
     }
 
     #[test]
+    fn compatibility_uplift_is_editable_but_not_directly_creatable() {
+        let reg = LayerTypeRegistry::builtin();
+        let meta = reg.get("uplift").expect("uplift metadata");
+        assert!(!meta.capabilities.user_creatable);
+        assert!(meta.capabilities.supports_duplication);
+        assert!(meta.capabilities.can_reorder);
+        assert_eq!(meta.suggested_next, &["landscape_evolution"]);
+        assert!(reg.create("uplift").is_some());
+    }
+
+    #[test]
     fn stage_filter() {
         let reg = LayerTypeRegistry::builtin();
         let sims: Vec<_> = reg.by_stage(WorkflowStage::Simulation).collect();
@@ -741,11 +607,45 @@ mod tests {
     }
 
     #[test]
-    fn meta_matches_kind_type_id() {
+    fn builtin_metadata_matches_every_factory_kind() {
         let reg = LayerTypeRegistry::builtin();
-        let kind = LayerKind::Island(IslandParams::default());
-        let meta = reg.meta_for_kind(&kind).unwrap();
-        assert_eq!(meta.type_id, "island");
-        assert_eq!(meta.workflow_stage, WorkflowStage::Generation);
+
+        for (meta, factory) in reg.entries.iter().zip(&reg.factories) {
+            let kind = factory();
+            assert_eq!(meta.type_id, kind.type_id(), "type id for {}", meta.type_id);
+            assert_eq!(
+                meta.display_name,
+                kind.type_display_name(),
+                "display name for {}",
+                meta.type_id
+            );
+            assert_eq!(
+                meta.workflow_stage,
+                kind.workflow_stage(),
+                "workflow stage for {}",
+                meta.type_id
+            );
+            assert!(std::ptr::eq(
+                meta,
+                reg.meta_for_kind(&kind)
+                    .expect("factory kind is registered")
+            ));
+
+            let created = reg.create(meta.type_id).expect("registered type creates");
+            assert_eq!(created.kind.type_id(), meta.type_id);
+        }
+
+        assert_eq!(
+            reg.get("stamp_2d").unwrap().workflow_stage,
+            WorkflowStage::Foundation
+        );
+        assert_eq!(
+            reg.get("stamp_3d").unwrap().workflow_stage,
+            WorkflowStage::Foundation
+        );
+        assert_eq!(
+            reg.get("coastal").unwrap().workflow_stage,
+            WorkflowStage::Simulation
+        );
     }
 }

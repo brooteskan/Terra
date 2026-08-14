@@ -140,16 +140,16 @@ impl LevelStepSettings {
     /// Draft → coarsest third, Medium → two thirds, Full/Export → all levels.
     pub fn truncate_for_preview(
         levels: Vec<SimLevel>,
-        quality: crate::eval::PreviewQuality,
+        quality: crate::quality::PreviewQuality,
     ) -> Vec<SimLevel> {
         if levels.is_empty() {
             return levels;
         }
         let n = levels.len();
         let keep = match quality {
-            crate::eval::PreviewQuality::Draft => (n + 2) / 3,
-            crate::eval::PreviewQuality::Medium => (2 * n + 2) / 3,
-            crate::eval::PreviewQuality::Full | crate::eval::PreviewQuality::Export => n,
+            crate::quality::PreviewQuality::Draft => (n + 2) / 3,
+            crate::quality::PreviewQuality::Medium => (2 * n + 2) / 3,
+            crate::quality::PreviewQuality::Full | crate::quality::PreviewQuality::Export => n,
         }
         .max(1)
         .min(n);
@@ -179,7 +179,7 @@ impl LevelStepSettings {
         start_level: u32,
         strength: f32,
         strength_curve: &[f32],
-        quality: crate::eval::PreviewQuality,
+        quality: crate::quality::PreviewQuality,
     ) -> Vec<SimLevel> {
         let mut levels = author_sim_levels(base, level_count, start_level, strength);
         // Precision is metres per simulation pixel. Values above one solve on
@@ -216,7 +216,7 @@ impl LevelStepSettings {
 mod tests {
     use super::*;
     use crate::analyze::default_sim_levels;
-    use crate::eval::PreviewQuality;
+    use crate::quality::PreviewQuality;
 
     #[test]
     fn upsample_chain_doubles() {

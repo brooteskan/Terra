@@ -5,8 +5,8 @@
 //! quantisation; it never adds post-terrace vertical noise.
 
 use crate::heightfield::Heightfield;
-use crate::layer::{FractalNoiseType, WorleyMetric};
 use crate::noise::{self, worley2};
+use crate::noise::{FractalNoiseType, WorleyMetric};
 
 use super::super::filter_kernels::{gradient, phasor_noise, slope_deg};
 
@@ -82,7 +82,12 @@ fn irregular_perturb(x: f32, z: f32, freq: f32, seed: u64) -> (f32, f32, f32) {
     // Low-frequency coherent elevation shift (fraction of local interval later).
     let elev = noise::sample_noise(FractalNoiseType::Perlin, x * f, z * f, seed);
     // Voronoi cells → local spacing variation (procedural noise cells).
-    let cell = worley2(x * f * 0.85, z * f * 0.85, seed ^ 0x51CEu64, WorleyMetric::Euclidean);
+    let cell = worley2(
+        x * f * 0.85,
+        z * f * 0.85,
+        seed ^ 0x51CEu64,
+        WorleyMetric::Euclidean,
+    );
     let spacing = ((cell.f2 - cell.f1) * 2.0 - 1.0).clamp(-1.0, 1.0);
     // Phasor → riser phase wander without high-frequency chatter.
     let phase = phasor_noise(x, z, f * 0.7, seed ^ 0xA11Au64);

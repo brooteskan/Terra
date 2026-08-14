@@ -7,15 +7,16 @@ members = [
     "crates/terra-gui",
     "crates/terra-io",
     "crates/terra-app",
+    "crates/terra-test-gpu",
 ]
 default-members = ["crates/terra-app"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.0-beta.1"
 edition = "2021"
 license = "MIT"
 authors = ["Terra Contributors"]
-repository = "https://github.com/local/terra"
+repository = "https://github.com/brooteskan/Terra"
 
 [workspace.dependencies]
 terra-core = { path = "crates/terra-core" }
@@ -23,6 +24,7 @@ terra-gpu = { path = "crates/terra-gpu" }
 terra-render = { path = "crates/terra-render" }
 terra-gui = { path = "crates/terra-gui" }
 terra-io = { path = "crates/terra-io" }
+terra-test-gpu = { path = "crates/terra-test-gpu" }
 
 glam = { version = "0.29", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }

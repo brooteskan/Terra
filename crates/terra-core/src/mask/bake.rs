@@ -6,7 +6,7 @@ use crate::heightfield::{Heightfield, HeightfieldMetrics};
 use std::collections::HashMap;
 
 /// Bake all mask assets against a reference heightfield.
-use crate::layer::OutputId;
+use crate::ids::OutputId;
 ///
 /// If `reference` metrics differ from `target`, heights are sampled by normalized UV.
 pub fn bake_mask_assets(
@@ -68,6 +68,12 @@ fn bake_source(
         MaskSource::None => MaskField::ones(hf.metrics),
         MaskSource::Named(name) => aux
             .get(name)
+            // Keep mask below fields in the module graph: these are compatibility
+            // spellings only, while fields::keys owns canonical writes and ingest.
+            .or_else(|| match name.as_str() {
+                "sediment_depth" | "loose_sediment" => aux.get("sediment_thickness"),
+                _ => None,
+            })
             .cloned()
             .unwrap_or_else(|| MaskField::ones(hf.metrics)),
         MaskSource::Constant(v) => MaskField::filled(hf.metrics, *v),
@@ -278,5 +284,27 @@ mod tests {
         );
         assert!((baked[&named_id].get(0, 0) - 0.25).abs() < 1e-6);
         assert!((baked[&output_mask_id].get(0, 0) - 0.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn legacy_sediment_named_source_resolves_the_canonical_aux_key() {
+        let metrics = HeightfieldMetrics::new(4, 4, 4.0, 4.0);
+        let id = MaskId::new();
+        let assets = [MaskAsset {
+            id,
+            name: "legacy sediment".into(),
+            source: MaskSource::Named("sediment_depth".into()),
+            ops: Vec::new(),
+            paint: None,
+            display_color: default_mask_display_color(),
+        }];
+        let mut aux = HashMap::new();
+        aux.insert(
+            "sediment_thickness".into(),
+            MaskField::filled(metrics, 0.625),
+        );
+
+        let baked = bake_mask_assets(&assets, &Heightfield::zeros(metrics), metrics, &aux);
+        assert!((baked[&id].get(0, 0) - 0.625).abs() < 1e-6);
     }
 }

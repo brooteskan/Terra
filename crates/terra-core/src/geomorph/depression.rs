@@ -125,6 +125,21 @@ pub fn handle_depressions(hf: &Heightfield, mode: DepressionMode) -> DepressionR
 /// Classic Priority-Flood fill: boundary cells are outlets; interior pits rise
 /// only enough to connect to a spill.
 pub fn priority_flood_fill(hf: &Heightfield) -> Heightfield {
+    priority_flood_fill_impl(hf, None)
+}
+
+/// Priority-Flood seeded by an explicit set of routing outlets.
+///
+/// Callers must provide at least one marked cell. Unlike [`priority_flood_fill`],
+/// this does not silently add the domain rim as an outlet.
+pub(crate) fn priority_flood_fill_from_outlets(
+    hf: &Heightfield,
+    outlets: &MaskField,
+) -> Heightfield {
+    priority_flood_fill_impl(hf, Some(outlets))
+}
+
+fn priority_flood_fill_impl(hf: &Heightfield, outlets: Option<&MaskField>) -> Heightfield {
     let w = hf.metrics.width as usize;
     let h = hf.metrics.height as usize;
     if w == 0 || h == 0 {
@@ -137,7 +152,10 @@ pub fn priority_flood_fill(hf: &Heightfield) -> Heightfield {
 
     for j in 0..h {
         for i in 0..w {
-            if i != 0 && j != 0 && i + 1 != w && j + 1 != h {
+            let is_outlet = outlets
+                .map(|mask| mask.get(i as u32, j as u32) > 0.5)
+                .unwrap_or(i == 0 || j == 0 || i + 1 == w || j + 1 == h);
+            if !is_outlet {
                 continue;
             }
             let index = j * w + i;
@@ -150,6 +168,14 @@ pub fn priority_flood_fill(hf: &Heightfield) -> Heightfield {
                 index,
             });
         }
+    }
+
+    debug_assert!(
+        !queue.is_empty(),
+        "priority_flood_fill_from_outlets requires a non-empty outlet mask"
+    );
+    if queue.is_empty() {
+        return hf.clone();
     }
 
     while let Some(cell) = queue.pop() {

@@ -9,7 +9,7 @@ use super::distribution::{
 };
 use super::{MaskId, MaskRef};
 use crate::heightfield::HeightfieldMetrics;
-use crate::layer::LayerId;
+use crate::ids::LayerId;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};

@@ -68,7 +68,10 @@ pub fn dist_base_kinds() -> Vec<(&'static str, DistNodeKind)> {
         ),
         (
             "Curvature",
-            DistNodeKind::Curvature { min: -1.0, max: 1.0 },
+            DistNodeKind::Curvature {
+                min: -1.0,
+                max: 1.0,
+            },
         ),
         ("Flow", DistNodeKind::Flow { min: 0.0, max: 1.0 }),
         (
@@ -166,9 +169,9 @@ pub fn dist_kind_icon(kind: &DistNodeKind) -> Icon {
         | DistNodeKind::NoiseRidged { .. }
         | DistNodeKind::NoiseWorley { .. }
         | DistNodeKind::NoiseBillow { .. } => Icon::Sparkles,
-        DistNodeKind::Slope { .. } | DistNodeKind::Steepness { .. } | DistNodeKind::Angle { .. } => {
-            Icon::Activity
-        }
+        DistNodeKind::Slope { .. }
+        | DistNodeKind::Steepness { .. }
+        | DistNodeKind::Angle { .. } => Icon::Activity,
         DistNodeKind::Height { .. } | DistNodeKind::SeaLevel { .. } => Icon::Mountain,
         DistNodeKind::Curvature { .. }
         | DistNodeKind::Cavity { .. }
@@ -208,9 +211,7 @@ pub fn dist_kind_description(label: &str, is_effect: bool) -> &'static str {
     } else {
         match label {
             "Fill" => "Constant coverage fill.",
-            "Noise" | "Perlin" | "Ridged" | "Worley" | "Billow" => {
-                "Procedural noise distribution."
-            }
+            "Noise" | "Perlin" | "Ridged" | "Worley" | "Billow" => "Procedural noise distribution.",
             "Slope" | "Steepness" => "Mask from terrain slope.",
             "Height" => "Mask from a height range.",
             "Curvature" => "Mask from terrain curvature.",

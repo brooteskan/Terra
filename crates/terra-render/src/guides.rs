@@ -180,7 +180,8 @@ impl GuideOverlay {
             snap_x,
             snap_z,
         );
-        if key == self.last_key && (self.state.grid || self.state.bounds) == (self.vertex_count > 0) {
+        if key == self.last_key && (self.state.grid || self.state.bounds) == (self.vertex_count > 0)
+        {
             if !self.state.grid && !self.state.bounds {
                 self.vertex_count = 0;
             }

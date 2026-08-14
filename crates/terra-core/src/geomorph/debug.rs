@@ -6,12 +6,12 @@
 use crate::heightfield::Heightfield;
 use crate::mask::MaskField;
 
-use super::{
-    analyze_terrain, GeomorphOptions, Precipitation, StreamExtractParams, WatershedOptions,
-};
 use super::depression::DepressionMode;
 use super::derivatives::DerivativeOptions;
 use super::routing::FlowModel;
+use super::{
+    analyze_terrain, GeomorphOptions, Precipitation, StreamExtractParams, WatershedOptions,
+};
 
 /// Every Phase 2 analysis product available as a debug overlay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -192,7 +192,9 @@ pub fn bake_debug_field(
         GeomorphDebugField::ValleyLikelihood => analysis.drainage.valley_likelihood.clone(),
         GeomorphDebugField::FillDelta => analysis.fill_delta.clone(),
         GeomorphDebugField::FlowDirection => analysis.graph.direction_mask.clone(),
-        GeomorphDebugField::FlowAccumulation => vec_to_mask_log(&analysis.drainage_area, height.metrics),
+        GeomorphDebugField::FlowAccumulation => {
+            vec_to_mask_log(&analysis.drainage_area, height.metrics)
+        }
         GeomorphDebugField::Discharge => vec_to_mask_log(&analysis.discharge, height.metrics),
         GeomorphDebugField::WatershedId => analysis.watersheds.id_mask.clone(),
         GeomorphDebugField::WatershedBoundary => analysis.watersheds.boundaries.clone(),

@@ -5,22 +5,21 @@
 //! (`tool_thumbs` / `ToolDef.icon`) — not bespoke reference illustrations.
 
 use crate::ui::actions::PanelAction;
-use crate::ui::add_layer_menu::create_layer_for_kind;
 use crate::ui::command_registry::fuzzy_match;
 use crate::ui::dist_kinds::{
     dist_base_kinds, dist_effect_kinds, dist_kind_description, dist_kind_icon,
 };
 use crate::ui::hierarchy_view::ArtistConcept;
-use crate::ui::tool_catalog::{all_tools_cached, quick_add_entries, ToolAction, ToolDef};
-use crate::ui::UiState;
-use terra_core::document::TerrainDocument;
-use terra_core::layer::{
-    biome_destination_section, is_shape_kind, BiomeSection, StackCategory,
-};
-use terra_core::mask::{DistNodeKind, MaskAsset, MaskId};
 use crate::ui::style::{
     self, FONT_SCALE, GAP, PAD, PAD_SM, ROW_H, TYPE_BODY, TYPE_CAPTION, TYPE_LABEL, TYPE_TITLE,
 };
+use crate::ui::tool_catalog::{
+    all_tools_cached, instantiate_layer_preset, quick_add_entries, ToolAction, ToolDef,
+};
+use crate::ui::UiState;
+use terra_core::document::TerrainDocument;
+use terra_core::layer::{biome_destination_section, is_shape_kind, BiomeSection, StackCategory};
+use terra_core::mask::{DistNodeKind, MaskAsset, MaskId};
 use terra_gui::{Color, DrawList, GuiContext, Icon, Id, Rect};
 
 const GRID_COLS: usize = 3;
@@ -50,7 +49,7 @@ fn clear_quick_add(ui_state: &mut UiState, state: &mut QuickAddState) {
     ui_state.quick_add_into = None;
     ui_state.quick_add_biome_section = None;
     ui_state.quick_add_distribution = None;
-    
+
     state.query.clear();
     state.scroll_y = 0.0;
     state.selected_id = None;
@@ -92,18 +91,10 @@ fn modal_subtitle(ui_state: &UiState) -> &'static str {
     }
     if let Some(section) = ui_state.quick_add_biome_section {
         return match section {
-            BiomeSection::Filters => {
-                "Choose a filter or landform effect for this biome."
-            }
-            BiomeSection::Materials => {
-                "Choose a material or surface dressing for this biome."
-            }
-            BiomeSection::Objects => {
-                "Choose vegetation or object scatter for this biome."
-            }
-            BiomeSection::LocalSims => {
-                "Choose a local sand / fluid simulation for this biome."
-            }
+            BiomeSection::Filters => "Choose a filter or landform effect for this biome.",
+            BiomeSection::Materials => "Choose a material or surface dressing for this biome.",
+            BiomeSection::Objects => "Choose vegetation or object scatter for this biome.",
+            BiomeSection::LocalSims => "Choose a local sand / fluid simulation for this biome.",
         };
     }
     if ui_state.quick_add_into.is_some() {
@@ -120,15 +111,11 @@ fn modal_subtitle(ui_state: &UiState) -> &'static str {
             ArtistConcept::WorldSimulations | ArtistConcept::LocalSimulations => {
                 "Choose a simulation or erosion process."
             }
-            ArtistConcept::GlobalMaterials => {
-                "Choose a material or surface dressing layer."
-            }
+            ArtistConcept::GlobalMaterials => "Choose a material or surface dressing layer.",
             ArtistConcept::Objects | ArtistConcept::GlobalScatter => {
                 "Choose an object or scatter layer."
             }
-            ArtistConcept::AdvancedPlacement => {
-                "Choose a distribution or placement mask."
-            }
+            ArtistConcept::AdvancedPlacement => "Choose a distribution or placement mask.",
         };
     }
     match ui_state.quick_add_category {
@@ -154,9 +141,7 @@ fn modal_tip(ui_state: &UiState) -> &'static str {
             BiomeSection::Objects => {
                 "Tip: Objects and vegetation scatter only where this biome owns."
             }
-            BiomeSection::LocalSims => {
-                "Tip: Local sims (sand / fluid) run inside this biome only."
-            }
+            BiomeSection::LocalSims => "Tip: Local sims (sand / fluid) run inside this biome only.",
         };
     }
     if ui_state.quick_add_into.is_some() {
@@ -217,9 +202,7 @@ fn search_placeholder(ui_state: &UiState) -> &'static str {
 /// alone — Modifier-class filters (Terrace, EffectFilter, …) also map to Shape there.
 fn tool_is_shape_layer(tool: &ToolDef) -> bool {
     match &tool.action {
-        ToolAction::AddLayer { kind, .. } => {
-            tool.id.starts_with("shape.") || is_shape_kind(kind)
-        }
+        ToolAction::AddLayer { kind, .. } => tool.id.starts_with("shape.") || is_shape_kind(kind),
         _ => false,
     }
 }
@@ -299,9 +282,7 @@ fn tool_matches_category(tool: &ToolDef, cat: StackCategory) -> bool {
 
 fn tool_matches_biome_section(tool: &ToolDef, section: BiomeSection) -> bool {
     match &tool.action {
-        ToolAction::AddLayer { kind, .. } => {
-            biome_destination_section(kind) == Some(section)
-        }
+        ToolAction::AddLayer { kind, .. } => biome_destination_section(kind) == Some(section),
         _ => false,
     }
 }
@@ -494,12 +475,17 @@ fn distribution_items() -> Vec<PickerItem> {
     items
 }
 
-fn collect_items(doc: &TerrainDocument, ui_state: &UiState, state: &QuickAddState) -> Vec<PickerItem> {
+fn collect_items(
+    doc: &TerrainDocument,
+    ui_state: &UiState,
+    state: &QuickAddState,
+) -> Vec<PickerItem> {
     if ui_state.quick_add_distribution.is_some() {
         let mut items: Vec<PickerItem> = distribution_items()
             .into_iter()
             .filter(|item| {
-                fuzzy_match(&state.query, item.label()) || fuzzy_match(&state.query, item.description())
+                fuzzy_match(&state.query, item.label())
+                    || fuzzy_match(&state.query, item.description())
             })
             .collect();
         if state.recent_only {
@@ -512,7 +498,9 @@ fn collect_items(doc: &TerrainDocument, ui_state: &UiState, state: &QuickAddStat
                 .position(|id| id == item.id())
                 .unwrap_or(usize::MAX);
             let effect_rank = match item {
-                PickerItem::Dist { is_effect: true, .. } => 1u8,
+                PickerItem::Dist {
+                    is_effect: true, ..
+                } => 1u8,
                 _ => 0u8,
             };
             (effect_rank, recent_rank, item.label().to_ascii_lowercase())
@@ -525,7 +513,9 @@ fn collect_items(doc: &TerrainDocument, ui_state: &UiState, state: &QuickAddStat
     let mut items: Vec<PickerItem> = org_items(ui_state)
         .into_iter()
         .chain(tools.into_iter().map(PickerItem::Tool))
-        .filter(|item| fuzzy_match(&state.query, item.label()) || fuzzy_match(&state.query, item.description()))
+        .filter(|item| {
+            fuzzy_match(&state.query, item.label()) || fuzzy_match(&state.query, item.description())
+        })
         .collect();
 
     if state.recent_only {
@@ -597,7 +587,9 @@ fn inputs_label(item: &PickerItem) -> &'static str {
         },
         PickerItem::Org { id, .. } if *id == "org.biome_paint" => "Active biome",
         PickerItem::Org { .. } => "None",
-        PickerItem::Dist { is_effect: true, .. } => "Parent distribution",
+        PickerItem::Dist {
+            is_effect: true, ..
+        } => "Parent distribution",
         PickerItem::Dist { .. } => "Terrain fields",
     }
 }
@@ -618,9 +610,7 @@ fn output_label(item: &PickerItem) -> &'static str {
                     StackCategory::Simulation
                 ) {
                     "Simulation result"
-                } else if biome_destination_section(kind)
-                    == Some(BiomeSection::Filters)
-                {
+                } else if biome_destination_section(kind) == Some(BiomeSection::Filters) {
                     "Biome filter"
                 } else {
                     "Heightfield"
@@ -634,7 +624,9 @@ fn output_label(item: &PickerItem) -> &'static str {
             "org.hole" => "Hole mask",
             _ => "Group",
         },
-        PickerItem::Dist { is_effect: true, .. } => "Refined distribution",
+        PickerItem::Dist {
+            is_effect: true, ..
+        } => "Refined distribution",
         PickerItem::Dist { .. } => "Distribution mask",
     }
 }
@@ -721,7 +713,7 @@ fn commit_item(
                 });
             }
             ToolAction::AddLayer { name, kind } => {
-                let layer = create_layer_for_kind(name, kind);
+                let layer = instantiate_layer_preset(name, kind);
                 let concept = ui_state.quick_add_concept;
                 if let Some(parent) = ui_state.quick_add_into {
                     actions.push(PanelAction::AddLayerInto { parent, layer });
@@ -779,9 +771,7 @@ fn commit_item(
             _ => {}
         },
         PickerItem::Dist {
-            kind,
-            is_effect,
-            ..
+            kind, is_effect, ..
         } => {
             if let Some(biome) = ui_state.quick_add_distribution {
                 if *is_effect {
@@ -796,7 +786,7 @@ fn commit_item(
                     });
                 }
             }
-        },
+        }
     }
     remember_tool(&mut ui_state.recent_tools, item.id());
     clear_quick_add(ui_state, state);
@@ -946,12 +936,21 @@ pub fn draw_quick_add(
         let menu = Rect::from_pos_size(filter_r.min_x, filter_r.max_y + 4.0, filter_w, 64.0);
         ui.panel_rounded(menu, style::COMBO_MENU_BG, style::RADIUS_SM);
         for (i, (label, recent)) in [("All tools", false), ("Recent", true)].iter().enumerate() {
-            let row = Rect::from_pos_size(menu.min_x + 4.0, menu.min_y + 4.0 + i as f32 * 28.0, filter_w - 8.0, 26.0);
+            let row = Rect::from_pos_size(
+                menu.min_x + 4.0,
+                menu.min_y + 4.0 + i as f32 * 28.0,
+                filter_w - 8.0,
+                26.0,
+            );
             let hov = ui.pointer_in(row);
             if hov {
                 ui.panel_rounded(row, style::HOVER_BG, 4.0);
             }
-            let mark = if state.recent_only == *recent { "● " } else { "   " };
+            let mark = if state.recent_only == *recent {
+                "● "
+            } else {
+                "   "
+            };
             ui.label_at(
                 row.min_x + 8.0,
                 row.min_y + 5.0,
@@ -978,12 +977,7 @@ pub fn draw_quick_add(
         popup.max_x - PAD - SIDEBAR_W - GAP,
         body_bot,
     );
-    let sidebar = Rect::from_min_max(
-        grid_area.max_x + GAP,
-        body_top,
-        popup.max_x - PAD,
-        body_bot,
-    );
+    let sidebar = Rect::from_min_max(grid_area.max_x + GAP, body_top, popup.max_x - PAD, body_bot);
 
     ui.begin_panel_scrolled(
         Id::new("quick_add_grid"),
@@ -992,7 +986,11 @@ pub fn draw_quick_add(
         &mut state.scroll_y,
     );
 
-    let cols = if grid_area.width() < 420.0 { 2 } else { GRID_COLS };
+    let cols = if grid_area.width() < 420.0 {
+        2
+    } else {
+        GRID_COLS
+    };
     let tile_w = ((grid_area.width() - TILE_GAP * (cols as f32 - 1.0)) / cols as f32).max(140.0);
 
     if items.is_empty() {
@@ -1113,7 +1111,12 @@ pub fn draw_quick_add(
     // —— Footer ——————————————————————————————————————————————————————
     let footer = Rect::from_min_max(popup.min_x, body_bot, popup.max_x, popup.max_y);
     ui.panel(
-        Rect::from_pos_size(footer.min_x + PAD, footer.min_y, footer.width() - PAD * 2.0, 1.0),
+        Rect::from_pos_size(
+            footer.min_x + PAD,
+            footer.min_y,
+            footer.width() - PAD * 2.0,
+            1.0,
+        ),
         style::SEPARATOR,
     );
     ui.label_at(
@@ -1134,12 +1137,7 @@ pub fn draw_quick_add(
         add_w,
         btn_h,
     );
-    let cancel_r = Rect::from_pos_size(
-        add_r.min_x - GAP - cancel_w,
-        add_r.min_y,
-        cancel_w,
-        btn_h,
-    );
+    let cancel_r = Rect::from_pos_size(add_r.min_x - GAP - cancel_w, add_r.min_y, cancel_w, btn_h);
 
     if text_button(ui, Id::new("qa_cancel"), "Cancel", cancel_r, false) {
         clear_quick_add(ui_state, state);
@@ -1188,6 +1186,163 @@ pub fn draw_quick_add(
     actions
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use terra_core::layer::{EffectFilterKind, Layer, LayerKind};
+
+    fn commit_catalog_layer(tool_id: &str) -> (LayerKind, Layer) {
+        let tool = quick_add_entries()
+            .into_iter()
+            .find(|tool| tool.id == tool_id)
+            .unwrap_or_else(|| panic!("Quick Add should expose {tool_id}"));
+        let ToolAction::AddLayer { name, kind } = &tool.action else {
+            panic!("{tool_id} should create a layer");
+        };
+        let expected_name = *name;
+        let expected_kind = kind.clone();
+        let item = PickerItem::Tool(tool);
+        let mut ui_state = UiState::default();
+        let mut state = QuickAddState::default();
+        let mut actions = Vec::new();
+
+        commit_item(&item, &mut ui_state, &mut state, &mut actions);
+
+        assert_eq!(actions.len(), 1);
+        let PanelAction::AddLayer(layer) = actions.remove(0) else {
+            panic!("generic Quick Add should emit AddLayer");
+        };
+        assert_eq!(layer.common.name, expected_name);
+        (expected_kind, layer)
+    }
+
+    fn assert_same_kind(expected: &LayerKind, actual: &LayerKind) {
+        assert_eq!(
+            serde_json::to_value(actual).expect("serialize created layer kind"),
+            serde_json::to_value(expected).expect("serialize catalog layer kind")
+        );
+    }
+
+    fn commit_org(id: &'static str) -> PanelAction {
+        let item = PickerItem::Org {
+            id,
+            label: "Test organisation item",
+            description: "Test organisation item.",
+            icon: Icon::Folder,
+        };
+        let mut ui_state = UiState::default();
+        let mut state = QuickAddState::default();
+        let mut actions = Vec::new();
+
+        commit_item(&item, &mut ui_state, &mut state, &mut actions);
+
+        assert_eq!(actions.len(), 1, "{id} should emit exactly one action");
+        actions.remove(0)
+    }
+
+    #[test]
+    fn scoped_quick_add_includes_registry_derived_routes() {
+        let mut shape_state = UiState::default();
+        shape_state.quick_add_concept = Some(ArtistConcept::Shape);
+        assert!(catalog_for_modal(&shape_state)
+            .iter()
+            .any(|tool| tool.registry_type_id == Some("island")));
+
+        let mut simulation_state = UiState::default();
+        simulation_state.quick_add_category = Some(StackCategory::Simulation);
+        assert!(catalog_for_modal(&simulation_state)
+            .iter()
+            .any(|tool| tool.registry_type_id == Some("river_network")));
+
+        let mut filter_state = UiState::default();
+        filter_state.quick_add_into = Some(terra_core::layer::LayerId::new());
+        filter_state.quick_add_biome_section = Some(BiomeSection::Filters);
+        assert!(catalog_for_modal(&filter_state)
+            .iter()
+            .any(|tool| tool.registry_type_id == Some("blur")));
+    }
+
+    #[test]
+    fn quick_add_commits_direct_island_layer() {
+        let (_, layer) = commit_catalog_layer("gen.island");
+        assert!(matches!(layer.kind, LayerKind::Island(_)));
+    }
+
+    #[test]
+    fn quick_add_preserves_non_default_effect_filter_preset() {
+        let (expected, layer) = commit_catalog_layer("filter.arid.rocky_plateaus");
+
+        let LayerKind::EffectFilter(params) = &layer.kind else {
+            panic!("Rocky Plateaus should remain an effect filter");
+        };
+        assert_eq!(params.kind, EffectFilterKind::RockyPlateaus);
+        assert_ne!(params.kind, EffectFilterKind::Smooth);
+        assert_same_kind(&expected, &layer.kind);
+    }
+
+    #[test]
+    fn quick_add_preserves_non_default_vegetation_preset() {
+        let (expected, layer) = commit_catalog_layer("obj.rocks");
+
+        let LayerKind::Vegetation(params) = &layer.kind else {
+            panic!("Rocks should remain a vegetation preset");
+        };
+        assert_eq!(params.density, 0.22);
+        assert_eq!(params.min_distance, 5.0);
+        assert_eq!(params.min_slope_deg, 22.0);
+        assert_eq!(params.max_slope_deg, 90.0);
+        assert!(!params.coverage.nodes.is_empty());
+        assert_same_kind(&expected, &layer.kind);
+    }
+
+    #[test]
+    fn quick_add_exposes_organisation_items_for_the_active_scope() {
+        let generic = UiState::default();
+        let generic_items = org_items(&generic);
+        let generic_ids: Vec<_> = generic_items.iter().map(PickerItem::id).collect();
+        assert_eq!(
+            generic_ids,
+            ["org.pass", "org.isolated", "org.biome", "org.hole"]
+        );
+
+        let mut biomes = UiState::default();
+        biomes.quick_add_concept = Some(ArtistConcept::Biomes);
+        let biome_items = org_items(&biomes);
+        let biome_ids: Vec<_> = biome_items.iter().map(PickerItem::id).collect();
+        assert_eq!(biome_ids, ["org.biome"]);
+
+        let mut biome_layers = UiState::default();
+        biome_layers.quick_add_concept = Some(ArtistConcept::BiomeLayers);
+        let biome_layer_items = org_items(&biome_layers);
+        let biome_layer_ids: Vec<_> = biome_layer_items.iter().map(PickerItem::id).collect();
+        assert_eq!(biome_layer_ids, ["org.biome_paint"]);
+    }
+
+    #[test]
+    fn quick_add_commits_organisation_items_through_picker_item_org() {
+        assert!(matches!(
+            commit_org("org.pass"),
+            PanelAction::AddGroup { .. }
+        ));
+        assert!(matches!(
+            commit_org("org.isolated"),
+            PanelAction::AddIsolatedGroup { .. }
+        ));
+        assert!(matches!(
+            commit_org("org.biome"),
+            PanelAction::AddBiome { .. }
+        ));
+        assert!(matches!(
+            commit_org("org.hole"),
+            PanelAction::AddHoleLayer { .. }
+        ));
+        assert!(matches!(
+            commit_org("org.biome_paint"),
+            PanelAction::AddBiomePaintLayer { .. }
+        ));
+    }
+}
+
 fn draw_sidebar(ui: &mut GuiContext<'_>, sidebar: Rect, item: &PickerItem) {
     let mut y = sidebar.min_y + PAD;
     ui.label_at(
@@ -1213,7 +1368,11 @@ fn draw_sidebar(ui: &mut GuiContext<'_>, sidebar: Rect, item: &PickerItem) {
     y += 18.0;
     if line1.len() < desc.len() {
         let rest = desc.get(line1.len().saturating_sub(1)..).unwrap_or("");
-        let line2 = DrawList::truncate_to_width(rest.trim_start_matches(['…', ' ']), FONT_SCALE * TYPE_LABEL, desc_w);
+        let line2 = DrawList::truncate_to_width(
+            rest.trim_start_matches(['…', ' ']),
+            FONT_SCALE * TYPE_LABEL,
+            desc_w,
+        );
         if !line2.is_empty() {
             ui.label_at(
                 sidebar.min_x + PAD,
@@ -1374,9 +1533,6 @@ fn apply_search_input(ui: &GuiContext<'_>, query: &mut String) {
     query.push_str(&ui.input.text);
 }
 
-pub fn contextual_suggestion_type_ids(
-    _doc: &TerrainDocument,
-    _ui_state: &UiState,
-) -> Vec<String> {
+pub fn contextual_suggestion_type_ids(_doc: &TerrainDocument, _ui_state: &UiState) -> Vec<String> {
     Vec::new()
 }

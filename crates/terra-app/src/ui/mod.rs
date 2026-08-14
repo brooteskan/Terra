@@ -1,6 +1,5 @@
 //! Terra product UI — editor chrome built on `terra-gui`.
 
-mod add_layer_menu;
 mod actions;
 mod bookmarks_gui;
 mod brand;
@@ -11,11 +10,11 @@ mod command_registry;
 mod contextual_create_gui;
 mod dist_kinds;
 mod dock_gui;
+mod hierarchy;
 mod hierarchy_view;
 mod history_gui;
 mod inspector;
 mod inspector_schema;
-mod hierarchy;
 mod panels;
 mod pipeline_gui;
 mod presets;
@@ -43,38 +42,38 @@ pub fn prefetch_tool_thumbnails() {
     tool_thumbs::prefetch_all();
 }
 
-pub use add_layer_menu::{
-    add_layer_menu, all_add_layer_entries, create_layer_by_type_id, create_layer_for_kind,
-    AddLayerEntry, OrganisationKind,
-};
+pub use actions::{MaskEditAction, PanelAction, TerrainSettingsUpdate};
 pub use chrome_gui::{
     apply_borderless_window_frame, caption_controls_width, draw_caption_controls,
     draw_export_unsupported_modal, ChromeGuiState,
 };
 pub use command_palette::{draw_command_palette, CommandPaletteState, PaletteAction};
-pub use command_registry::{commands, fuzzy_match, CommandCategory, CommandDef, CommandId};
+pub(crate) use command_registry::resolve_workspace_command;
+pub use command_registry::{
+    commands, format_shortcuts, fuzzy_match, resolve_shortcut, resolve_shortcut_for_input,
+    BindingVisibility, CommandCategory, CommandDef, CommandId, ShortcutBinding, ShortcutChord,
+    ShortcutModifiers,
+};
 pub use contextual_create_gui::{
     create_to_workspace, draw_viewport_context_menu, hierarchy_add_actions, workspace_to_create,
     ViewportContextMenu,
 };
 pub use dock_gui::DockGuiState;
-pub use hierarchy_view::{
-    advanced_placement_id, biome_section_artist_label, hierarchy_identity_ids, mask_stack_row_id,
-    world_rule_entity_meta, world_rules_meta, ArtistConcept, TERRAIN_ROOT,
-    WORLD_SECTION,
-};
-pub use inspector::{draw_inspector_gui, InspectorGuiState};
-pub use inspector_schema::InspectorSection;
 pub use hierarchy::{
     draw_layers_gui, hierarchy_presentation_snapshot, LayerDragSource, LayerPresentationState,
     LayersGuiState,
 };
+pub use hierarchy_view::{
+    advanced_placement_id, biome_section_artist_label, hierarchy_identity_ids, mask_stack_row_id,
+    world_rule_entity_meta, world_rules_meta, ArtistConcept, TERRAIN_ROOT, WORLD_SECTION,
+};
+pub use inspector::{draw_inspector_gui, InspectorGuiState};
+pub use inspector_schema::InspectorSection;
 pub use panels::{draw_windows, WindowsGuiState};
-pub use actions::{MaskEditAction, PanelAction};
 pub use presets::{
     builtin_presets, contextual_presets, layers_from_preset, layers_from_project_template,
-    project_template_by_id, project_templates, world_design_templates,
-    ContextualPreset, LayerPreset, ProjectTemplate,
+    project_template_by_id, project_templates, world_design_templates, ContextualPreset,
+    LayerPreset, ProjectTemplate,
 };
 pub use project_home_gui::{
     draw_discard_confirm, draw_new_project_templates, draw_project_home, DiscardConfirmChoice,
@@ -94,6 +93,7 @@ pub use workspace::{
     WorkspaceId, WorkspaceMode, WorkspaceState, WorkspaceToolFilter,
 };
 
+use serde::{Deserialize, Serialize};
 use terra_core::document::TerrainDocument;
 use terra_core::eval::PreviewQuality;
 use terra_core::layer::{LayerId, LayerKind};
@@ -201,10 +201,11 @@ pub struct UiState {
     pub bookmarks: [Option<CameraBookmark>; 9],
     /// Read-only history labels supplied by the app, oldest to newest.
     pub history_descriptions: Vec<String>,
-    /// Pending preview resolution chosen from the top-bar dropdown.
-    pub pending_preview_resolution: Option<u32>,
     /// Environment lighting preset for the 3D viewport (presentation only).
     pub lighting_preset: LightingPreset,
+    /// True when the lighting values have been edited away from `lighting_preset`,
+    /// so the preset field renders blank. Cleared when a preset is (re)selected.
+    pub lighting_customized: bool,
     /// Converged samples in Progressive RT mode (read-only renderer telemetry).
     pub progressive_samples: u32,
     /// Progressive path-tracer active this frame (synced from renderer mode).
@@ -225,6 +226,12 @@ pub struct UiState {
     pub brush_symmetry: bool,
     /// Dock layout (resizable / collapsible panels).
     pub layout: terra_gui::LayoutPrefs,
+    /// Preferred task workspace id (`sculpt`, `biomes`, …). Editor preference,
+    /// persisted in the app's editor prefs file (not the dock-geometry blob).
+    pub preferred_workspace: String,
+    /// When true, creating an entity may switch to its home workspace.
+    /// Default false — artists stay in the current workspace unless they opt in.
+    pub auto_switch_workspace_on_create: bool,
     /// Biome Focus — definition currently being polished (WHAT + WHERE).
     pub biome_focus: Option<terra_core::biome_definition::BiomeDefinitionId>,
     /// Bookmarks floating window visible.
@@ -235,7 +242,8 @@ pub struct UiState {
     pub pending_bookmark_save: Option<usize>,
     /// Pending camera bookmark recall slot (0..8), consumed by the app.
     pub pending_bookmark_recall: Option<usize>,
-    /// Dirty flag — layout should be written to disk.
+    /// Dirty flag — editor prefs (dock geometry + workspace + render settings)
+    /// should be written to disk.
     pub layout_dirty: bool,
     /// Snapshot of dirty tile IDs `(tx, tz)` for the dirty-tiles overlay.
     pub dirty_tile_ids: Vec<(u32, u32)>,
@@ -336,6 +344,166 @@ impl LightingPreset {
     }
 }
 
+/// Convert a sun azimuth (degrees, compass bearing around +Y) and elevation
+/// (degrees above the horizon) into a `light_dir` xyz — the direction *from* the
+/// light *toward* the scene, matching `EnvironmentLighting::light_dir`. The
+/// result is unit length (the renderer normalizes it anyway); sun intensity is
+/// carried separately in `light_dir.w`.
+pub fn sun_dir_from_az_el(azimuth_deg: f32, elevation_deg: f32) -> [f32; 3] {
+    let az = azimuth_deg.to_radians();
+    let el = elevation_deg.to_radians();
+    let ce = el.cos();
+    // toward-sun = (ce·cos az, sin el, ce·sin az); light_dir points the other way.
+    [-(ce * az.cos()), -el.sin(), -(ce * az.sin())]
+}
+
+/// Inverse of [`sun_dir_from_az_el`]: recover `(azimuth, elevation)` in degrees
+/// from a `light_dir` xyz. Azimuth is wrapped to `[0, 360)`.
+pub fn sun_az_el_from_dir(light_dir: [f32; 3]) -> (f32, f32) {
+    // toward-sun is the negated light direction.
+    let s = [-light_dir[0], -light_dir[1], -light_dir[2]];
+    let len = (s[0] * s[0] + s[1] * s[1] + s[2] * s[2]).sqrt().max(1e-6);
+    let (x, y, z) = (s[0] / len, s[1] / len, s[2] / len);
+    let elevation = y.clamp(-1.0, 1.0).asin().to_degrees();
+    let mut azimuth = z.atan2(x).to_degrees();
+    if azimuth < 0.0 {
+        azimuth += 360.0;
+    }
+    (azimuth, elevation)
+}
+
+#[cfg(test)]
+mod sun_dir_tests {
+    use super::*;
+
+    #[test]
+    fn az_el_round_trips_through_dir() {
+        for &(az, el) in &[(0.0f32, 45.0f32), (90.0, 10.0), (215.0, 72.0), (359.0, 1.0)] {
+            let dir = sun_dir_from_az_el(az, el);
+            let (az2, el2) = sun_az_el_from_dir(dir);
+            assert!((el - el2).abs() < 1e-2, "elevation {el} -> {el2}");
+            // Compare azimuth modulo 360 so 359° vs 359° does not read as a 360° gap.
+            let daz = ((az - az2 + 540.0) % 360.0 - 180.0).abs();
+            assert!(daz < 1e-2, "azimuth {az} -> {az2}");
+        }
+    }
+
+    #[test]
+    fn studio_preset_reads_as_a_high_sun() {
+        let (ld, _, _) = LightingPreset::Studio.params();
+        let (_az, el) = sun_az_el_from_dir([ld[0], ld[1], ld[2]]);
+        assert!(el > 60.0, "Studio should read as a high sun, got {el}");
+    }
+}
+
+/// Persisted, serde-stable form of the viewport render controls (user preference).
+///
+/// This is the on-disk vocabulary — render `mode`/`preset` are stored as strings so
+/// the editor prefs file does not depend on `terra_render`'s enums. The runtime source
+/// of truth is [`ViewportRenderSettings`]; convert with [`ViewportRenderSettings::from_prefs`]
+/// / [`ViewportRenderSettings::to_prefs`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ViewportRenderPrefs {
+    #[serde(default = "default_render_mode")]
+    pub mode: String,
+    #[serde(default = "default_render_preset")]
+    pub preset: String,
+    #[serde(default = "default_target_fps")]
+    pub target_fps: f32,
+    #[serde(default = "default_max_spp")]
+    pub max_spp: u32,
+    #[serde(default = "default_true")]
+    pub dynamic_resolution: bool,
+    #[serde(default = "default_true")]
+    pub denoise: bool,
+    #[serde(default = "default_interactive_spp")]
+    pub interactive_spp: u32,
+    #[serde(default = "default_settling_spp")]
+    pub settling_spp: u32,
+    #[serde(default = "default_refining_spp")]
+    pub refining_spp: u32,
+    #[serde(default = "default_bounces_interactive")]
+    pub max_bounces_interactive: u32,
+    #[serde(default = "default_bounces_refining")]
+    pub max_bounces_refining: u32,
+    #[serde(default = "default_min_scale")]
+    pub min_internal_scale: f32,
+    #[serde(default = "default_max_scale")]
+    pub max_internal_scale: f32,
+    #[serde(default = "default_history_clamp")]
+    pub history_clamp_k: f32,
+    #[serde(default = "default_converge")]
+    pub converge_fraction: f32,
+    #[serde(default)]
+    pub debug_viz_mode: u32,
+}
+
+fn default_render_mode() -> String {
+    "Raster".into()
+}
+fn default_render_preset() -> String {
+    "Balanced".into()
+}
+fn default_target_fps() -> f32 {
+    60.0
+}
+fn default_max_spp() -> u32 {
+    128
+}
+fn default_true() -> bool {
+    true
+}
+fn default_interactive_spp() -> u32 {
+    1
+}
+fn default_settling_spp() -> u32 {
+    2
+}
+fn default_refining_spp() -> u32 {
+    4
+}
+fn default_bounces_interactive() -> u32 {
+    2
+}
+fn default_bounces_refining() -> u32 {
+    4
+}
+fn default_min_scale() -> f32 {
+    0.5
+}
+fn default_max_scale() -> f32 {
+    1.0
+}
+fn default_history_clamp() -> f32 {
+    1.5
+}
+fn default_converge() -> f32 {
+    0.95
+}
+
+impl Default for ViewportRenderPrefs {
+    fn default() -> Self {
+        Self {
+            mode: default_render_mode(),
+            preset: default_render_preset(),
+            target_fps: default_target_fps(),
+            max_spp: default_max_spp(),
+            dynamic_resolution: true,
+            denoise: true,
+            interactive_spp: default_interactive_spp(),
+            settling_spp: default_settling_spp(),
+            refining_spp: default_refining_spp(),
+            max_bounces_interactive: default_bounces_interactive(),
+            max_bounces_refining: default_bounces_refining(),
+            min_internal_scale: default_min_scale(),
+            max_internal_scale: default_max_scale(),
+            history_clamp_k: default_history_clamp(),
+            converge_fraction: default_converge(),
+            debug_viz_mode: 0,
+        }
+    }
+}
+
 /// Primary viewport rendering controls (synced to [`terra_render::ViewportQualityManager`]).
 #[derive(Debug, Clone)]
 pub struct ViewportRenderSettings {
@@ -347,6 +515,9 @@ pub struct ViewportRenderSettings {
     pub denoise: bool,
     pub menu_open: bool,
     pub advanced_open: bool,
+    /// Persisted scroll offset for the render panel (survives frames; reset would
+    /// snap the window back to the top every frame).
+    pub menu_scroll: f32,
     pub interactive_spp: u32,
     pub settling_spp: u32,
     pub refining_spp: u32,
@@ -358,11 +529,35 @@ pub struct ViewportRenderSettings {
     pub converge_fraction: f32,
     /// Developer debug visualization (0 = final). Hidden from artists by default.
     pub debug_viz_mode: u32,
+    /// Editable sun direction, shared by Raster and RT. Azimuth is a compass
+    /// bearing around +Y (degrees); elevation is degrees above the horizon.
+    /// Seeded from the lighting preset when it changes, then overrides the
+    /// preset's baked direction so the sliders move the sun.
+    pub sun_azimuth_deg: f32,
+    pub sun_elevation_deg: f32,
+    /// Editable sun intensity (`light_dir.w`) and tonemap exposure, shared by
+    /// both renderers. Seeded from the preset on change, then overridden.
+    pub sun_intensity: f32,
+    pub exposure: f32,
+    /// Editable sky / clear color, shared by both renderers (raster atmosphere +
+    /// fog, RT sky). Seeded from the preset on change, then overridden.
+    pub sky_color: [f32; 3],
+    /// Raster shading controls (inert in the RT backend). Ambient and fog default
+    /// to 1.0 (the current look); shadow_strength 0 keeps cast shadows off until
+    /// dialed up. These are not seeded from presets — they are raster tweaks.
+    pub ambient_strength: f32,
+    pub shadow_strength: f32,
+    pub fog_strength: f32,
 }
 
 impl Default for ViewportRenderSettings {
     fn default() -> Self {
         let cfg = terra_render::RenderQualityConfig::default();
+        // Seed the editable sun angle from the default lighting preset so the
+        // initial state matches what selecting Studio would produce.
+        let (studio_dir, studio_exposure, studio_clear) = LightingPreset::Studio.params();
+        let (sun_azimuth_deg, sun_elevation_deg) =
+            sun_az_el_from_dir([studio_dir[0], studio_dir[1], studio_dir[2]]);
         Self {
             mode: cfg.mode,
             preset: cfg.preset,
@@ -372,6 +567,7 @@ impl Default for ViewportRenderSettings {
             denoise: cfg.denoise_enabled,
             menu_open: false,
             advanced_open: false,
+            menu_scroll: 0.0,
             interactive_spp: cfg.interactive_spp,
             settling_spp: cfg.settling_spp,
             refining_spp: cfg.refining_spp,
@@ -382,12 +578,20 @@ impl Default for ViewportRenderSettings {
             history_clamp_k: cfg.history_clamp_k,
             converge_fraction: cfg.converge_fraction,
             debug_viz_mode: 0,
+            sun_azimuth_deg,
+            sun_elevation_deg,
+            sun_intensity: studio_dir[3],
+            exposure: studio_exposure,
+            sky_color: studio_clear,
+            ambient_strength: 1.0,
+            shadow_strength: 0.0,
+            fog_strength: 1.0,
         }
     }
 }
 
 impl ViewportRenderSettings {
-    pub fn from_prefs(prefs: &terra_gui::ViewportRenderPrefs) -> Self {
+    pub fn from_prefs(prefs: &ViewportRenderPrefs) -> Self {
         let mut s = Self::default();
         s.mode = match prefs.mode.as_str() {
             "Fast" => terra_render::ViewportRendererMode::Fast,
@@ -417,8 +621,8 @@ impl ViewportRenderSettings {
         s
     }
 
-    pub fn to_prefs(&self) -> terra_gui::ViewportRenderPrefs {
-        terra_gui::ViewportRenderPrefs {
+    pub fn to_prefs(&self) -> ViewportRenderPrefs {
+        ViewportRenderPrefs {
             mode: match self.mode {
                 terra_render::ViewportRendererMode::Fast => "Fast".into(),
                 terra_render::ViewportRendererMode::Raster => "Raster".into(),
@@ -508,6 +712,7 @@ impl UiState {
             viewport_mode: self.preview_mode,
             viewport_overlays: self.viewport_overlays,
             lighting_preset: self.lighting_preset,
+            lighting_customized: self.lighting_customized,
             inspector_advanced: self.inspector_advanced,
             brush: BrushWorkspaceState {
                 radius: self.sculpt_radius,
@@ -547,6 +752,10 @@ impl UiState {
         self.preview_mode = ws.viewport_mode;
         self.viewport_overlays = ws.viewport_overlays;
         self.lighting_preset = ws.lighting_preset;
+        // Carry the customized flag with the preset so switching workspaces preserves
+        // an edited look, instead of clearing it and letting the redraw seed snap the
+        // viewport back to the preset (the "entering Sculpt resets lighting" bug).
+        self.lighting_customized = ws.lighting_customized;
         self.inspector_advanced = ws.inspector_advanced;
         self.sculpt_radius = ws.brush.radius;
         self.sculpt_strength = ws.brush.strength;
@@ -590,7 +799,7 @@ impl UiState {
         ws.switch_workspace(id);
         self.apply_workspace_state(&ws);
         self.tool_drag = None;
-        self.layout.preferred_workspace = id.as_str().to_string();
+        self.preferred_workspace = id.as_str().to_string();
         self.layout_dirty = true;
         let def = workspace_definition(id);
         self.status = format!("Workspace: {} — {}", def.name, def.description);
@@ -616,9 +825,9 @@ impl UiState {
         workspace_definition(self.active_workspace)
     }
 
-    /// Apply persisted preferred workspace from layout prefs (editor-only).
+    /// Apply persisted preferred workspace from editor prefs (editor-only).
     pub fn apply_preferred_workspace_from_prefs(&mut self) {
-        if let Some(id) = WorkspaceId::parse(&self.layout.preferred_workspace) {
+        if let Some(id) = WorkspaceId::parse(&self.preferred_workspace) {
             // Direct field sync without re-dirtying layout on load.
             let mut ws = self.workspace_state();
             ws.switch_workspace(id);
@@ -751,7 +960,7 @@ impl UiState {
         self.viewport_lighting_selected = false;
         self.pending_close_mask_editor = false;
         let _ov = &mut self.viewport_overlays;
-        }
+    }
 
     /// Leave Mask view and restore Terrain chrome (tool rail). Schedules session close.
     pub fn leave_mask_view(&mut self) {
@@ -764,7 +973,6 @@ impl UiState {
         self.show_mask_editor = false;
         self.viewport_lighting_selected = false;
     }
-
 }
 
 /// Optional viewport aids. These flags affect editor presentation, not terrain data.
@@ -936,12 +1144,7 @@ impl EditorTool {
 
     /// Raise / Lower / Smooth / Paint Mask / Paint Biome — own left-drag paint and wheel size.
     pub fn is_brush(self) -> bool {
-        self.is_sculpt()
-            || matches!(
-                self,
-                EditorTool::PaintMask
-                    | EditorTool::PaintBiome
-            )
+        self.is_sculpt() || matches!(self, EditorTool::PaintMask | EditorTool::PaintBiome)
     }
 
     pub fn is_view(self) -> bool {
@@ -991,11 +1194,6 @@ pub struct FrameProfile {
     pub disabled_layers: u32,
     pub slowest_layer: String,
     pub slowest_layer_us: u64,
-    pub terrain_revision: u64,
-    pub invalidated_tiles: usize,
-    pub terrain_work_queued: usize,
-    pub terrain_work_cancelled: u64,
-    pub refinement_state: &'static str,
     pub tile_cache_resident: usize,
     pub tile_cache_pinned: usize,
     pub tile_cache_used_mb: f32,
@@ -1063,19 +1261,6 @@ impl FrameProfile {
         }
     }
 
-    pub fn update_terrain_runtime(&mut self, stats: terra_core::TerrainRuntimeStats) {
-        self.terrain_revision = stats.revision;
-        self.invalidated_tiles = stats.invalidated_tiles;
-        self.terrain_work_queued = stats.work.queued;
-        self.terrain_work_cancelled = stats.work.cancelled + stats.work.stale_discarded;
-        self.refinement_state = match stats.refinement {
-            terra_core::EditorRefinementState::Interactive => "Interactive",
-            terra_core::EditorRefinementState::Settling => "Settling",
-            terra_core::EditorRefinementState::Refining => "Refining",
-            terra_core::EditorRefinementState::Converged => "Converged",
-            terra_core::EditorRefinementState::Export => "Export",
-        };
-    }
     pub fn update_tile_cache(&mut self, stats: terra_core::TileCacheStats, pending_uploads: usize) {
         const MIB: f32 = 1024.0 * 1024.0;
         self.tile_cache_resident = stats.resident_tiles;
@@ -1268,7 +1453,7 @@ pub struct FrameUiOutput {
 /// Draw all editor chrome with terra-gui.
 pub fn draw_editor_gui(
     ui: &mut GuiContext<'_>,
-    doc: &mut TerrainDocument,
+    doc: &TerrainDocument,
     ui_state: &mut UiState,
     chrome: &mut ChromeGuiState,
     tools: &mut ToolsGuiState,
@@ -1366,7 +1551,8 @@ pub fn draw_editor_gui(
     draw_menu_overlays(ui, ui_state, chrome, &mut out);
     // Global popups are drawn after menus and other chrome.
     let mut quick_add = std::mem::take(&mut ui_state.quick_add);
-    out.actions.extend(ui.with_menu_input(|ui| draw_quick_add(ui, doc, ui_state, &mut quick_add)));
+    out.actions
+        .extend(ui.with_menu_input(|ui| draw_quick_add(ui, doc, ui_state, &mut quick_add)));
     ui_state.quick_add = quick_add;
     out.actions
         .extend(draw_viewport_context_menu(ui, doc, ui_state));

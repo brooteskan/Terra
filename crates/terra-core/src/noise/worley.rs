@@ -1,5 +1,4 @@
-use super::hash2;
-use crate::layer::WorleyMetric;
+use super::{canonical_seed32, hash2, WorleyMetric};
 
 pub struct WorleyResult {
     pub f1: f32,
@@ -8,7 +7,7 @@ pub struct WorleyResult {
 
 /// Cellular / Worley noise: two nearest feature distances.
 pub fn worley2(x: f32, z: f32, seed: u64, metric: WorleyMetric) -> WorleyResult {
-    let seed = seed as u32;
+    let seed = canonical_seed32(seed);
     let xi = x.floor() as i32;
     let zi = z.floor() as i32;
     let mut f1 = f32::INFINITY;

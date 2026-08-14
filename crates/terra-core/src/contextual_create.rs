@@ -313,7 +313,7 @@ impl CreateError {
 pub fn kind_available(kind: CreateKind, ctx: &CreateContext) -> bool {
     match kind {
         // Procedural Regions removed (WC single-stack).
-                CreateKind::WorldRule => true,
+        CreateKind::WorldRule => true,
         CreateKind::SimulationSource
         | CreateKind::SimulationDomain
         | CreateKind::RiverSource
@@ -711,7 +711,7 @@ fn create_biome(
     name: &str,
 ) -> Result<(CreatedEntity, String, CreateToolHint, Option<&'static str>), CreateError> {
     let biome = LayerGroup::biome(name);
-        let id = biome.id;
+    let id = biome.id;
     session.document.stack.ensure_category_folders();
     if let Some(folder) = session
         .document

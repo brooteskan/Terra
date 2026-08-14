@@ -14,11 +14,14 @@ mod streams;
 mod watersheds;
 
 pub use accumulation::{
-    accumulate_discharge, accumulate_drainage_area, Precipitation, PrecipitationSource,
+    accumulate_discharge, accumulate_drainage_area, accumulate_drainage_area_d8, Precipitation,
+    PrecipitationSource,
 };
 pub use debug::{bake_debug_field, GeomorphDebugField};
+pub(crate) use depression::priority_flood_fill_from_outlets;
 pub use depression::{
-    handle_depressions, BreachParams, DepressionMode, DepressionResult, PreserveBasinsParams,
+    handle_depressions, priority_flood_fill, BreachParams, DepressionMode, DepressionResult,
+    PreserveBasinsParams,
 };
 pub use derivatives::{
     aspect_radians, cavity_openness, convexity_concavity, gaussian_curvature, gradient_components,
@@ -26,7 +29,7 @@ pub use derivatives::{
     ridge_valley_likelihood, slope_magnitude, DerivativeOptions, DerivativeSet,
 };
 pub use drainage::{
-    drainage_analysis, drainage_density, distance_to_ridge, distance_to_valley, ridge_mask,
+    distance_to_ridge, distance_to_valley, drainage_analysis, drainage_density, ridge_mask,
     valley_mask, DrainageAnalysis,
 };
 pub use fixtures::{
@@ -34,12 +37,12 @@ pub use fixtures::{
     SyntheticKind,
 };
 pub use routing::{
-    build_flow_graph, flow_direction_d8, flow_direction_dinfinity, FlowDir, FlowGraph, FlowModel,
-    FlowReceiver, NO_FLOW, D8_OFFSETS,
+    build_flow_graph, flow_direction_d8, flow_direction_dinfinity, D8Drainage, FlowGraph,
+    FlowModel, FlowReceiver, D8_OFFSETS, NO_FLOW,
 };
 pub use streams::{
-    extract_streams, channel_width_estimate, distance_to_channel, strahler_order, StreamNetwork,
-    StreamExtractParams,
+    channel_width_estimate, distance_to_channel, extract_streams, strahler_order,
+    StreamExtractParams, StreamNetwork,
 };
 pub use watersheds::{
     discover_outlets, local_contributing_area, watershed_boundaries, watersheds_from_graph,

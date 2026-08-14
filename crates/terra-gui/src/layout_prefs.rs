@@ -10,7 +10,7 @@ use crate::style::RIGHT_PANEL_W;
 const DEFAULT_LEFT_RAIL_W: f32 = 72.0;
 /// Default contextual tool panel width.
 const DEFAULT_TOOL_PANEL_W: f32 = 228.0;
-/// Default full-height left dock (e.g. mask editor).
+/// Default full-height left dock width.
 const DEFAULT_LEFT_DOCK_W: f32 = 320.0;
 
 /// Persisted / live dock layout for an IDE-style shell.
@@ -26,136 +26,19 @@ pub struct LayoutPrefs {
     pub tool_panel_collapsed: bool,
     /// When true, the inspector is collapsed and layers take the full right rail.
     pub inspector_collapsed: bool,
-    /// Runtime: hide Generate/Sculpt mode rail (artist intents). Not persisted meaningfully.
+    /// Runtime: hide the mode rail. Not persisted meaningfully.
     #[serde(default)]
     pub hide_mode_rail: bool,
-    /// Runtime: hide WC layers tree (artist intents). Not persisted meaningfully.
+    /// Runtime: hide the layers tree. Not persisted meaningfully.
     #[serde(default)]
     pub hide_layers_panel: bool,
-    /// Width of the Mask-view left dock. Persisted across sessions.
+    /// Width of the full-height left dock. Persisted across sessions.
     #[serde(default = "default_mask_editor_panel_w")]
     pub mask_editor_panel_w: f32,
     /// Runtime: when set, left chrome is a single full-height dock of this width
-    /// (mode rail + tool panel hidden). Used by Mask view.
+    /// (mode rail + tool panel hidden).
     #[serde(default, skip_serializing)]
     pub left_dock_w: Option<f32>,
-    /// Preferred task workspace id (`sculpt`, `biomes`, …). Editor preference only.
-    #[serde(default = "default_preferred_workspace")]
-    pub preferred_workspace: String,
-    /// When true, creating an entity may switch to its home workspace.
-    /// Default false — artists stay in the current workspace unless they opt in.
-    #[serde(default)]
-    pub auto_switch_workspace_on_create: bool,
-    /// Persisted viewport render quality settings (user preference).
-    #[serde(default)]
-    pub viewport_render: ViewportRenderPrefs,
-}
-
-/// User-level viewport render preferences (Phase 12).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ViewportRenderPrefs {
-    #[serde(default = "default_render_mode")]
-    pub mode: String,
-    #[serde(default = "default_render_preset")]
-    pub preset: String,
-    #[serde(default = "default_target_fps")]
-    pub target_fps: f32,
-    #[serde(default = "default_max_spp")]
-    pub max_spp: u32,
-    #[serde(default = "default_true")]
-    pub dynamic_resolution: bool,
-    #[serde(default = "default_true")]
-    pub denoise: bool,
-    #[serde(default = "default_interactive_spp")]
-    pub interactive_spp: u32,
-    #[serde(default = "default_settling_spp")]
-    pub settling_spp: u32,
-    #[serde(default = "default_refining_spp")]
-    pub refining_spp: u32,
-    #[serde(default = "default_bounces_interactive")]
-    pub max_bounces_interactive: u32,
-    #[serde(default = "default_bounces_refining")]
-    pub max_bounces_refining: u32,
-    #[serde(default = "default_min_scale")]
-    pub min_internal_scale: f32,
-    #[serde(default = "default_max_scale")]
-    pub max_internal_scale: f32,
-    #[serde(default = "default_history_clamp")]
-    pub history_clamp_k: f32,
-    #[serde(default = "default_converge")]
-    pub converge_fraction: f32,
-    #[serde(default)]
-    pub debug_viz_mode: u32,
-}
-
-fn default_render_mode() -> String {
-    "Raster".into()
-}
-fn default_render_preset() -> String {
-    "Balanced".into()
-}
-fn default_target_fps() -> f32 {
-    60.0
-}
-fn default_max_spp() -> u32 {
-    128
-}
-fn default_true() -> bool {
-    true
-}
-fn default_interactive_spp() -> u32 {
-    1
-}
-fn default_settling_spp() -> u32 {
-    2
-}
-fn default_refining_spp() -> u32 {
-    4
-}
-fn default_bounces_interactive() -> u32 {
-    2
-}
-fn default_bounces_refining() -> u32 {
-    4
-}
-fn default_min_scale() -> f32 {
-    0.5
-}
-fn default_max_scale() -> f32 {
-    1.0
-}
-fn default_history_clamp() -> f32 {
-    1.5
-}
-fn default_converge() -> f32 {
-    0.95
-}
-
-impl Default for ViewportRenderPrefs {
-    fn default() -> Self {
-        Self {
-            mode: default_render_mode(),
-            preset: default_render_preset(),
-            target_fps: default_target_fps(),
-            max_spp: default_max_spp(),
-            dynamic_resolution: true,
-            denoise: true,
-            interactive_spp: default_interactive_spp(),
-            settling_spp: default_settling_spp(),
-            refining_spp: default_refining_spp(),
-            max_bounces_interactive: default_bounces_interactive(),
-            max_bounces_refining: default_bounces_refining(),
-            min_internal_scale: default_min_scale(),
-            max_internal_scale: default_max_scale(),
-            history_clamp_k: default_history_clamp(),
-            converge_fraction: default_converge(),
-            debug_viz_mode: 0,
-        }
-    }
-}
-
-fn default_preferred_workspace() -> String {
-    "sculpt".into()
 }
 
 fn default_mask_editor_panel_w() -> f32 {
@@ -174,9 +57,6 @@ impl Default for LayoutPrefs {
             hide_layers_panel: false,
             mask_editor_panel_w: DEFAULT_LEFT_DOCK_W,
             left_dock_w: None,
-            preferred_workspace: default_preferred_workspace(),
-            auto_switch_workspace_on_create: false,
-            viewport_render: ViewportRenderPrefs::default(),
         }
     }
 }

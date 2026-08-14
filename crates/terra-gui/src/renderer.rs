@@ -411,6 +411,13 @@ impl GuiRenderer {
         );
     }
 
+    /// Record and submit one GUI pass that composites **over** `view`.
+    ///
+    /// The pass loads the existing attachment (`LoadOp::Load` below), so in the
+    /// editor's frame seam this draws on top of the terrain already rendered
+    /// into the same surface — it must never clear. Flipping that load op blanks
+    /// the viewport with no compile error; `tests/frame_seam.rs` and terra-app's
+    /// `frame_compositing` test guard it.
     pub fn render(
         &mut self,
         device: &wgpu::Device,
@@ -747,7 +754,7 @@ fn pack_image_atlas(images: &[(u32, u32, Vec<u8>)]) -> (u32, u32, Vec<u8>, Vec<[
                     rgba: rgba.clone(),
                 };
             }
-            // Downscale oversized sources (terrain preview, etc.) for the atlas.
+            // Downscale oversized sources (large image previews, etc.) for the atlas.
             let scale = (MAX_DIM as f32 / w as f32)
                 .min(MAX_DIM as f32 / h as f32)
                 .min(1.0);

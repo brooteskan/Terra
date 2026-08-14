@@ -1,9 +1,9 @@
-﻿//! Layer parameter kinds (split by family).
+//! Layer parameter kinds (split by family).
 
 use super::filters::EffectFilterParams;
 use super::noise::{
-    CanyonParams, DuneParams, FbmParams, ImportHeightmapParams, MesaParams,
-    MountainParams, NoiseParams, PlateauParams, VolcanoParams,
+    CanyonParams, DuneParams, FbmParams, ImportHeightmapParams, MesaParams, MountainParams,
+    NoiseParams, PlateauParams, VolcanoParams,
 };
 use serde::{Deserialize, Serialize};
 
@@ -441,4 +441,3 @@ impl Default for PolygonHeightParams {
         }
     }
 }
-

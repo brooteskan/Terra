@@ -71,7 +71,11 @@ pub fn extract_streams(
             let o = order_raw[j * w + i] as f32;
             order.set(i as u32, j as u32, o);
             order_normalised.set(i as u32, j as u32, o / max_order);
-            hierarchy.set(i as u32, j as u32, if o > 0.0 { o / max_order } else { 0.0 });
+            hierarchy.set(
+                i as u32,
+                j as u32,
+                if o > 0.0 { o / max_order } else { 0.0 },
+            );
         }
     }
 
@@ -180,12 +184,7 @@ mod tests {
                 width_scale: 1.0,
             },
         );
-        let max_o = net
-            .order
-            .data()
-            .iter()
-            .copied()
-            .fold(0.0f32, f32::max);
+        let max_o = net.order.data().iter().copied().fold(0.0f32, f32::max);
         assert!(max_o >= 1.0, "max order={max_o}");
         assert!(net.channel_mask.data().iter().any(|&v| v > 0.5));
     }

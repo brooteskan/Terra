@@ -1,12 +1,11 @@
 //! Multi-scale terrain derivatives in world units.
 //!
 //! Finite differences use sampling radius expressed in metres (converted to
-//! texels via [`crate::terrain_eval::world_radius_texels`]). Profile / plan /
+//! texels via [`crate::heightfield::world_radius_texels`]). Profile / plan /
 //! mean / Gaussian curvatures follow Zevenbergen–Thorne / Evans forms.
 
-use crate::heightfield::Heightfield;
+use crate::heightfield::{world_radius_texels, Heightfield};
 use crate::mask::MaskField;
-use crate::terrain_eval::world_radius_texels;
 
 /// Sampling controls for derivative kernels.
 #[derive(Debug, Clone)]
@@ -104,10 +103,7 @@ fn sample_h(hf: &Heightfield, i: i32, j: i32) -> f32 {
 /// First derivatives and magnitude (world units: ∂h/∂x, ∂h/∂z, |∇h|).
 ///
 /// Magnitude is stored raw (not mask-normalised) so consumers can convert.
-pub fn gradient_components(
-    hf: &Heightfield,
-    radius_m: f32,
-) -> (MaskField, MaskField, MaskField) {
+pub fn gradient_components(hf: &Heightfield, radius_m: f32) -> (MaskField, MaskField, MaskField) {
     use rayon::prelude::*;
 
     let m = hf.metrics;
@@ -170,7 +166,10 @@ pub fn aspect_radians(hf: &Heightfield, radius_m: f32) -> MaskField {
     out
 }
 
-fn second_derivatives(hf: &Heightfield, radius_m: f32) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+fn second_derivatives(
+    hf: &Heightfield,
+    radius_m: f32,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
     let m = hf.metrics;
     let w = m.width as usize;
     let h = m.height as usize;
@@ -212,12 +211,20 @@ fn second_derivatives(hf: &Heightfield, radius_m: f32) -> (Vec<f32>, Vec<f32>, V
 
 fn map_signed_curvature(raw: &[f32], m: crate::heightfield::HeightfieldMetrics) -> MaskField {
     let mut out = MaskField::zeros(m);
-    let max_abs = raw.iter().copied().fold(0.0f32, |a, v| a.max(v.abs())).max(1e-6);
+    let max_abs = raw
+        .iter()
+        .copied()
+        .fold(0.0f32, |a, v| a.max(v.abs()))
+        .max(1e-6);
     for j in 0..m.height {
         for i in 0..m.width {
             let v = raw[(j * m.width + i) as usize];
             // Map signed curvature to [0,1] with 0.5 = flat.
-            out.set(i, j, (0.5 + 0.5 * (v / max_abs).clamp(-1.0, 1.0)).clamp(0.0, 1.0));
+            out.set(
+                i,
+                j,
+                (0.5 + 0.5 * (v / max_abs).clamp(-1.0, 1.0)).clamp(0.0, 1.0),
+            );
         }
     }
     out
@@ -380,14 +387,11 @@ pub fn cavity_openness(hf: &Heightfield, radius_m: f32, sectors: u32) -> MaskFie
                 for step in 1..=r_max {
                     let ni = i + (dir_x * step as f32).round() as i32;
                     let nj = j + (dir_z * step as f32).round() as i32;
-                    if ni < 0
-                        || nj < 0
-                        || ni >= m.width as i32
-                        || nj >= m.height as i32
-                    {
+                    if ni < 0 || nj < 0 || ni >= m.width as i32 || nj >= m.height as i32 {
                         break;
                     }
-                    let dist = ((step as f32 * dir_x * dx).hypot(step as f32 * dir_z * dz)).max(1e-6);
+                    let dist =
+                        ((step as f32 * dir_x * dx).hypot(step as f32 * dir_z * dz)).max(1e-6);
                     let elev = ((sample_h(hf, ni, nj) - h0) / dist).atan();
                     if elev > max_elev {
                         max_elev = elev;
@@ -398,8 +402,8 @@ pub fn cavity_openness(hf: &Heightfield, radius_m: f32, sectors: u32) -> MaskFie
             }
             let mean_open = openness / sectors as f32;
             // Cavity: low openness.
-            let cavity = (1.0 - (mean_open / std::f32::consts::FRAC_PI_2).clamp(0.0, 1.0))
-                .clamp(0.0, 1.0);
+            let cavity =
+                (1.0 - (mean_open / std::f32::consts::FRAC_PI_2).clamp(0.0, 1.0)).clamp(0.0, 1.0);
             out.set(i as u32, j as u32, cavity);
         }
     }

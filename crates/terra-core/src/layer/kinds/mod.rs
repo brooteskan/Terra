@@ -22,7 +22,6 @@ pub use shapes::*;
 pub use vegetation::*;
 
 use super::BlendMode;
-use serde::{Deserialize, Serialize};
 pub use crate::authoring::{
     EcosystemFeedbackParams, GeomorphicDetailParams, GradientReconstructParams,
     HydrologyRepairParams, SculptPoint, SculptStroke, SculptStrokeKind, SculptStrokeParams,
@@ -31,6 +30,7 @@ pub use crate::authoring::{
 pub use crate::landscape_evolution::{
     BoundaryMode, EvolutionSolverMode, LandscapeEvolutionParams, UpliftMode,
 };
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LayerKind {

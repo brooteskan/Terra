@@ -5,8 +5,9 @@
 
 use crate::analyze::{AeolianState, AeolianTransportParams};
 use crate::heightfield::Heightfield;
-use crate::layer::{EffectFilterParams, FractalNoiseType, WorleyFeature, WorleyParams};
+use crate::layer::EffectFilterParams;
 use crate::noise;
+use crate::noise::{FractalNoiseType, WorleyFeature, WorleyParams};
 
 use super::box_blur_height;
 use super::filter_kernels::{
@@ -55,23 +56,23 @@ fn domain_warp_xz(x: f32, z: f32, p: &EffectFilterParams) -> (f32, f32) {
     if p.warp_strength.abs() > 1e-5 {
         let wf = p.warp_frequency.max(1e-5);
         let wx = noise::perlin2(xr * wf, zr * wf, p.seed) * p.warp_strength;
-        let wz = noise::perlin2(xr * wf + 19.1, zr * wf + 7.3, p.seed.wrapping_add(1))
-            * p.warp_strength;
+        let wz =
+            noise::perlin2(xr * wf + 19.1, zr * wf + 7.3, p.seed.wrapping_add(1)) * p.warp_strength;
         xr += wx;
         zr += wz;
     }
     (xr, zr)
 }
 
-fn noise_params(p: &EffectFilterParams) -> crate::layer::NoiseParams {
-    crate::layer::NoiseParams {
+fn noise_params(p: &EffectFilterParams) -> crate::noise::NoiseParams {
+    crate::noise::NoiseParams {
         seed: p.seed,
         frequency: p.effective_frequency(),
         amplitude: 1.0,
         octaves: p.octaves.max(1),
         lacunarity: p.lacunarity.max(1.01),
         persistence: p.persistence.clamp(0.05, 0.95),
-        ..crate::layer::NoiseParams::default()
+        ..crate::noise::NoiseParams::default()
     }
 }
 
@@ -216,8 +217,11 @@ pub(super) fn talus_fill(input: &Heightfield, p: &EffectFilterParams) -> Heightf
 }
 
 pub(super) fn sediment_fill_soft(input: &Heightfield, p: &EffectFilterParams) -> Heightfield {
-    let (dirs, _) = crate::hydro::flow_direction_d8(input);
-    let flow = crate::hydro::flow_accumulation_d8(input, &dirs);
+    let graph = crate::geomorph::build_flow_graph(input, crate::geomorph::FlowModel::D8);
+    let flow = crate::geomorph::accumulate_drainage_area(
+        &graph,
+        &crate::geomorph::Precipitation::uniform(1.0),
+    );
     let (filled, _) = crate::analyze::sediment_fill_soft_mass(
         input,
         p.amount,
@@ -419,14 +423,14 @@ pub(super) fn ridged_detail(input: &Heightfield, p: &EffectFilterParams) -> Heig
     let mut out = input.clone();
     let freq = p.frequency.max(1e-5);
     let amt = p.amount;
-    let np = crate::layer::NoiseParams {
+    let np = crate::noise::NoiseParams {
         seed: p.seed,
         frequency: freq,
         amplitude: 1.0,
         octaves: 5,
         lacunarity: 2.1,
         persistence: 0.55,
-        ..crate::layer::NoiseParams::default()
+        ..crate::noise::NoiseParams::default()
     };
     for j in 0..input.metrics.height {
         for i in 0..input.metrics.width {
@@ -443,14 +447,14 @@ pub(super) fn rugged(input: &Heightfield, p: &EffectFilterParams) -> Heightfield
     let mut out = input.clone();
     let freq = p.frequency.max(1e-5);
     let amt = p.amount;
-    let np = crate::layer::NoiseParams {
+    let np = crate::noise::NoiseParams {
         seed: p.seed ^ 0xA06Du64,
         frequency: freq,
         amplitude: 1.0,
         octaves: 6,
         lacunarity: 2.3,
         persistence: 0.6,
-        ..crate::layer::NoiseParams::default()
+        ..crate::noise::NoiseParams::default()
     };
     for j in 0..input.metrics.height {
         for i in 0..input.metrics.width {
@@ -639,7 +643,7 @@ pub(super) fn scatter_detail(input: &Heightfield, p: &EffectFilterParams) -> Hei
             let (wx, wz) = domain_warp_xz(x, z, p);
             let cx = (wx / cell).floor() as i32;
             let cz = (wz / cell).floor() as i32;
-            let h = crate::noise::hash2(cx, cz, p.seed as u32);
+            let h = crate::noise::hash2(cx, cz, crate::noise::canonical_seed32(p.seed));
             // Sparse: only ~12% of cells fire an impulse.
             if (h % 1000) > 120 {
                 continue;
@@ -1059,9 +1063,11 @@ pub(super) fn terrace_steep(input: &Heightfield, p: &EffectFilterParams) -> Heig
 
 /// Phase 9 geological strata: band displace + soft-bed exposure on steep faces.
 pub(super) fn strata_filter(input: &Heightfield, p: &EffectFilterParams) -> Heightfield {
-    use crate::layer::BedGeometry;
-    use super::geology::{expose_strata_height, strata_band_displace, strata_fields_with, StrataFieldParams};
     use super::filter_kernels::slope_deg as slope_at;
+    use super::geology::{
+        expose_strata_height, strata_band_displace, strata_fields_with, StrataFieldParams,
+    };
+    use crate::layer::BedGeometry;
 
     let freq = p.effective_frequency();
     let banded = strata_band_displace(input, freq, p.amount, p.seed);
@@ -1187,7 +1193,7 @@ pub(super) fn design_voronoi(input: &Heightfield, p: &EffectFilterParams) -> Hei
                 wx * freq,
                 wz * freq,
                 p.seed,
-                crate::layer::WorleyMetric::Euclidean,
+                crate::noise::WorleyMetric::Euclidean,
             );
             let feature = match p.voronoi_feature {
                 WorleyFeature::F1 => 1.0 - w.f1.clamp(0.0, 1.0),
@@ -1327,7 +1333,7 @@ pub(super) fn noise_voronoi(input: &Heightfield, p: &EffectFilterParams) -> Heig
     let wp = WorleyParams {
         base: noise_params(p),
         feature: p.voronoi_feature,
-        distance_metric: crate::layer::WorleyMetric::Euclidean,
+        distance_metric: crate::noise::WorleyMetric::Euclidean,
     };
     for j in 0..input.metrics.height {
         for i in 0..input.metrics.width {

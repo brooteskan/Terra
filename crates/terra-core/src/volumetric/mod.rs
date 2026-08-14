@@ -7,7 +7,7 @@
 use crate::heightfield::Heightfield;
 use crate::layer::{LocalSdfParams, OverhangStampParams};
 use crate::mask::MaskField;
-use crate::noise::value_noise2;
+use crate::noise::{canonical_seed32, value_noise2};
 
 /// Result of an opt-in volumetric stamp: carved floor + ceiling dual-height + region mask.
 #[derive(Debug, Clone)]
@@ -56,6 +56,7 @@ pub fn apply_overhang_stamp(hf: &Heightfield, p: &OverhangStampParams) -> DualHe
     let lip = p.lip_height.max(0.0);
     let falloff = p.falloff.clamp(0.05, 1.0);
     let noise_amp = p.noise_amplitude.clamp(0.0, 1.0);
+    let seed_phase = canonical_seed32(p.seed) as f32;
     let ent = p.entrance_angle_deg.to_radians();
     let ent_dir = (ent.cos(), ent.sin());
 
@@ -92,7 +93,7 @@ pub fn apply_overhang_stamp(hf: &Heightfield, p: &OverhangStampParams) -> DualHe
 
             let h0 = hf.get(i, j);
             let n = if noise_amp > 1e-5 {
-                value_noise2(u * 48.0 + p.seed as f32 * 0.01, v * 48.0, p.seed) * 0.5 + 0.5
+                value_noise2(u * 48.0 + seed_phase * 0.01, v * 48.0, p.seed) * 0.5 + 0.5
             } else {
                 0.5
             };
@@ -247,7 +248,7 @@ fn cave_sdf(
 
     if noise_amp > 1e-5 {
         let n = value_noise2(
-            x * 0.08 + seed as f32 * 0.001,
+            x * 0.08 + canonical_seed32(seed) as f32 * 0.001,
             z * 0.08 + y * 0.05,
             seed.wrapping_add(17),
         );
@@ -453,6 +454,31 @@ mod tests {
         assert!(a.mask.get(ci, cj) > 0.05);
         assert!(a.height.get(ci, cj) < hf.get(ci, cj) - 1.0);
         assert!(a.ceiling.get(ci, cj) > a.height.get(ci, cj) + 0.5);
+    }
+
+    #[test]
+    fn overhang_high_seed_bits_change_the_carved_field() {
+        let hf = cliff_plateau(48);
+        let low = OverhangStampParams {
+            u: 0.55,
+            v: 0.5,
+            radius_uv: 0.12,
+            depth: 12.0,
+            lip_height: 1.5,
+            entrance_angle_deg: 180.0,
+            falloff: 0.35,
+            seed: 7,
+            noise_amplitude: 0.4,
+        };
+        let high = OverhangStampParams {
+            seed: low.seed + (1u64 << 32),
+            ..low.clone()
+        };
+
+        assert_ne!(
+            apply_overhang_stamp(&hf, &low).height.to_dense(),
+            apply_overhang_stamp(&hf, &high).height.to_dense()
+        );
     }
 
     #[test]

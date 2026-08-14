@@ -307,6 +307,9 @@ pub fn clamp_timestep_cfl(timestep: f32, dx: f32, max_speed: f32) -> f32 {
 }
 
 /// Sanitize a dense field in place (NaN/Inf → 0, negatives → 0).
+///
+/// For non-negative quantities (water depth, sediment load). For terrain height,
+/// use [`sanitize_finite`], which preserves genuine sub-zero (underwater) terrain.
 pub fn sanitize_field(data: &mut [f32]) -> u32 {
     let mut hits = 0u32;
     for v in data.iter_mut() {
@@ -314,6 +317,21 @@ pub fn sanitize_field(data: &mut [f32]) -> u32 {
             *v = 0.0;
             hits += 1;
         } else if *v < 0.0 {
+            *v = 0.0;
+            hits += 1;
+        }
+    }
+    hits
+}
+
+/// Sanitize a dense height field in place (NaN/Inf → 0 only).
+///
+/// Unlike [`sanitize_field`], negative samples are preserved: below-sea-level
+/// bathymetry is valid terrain, not garbage to clip.
+pub fn sanitize_finite(data: &mut [f32]) -> u32 {
+    let mut hits = 0u32;
+    for v in data.iter_mut() {
+        if !v.is_finite() {
             *v = 0.0;
             hits += 1;
         }
@@ -630,9 +648,10 @@ impl HydraulicErosionCore {
             result = apply_particle_erosion(result, &p, &hardness_eff);
         }
 
-        // Sanitize oracle fields.
+        // Sanitize oracle fields. Height keeps valid sub-zero bathymetry;
+        // only water/sediment (below) are clamped non-negative.
         let mut height = result.height.to_dense();
-        sanitize_field(&mut height);
+        sanitize_finite(&mut height);
         result.height = Heightfield::from_dense(input.metrics, &height);
         sanitize_field(result.water_raw.data_mut());
         sanitize_field(result.sediment_raw.data_mut());
@@ -674,9 +693,9 @@ impl HydraulicErosionCore {
 
     /// Convenience: height-only apply for EffectFilter morphology path.
     pub fn apply_height(&self, input: &Heightfield, hardness: Option<&MaskField>) -> Heightfield {
-        let k = hardness
-            .cloned()
-            .unwrap_or_else(|| MaskField::filled(input.metrics, self.params.hardness.clamp(0.0, 1.0)));
+        let k = hardness.cloned().unwrap_or_else(|| {
+            MaskField::filled(input.metrics, self.params.hardness.clamp(0.0, 1.0))
+        });
         let (result, _, _, _) = self.simulate(input, &k, None, None, None, None);
         result.height
     }
@@ -767,8 +786,35 @@ mod tests {
             .zip(out.to_dense().iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
-        assert!(max_dh > 0.1, "soft flows should reshape drainage, max_dh={max_dh}");
+        assert!(
+            max_dh > 0.1,
+            "soft flows should reshape drainage, max_dh={max_dh}"
+        );
         assert!(out.get(2, 2) <= hf.get(2, 2) + 0.75);
+    }
+
+    #[test]
+    fn hydraulic_preserves_sub_zero_bathymetry() {
+        // Island dome ringed by a deep sub-zero (underwater) shelf. Hydraulic
+        // erosion sanitizes non-finite samples but must keep negative terrain;
+        // before this fix `sanitize_field` clamped the whole seabed to 0.
+        let m = HeightfieldMetrics::new(40, 40, 320.0, 320.0);
+        let mut hf = Heightfield::filled(m, -200.0);
+        for j in 0..40 {
+            for i in 0..40 {
+                let r = ((i as f32 - 20.0).powi(2) + (j as f32 - 20.0).powi(2)).sqrt();
+                if r < 8.0 {
+                    hf.set(i, j, 120.0 - r * 4.0); // land above water
+                }
+            }
+        }
+        let core = HydraulicErosionCore::new(HydraulicErosionParams::default());
+        let out = core.apply_height(&hf, None);
+        let min = out.to_dense().iter().copied().fold(f32::INFINITY, f32::min);
+        assert!(
+            min < -150.0,
+            "hydraulic erosion flattened bathymetry: min={min}"
+        );
     }
 
     #[test]

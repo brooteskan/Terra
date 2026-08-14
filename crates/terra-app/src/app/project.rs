@@ -1,10 +1,11 @@
 use std::path::PathBuf;
 
+use crate::ui::{
+    project_template_by_id, resolve_workspace_command, CommandId, NewWorldSettings,
+    ProjectHomeAction,
+};
 use terra_core::document::EditorSession;
 use terra_io::{save_project, ProjectIoResult};
-use crate::ui::{
-    project_template_by_id, CommandId, NewWorldSettings, ProjectHomeAction,
-};
 
 use super::{
     default_terra_projects_dir, document_from_world_settings, prepare_project_path,
@@ -64,11 +65,66 @@ impl TerraApp {
             return;
         }
         self.ui_state.status = "Savingâ€¦".into();
+        self.sync_lighting_to_document();
         self.project_io
             .start_save(self.session.document.clone(), path);
         if let Some(w) = &self.window {
             w.request_redraw();
         }
+    }
+
+    /// Copy the editable viewport lighting into the document so File > Save persists it.
+    pub(crate) fn sync_lighting_to_document(&mut self) {
+        let vr = &self.ui_state.viewport_render;
+        let preset = if self.ui_state.lighting_customized {
+            String::new()
+        } else {
+            self.ui_state.lighting_preset.label().to_string()
+        };
+        self.session.document.viewport_lighting = terra_core::document::ViewportLighting {
+            sun_azimuth_deg: vr.sun_azimuth_deg,
+            sun_elevation_deg: vr.sun_elevation_deg,
+            sun_intensity: vr.sun_intensity,
+            exposure: vr.exposure,
+            sky_color: vr.sky_color,
+            ambient_strength: vr.ambient_strength,
+            shadow_strength: vr.shadow_strength,
+            fog_strength: vr.fog_strength,
+            preset,
+        };
+    }
+
+    /// Restore editable viewport lighting from the current document (on open / new).
+    pub(crate) fn apply_document_lighting(&mut self) {
+        let l = self.session.document.viewport_lighting.clone();
+        {
+            let vr = &mut self.ui_state.viewport_render;
+            vr.sun_azimuth_deg = l.sun_azimuth_deg;
+            vr.sun_elevation_deg = l.sun_elevation_deg;
+            vr.sun_intensity = l.sun_intensity;
+            vr.exposure = l.exposure;
+            vr.sky_color = l.sky_color;
+            vr.ambient_strength = l.ambient_strength;
+            vr.shadow_strength = l.shadow_strength;
+            vr.fog_strength = l.fog_strength;
+        }
+        match crate::ui::LightingPreset::ALL
+            .iter()
+            .find(|p| p.label() == l.preset.as_str())
+        {
+            Some(preset) => {
+                self.ui_state.lighting_preset = *preset;
+                self.ui_state.lighting_customized = false;
+            }
+            None => {
+                // Saved as a customized (blank) look; keep the loaded values as-is.
+                self.ui_state.lighting_customized = true;
+            }
+        }
+        // Match the change-tracker so the redraw seed does not overwrite the loaded
+        // values on the next frame.
+        self.last_lighting_preset = self.ui_state.lighting_preset;
+        self.last_lighting_customized = self.ui_state.lighting_customized;
     }
 
     pub(crate) fn save_project_as(&mut self) {
@@ -262,10 +318,7 @@ impl TerraApp {
         self.pending_eval = false;
 
         // Fresh session (undo stacks, outdated sims, rebuild feedback) — same as a cold open.
-        let world_size = (
-            document.metrics.world_size_x,
-            document.metrics.world_size_z,
-        );
+        let world_size = (document.metrics.world_size_x, document.metrics.world_size_z);
         let ocean = Some(document.blueprint.sea_level).filter(|v| v.is_finite());
         let mut session = EditorSession::new();
         session.document = document;
@@ -279,6 +332,7 @@ impl TerraApp {
         self.pending_project_action = None;
 
         self.reset_runtime_for_document(world_size, ocean);
+        self.apply_document_lighting();
 
         // Editor chrome starts minimized on create/open.
         self.layers_gui
@@ -323,23 +377,28 @@ impl TerraApp {
         self.pending_tile_uploads.clear();
 
         let metrics = self.session.document.metrics;
-        self.terrain_runtime.reconfigure(terra_core::PyramidConfig::new(
-            self.session.document.preview_resolution.max(256),
-            metrics.world_size_x,
-            metrics.world_size_z,
-        ));
+        self.terrain_runtime
+            .reconfigure(terra_core::PyramidConfig::new(
+                self.session.document.preview_resolution.max(256),
+                metrics.world_size_x,
+                metrics.world_size_z,
+            ));
 
         if let Some(engine) = self.gpu_engine.as_mut() {
-            if let Some(renderer) = self.renderer.as_ref() {
-                engine.reset_project_state(&renderer.device, &renderer.queue);
+            if let Some(gpu) = self.gpu.as_ref() {
+                engine.reset_project_state(&gpu.device, &gpu.queue);
             }
         }
         if let Some(renderer) = self.renderer.as_mut() {
             renderer.reset_project_state(world_size, ocean_level);
         }
-        // Drop progressive tile residency; uploads rebuild for the new document.
-        self.tile_atlas = None;
-        self.pending_tile_uploads.clear();
+        // Preserve the GPU allocation, but make all previous-document pages unreachable.
+        if let (Some(atlas), Some(gpu)) = (self.tile_atlas.as_mut(), self.gpu.as_ref()) {
+            atlas.clear(&gpu.queue);
+            self.ui_state
+                .profile
+                .update_tile_cache(atlas.residency().stats(), 0);
+        }
     }
 
     pub(crate) fn close_project(&mut self) {
@@ -481,13 +540,9 @@ impl TerraApp {
         );
         match decision {
             ShapeTargetDecision::UseExisting(id) => {
-                if self
-                    .session
-                    .document
-                    .stack
-                    .find(id)
-                    .is_some_and(|l| matches!(l.kind, terra_core::layer::LayerKind::SculptStrokes(_)))
-                {
+                if self.session.document.stack.find(id).is_some_and(|l| {
+                    matches!(l.kind, terra_core::layer::LayerKind::SculptStrokes(_))
+                }) {
                     self.ui_state.shape_session_layer = Some(id);
                 }
                 self.session.document.selected = Some(id);
@@ -540,8 +595,20 @@ impl TerraApp {
         self.session.document.sync_biome_paint_to_mask(biome_id);
     }
 
-
-    pub(crate) fn dispatch_shortcut(&mut self, command: &str) {
+    pub(crate) fn dispatch_command(&mut self, command: &str) {
+        if self.screen == AppScreen::Editor {
+            if let Some(workspace) = resolve_workspace_command(command) {
+                let previous = self.ui_state.biome_color_preview;
+                self.ui_state.switch_workspace(workspace);
+                if self.ui_state.biome_color_preview != previous
+                    || workspace == crate::ui::WorkspaceId::Biomes
+                {
+                    self.placement_tint_dirty = true;
+                    self.preview_dirty = true;
+                }
+                return;
+            }
+        }
         match command {
             CommandId::OPEN_COMMAND_PALETTE if self.screen == AppScreen::Editor => {
                 self.ui_state.show_command_palette = true
@@ -553,12 +620,20 @@ impl TerraApp {
             CommandId::REDO if self.screen == AppScreen::Editor => self.redo(),
             CommandId::SAVE if self.screen == AppScreen::Editor => self.save_current_project(),
             CommandId::SAVE_AS if self.screen == AppScreen::Editor => self.save_project_as(),
+            CommandId::FRAME_TERRAIN if self.screen == AppScreen::Editor => self.frame_terrain(),
             CommandId::NEW_PROJECT => self.request_project_action(PendingProjectAction::New),
             CommandId::OPEN_PROJECT => self.request_project_action(PendingProjectAction::Open),
             CommandId::CLOSE_PROJECT if self.screen == AppScreen::Editor => {
                 self.request_project_action(PendingProjectAction::Close)
             }
             _ => {}
+        }
+    }
+
+    pub(crate) fn frame_terrain(&mut self) {
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.request_camera_reframe();
+            renderer.frame_camera_to_terrain();
         }
     }
 
@@ -653,5 +728,141 @@ impl TerraApp {
         }
         self.mark_document_dirty();
         self.request_rebuild();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use terra_core::{FieldId, Heightfield, HeightfieldMetrics, TerrainTileKey};
+    use terra_gpu::GpuTileAtlas;
+    use terra_render::{GpuContext, TerrainRenderer};
+
+    #[test]
+    fn new_world_settings_document_round_trips_material_bounds() {
+        let doc = document_from_world_settings("alpine", 2_048.0, 0.0);
+        let json = doc.to_json().expect("new-world document must serialize");
+        assert!(!json.contains("\"min_height\":null"));
+        assert!(!json.contains("\"max_height\":null"));
+        let loaded = terra_core::document::TerrainDocument::from_json(&json)
+            .expect("new-world document must reload");
+        let normalized = loaded.to_json().expect("new-world document must resave");
+        terra_core::document::TerrainDocument::from_json(&normalized)
+            .expect("resaved new-world document must reload");
+    }
+
+    /// Revert check for #34: document reset must retain an empty atlas and the
+    /// existing upload/sync path must make it streamable again.
+    #[test]
+    fn reset_then_upload_preserves_atlas_and_invalidates_old_page() {
+        let Some(gpu) = terra_test_gpu::headless() else {
+            return;
+        };
+        let context = GpuContext {
+            device: gpu.device.clone(),
+            queue: gpu.queue.clone(),
+            surface_format: wgpu::TextureFormat::Rgba8Unorm,
+        };
+        let mut app = TerraApp::default();
+        app.renderer = Some(TerrainRenderer::new_headless(&context, 64, 64));
+        app.gpu = Some(context);
+        let config = app.terrain_runtime.pyramid.config;
+        app.tile_atlas = Some(
+            GpuTileAtlas::new(&gpu.device, config.tile_size, config.halo, 4).expect("test atlas"),
+        );
+
+        let metrics = HeightfieldMetrics {
+            width: config.tile_size,
+            height: config.tile_size,
+            world_size_x: 1000.0,
+            world_size_z: 1000.0,
+            tile_size: config.tile_size,
+            halo: config.halo,
+        };
+        app.last_height = Some(Heightfield::filled(metrics, 1.0));
+        app.queue_final_tile_uploads();
+        let (_, old_level, old_tile) = *app
+            .pending_tile_uploads
+            .front()
+            .expect("old document upload queued");
+        assert_eq!(app.upload_pending_terrain_tiles(), 1);
+        let old_key = TerrainTileKey {
+            layer: None,
+            field: FieldId::Height,
+            level: old_level,
+            tile: old_tile,
+        };
+        let old_handle = app
+            .tile_atlas
+            .as_mut()
+            .expect("atlas before reset")
+            .lookup(&old_key)
+            .expect("old page resident");
+        assert_eq!(
+            app.terrain_runtime
+                .pyramid
+                .record(&old_key)
+                .expect("pyramid mirrors uploaded page")
+                .handle,
+            old_handle
+        );
+        assert!(app
+            .renderer
+            .as_ref()
+            .expect("renderer")
+            .tile_stream_enabled());
+        let atlas_config = {
+            let atlas = app.tile_atlas.as_ref().unwrap();
+            (atlas.tile_size(), atlas.halo(), atlas.max_pages())
+        };
+
+        app.reset_runtime_for_document((1000.0, 1000.0), None);
+
+        let atlas = app.tile_atlas.as_ref().expect("reset must retain atlas");
+        assert_eq!(
+            (atlas.tile_size(), atlas.halo(), atlas.max_pages()),
+            atlas_config
+        );
+        assert_eq!(atlas.residency().stats().resident_tiles, 0);
+        assert_eq!(atlas.residency().resolve_handle(old_handle), None);
+        assert!(app.terrain_runtime.pyramid.record(&old_key).is_none());
+        assert!(app.pending_tile_uploads.is_empty());
+        assert!(!app
+            .renderer
+            .as_ref()
+            .expect("renderer")
+            .tile_stream_enabled());
+
+        app.last_height = Some(Heightfield::filled(metrics, 2.0));
+        app.queue_final_tile_uploads();
+        let (_, new_level, new_tile) = *app
+            .pending_tile_uploads
+            .front()
+            .expect("new document upload queued");
+        assert_eq!(app.upload_pending_terrain_tiles(), 1);
+        let new_key = TerrainTileKey {
+            layer: None,
+            field: FieldId::Height,
+            level: new_level,
+            tile: new_tile,
+        };
+        let atlas = app.tile_atlas.as_mut().expect("atlas after upload");
+        let new_handle = atlas.lookup(&new_key).expect("new page resident");
+        assert_eq!(
+            app.terrain_runtime
+                .pyramid
+                .record(&new_key)
+                .expect("pyramid mirrors replacement page")
+                .handle,
+            new_handle
+        );
+        assert_eq!(new_handle.slot, old_handle.slot);
+        assert_ne!(new_handle.generation, old_handle.generation);
+        assert_eq!(atlas.residency().resolve_handle(old_handle), None);
+        assert!(app
+            .renderer
+            .as_ref()
+            .expect("renderer")
+            .tile_stream_enabled());
     }
 }

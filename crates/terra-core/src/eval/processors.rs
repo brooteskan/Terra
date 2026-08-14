@@ -13,8 +13,15 @@ use crate::mask::{MaskField, MaskSource};
 use crate::surface;
 use crate::volumetric;
 
+/// Evaluates built-in layer kinds by matching on [`LayerKind`].
+///
+/// There is no processor registration and no pluggable seam: every built-in
+/// kind is dispatched by the single `match` in [`ProcessorRegistry::evaluate`],
+/// which keeps the set closed and serde-friendly. If a pluggable seam is ever
+/// wanted, it should arrive together with its first implementor rather than as
+/// an empty abstraction.
 pub struct ProcessorRegistry {
-    // Kind handled via match on LayerKind for serde-friendly built-ins.
+    // No state: built-in kinds are dispatched by the match in `evaluate`.
 }
 
 impl ProcessorRegistry {
@@ -22,6 +29,11 @@ impl ProcessorRegistry {
         Self {}
     }
 
+    /// Evaluate a single layer by matching on its [`LayerKind`].
+    ///
+    /// This `match` is the real dispatch mechanism — the one place every
+    /// built-in kind becomes a height contribution. Adding a kind means adding
+    /// an arm here.
     pub fn evaluate(
         &self,
         ctx: &mut EvalContext,
@@ -39,7 +51,7 @@ impl ProcessorRegistry {
                         keys::SCULPT_PROTECTION,
                         keys::UPLIFT_RATE,
                         keys::HARDNESS,
-                        keys::SEDIMENT_DEPTH,
+                        keys::SEDIMENT_THICKNESS,
                         keys::EDIT_REGION,
                     ],
                 ))
@@ -87,8 +99,7 @@ impl ProcessorRegistry {
                     crate::eval::PreviewQuality::Draft => {
                         authored.iterations = authored.iterations.min(6);
                         authored.fixed_point_iters = authored.fixed_point_iters.min(3);
-                        authored.solver =
-                            crate::landscape_evolution::EvolutionSolverMode::Fast;
+                        authored.solver = crate::landscape_evolution::EvolutionSolverMode::Fast;
                     }
                     crate::eval::PreviewQuality::Medium => {
                         authored.iterations = authored.iterations.min(16);
@@ -159,8 +170,8 @@ impl ProcessorRegistry {
                 let hardness = ctx.aux_maps.hardness.clone();
                 let sediment = ctx
                     .aux_maps
-                    .get(keys::SEDIMENT_DEPTH)
-                    .cloned()
+                    .sediment_thickness
+                    .clone()
                     .or_else(|| ctx.aux_maps.sediment.clone());
                 Ok(publish_authoring(
                     ctx,
@@ -247,9 +258,8 @@ impl ProcessorRegistry {
                     let (hf, erosion, deposit) = analyze::thermal_erode_with_strata_ex(
                         input, p, &reference, &strata, default_k, &geom,
                     );
-                    let hardness = bake_hardness_from_strata_ex(
-                        &reference, &hf, &strata, default_k, &geom,
-                    );
+                    let hardness =
+                        bake_hardness_from_strata_ex(&reference, &hf, &strata, default_k, &geom);
                     ctx.aux_insert(keys::HARDNESS, hardness);
                     let mats = surface::material_weights_at_depth(&reference, &hf, &strata);
                     ctx.aux_insert(keys::MATERIALS, mats);
@@ -264,13 +274,9 @@ impl ProcessorRegistry {
                 if p.layered_materials {
                     let initial = analyze::MassWastingState::with_optional_layers(
                         input,
-                        ctx.aux.get(keys::BEDROCK_HEIGHT),
-                        ctx.aux
-                            .get(keys::DEBRIS_DEPTH)
-                            .or_else(|| ctx.aux.get(keys::LOOSE_SEDIMENT)),
-                        ctx.aux
-                            .get(keys::LOOSE_SEDIMENT)
-                            .or_else(|| ctx.aux.get(keys::SEDIMENT_DEPTH)),
+                        ctx.aux_maps.bedrock_height.as_ref(),
+                        ctx.aux_maps.get(keys::DEBRIS_DEPTH),
+                        ctx.aux_maps.sediment_thickness.as_ref(),
                         0.0,
                         0.0,
                     );
@@ -280,12 +286,9 @@ impl ProcessorRegistry {
                     ctx.aux_insert(keys::DEPOSITION, result.deposition.clone());
                     ctx.aux_insert(keys::DEBRIS_DEPTH, result.loose_debris.clone());
                     ctx.aux_insert(keys::BEDROCK_HEIGHT, result.bedrock);
-                    ctx.aux_insert(keys::LOOSE_SEDIMENT, result.loose_debris);
+                    ctx.aux_insert(keys::SEDIMENT_THICKNESS, result.sediment);
                     ctx.aux_insert(keys::TALUS_STABILITY, result.talus_stability);
                     ctx.aux_insert(keys::INSTABILITY, result.instability);
-                    if result.sediment.data().iter().any(|v| *v > 1e-6) {
-                        ctx.aux_insert(keys::SEDIMENT_DEPTH, result.sediment);
-                    }
                     ctx.ensure_derived_fields(&result.height);
                     return Ok(result.height);
                 }
@@ -305,13 +308,9 @@ impl ProcessorRegistry {
                 ctx.aux_insert(keys::HARDNESS, hardness.clone());
                 let initial = analyze::MassWastingState::with_optional_layers(
                     input,
-                    ctx.aux.get(keys::BEDROCK_HEIGHT),
-                    ctx.aux
-                        .get(keys::DEBRIS_DEPTH)
-                        .or_else(|| ctx.aux.get(keys::LOOSE_SEDIMENT)),
-                    ctx.aux
-                        .get(keys::SEDIMENT_DEPTH)
-                        .or_else(|| ctx.aux.get(keys::LOOSE_SEDIMENT)),
+                    ctx.aux_maps.bedrock_height.as_ref(),
+                    ctx.aux_maps.get(keys::DEBRIS_DEPTH),
+                    ctx.aux_maps.sediment_thickness.as_ref(),
                     p.initial_debris_thickness,
                     p.initial_sediment_thickness,
                 );
@@ -319,9 +318,8 @@ impl ProcessorRegistry {
                 ctx.aux_insert(keys::EROSION, result.erosion);
                 ctx.aux_insert(keys::DEPOSITION, result.deposition);
                 ctx.aux_insert(keys::BEDROCK_HEIGHT, result.bedrock);
-                ctx.aux_insert(keys::DEBRIS_DEPTH, result.debris.clone());
-                ctx.aux_insert(keys::LOOSE_SEDIMENT, result.debris);
-                ctx.aux_insert(keys::SEDIMENT_DEPTH, result.sediment);
+                ctx.aux_insert(keys::DEBRIS_DEPTH, result.debris);
+                ctx.aux_insert(keys::SEDIMENT_THICKNESS, result.sediment);
                 ctx.aux_insert(keys::SLIDE_PATH, result.slide_path);
                 ctx.aux_insert(keys::INSTABILITY, result.instability);
                 ctx.aux_insert(keys::FLOW_ACCUMULATION, result.flow_accumulation);
@@ -355,11 +353,19 @@ impl ProcessorRegistry {
                     // Use the currently exposed stratum as the droplet resistance,
                     // then rebake after fine erosion reveals any deeper material.
                     let particle_hardness = bake_hardness_from_strata_ex(
-                        &reference, &result.height, &strata, default_k, &geom,
+                        &reference,
+                        &result.height,
+                        &strata,
+                        default_k,
+                        &geom,
                     );
                     result = analyze::apply_particle_erosion(result, &p, &particle_hardness);
                     let mut hardness = bake_hardness_from_strata_ex(
-                        &reference, &result.height, &strata, default_k, &geom,
+                        &reference,
+                        &result.height,
+                        &strata,
+                        default_k,
+                        &geom,
                     );
                     if p.sediment_softness > 0.0 {
                         hardness = analyze::apply_sediment_softness(
@@ -469,7 +475,7 @@ impl ProcessorRegistry {
                             ctx.aux_insert(keys::BEDROCK_HEIGHT, bedrock);
                         }
                         if let Some(loose) = outputs.loose_sediment {
-                            ctx.aux_insert(keys::LOOSE_SEDIMENT, loose);
+                            ctx.aux_insert(keys::SEDIMENT_THICKNESS, loose);
                         }
                     }
                 } else if p.output_water {
@@ -534,7 +540,11 @@ impl ProcessorRegistry {
                         input, &p, &reference, &strata, default_k,
                     );
                     let hardness = bake_hardness_from_strata_ex(
-                        &reference, &result.height, &strata, default_k, &geom,
+                        &reference,
+                        &result.height,
+                        &strata,
+                        default_k,
+                        &geom,
                     );
                     ctx.aux_insert(keys::HARDNESS, hardness);
                     let mats =

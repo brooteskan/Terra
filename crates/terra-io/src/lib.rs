@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use terra_core::document::TerrainDocument;
-use terra_core::eval::{EvalContext, PreviewQuality};
+use terra_core::eval::{EvalContext, PreviewQuality, StackEvaluator};
 use terra_core::heightfield::{Heightfield, HeightfieldMetrics};
 use thiserror::Error;
 
@@ -124,7 +124,7 @@ fn evaluate_document_for_export(
         tile_size: doc.metrics.tile_size.min(doc.export_resolution),
         halo: doc.metrics.halo,
     };
-    let mut eval = terra_core::domain::TerrainPipelineExecutor::new();
+    let mut evaluator = StackEvaluator::new();
     let mut ctx = EvalContext::new(metrics);
     ctx.quality = PreviewQuality::Export;
     ctx.level_steps = doc.level_steps.clone();
@@ -136,7 +136,7 @@ fn evaluate_document_for_export(
         metrics,
         &std::collections::HashMap::new(),
     );
-    let height = eval.evaluate_stack(&doc.stack, &mut ctx, "export")?;
+    let height = evaluator.rebuild_all(&doc.stack, &mut ctx)?;
     Ok((height, ctx))
 }
 

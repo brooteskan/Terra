@@ -96,7 +96,8 @@ impl ShadowMap {
             mapped_at_creation: false,
         });
 
-        let bind_group = make_shadow_bind_group(device, &bind_group_layout, &uniform_buf, height_view);
+        let bind_group =
+            make_shadow_bind_group(device, &bind_group_layout, &uniform_buf, height_view);
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("shadow-depth"),
@@ -159,11 +160,15 @@ impl ShadowMap {
     }
 
     pub fn recreate_bind_group(&mut self, device: &wgpu::Device, height_view: &wgpu::TextureView) {
-        self.bind_group =
-            make_shadow_bind_group(device, &self.bind_group_layout, &self.uniform_buf, height_view);
+        self.bind_group = make_shadow_bind_group(
+            device,
+            &self.bind_group_layout,
+            &self.uniform_buf,
+            height_view,
+        );
     }
 
-    /// Fit an orthographic light frustum around the terrain AABB.
+    /// Fit an orthographic light frustum around the terrain AABB and upload it.
     pub fn update_light(
         &self,
         queue: &wgpu::Queue,
@@ -171,30 +176,7 @@ impl ShadowMap {
         world_size: (f32, f32),
         height_range: (f32, f32),
     ) -> Mat4 {
-        let center = Vec3::new(world_size.0 * 0.5, (height_range.0 + height_range.1) * 0.5, world_size.1 * 0.5);
-        let mut dir = Vec3::new(
-            light_dir_from_light[0],
-            light_dir_from_light[1],
-            light_dir_from_light[2],
-        );
-        if dir.length_squared() < 1e-6 {
-            dir = Vec3::new(-0.35, -0.9, -0.2);
-        }
-        dir = dir.normalize();
-        // light_dir is "from light toward scene"; camera looks along that axis.
-        let extent = world_size.0.max(world_size.1).max(1.0);
-        let dist = extent * 1.6;
-        let eye = center - dir * dist;
-        let up = if dir.y.abs() > 0.95 {
-            Vec3::X
-        } else {
-            Vec3::Y
-        };
-        let view = Mat4::look_at_rh(eye, center, up);
-        let half = extent * 0.72;
-        let span = (height_range.1 - height_range.0).max(extent * 0.15);
-        let proj = Mat4::orthographic_rh(-half, half, -half, half, dist * 0.05, dist + span * 2.0);
-        let light_view_proj = proj * view;
+        let light_view_proj = fit_shadow_ortho(light_dir_from_light, world_size, height_range);
         let uniforms = ShadowUniforms {
             light_view_proj: light_view_proj.to_cols_array_2d(),
             params: [
@@ -206,6 +188,89 @@ impl ShadowMap {
         };
         queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
         light_view_proj
+    }
+}
+
+/// Orthographic light view-projection covering the entire terrain AABB for any sun
+/// direction. A fixed half-extent leaves an uncovered wedge whose edge rotates with
+/// the sun azimuth, so fit the bounds to the eight AABB corners transformed into
+/// light-view space. A free function so the coverage is unit-testable without a GPU.
+pub fn fit_shadow_ortho(
+    light_dir_from_light: [f32; 3],
+    world_size: (f32, f32),
+    height_range: (f32, f32),
+) -> Mat4 {
+    let center = Vec3::new(
+        world_size.0 * 0.5,
+        (height_range.0 + height_range.1) * 0.5,
+        world_size.1 * 0.5,
+    );
+    let mut dir = Vec3::from_array(light_dir_from_light);
+    if dir.length_squared() < 1e-6 {
+        dir = Vec3::new(-0.35, -0.9, -0.2);
+    }
+    dir = dir.normalize();
+    // light_dir is "from light toward scene"; the light camera looks along it.
+    let extent = world_size.0.max(world_size.1).max(1.0);
+    let eye = center - dir * extent * 1.6;
+    let up = if dir.y.abs() > 0.95 { Vec3::X } else { Vec3::Y };
+    let view = Mat4::look_at_rh(eye, center, up);
+
+    let (x0, x1) = (0.0, world_size.0.max(1.0));
+    let (z0, z1) = (0.0, world_size.1.max(1.0));
+    let (y0, y1) = (height_range.0, height_range.1.max(height_range.0 + 1.0));
+    let mut lo = Vec3::splat(f32::INFINITY);
+    let mut hi = Vec3::splat(f32::NEG_INFINITY);
+    for &cx in &[x0, x1] {
+        for &cy in &[y0, y1] {
+            for &cz in &[z0, z1] {
+                let v = view.transform_point3(Vec3::new(cx, cy, cz));
+                lo = lo.min(v);
+                hi = hi.max(v);
+            }
+        }
+    }
+    // Small margin so PCF taps at the border stay inside the map.
+    let pad = (hi - lo).length() * 0.02 + 1.0;
+    // View looks down -Z, so AABB points have negative z; near/far are the positive
+    // distances -hi.z (closest to the light) and -lo.z (farthest).
+    let near = (-hi.z - pad).max(0.01);
+    let far = (-lo.z + pad).max(near + 1.0);
+    Mat4::orthographic_rh(lo.x - pad, hi.x + pad, lo.y - pad, hi.y + pad, near, far) * view
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ortho_covers_whole_terrain_for_any_sun() {
+        let world = (4096.0, 2048.0);
+        let heights = (-120.0, 900.0);
+        for az_i in 0..12 {
+            let az = az_i as f32 / 12.0 * std::f32::consts::TAU;
+            for &el_deg in &[5.0f32, 25.0, 55.0, 85.0] {
+                let el = el_deg.to_radians();
+                let ce = el.cos();
+                // Direction from light toward scene (sun above the horizon).
+                let dir = [-(ce * az.cos()), -el.sin(), -(ce * az.sin())];
+                let m = fit_shadow_ortho(dir, world, heights);
+                for &x in &[0.0, world.0] {
+                    for &y in &[heights.0, heights.1] {
+                        for &z in &[0.0, world.1] {
+                            let c = m * glam::Vec4::new(x, y, z, 1.0);
+                            assert!(
+                                c.x.abs() <= 1.0 + 1e-3
+                                    && c.y.abs() <= 1.0 + 1e-3
+                                    && c.z >= -1e-3
+                                    && c.z <= 1.0 + 1e-3,
+                                "corner ({x},{y},{z}) left clip space at az_i={az_i} el={el_deg}: {c:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -232,7 +297,10 @@ fn make_shadow_bind_group(
 }
 
 /// Atmosphere helpers derived from sun direction for clear colour / fog.
-pub fn atmosphere_from_sun(light_dir_from_light: [f32; 3], base_clear: [f32; 3]) -> ([f32; 3], [f32; 4]) {
+pub fn atmosphere_from_sun(
+    light_dir_from_light: [f32; 3],
+    base_clear: [f32; 3],
+) -> ([f32; 3], [f32; 4]) {
     let mut dir = Vec3::from_array(light_dir_from_light);
     if dir.length_squared() < 1e-6 {
         dir = Vec3::new(-0.35, -0.9, -0.2);

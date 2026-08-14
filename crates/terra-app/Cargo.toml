@@ -27,3 +27,6 @@ serde_json = { workspace = true }
 rfd = { workspace = true }
 directories = { workspace = true }
 image = { workspace = true }
+
+[dev-dependencies]
+terra-test-gpu = { workspace = true }

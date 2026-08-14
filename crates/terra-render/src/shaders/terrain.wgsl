@@ -23,6 +23,8 @@ struct FrameUniforms {
     fog: vec4<f32>,
     // x=shadow_enabled, y=depth_bias, z=stream_level, w=soft_scale
     shadow: vec4<f32>,
+    // Raster shading: x=ambient_strength, y=shadow_strength, z=fog_strength, w=unused
+    raster: vec4<f32>,
 };
 
 /// Physical page-table row (must match `GpuPageTableEntry`, 48 bytes).
@@ -319,10 +321,13 @@ fn sample_shadow_map(world_pos: vec3<f32>, n: vec3<f32>, sun_dir: vec3<f32>) -> 
     if (u.shadow.x < 0.5) {
         return 1.0;
     }
-    // Slope-scaled bias along the light direction.
+    // Slope-scaled bias along the light direction, scaled by world size: a shadow
+    // texel is metres wide on km-scale terrain, so the old sub-metre offset left
+    // lit surfaces self-shadowing (acne that darkened lit areas as strength rose).
     let ndl = max(dot(n, sun_dir), 0.0);
-    let bias = u.shadow.y * (1.0 + (1.0 - ndl) * 3.0);
-    let light_clip = u.light_view_proj * vec4<f32>(world_pos + sun_dir * bias * 12.0, 1.0);
+    let world_extent = max(u.world.x, u.world.y);
+    let bias = u.shadow.y * world_extent * (1.0 + (1.0 - ndl) * 3.0);
+    let light_clip = u.light_view_proj * vec4<f32>(world_pos + sun_dir * bias, 1.0);
     let ndc = light_clip.xyz / max(light_clip.w, 1e-4);
     let uv = ndc.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5, 0.5);
     if (any(uv < vec2<f32>(0.001)) || any(uv > vec2<f32>(0.999)) || ndc.z < 0.0 || ndc.z > 1.0) {
@@ -341,8 +346,9 @@ fn sample_shadow_map(world_pos: vec3<f32>, n: vec3<f32>, sun_dir: vec3<f32>) -> 
     vis += textureSampleCompare(shadow_map, shadow_samp, uv + vec2<f32>(-0.5 * texel,  1.5 * texel), ndc.z);
     vis += textureSampleCompare(shadow_map, shadow_samp, uv + vec2<f32>( 1.5 * texel, -1.5 * texel), ndc.z);
     vis += textureSampleCompare(shadow_map, shadow_samp, uv + vec2<f32>(-1.5 * texel,  1.5 * texel), ndc.z);
-    // Soften contact: never crush lit slopes to pure black.
-    return mix(0.35, 1.0, vis / 9.0);
+    // Shadow darkness from the raster shadow-strength control: 0 = no darkening,
+    // 1 = fully black in shadow. (0.65 reproduces the old fixed 0.35 floor.)
+    return mix(1.0 - u.raster.y, 1.0, vis / 9.0);
 }
 
 /// Trace against the full heightfield rather than only nearby screen pixels.
@@ -647,7 +653,7 @@ fn fs_main(i: VsOut) -> @location(0) vec4<f32> {
         shadow_visibility = min(shadow_visibility, mix(ray_vis, ray_vis * ao, 0.35));
         sky_visibility = mix(0.28, 1.0, stochastic_sky_visibility(origin, n, i.position.xy));
     }
-    let ambient = (hemi * 0.38 + bounce * mix(0.65, 1.25, sky_visibility)) * sky_visibility;
+    let ambient = (hemi * 0.38 + bounce * mix(0.65, 1.25, sky_visibility)) * sky_visibility * u.raster.x;
     // Cook-Torrance GGX using authored roughness and metalness.
     let view_dir = normalize(u.eye.xyz - i.world_pos);
     let half_v = normalize(sun_dir + view_dir);
@@ -682,7 +688,7 @@ fn fs_main(i: VsOut) -> @location(0) vec4<f32> {
     let fog_warm = vec3<f32>(0.62, 0.55, 0.42);
     let fog_hi = vec3<f32>(0.55, 0.62, 0.72);
     let fog_col = mix(mix(fog_cool, fog_warm, sun_scatter * 0.45), fog_hi, height_haze);
-    color = mix(color, fog_col, clamp(fog_amount, 0.0, max(u.fog.z, 0.05)));
+    color = mix(color, fog_col, clamp(fog_amount * u.raster.z, 0.0, max(u.fog.z, 0.05)));
 
     let exposure = max(u.eye.w, 0.1);
     color = aces_tonemap(color * exposure);

@@ -3,11 +3,9 @@
 //! Processors should prefer the typed fields on [`AuxMaps`]. The HashMap adapters
 //! keep mask baking, disk cache, and export paths working during migration.
 
-mod context;
 mod id;
 mod invalidation;
 
-pub use context::TerrainContext;
 pub use id::FieldId;
 pub use invalidation::{
     fields_invalidated_by, height_dependents, shared_physical_fields, IterativeFieldGuard,
@@ -54,6 +52,7 @@ pub mod keys {
     pub const TECTONIC_BASE: &str = "tectonic_base";
     /// Water discharge / drainage contribution (Q).
     pub const WATER_DISCHARGE: &str = "water_discharge";
+    /// Legacy fine-sediment spelling. Accepted on ingest; emit [`SEDIMENT_THICKNESS`].
     pub const SEDIMENT_DEPTH: &str = "sediment_depth";
     pub const EDIT_REGION: &str = "edit_region";
     pub const REPAIR_REGION: &str = "repair_region";
@@ -108,9 +107,9 @@ pub mod keys {
     pub const CHANNEL_MASK: &str = "channel_mask";
     /// Bedrock height under loose sediment (layered hydraulic / mass wasting).
     pub const BEDROCK_HEIGHT: &str = "bedrock_height";
-    /// Loose sediment thickness (layered hydraulic).
+    /// Legacy fine-sediment spelling. Accepted on ingest; emit [`SEDIMENT_THICKNESS`].
     pub const LOOSE_SEDIMENT: &str = "loose_sediment";
-    /// Alias used by FieldId::SedimentThickness / typed AuxMaps.
+    /// Canonical loose sediment / alluvium thickness key.
     pub const SEDIMENT_THICKNESS: &str = "sediment_thickness";
     /// Persistent soil / regolith depth (metres).
     pub const SOIL_DEPTH: &str = "soil_depth";
@@ -118,6 +117,18 @@ pub mod keys {
     pub const LITHOLOGY: &str = "lithology";
     /// Water velocity magnitude proxy from hydraulic flux.
     pub const WATER_VELOCITY: &str = "water_velocity";
+
+    /// Canonicalise legacy aux spellings without changing unrelated free-form keys.
+    pub fn canonical(key: &str) -> &str {
+        match key {
+            SEDIMENT_DEPTH | LOOSE_SEDIMENT => SEDIMENT_THICKNESS,
+            other => other,
+        }
+    }
+
+    pub fn is_sediment_thickness_key(key: &str) -> bool {
+        matches!(key, SEDIMENT_THICKNESS | SEDIMENT_DEPTH | LOOSE_SEDIMENT)
+    }
 }
 
 /// Typed auxiliary fields produced by sims and analysis.
@@ -183,14 +194,15 @@ impl AuxMaps {
     /// Insert by well-known or free-form string key.
     pub fn insert(&mut self, key: impl Into<String>, field: MaskField) {
         let key = key.into();
-        match key.as_str() {
+        let canonical = keys::canonical(&key);
+        match canonical {
             keys::WETNESS => self.wetness = Some(field),
             keys::SEDIMENT => self.sediment = Some(field),
             keys::EROSION => self.erosion = Some(field),
             keys::DEPOSITION => self.deposition = Some(field),
             keys::HARDNESS => self.hardness = Some(field),
             keys::BEDROCK_HEIGHT => self.bedrock_height = Some(field),
-            keys::SEDIMENT_THICKNESS | keys::LOOSE_SEDIMENT => self.sediment_thickness = Some(field),
+            keys::SEDIMENT_THICKNESS => self.sediment_thickness = Some(field),
             keys::SOIL_DEPTH => self.soil_depth = Some(field),
             keys::LITHOLOGY => self.lithology = Some(field),
             keys::FLOW_DIRECTION => self.flow_direction = Some(field),
@@ -213,20 +225,20 @@ impl AuxMaps {
             keys::OVERHANG_CEILING => self.overhang_ceiling = Some(field),
             keys::OVERHANG_MASK => self.overhang_mask = Some(field),
             _ => {
-                self.extras.insert(key, field);
+                self.extras.insert(canonical.to_string(), field);
             }
         }
     }
 
     pub fn get(&self, key: &str) -> Option<&MaskField> {
-        match key {
+        match keys::canonical(key) {
             keys::WETNESS => self.wetness.as_ref(),
             keys::SEDIMENT => self.sediment.as_ref(),
             keys::EROSION => self.erosion.as_ref(),
             keys::DEPOSITION => self.deposition.as_ref(),
             keys::HARDNESS => self.hardness.as_ref(),
             keys::BEDROCK_HEIGHT => self.bedrock_height.as_ref(),
-            keys::SEDIMENT_THICKNESS | keys::LOOSE_SEDIMENT => self.sediment_thickness.as_ref(),
+            keys::SEDIMENT_THICKNESS => self.sediment_thickness.as_ref(),
             keys::SOIL_DEPTH => self.soil_depth.as_ref(),
             keys::LITHOLOGY => self.lithology.as_ref(),
             keys::FLOW_DIRECTION => self.flow_direction.as_ref(),
@@ -263,7 +275,18 @@ impl AuxMaps {
 
     pub fn extend_hashmap(&mut self, map: &HashMap<String, MaskField>) {
         for (k, v) in map {
-            self.insert(k.clone(), v.clone());
+            if !keys::is_sediment_thickness_key(k) {
+                self.insert(k.clone(), v.clone());
+            }
+        }
+        // HashMap iteration order is intentionally irrelevant. Prefer the canonical
+        // representation, then the newer simulation alias, then the oldest alias.
+        if let Some(field) = map
+            .get(keys::SEDIMENT_THICKNESS)
+            .or_else(|| map.get(keys::SEDIMENT_DEPTH))
+            .or_else(|| map.get(keys::LOOSE_SEDIMENT))
+        {
+            self.sediment_thickness = Some(field.clone());
         }
     }
 
@@ -330,9 +353,8 @@ impl AuxMaps {
 
     /// Ensure slope / curvature caches exist for `hf`.
     ///
-    /// Prefer [`crate::terrain_eval::DerivedFieldCache`] / [`crate::fields::TerrainContext::get_derived`]
-    /// when revision tracking is required. This helper remains for processors that
-    /// only hold `AuxMaps`.
+    /// This is the supported helper for processors that hold `AuxMaps` and need
+    /// slope or curvature derived from the current heightfield.
     pub fn ensure_derived(&mut self, hf: &Heightfield) {
         if self.slope.is_none() {
             self.slope = Some(slope_degrees(hf));
@@ -590,6 +612,51 @@ mod tests {
         let back = AuxMaps::from_hashmap(&map);
         assert!(back.wetness.is_some());
         assert!(back.extras.contains_key("custom"));
+    }
+
+    #[test]
+    fn sediment_aliases_ingest_but_only_the_canonical_key_is_emitted() {
+        let m = HeightfieldMetrics::new(2, 2, 2.0, 2.0);
+        for alias in [keys::SEDIMENT_DEPTH, keys::LOOSE_SEDIMENT] {
+            let mut map = HashMap::new();
+            map.insert(alias.to_string(), MaskField::from_raw(m, &[1.25; 4]));
+            let aux = AuxMaps::from_hashmap(&map);
+            assert_eq!(aux.sediment_thickness.as_ref().unwrap().get(0, 0), 1.25);
+
+            let emitted = aux.to_hashmap();
+            assert_eq!(emitted[keys::SEDIMENT_THICKNESS].get(0, 0), 1.25);
+            assert!(!emitted.contains_key(keys::SEDIMENT_DEPTH));
+            assert!(!emitted.contains_key(keys::LOOSE_SEDIMENT));
+        }
+    }
+
+    #[test]
+    fn canonical_sediment_wins_mixed_legacy_ingest_and_debris_stays_distinct() {
+        let m = HeightfieldMetrics::new(2, 2, 2.0, 2.0);
+        let mut map = HashMap::new();
+        map.insert(
+            keys::LOOSE_SEDIMENT.into(),
+            MaskField::from_raw(m, &[1.0; 4]),
+        );
+        map.insert(
+            keys::SEDIMENT_DEPTH.into(),
+            MaskField::from_raw(m, &[2.0; 4]),
+        );
+        map.insert(
+            keys::SEDIMENT_THICKNESS.into(),
+            MaskField::from_raw(m, &[3.0; 4]),
+        );
+        map.insert(keys::DEBRIS_DEPTH.into(), MaskField::from_raw(m, &[4.0; 4]));
+
+        let aux = AuxMaps::from_hashmap(&map);
+        assert_eq!(aux.sediment_thickness.as_ref().unwrap().get(0, 0), 3.0);
+        assert_eq!(aux.get(keys::DEBRIS_DEPTH).unwrap().get(0, 0), 4.0);
+
+        let emitted = aux.to_hashmap();
+        assert_eq!(emitted[keys::SEDIMENT_THICKNESS].get(0, 0), 3.0);
+        assert_eq!(emitted[keys::DEBRIS_DEPTH].get(0, 0), 4.0);
+        assert!(!emitted.contains_key(keys::SEDIMENT_DEPTH));
+        assert!(!emitted.contains_key(keys::LOOSE_SEDIMENT));
     }
 
     #[test]

@@ -1,12 +1,12 @@
 //! Non-linear workspace system: presentation focus without project/eval mutation.
 
-use terra_core::document::TerrainDocument;
-use terra_core::eval::EvalScheduler;
-use terra_core::layer::{LayerKind, MaterialsParams};
-use terra_gui::LayoutPrefs;
+use terra_app::app::prefs::EditorPrefs;
 use terra_app::ui::{
     all_tools, tools_for_workspace, workspace_definition, UiState, WorkspaceId, WorkspaceMode,
 };
+use terra_core::document::TerrainDocument;
+use terra_core::eval::EvalScheduler;
+use terra_core::layer::{LayerKind, MaterialsParams};
 
 fn selection_snapshot(
     doc: &TerrainDocument,
@@ -53,20 +53,43 @@ fn switch_does_not_invalidate_terrain() {
 }
 
 #[test]
-fn preferred_workspace_persists_in_layout_prefs() {
+fn preferred_workspace_persists_in_editor_prefs() {
     let mut ui = UiState::default();
     ui.switch_workspace(WorkspaceId::Simulation);
-    assert_eq!(ui.layout.preferred_workspace, "simulation");
+    assert_eq!(ui.preferred_workspace, "simulation");
     assert!(ui.layout_dirty);
 
-    let json = serde_json::to_string(&ui.layout).unwrap();
-    let back: LayoutPrefs = serde_json::from_str(&json).unwrap();
+    // Assemble the on-disk prefs the way the app's save seam does, then round-trip.
+    let prefs = EditorPrefs {
+        layout: ui.layout.clone(),
+        preferred_workspace: ui.preferred_workspace.clone(),
+        auto_switch_workspace_on_create: ui.auto_switch_workspace_on_create,
+        viewport_render: ui.viewport_render.to_prefs(),
+    };
+    let json = serde_json::to_string(&prefs).unwrap();
+    let back: EditorPrefs = serde_json::from_str(&json).unwrap();
     assert_eq!(back.preferred_workspace, "simulation");
 
     let mut ui2 = UiState::default();
-    ui2.layout = back;
+    ui2.preferred_workspace = back.preferred_workspace;
     ui2.apply_preferred_workspace_from_prefs();
     assert_eq!(ui2.active_workspace, WorkspaceId::Simulation);
+}
+
+#[test]
+fn legacy_all_tools_preference_loads_as_objects() {
+    let prefs = EditorPrefs {
+        preferred_workspace: "all_tools".to_string(),
+        ..EditorPrefs::default()
+    };
+    let json = serde_json::to_string(&prefs).unwrap();
+    let loaded: EditorPrefs = serde_json::from_str(&json).unwrap();
+
+    let mut ui = UiState::default();
+    ui.preferred_workspace = loaded.preferred_workspace;
+    ui.apply_preferred_workspace_from_prefs();
+
+    assert_eq!(ui.active_workspace, WorkspaceId::Objects);
 }
 
 #[test]

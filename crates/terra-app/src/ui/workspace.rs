@@ -6,6 +6,7 @@
 //! Copy uses: Workspace, Tools, Suggested actions, Current task.
 //! Avoid: Step, Stage complete, Continue, Required next action, All Tools (removed).
 
+use crate::ui::style;
 use serde::{Deserialize, Serialize};
 use terra_core::biome_definition::BiomeDefinitionId;
 use terra_core::biome_paint::BiomePaintTool;
@@ -14,7 +15,6 @@ use terra_core::eval::PreviewQuality;
 use terra_core::layer::{LayerId, StackCategory};
 use terra_core::mask::{MaskId, MaskPaintTool};
 use terra_gui::{Color, Icon};
-use crate::ui::style;
 
 use crate::ui::{EditorTool, LightingPreset, Preview2dMode, ViewportOverlayFlags};
 
@@ -111,6 +111,23 @@ impl WorkspaceId {
             Self::AllTools => None,
         }
     }
+
+    /// Stable command id for workspaces exposed by the command palette.
+    ///
+    /// `AllTools` is compatibility-only and deliberately has no visible command.
+    pub const fn command_id(self) -> Option<&'static str> {
+        match self {
+            Self::World => Some("workspace.world"),
+            Self::Sculpt => Some("workspace.sculpt"),
+            Self::Biomes => Some("workspace.biomes"),
+            Self::Develop => Some("workspace.develop"),
+            Self::Rules => Some("workspace.rules"),
+            Self::Simulation => Some("workspace.simulation"),
+            Self::Surface => Some("workspace.surface"),
+            Self::Objects => Some("workspace.objects"),
+            Self::AllTools => None,
+        }
+    }
 }
 
 // Metadata-driven definition
@@ -192,6 +209,8 @@ pub struct WorkspaceDefinition {
     pub name: &'static str,
     pub description: &'static str,
     pub icon: Icon,
+    /// Artist-facing command name, or `None` for compatibility-only workspaces.
+    pub command_name: Option<&'static str>,
     pub tools: WorkspaceToolFilter,
     pub hierarchy: HierarchyEmphasis,
     pub preferred_overlays: ViewportOverlayFlags,
@@ -258,6 +277,7 @@ static WORKSPACE_DEFINITIONS: [WorkspaceDefinition; 9] = [
         name: "World",
         description: "Seed, size, sea level, blueprint, and regions.",
         icon: Icon::Package,
+        command_name: Some("Switch Workspace: World"),
         tools: WorkspaceToolFilter::CatalogModes(&[WorkspaceMode::Utilities]),
         hierarchy: HierarchyEmphasis {
             prefer_roles: &[],
@@ -279,6 +299,7 @@ static WORKSPACE_DEFINITIONS: [WorkspaceDefinition; 9] = [
         name: "Sculpt",
         description: "Height brushes, landforms, and shapes.",
         icon: Icon::Pencil,
+        command_name: Some("Switch Workspace: Sculpt"),
         tools: WorkspaceToolFilter::CatalogModes(&[WorkspaceMode::Terrain]),
         hierarchy: HierarchyEmphasis {
             prefer_roles: &[DomainRole::ShapeLayer],
@@ -300,6 +321,7 @@ static WORKSPACE_DEFINITIONS: [WorkspaceDefinition; 9] = [
         name: "Biomes",
         description: "Biome placement, paint, and definitions.",
         icon: Icon::Layers,
+        command_name: Some("Switch Workspace: Biomes"),
         tools: WorkspaceToolFilter::CatalogModes(&[WorkspaceMode::Biomes]),
         hierarchy: HierarchyEmphasis {
             prefer_roles: &[DomainRole::MaskLayer, DomainRole::TerrainFilter],
@@ -319,6 +341,7 @@ static WORKSPACE_DEFINITIONS: [WorkspaceDefinition; 9] = [
         description:
             "World Creatorâ€“style terrain filters â€” general, effect, arid, erosion, sediment.",
         icon: Icon::SlidersHorizontal,
+        command_name: Some("Switch Workspace: Filters"),
         tools: WorkspaceToolFilter::WcFilters,
         hierarchy: HierarchyEmphasis {
             prefer_roles: &[
@@ -347,6 +370,7 @@ static WORKSPACE_DEFINITIONS: [WorkspaceDefinition; 9] = [
         name: "Mask",
         description: "Paint and edit masks Ã¢â‚¬â€ coverage, placement, and advanced mask stacks.",
         icon: Icon::CircleDot,
+        command_name: Some("Switch Workspace: Mask"),
         tools: WorkspaceToolFilter::CatalogModes(&[WorkspaceMode::Masks]),
         hierarchy: HierarchyEmphasis {
             prefer_roles: &[DomainRole::MaskLayer],
@@ -368,6 +392,7 @@ static WORKSPACE_DEFINITIONS: [WorkspaceDefinition; 9] = [
         name: "Simulation",
         description: "Simulation Scenarios Ã¢â‚¬â€ coherent physical setups (optional).",
         icon: Icon::Droplets,
+        command_name: Some("Switch Workspace: Simulation"),
         tools: WorkspaceToolFilter::CatalogModes(&[WorkspaceMode::Simulation]),
         hierarchy: HierarchyEmphasis {
             prefer_roles: &[DomainRole::SimulationLayer],
@@ -386,6 +411,7 @@ static WORKSPACE_DEFINITIONS: [WorkspaceDefinition; 9] = [
         name: "Surface",
         description: "Materials and surface attributes.",
         icon: Icon::Paintbrush,
+        command_name: Some("Switch Workspace: Surface"),
         tools: WorkspaceToolFilter::CatalogModes(&[WorkspaceMode::Materials]),
         hierarchy: HierarchyEmphasis {
             prefer_roles: &[DomainRole::MaterialLayer],
@@ -404,6 +430,7 @@ static WORKSPACE_DEFINITIONS: [WorkspaceDefinition; 9] = [
         name: "Objects",
         description: "Scatter, vegetation, and props.",
         icon: Icon::Sparkles,
+        command_name: Some("Switch Workspace: Objects"),
         tools: WorkspaceToolFilter::CatalogModes(&[WorkspaceMode::Objects]),
         hierarchy: HierarchyEmphasis {
             prefer_roles: &[DomainRole::ScatterLayer, DomainRole::ObjectLayer],
@@ -422,6 +449,7 @@ static WORKSPACE_DEFINITIONS: [WorkspaceDefinition; 9] = [
         name: "All Tools",
         description: "Legacy Ã¢â‚¬â€ removed from the TOOLS rail; remaps to Objects.",
         icon: Icon::Grid3x3,
+        command_name: None,
         tools: WorkspaceToolFilter::All,
         hierarchy: HierarchyEmphasis::NONE,
         preferred_overlays: ViewportOverlayFlags::EMPTY,
@@ -763,6 +791,10 @@ pub struct WorkspaceState {
     pub viewport_mode: Preview2dMode,
     pub viewport_overlays: ViewportOverlayFlags,
     pub lighting_preset: LightingPreset,
+    /// Whether the live lighting has been edited away from `lighting_preset`.
+    /// Carried alongside the preset so switching workspaces preserves a custom
+    /// look instead of snapping back to the preset on the next redraw.
+    pub lighting_customized: bool,
     pub inspector_advanced: bool,
     pub brush: BrushWorkspaceState,
     pub biome_paint_tool: BiomePaintTool,
@@ -795,6 +827,7 @@ impl Default for WorkspaceState {
             viewport_mode: Preview2dMode::Lit,
             viewport_overlays: ViewportOverlayFlags::default(),
             lighting_preset: LightingPreset::Studio,
+            lighting_customized: false,
             inspector_advanced: false,
             brush: BrushWorkspaceState::default(),
             biome_paint_tool: BiomePaintTool::default(),
@@ -837,6 +870,7 @@ impl WorkspaceState {
         let selected_mask = self.selected_mask;
         let paint_mask = self.paint_mask;
         let lighting = self.lighting_preset;
+        let lighting_customized = self.lighting_customized;
         let inspector_advanced = self.inspector_advanced;
 
         self.active = id;
@@ -882,6 +916,7 @@ impl WorkspaceState {
         self.selected_mask = selected_mask;
         self.paint_mask = paint_mask;
         self.lighting_preset = lighting;
+        self.lighting_customized = lighting_customized;
         self.inspector_advanced = inspector_advanced;
     }
 

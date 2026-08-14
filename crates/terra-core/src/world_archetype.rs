@@ -85,12 +85,8 @@ impl WorldTemplate {
             Self::TropicalIsland => {
                 "Island landmass → evolution → shore profile → geomorphic detail."
             }
-            Self::Alpine => {
-                "Uplift → materials → landscape evolution → debris → talus → detail."
-            }
-            Self::Desert => {
-                "Mesa + canyon → layered strata → evolution → thermal talus → detail."
-            }
+            Self::Alpine => "Uplift → materials → landscape evolution → debris → talus → detail.",
+            Self::Desert => "Mesa + canyon → layered strata → evolution → thermal talus → detail.",
             Self::RiverValley => {
                 "Valley uplift → SPE → floodplain fill → river carve → coastal edge."
             }
@@ -98,9 +94,7 @@ impl WorldTemplate {
             Self::YoungMountains => {
                 "Strong uplift → short evolution → immature SPE → debris → detail."
             }
-            Self::OldMountains => {
-                "Broad uplift → long evolution → mild SPE → deposition → detail."
-            }
+            Self::OldMountains => "Broad uplift → long evolution → mild SPE → deposition → detail.",
             Self::DuneField => "Hard floor → substrate → dunes → sand transport → detail.",
             Self::Coastal => "Coastal landmass → uplift → SPE to sea → shore → detail.",
         }
@@ -202,7 +196,12 @@ pub fn build_world(
         WorldTemplate::RiverValley | WorldTemplate::Coastal => BiomeLibrary::river_valley_palette(),
         WorldTemplate::Blank => unreachable!(),
     };
-    finish_biomes(&mut doc, biomes, mps, matches!(template, WorldTemplate::Alpine));
+    finish_biomes(
+        &mut doc,
+        biomes,
+        mps,
+        matches!(template, WorldTemplate::Alpine),
+    );
     doc
 }
 
@@ -792,9 +791,18 @@ mod tests {
         assert!(!doc.biome_library.definitions.is_empty());
         assert!(doc.selected_biome_layer.is_some());
         assert_eq!(doc.shapes.shapes.len(), 2);
-        assert!(has_kind(&doc, |k| matches!(k, LayerKind::GradientReconstruct(_))));
-        assert!(!has_kind(&doc, |k| matches!(k, LayerKind::LandscapeEvolution(_))));
-        assert!(!has_process(&doc, |k| matches!(k, LayerKind::EffectFilter(_))));
+        assert!(has_kind(&doc, |k| matches!(
+            k,
+            LayerKind::GradientReconstruct(_)
+        )));
+        assert!(!has_kind(&doc, |k| matches!(
+            k,
+            LayerKind::LandscapeEvolution(_)
+        )));
+        assert!(!has_process(&doc, |k| matches!(
+            k,
+            LayerKind::EffectFilter(_)
+        )));
     }
 
     #[test]
@@ -805,9 +813,15 @@ mod tests {
         assert!(!doc.biome_library.definitions.is_empty());
         assert!(has_kind(&doc, |k| matches!(k, LayerKind::Island(_))));
         assert!(has_kind(&doc, |k| matches!(k, LayerKind::Materials(_))));
-        assert!(has_kind(&doc, |k| matches!(k, LayerKind::LandscapeEvolution(_))));
+        assert!(has_kind(&doc, |k| matches!(
+            k,
+            LayerKind::LandscapeEvolution(_)
+        )));
         assert!(has_kind(&doc, |k| matches!(k, LayerKind::Coastal(_))));
-        assert!(has_kind(&doc, |k| matches!(k, LayerKind::GeomorphicDetail(_))));
+        assert!(has_kind(&doc, |k| matches!(
+            k,
+            LayerKind::GeomorphicDetail(_)
+        )));
         let mat = index_of(&doc, |k| matches!(k, LayerKind::Materials(_))).unwrap();
         let evo = index_of(&doc, |k| matches!(k, LayerKind::LandscapeEvolution(_))).unwrap();
         assert!(mat < evo, "materials must precede landscape evolution");
@@ -815,7 +829,11 @@ mod tests {
 
     #[test]
     fn all_non_blank_templates_follow_cause_effect() {
-        for t in WorldTemplate::all().iter().copied().filter(|t| *t != WorldTemplate::Blank) {
+        for t in WorldTemplate::all()
+            .iter()
+            .copied()
+            .filter(|t| *t != WorldTemplate::Blank)
+        {
             let doc = t.build(8_000.0, 128);
             assert_eq!(doc.presets_used.first().map(String::as_str), Some(t.id()));
             assert!(!doc.biome_library.definitions.is_empty(), "{}", t.id());
@@ -842,7 +860,8 @@ mod tests {
             if !matches!(t, WorldTemplate::DuneField) {
                 let mat = index_of(&doc, |k| matches!(k, LayerKind::Materials(_)))
                     .unwrap_or_else(|| panic!("{}: missing materials", t.id()));
-                let evo = index_of(&doc, |k| matches!(k, LayerKind::LandscapeEvolution(_))).unwrap();
+                let evo =
+                    index_of(&doc, |k| matches!(k, LayerKind::LandscapeEvolution(_))).unwrap();
                 assert!(mat < evo, "{}: materials before evolution", t.id());
             }
         }

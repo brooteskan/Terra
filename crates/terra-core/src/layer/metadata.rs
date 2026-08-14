@@ -169,143 +169,156 @@ pub struct LayerInstanceMeta {
 }
 
 impl LayerKind {
-    /// Hierarchy role for Region / Shape / Biome migration (see `domain::classify`).
-    pub fn domain_role(&self) -> crate::domain::DomainRole {
-        crate::domain::classify_layer_kind(self)
+    /// Core identity shared by direct kind consumers and the type registry.
+    ///
+    /// Keep this match exhaustive so a new kind cannot be added without also
+    /// defining its stable id, default display name, and authoring stage.
+    fn type_identity(&self) -> (&'static str, &'static str, WorkflowStage) {
+        match self {
+            LayerKind::SculptBase(_) => ("sculpt_base", "Base", WorkflowStage::Foundation),
+            LayerKind::SculptStrokes(_) => (
+                "sculpt_strokes",
+                "Semantic Sculpt",
+                WorkflowStage::Foundation,
+            ),
+            LayerKind::TerrainConstraints(_) => (
+                "terrain_constraints",
+                "Terrain Constraints",
+                WorkflowStage::Foundation,
+            ),
+            LayerKind::GradientReconstruct(_) => (
+                "gradient_reconstruct",
+                "Gradient Reconstruct",
+                WorkflowStage::Generation,
+            ),
+            LayerKind::LandscapeEvolution(_) => (
+                "landscape_evolution",
+                "Landscape Evolution",
+                WorkflowStage::Simulation,
+            ),
+            LayerKind::HydrologyRepair(_) => (
+                "hydrology_repair",
+                "Hydrology Repair",
+                WorkflowStage::Simulation,
+            ),
+            LayerKind::GeomorphicDetail(_) => (
+                "geomorphic_detail",
+                "Geomorphic Detail",
+                WorkflowStage::Generation,
+            ),
+            LayerKind::EcosystemFeedback(_) => (
+                "ecosystem_feedback",
+                "Ecosystem Feedback",
+                WorkflowStage::Simulation,
+            ),
+            LayerKind::Flat(_) => ("flat", "Flat", WorkflowStage::Generation),
+            LayerKind::Ramp(_) => ("ramp", "Ramp", WorkflowStage::Generation),
+            LayerKind::NoiseValue(_) => ("noise_value", "Value Noise", WorkflowStage::Generation),
+            LayerKind::NoisePerlin(_) => {
+                ("noise_perlin", "Perlin Noise", WorkflowStage::Generation)
+            }
+            LayerKind::NoiseOpenSimplex(_) => (
+                "noise_open_simplex",
+                "OpenSimplex Noise",
+                WorkflowStage::Generation,
+            ),
+            LayerKind::NoiseWorley(_) => {
+                ("noise_worley", "Worley Noise", WorkflowStage::Generation)
+            }
+            LayerKind::Fbm(_) => ("fbm", "FBM", WorkflowStage::Generation),
+            LayerKind::Ridged(_) => ("ridged", "Ridged", WorkflowStage::Generation),
+            LayerKind::DomainWarp(_) => ("domain_warp", "Domain Warp", WorkflowStage::Generation),
+            LayerKind::Terrace(_) => ("terrace", "Terrace", WorkflowStage::Generation),
+            LayerKind::Plateau(_) => ("plateau", "Plateau", WorkflowStage::Generation),
+            LayerKind::Mesa(_) => ("mesa", "Mesa", WorkflowStage::Generation),
+            LayerKind::Island(_) => ("island", "Island", WorkflowStage::Generation),
+            LayerKind::Mountains(_) => ("mountain", "Mountains", WorkflowStage::Generation),
+            LayerKind::Volcano(_) => ("volcano", "Volcano", WorkflowStage::Generation),
+            LayerKind::Uplift(_) => ("uplift", "Uplift", WorkflowStage::Generation),
+            LayerKind::Dunes(_) => ("dunes", "Dunes", WorkflowStage::Generation),
+            LayerKind::Canyons(_) => ("canyon", "Canyons", WorkflowStage::Generation),
+            LayerKind::VoronoiRegions(_) => {
+                ("voronoi", "Voronoi Regions", WorkflowStage::Generation)
+            }
+            LayerKind::ImportHeightmap(_) => (
+                "import_heightmap",
+                "Import Heightmap",
+                WorkflowStage::Foundation,
+            ),
+            LayerKind::ThermalErosion(_) => (
+                "thermal_erosion",
+                "Thermal Erosion",
+                WorkflowStage::Simulation,
+            ),
+            LayerKind::HydraulicErosion(_) => (
+                "hydraulic_erosion",
+                "Hydraulic Erosion",
+                WorkflowStage::Simulation,
+            ),
+            LayerKind::DebrisFlow(_) => ("debris_flow", "Debris Flow", WorkflowStage::Simulation),
+            LayerKind::StreamPowerErosion(_) => {
+                ("stream_power", "Stream Power", WorkflowStage::Simulation)
+            }
+            LayerKind::MultiScaleAmplify(_) => (
+                "multi_scale_amplify",
+                "Multi-Scale Amplify",
+                WorkflowStage::Simulation,
+            ),
+            LayerKind::RiverCarve(_) => ("river_carve", "River Carve", WorkflowStage::Simulation),
+            LayerKind::Blur(_) => ("blur", "Blur", WorkflowStage::Generation),
+            LayerKind::Coastal(_) => ("coastal", "Coastal", WorkflowStage::Simulation),
+            LayerKind::EffectFilter(_) => {
+                ("effect_filter", "Effect Filter", WorkflowStage::Generation)
+            }
+            LayerKind::Materials(_) => ("materials", "Materials", WorkflowStage::Materials),
+            LayerKind::Biomes(_) => (
+                "climate_biomes",
+                "Climate Classification",
+                WorkflowStage::BiomePlacement,
+            ),
+            LayerKind::Vegetation(_) => ("vegetation", "Vegetation", WorkflowStage::Scatter),
+            LayerKind::OverhangStamp(_) => (
+                "overhang_stamp",
+                "Overhang Stamp",
+                WorkflowStage::Generation,
+            ),
+            LayerKind::LocalSdf(_) => ("local_sdf", "Local SDF", WorkflowStage::Generation),
+            LayerKind::Path(_) => ("path", "Path", WorkflowStage::Generation),
+            LayerKind::RiverNetwork(_) => {
+                ("river_network", "River Network", WorkflowStage::Simulation)
+            }
+            LayerKind::SandSimulation(_) => {
+                ("sand_simulation", "Sand Simulation", WorkflowStage::Objects)
+            }
+            LayerKind::FluidSimulation(_) => (
+                "fluid_simulation",
+                "Fluid Simulation",
+                WorkflowStage::Objects,
+            ),
+            LayerKind::ProceduralShape(_) => (
+                "procedural_shape",
+                "Procedural Shape",
+                WorkflowStage::Generation,
+            ),
+            LayerKind::Stamp2d(_) => ("stamp_2d", "2D Stamp", WorkflowStage::Foundation),
+            LayerKind::Stamp3d(_) => ("stamp_3d", "3D Stamp", WorkflowStage::Foundation),
+            LayerKind::PolygonHeight(_) => ("polygon_height", "Polygon", WorkflowStage::Generation),
+        }
     }
 
     /// Stable type id for registry / metadata (serde variant name style).
     pub fn type_id(&self) -> &'static str {
-        match self {
-            LayerKind::SculptBase(_) => "sculpt_base",
-            LayerKind::SculptStrokes(_) => "sculpt_strokes",
-            LayerKind::TerrainConstraints(_) => "terrain_constraints",
-            LayerKind::GradientReconstruct(_) => "gradient_reconstruct",
-            LayerKind::LandscapeEvolution(_) => "landscape_evolution",
-            LayerKind::HydrologyRepair(_) => "hydrology_repair",
-            LayerKind::GeomorphicDetail(_) => "geomorphic_detail",
-            LayerKind::EcosystemFeedback(_) => "ecosystem_feedback",
-            LayerKind::Flat(_) => "flat",
-            LayerKind::Ramp(_) => "ramp",
-            LayerKind::NoiseValue(_) => "noise_value",
-            LayerKind::NoisePerlin(_) => "noise_perlin",
-            LayerKind::NoiseOpenSimplex(_) => "noise_open_simplex",
-            LayerKind::NoiseWorley(_) => "noise_worley",
-            LayerKind::Fbm(_) => "fbm",
-            LayerKind::Ridged(_) => "ridged",
-            LayerKind::DomainWarp(_) => "domain_warp",
-            LayerKind::Terrace(_) => "terrace",
-            LayerKind::Plateau(_) => "plateau",
-            LayerKind::Mesa(_) => "mesa",
-            LayerKind::Island(_) => "island",
-            LayerKind::Mountains(_) => "mountain",
-            LayerKind::Volcano(_) => "volcano",
-            LayerKind::Uplift(_) => "uplift",
-            LayerKind::Dunes(_) => "dunes",
-            LayerKind::Canyons(_) => "canyon",
-            LayerKind::VoronoiRegions(_) => "voronoi",
-            LayerKind::ImportHeightmap(_) => "import_heightmap",
-            LayerKind::ThermalErosion(_) => "thermal_erosion",
-            LayerKind::HydraulicErosion(_) => "hydraulic_erosion",
-            LayerKind::DebrisFlow(_) => "debris_flow",
-            LayerKind::StreamPowerErosion(_) => "stream_power",
-            LayerKind::MultiScaleAmplify(_) => "multi_scale_amplify",
-            LayerKind::RiverCarve(_) => "river_carve",
-            LayerKind::Blur(_) => "blur",
-            LayerKind::Coastal(_) => "coastal",
-            LayerKind::EffectFilter(_) => "effect_filter",
-            LayerKind::Materials(_) => "materials",
-            LayerKind::Biomes(_) => "climate_biomes",
-            LayerKind::Vegetation(_) => "vegetation",
-            LayerKind::OverhangStamp(_) => "overhang_stamp",
-            LayerKind::LocalSdf(_) => "local_sdf",
-            LayerKind::Path(_) => "path",
-            LayerKind::RiverNetwork(_) => "river_network",
-            LayerKind::SandSimulation(_) => "sand_simulation",
-            LayerKind::FluidSimulation(_) => "fluid_simulation",
-            LayerKind::ProceduralShape(_) => "procedural_shape",
-            LayerKind::Stamp2d(_) => "stamp_2d",
-            LayerKind::Stamp3d(_) => "stamp_3d",
-            LayerKind::PolygonHeight(_) => "polygon_height",
-        }
+        self.type_identity().0
     }
 
     /// Default human label for this kind (before instance rename).
     pub fn type_display_name(&self) -> &'static str {
-        match self {
-            LayerKind::SculptBase(_) => "Base",
-            LayerKind::SculptStrokes(_) => "Semantic Sculpt",
-            LayerKind::TerrainConstraints(_) => "Terrain Constraints",
-            LayerKind::GradientReconstruct(_) => "Gradient Reconstruct",
-            LayerKind::LandscapeEvolution(_) => "Landscape Evolution",
-            LayerKind::HydrologyRepair(_) => "Hydrology Repair",
-            LayerKind::GeomorphicDetail(_) => "Geomorphic Detail",
-            LayerKind::EcosystemFeedback(_) => "Ecosystem Feedback",
-            LayerKind::Flat(_) => "Flat",
-            LayerKind::Ramp(_) => "Ramp",
-            LayerKind::NoiseValue(_) => "Value Noise",
-            LayerKind::NoisePerlin(_) => "Perlin Noise",
-            LayerKind::NoiseOpenSimplex(_) => "OpenSimplex Noise",
-            LayerKind::NoiseWorley(_) => "Worley Noise",
-            LayerKind::Fbm(_) => "FBM",
-            LayerKind::Ridged(_) => "Ridged",
-            LayerKind::DomainWarp(_) => "Domain Warp",
-            LayerKind::Terrace(_) => "Terrace",
-            LayerKind::Plateau(_) => "Plateau",
-            LayerKind::Mesa(_) => "Mesa",
-            LayerKind::Island(_) => "Island",
-            LayerKind::Mountains(_) => "Mountains",
-            LayerKind::Volcano(_) => "Volcano",
-            LayerKind::Uplift(_) => "Uplift",
-            LayerKind::Dunes(_) => "Dunes",
-            LayerKind::Canyons(_) => "Canyons",
-            LayerKind::VoronoiRegions(_) => "Voronoi Regions",
-            LayerKind::ImportHeightmap(_) => "Import Heightmap",
-            LayerKind::ThermalErosion(_) => "Thermal Erosion",
-            LayerKind::HydraulicErosion(_) => "Hydraulic Erosion",
-            LayerKind::DebrisFlow(_) => "Debris Flow",
-            LayerKind::StreamPowerErosion(_) => "Stream Power",
-            LayerKind::MultiScaleAmplify(_) => "Multi-Scale Amplify",
-            LayerKind::RiverCarve(_) => "River Carve",
-            LayerKind::Blur(_) => "Blur",
-            LayerKind::Coastal(_) => "Coastal",
-            LayerKind::EffectFilter(_) => "Effect Filter",
-            LayerKind::Materials(_) => "Materials",
-            LayerKind::Biomes(_) => "Climate Classification",
-            LayerKind::Vegetation(_) => "Vegetation",
-            LayerKind::OverhangStamp(_) => "Overhang Stamp",
-            LayerKind::LocalSdf(_) => "Local SDF",
-            LayerKind::Path(_) => "Path",
-            LayerKind::RiverNetwork(_) => "River Network",
-            LayerKind::SandSimulation(_) => "Sand Simulation",
-            LayerKind::FluidSimulation(_) => "Fluid Simulation",
-            LayerKind::ProceduralShape(_) => "Procedural Shape",
-            LayerKind::Stamp2d(_) => "2D Stamp",
-            LayerKind::Stamp3d(_) => "3D Stamp",
-            LayerKind::PolygonHeight(_) => "Polygon",
-        }
+        self.type_identity().1
     }
 
     /// Artist workflow stage for this kind (metadata).
     pub fn workflow_stage(&self) -> WorkflowStage {
-        match self {
-            LayerKind::SculptBase(_)
-            | LayerKind::ImportHeightmap(_)
-            | LayerKind::SculptStrokes(_)
-            | LayerKind::TerrainConstraints(_) => WorkflowStage::Foundation,
-            LayerKind::Materials(_) => WorkflowStage::Materials,
-            LayerKind::Biomes(_) => WorkflowStage::BiomePlacement,
-            LayerKind::Vegetation(_) => WorkflowStage::Scatter,
-            LayerKind::SandSimulation(_) | LayerKind::FluidSimulation(_) => WorkflowStage::Objects,
-            other => match other.category() {
-                OperationCategory::Simulation | OperationCategory::Analysis => {
-                    WorkflowStage::Simulation
-                }
-                OperationCategory::ImportedData => WorkflowStage::Foundation,
-                OperationCategory::Surface => WorkflowStage::Materials,
-                _ => WorkflowStage::Generation,
-            },
-        }
+        self.type_identity().2
     }
 }
 

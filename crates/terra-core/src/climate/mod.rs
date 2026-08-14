@@ -6,7 +6,7 @@
 
 use crate::analyze::jump_flood_distance;
 use crate::heightfield::Heightfield;
-use crate::layer::{BiomeBand, BiomesParams};
+use crate::layer::{BiomeBand, BiomesParams, OPEN_HEIGHT_MAX, OPEN_HEIGHT_MIN};
 use crate::mask::MaskField;
 
 /// Packed climate / biome output maps (all values typically in \[0,1\]).
@@ -275,8 +275,8 @@ pub fn default_climate_bands() -> Vec<BiomeBand> {
         BiomeBand {
             name: "Desert".into(),
             id: 1,
-            min_height: f32::NEG_INFINITY,
-            max_height: f32::INFINITY,
+            min_height: OPEN_HEIGHT_MIN,
+            max_height: OPEN_HEIGHT_MAX,
             min_wetness: 0.0,
             max_wetness: 1.0,
             min_temp: 0.45,
@@ -291,8 +291,8 @@ pub fn default_climate_bands() -> Vec<BiomeBand> {
         BiomeBand {
             name: "Grassland".into(),
             id: 2,
-            min_height: f32::NEG_INFINITY,
-            max_height: f32::INFINITY,
+            min_height: OPEN_HEIGHT_MIN,
+            max_height: OPEN_HEIGHT_MAX,
             min_wetness: 0.0,
             max_wetness: 1.0,
             min_temp: 0.35,
@@ -307,8 +307,8 @@ pub fn default_climate_bands() -> Vec<BiomeBand> {
         BiomeBand {
             name: "Temperate Forest".into(),
             id: 3,
-            min_height: f32::NEG_INFINITY,
-            max_height: f32::INFINITY,
+            min_height: OPEN_HEIGHT_MIN,
+            max_height: OPEN_HEIGHT_MAX,
             min_wetness: 0.0,
             max_wetness: 1.0,
             min_temp: 0.28,
@@ -323,8 +323,8 @@ pub fn default_climate_bands() -> Vec<BiomeBand> {
         BiomeBand {
             name: "Wetland".into(),
             id: 4,
-            min_height: f32::NEG_INFINITY,
-            max_height: f32::INFINITY,
+            min_height: OPEN_HEIGHT_MIN,
+            max_height: OPEN_HEIGHT_MAX,
             min_wetness: 0.0,
             max_wetness: 1.0,
             min_temp: 0.2,
@@ -339,8 +339,8 @@ pub fn default_climate_bands() -> Vec<BiomeBand> {
         BiomeBand {
             name: "Boreal".into(),
             id: 5,
-            min_height: f32::NEG_INFINITY,
-            max_height: f32::INFINITY,
+            min_height: OPEN_HEIGHT_MIN,
+            max_height: OPEN_HEIGHT_MAX,
             min_wetness: 0.0,
             max_wetness: 1.0,
             min_temp: 0.12,
@@ -355,8 +355,8 @@ pub fn default_climate_bands() -> Vec<BiomeBand> {
         BiomeBand {
             name: "Alpine".into(),
             id: 6,
-            min_height: f32::NEG_INFINITY,
-            max_height: f32::INFINITY,
+            min_height: OPEN_HEIGHT_MIN,
+            max_height: OPEN_HEIGHT_MAX,
             min_wetness: 0.0,
             max_wetness: 1.0,
             min_temp: 0.0,
@@ -371,7 +371,7 @@ pub fn default_climate_bands() -> Vec<BiomeBand> {
         BiomeBand {
             name: "Coast".into(),
             id: 7,
-            min_height: f32::NEG_INFINITY,
+            min_height: OPEN_HEIGHT_MIN,
             max_height: 25.0,
             min_wetness: 0.0,
             max_wetness: 1.0,

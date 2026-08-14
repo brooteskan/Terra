@@ -4,12 +4,12 @@
 //! small background pool so the UI can show Lucide placeholders until ready.
 //! Prefer [`prefetch_all`] at startup so Quick Add / Tools don't hitch on first open.
 
-#[cfg(not(test))]
-use std::sync::{mpsc, Arc, Mutex};
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     OnceLock,
 };
+#[cfg(not(test))]
+use std::sync::{mpsc, Arc, Mutex};
 
 #[cfg(not(test))]
 type ThumbJob = Box<dyn FnOnce() + Send + 'static>;
@@ -183,7 +183,10 @@ thumb!(pinch, "../../../../assets/tools/tool_pinch.png");
 thumb!(inflate, "../../../../assets/tools/tool_inflate.png");
 
 // —— Shape layers ——————————————————————————————————————————————
-thumb!(shape_sculpt, "../../../../assets/tools/tool_shape_sculpt.png");
+thumb!(
+    shape_sculpt,
+    "../../../../assets/tools/tool_shape_sculpt.png"
+);
 thumb!(
     shape_stamp_2d,
     "../../../../assets/tools/tool_shape_stamp_2d.png"
@@ -209,7 +212,10 @@ thumb!(
 // —— Biomes ————————————————————————————————————————————————————
 thumb!(biome_paint, "../../../../assets/tools/tool_biome_paint.png");
 thumb!(biome_erase, "../../../../assets/tools/tool_biome_erase.png");
-thumb!(biome_smooth, "../../../../assets/tools/tool_biome_smooth.png");
+thumb!(
+    biome_smooth,
+    "../../../../assets/tools/tool_biome_smooth.png"
+);
 thumb!(
     biome_replace,
     "../../../../assets/tools/tool_biome_replace.png"
@@ -223,10 +229,16 @@ thumb!(
     biome_polygon,
     "../../../../assets/tools/tool_biome_polygon.png"
 );
-thumb!(biome_create, "../../../../assets/tools/tool_biome_create.png");
+thumb!(
+    biome_create,
+    "../../../../assets/tools/tool_biome_create.png"
+);
 
 // —— Materials —————————————————————————————————————————————————
-thumb!(mat_material, "../../../../assets/tools/tool_mat_material.png");
+thumb!(
+    mat_material,
+    "../../../../assets/tools/tool_mat_material.png"
+);
 thumb!(mat_colour, "../../../../assets/tools/tool_mat_colour.png");
 thumb!(mat_wetness, "../../../../assets/tools/tool_mat_wetness.png");
 thumb!(mat_snow, "../../../../assets/tools/tool_mat_snow.png");
@@ -241,7 +253,10 @@ thumb!(obj_debris, "../../../../assets/tools/tool_obj_debris.png");
 thumb!(obj_custom, "../../../../assets/tools/tool_obj_custom.png");
 thumb!(obj_density, "../../../../assets/tools/tool_obj_density.png");
 thumb!(obj_scale, "../../../../assets/tools/tool_obj_scale.png");
-thumb!(obj_rotation, "../../../../assets/tools/tool_obj_rotation.png");
+thumb!(
+    obj_rotation,
+    "../../../../assets/tools/tool_obj_rotation.png"
+);
 thumb!(obj_slope, "../../../../assets/tools/tool_obj_slope.png");
 thumb!(obj_height, "../../../../assets/tools/tool_obj_height.png");
 
@@ -266,7 +281,10 @@ thumb!(
     mask_distance,
     "../../../../assets/tools/tool_mask_distance.png"
 );
-thumb!(mask_painted, "../../../../assets/tools/tool_mask_painted.png");
+thumb!(
+    mask_painted,
+    "../../../../assets/tools/tool_mask_painted.png"
+);
 thumb!(
     mask_combined,
     "../../../../assets/tools/tool_mask_combined.png"
@@ -274,7 +292,10 @@ thumb!(
 
 // —— Utilities —————————————————————————————————————————————————
 thumb!(util_move, "../../../../assets/tools/tool_util_move.png");
-thumb!(util_measure, "../../../../assets/tools/tool_util_measure.png");
+thumb!(
+    util_measure,
+    "../../../../assets/tools/tool_util_measure.png"
+);
 thumb!(util_bake, "../../../../assets/tools/tool_util_bake.png");
 
 // —— Filters (WC Develop) ——————————————————————————————————————
@@ -290,7 +311,10 @@ thumb!(
     filter_zero_edge,
     "../../../../assets/tools/tool_filter_zero_edge.png"
 );
-thumb!(filter_curve, "../../../../assets/tools/tool_filter_curve.png");
+thumb!(
+    filter_curve,
+    "../../../../assets/tools/tool_filter_curve.png"
+);
 thumb!(
     filter_cutoff,
     "../../../../assets/tools/tool_filter_cutoff.png"
@@ -335,7 +359,10 @@ thumb!(
     filter_scatter,
     "../../../../assets/tools/tool_filter_scatter.png"
 );
-thumb!(filter_shore, "../../../../assets/tools/tool_filter_shore.png");
+thumb!(
+    filter_shore,
+    "../../../../assets/tools/tool_filter_shore.png"
+);
 thumb!(
     filter_smooth_ridges,
     "../../../../assets/tools/tool_filter_smooth_ridges.png"
@@ -348,7 +375,10 @@ thumb!(
     filter_strata,
     "../../../../assets/tools/tool_filter_strata.png"
 );
-thumb!(filter_swirl, "../../../../assets/tools/tool_filter_swirl.png");
+thumb!(
+    filter_swirl,
+    "../../../../assets/tools/tool_filter_swirl.png"
+);
 thumb!(
     filter_washed_off,
     "../../../../assets/tools/tool_filter_washed_off.png"
@@ -357,7 +387,10 @@ thumb!(
     filter_billow,
     "../../../../assets/tools/tool_filter_billow.png"
 );
-thumb!(filter_gabor, "../../../../assets/tools/tool_filter_gabor.png");
+thumb!(
+    filter_gabor,
+    "../../../../assets/tools/tool_filter_gabor.png"
+);
 thumb!(
     filter_perlin,
     "../../../../assets/tools/tool_filter_perlin.png"
@@ -375,7 +408,10 @@ thumb!(
     "../../../../assets/tools/tool_filter_value_noise.png"
 );
 thumb!(filter_wave, "../../../../assets/tools/tool_filter_wave.png");
-thumb!(filter_white, "../../../../assets/tools/tool_filter_white.png");
+thumb!(
+    filter_white,
+    "../../../../assets/tools/tool_filter_white.png"
+);
 thumb!(
     filter_chipped,
     "../../../../assets/tools/tool_filter_chipped.png"
@@ -416,7 +452,10 @@ thumb!(
     filter_soft_flows,
     "../../../../assets/tools/tool_filter_soft_flows.png"
 );
-thumb!(filter_rocky, "../../../../assets/tools/tool_filter_rocky.png");
+thumb!(
+    filter_rocky,
+    "../../../../assets/tools/tool_filter_rocky.png"
+);
 thumb!(
     filter_thin_flows,
     "../../../../assets/tools/tool_filter_thin_flows.png"
@@ -493,9 +532,7 @@ pub fn thumb_for_tool(id: &str) -> Option<&'static ToolThumb> {
         "filter.sediment.fill_soft" => filter_fills_soft(),
         "erosion.talus" | "sim.talus" | "sculpt.erode_brush" | "filter.sediment.talus" => talus(),
         "sim.weathering" => weathering(),
-        "filter.arid.rocky_cliffs"
-        | "sim.rocky_cliffs"
-        | "filter.effect.cliff_reinforce" => mesa(),
+        "filter.arid.rocky_cliffs" | "sim.rocky_cliffs" | "filter.effect.cliff_reinforce" => mesa(),
 
         // Brushes
         "sculpt.raise" => raise(),

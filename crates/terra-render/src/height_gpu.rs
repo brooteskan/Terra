@@ -8,6 +8,10 @@ use terra_core::heightfield::Heightfield;
 use terra_core::mask::MaskField;
 use terra_core::tiling::SampleRect;
 
+/// Small resident texture extent used while no project is active.
+/// Existing upload/presentation paths restore the next document's dimensions.
+const PROJECT_RESET_TEXTURE_EXTENT: u32 = 8;
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct NormalUniforms {
@@ -74,6 +78,65 @@ impl HeightSlot {
             width,
             height_px: height,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use terra_core::heightfield::HeightfieldMetrics;
+
+    fn assert_slot_dimensions(height: &HeightGpu, width: u32, height_px: u32) {
+        assert_eq!(height.tex_size, (width, height_px));
+        for slot in &height.slots {
+            assert_eq!((slot.width, slot.height_px), (width, height_px));
+            assert_eq!(
+                (slot.height.width(), slot.height.height()),
+                (width, height_px)
+            );
+            assert_eq!(
+                (slot.normal.width(), slot.normal.height()),
+                (width, height_px)
+            );
+        }
+    }
+
+    /// Revert check for #35: reset must replace, rather than retain, project-sized slots.
+    #[test]
+    fn project_reset_shrinks_slots_and_defers_old_textures() {
+        let Some(gpu) = terra_test_gpu::headless() else {
+            return;
+        };
+        let mut height = HeightGpu::new(&gpu.device, 64);
+
+        height.reset_project_state(&gpu.device, &gpu.queue, (1000.0, 750.0));
+
+        assert_slot_dimensions(
+            &height,
+            PROJECT_RESET_TEXTURE_EXTENT,
+            PROJECT_RESET_TEXTURE_EXTENT,
+        );
+        assert!(height.shared_height_view.is_none());
+        assert_eq!(height.retirement.pending(), 4);
+        height.tick_retirement(2);
+        assert_eq!(height.retirement.pending(), 4);
+        height.tick_retirement(3);
+        assert_eq!(height.retirement.pending(), 0);
+    }
+
+    #[test]
+    fn upload_after_project_reset_restores_requested_size() {
+        let Some(gpu) = terra_test_gpu::headless() else {
+            return;
+        };
+        let mut height = HeightGpu::new(&gpu.device, 64);
+        height.reset_project_state(&gpu.device, &gpu.queue, (1000.0, 750.0));
+
+        let metrics = HeightfieldMetrics::new(32, 48, 320.0, 480.0);
+        height.upload_and_swap(&gpu.device, &gpu.queue, &Heightfield::zeros(metrics));
+
+        assert_slot_dimensions(&height, 32, 48);
+        assert_eq!(height.world_size, (320.0, 480.0));
     }
 }
 
@@ -178,7 +241,7 @@ pub struct HeightGpu {
 
 impl HeightGpu {
     pub fn new(device: &wgpu::Device, initial: u32) -> Self {
-        let w = initial.max(8);
+        let w = initial.max(PROJECT_RESET_TEXTURE_EXTENT);
         let slots = [HeightSlot::new(device, w, w), HeightSlot::new(device, w, w)];
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("height-samp"),
@@ -356,8 +419,6 @@ impl HeightGpu {
         self.world_size = (hf.metrics.world_size_x, hf.metrics.world_size_z);
         self.height_range = hf.min_max();
 
-        let slot = &self.slots[self.write];
-
         let full = SampleRect { x: 0, y: 0, w, h };
         let rects: Vec<SampleRect> = match regions {
             Some(r) if !r.is_empty() => r.to_vec(),
@@ -366,6 +427,43 @@ impl HeightGpu {
 
         // Prefer tiling samples over a full dense flatten when uploading partial rects.
         let use_dense = rects.len() == 1 && rects[0].w == w && rects[0].h == h;
+
+        // A partial upload writes only its dirty rects into the write slot, which
+        // still holds stale content from two frames ago (zeros on its first reuse).
+        // Seed the write slot from the current display slot first — mirroring the
+        // GPU-to-GPU path's "seed write slot from last display" — so texels outside
+        // the dirty rects survive the display swap. Normals are then recomputed over
+        // the whole reconstructed field (below) rather than just the dirty union.
+        let partial = !use_dense
+            && self.slots[self.display].width == w
+            && self.slots[self.display].height_px == h;
+        if partial {
+            let mut seed = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("height-seed-enc"),
+            });
+            seed.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.slots[self.display].height,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.slots[self.write].height,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+            );
+            queue.submit(Some(seed.finish()));
+        }
+
+        let slot = &self.slots[self.write];
         let dense = if use_dense { Some(hf.to_dense()) } else { None };
 
         let mut encoder = if staging.is_some() {
@@ -438,13 +536,20 @@ impl HeightGpu {
             queue.submit(Some(enc.finish()));
         }
 
-        let normal_region = regions
-            .and_then(|r| {
-                let mut iter = r.iter().copied();
-                let first = iter.next()?;
-                Some(iter.fold(first, |a, b| a.union(b)).padded(&hf.metrics, 1))
-            })
-            .unwrap_or(full);
+        let normal_region = if partial {
+            // The write slot was seeded from display and patched, so it now holds
+            // the complete field — recompute every normal from it, not just the
+            // dirty union (whose neighbours would otherwise stay stale).
+            full
+        } else {
+            regions
+                .and_then(|r| {
+                    let mut iter = r.iter().copied();
+                    let first = iter.next()?;
+                    Some(iter.fold(first, |a, b| a.union(b)).padded(&hf.metrics, 1))
+                })
+                .unwrap_or(full)
+        };
 
         self.compute_normals_region_and_swap(
             device,
@@ -751,7 +856,8 @@ impl HeightGpu {
         }
     }
 
-    /// Drop any borrowed engine view and zero display heights (project switch).
+    /// Drop any borrowed engine view and replace project-sized slots with the
+    /// small blank baseline. Replaced textures keep the normal deferred-retirement path.
     pub fn reset_project_state(
         &mut self,
         device: &wgpu::Device,
@@ -761,8 +867,8 @@ impl HeightGpu {
         self.shared_height_view = None;
         self.world_size = world_size;
         self.height_range = (0.0, 1.0);
-        let w = self.tex_size.0.max(8);
-        let h = self.tex_size.1.max(8);
+        let w = PROJECT_RESET_TEXTURE_EXTENT;
+        let h = PROJECT_RESET_TEXTURE_EXTENT;
         self.ensure_size(device, w, h);
         let zeros = vec![0f32; (w as usize).saturating_mul(h as usize)];
         for slot in &self.slots {
@@ -794,12 +900,7 @@ impl HeightGpu {
             h,
             world_size.0 / w.max(1) as f32,
             world_size.1 / h.max(1) as f32,
-            SampleRect {
-                x: 0,
-                y: 0,
-                w,
-                h,
-            },
+            SampleRect { x: 0, y: 0, w, h },
         );
     }
 

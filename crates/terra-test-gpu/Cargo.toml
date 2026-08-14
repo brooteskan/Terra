@@ -1,0 +1,11 @@
+[package]
+name = "terra-test-gpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Headless GPU harness for Terra render / UI tests (dev-only)"
+publish = false
+
+[dependencies]
+wgpu = { workspace = true }
+pollster = { workspace = true }

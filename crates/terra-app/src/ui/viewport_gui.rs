@@ -1,9 +1,12 @@
 //! Contextual viewport toolbar, brush bar, and view gizmo.
 
+use crate::ui::style::{self, FONT_SCALE, GAP, PAD, TYPE_BODY, TYPE_CAPTION, TYPE_LABEL};
 use crate::ui::{EditorTool, LightingPreset, Preview2dMode, UiState};
 use terra_core::document::TerrainDocument;
-use crate::ui::style::{self, FONT_SCALE, GAP, PAD, TYPE_BODY, TYPE_CAPTION, TYPE_LABEL};
-use terra_gui::{checkbox, combo, section_header, slider_f32, slider_i32, Color, DrawList, GuiContext, Icon, Id, Rect};
+use terra_gui::{
+    checkbox, combo, section_header, slider_f32, slider_i32, Color, DrawList, GuiContext, Icon, Id,
+    Rect,
+};
 use terra_render::{QualityPreset, ViewportRendererMode};
 
 /// Bottom viewport tool-mode buttons (legacy authoring modes; kept for tools rail).
@@ -41,7 +44,9 @@ impl ViewportToolMode {
         match self {
             Self::Move => tool.is_move(),
             Self::Measure => matches!(tool, EditorTool::Measure),
-            Self::Sculpt => tool.is_sculpt() || matches!(tool, EditorTool::PaintMask | EditorTool::PaintBiome),
+            Self::Sculpt => {
+                tool.is_sculpt() || matches!(tool, EditorTool::PaintMask | EditorTool::PaintBiome)
+            }
             Self::Mask => matches!(tool, EditorTool::PaintMask),
             Self::Biome => matches!(tool, EditorTool::PaintBiome),
         }
@@ -343,21 +348,21 @@ fn estimate_viewport_mode_bar_width(state: &UiState, vp: Rect) -> f32 {
         + gap * (labels.len().saturating_sub(1) as f32);
     let lighting_w = (18.0
         + 4.0
-        + DrawList::text_width(state.lighting_preset.label(), font_scale)
+        + DrawList::text_width(
+            if state.lighting_customized {
+                ""
+            } else {
+                state.lighting_preset.label()
+            },
+            font_scale,
+        )
         + 14.0
         + label_pad_x)
         .max(72.0)
         .min(148.0);
     let render_w = (DrawList::text_width("Render", font_scale) + label_pad_x * 2.0).max(64.0);
-    let content_w = modes_w
-        + sep_gap
-        + 1.0
-        + sep_gap
-        + lighting_w
-        + sep_gap
-        + 1.0
-        + sep_gap
-        + render_w;
+    let content_w =
+        modes_w + sep_gap + 1.0 + sep_gap + lighting_w + sep_gap + 1.0 + sep_gap + render_w;
     (content_w + pad_x * 2.0).min(vp.width() - PAD * 2.0)
 }
 
@@ -408,14 +413,15 @@ fn draw_viewport_mode_bar(
     let item_radius = style::RADIUS_SM;
     let sep_gap = 10.0;
 
-    let preset_label = state.lighting_preset.label();
-    let lighting_w = (18.0
-        + 4.0
-        + DrawList::text_width(preset_label, font_scale)
-        + 14.0
-        + label_pad_x)
-        .max(72.0)
-        .min(148.0);
+    let preset_label = if state.lighting_customized {
+        ""
+    } else {
+        state.lighting_preset.label()
+    };
+    let lighting_w =
+        (18.0 + 4.0 + DrawList::text_width(preset_label, font_scale) + 14.0 + label_pad_x)
+            .max(72.0)
+            .min(148.0);
 
     let widths: Vec<f32> = items
         .iter()
@@ -440,10 +446,10 @@ fn draw_viewport_mode_bar(
         }
         let rect = Rect::from_pos_size(x, btn_y, width, btn_h);
         let active = match item {
-            ModeItem::Terrain => {
-                state.preview_mode == Preview2dMode::Lit && !state.is_mask_view()
+            ModeItem::Terrain => state.preview_mode == Preview2dMode::Lit && !state.is_mask_view(),
+            ModeItem::Height => {
+                state.preview_mode == Preview2dMode::Height && !state.is_mask_view()
             }
-            ModeItem::Height => state.preview_mode == Preview2dMode::Height && !state.is_mask_view(),
             ModeItem::Slope => state.preview_mode == Preview2dMode::Slope && !state.is_mask_view(),
             ModeItem::Flow => state.preview_mode == Preview2dMode::Flow && !state.is_mask_view(),
             ModeItem::Mask => state.is_mask_view(),
@@ -767,8 +773,12 @@ fn mode_button(
     };
     if dropdown {
         let chevron_slot = 16.0;
-        let label_rect =
-            Rect::from_min_max(rect.min_x, rect.min_y, rect.max_x - chevron_slot, rect.max_y);
+        let label_rect = Rect::from_min_max(
+            rect.min_x,
+            rect.min_y,
+            rect.max_x - chevron_slot,
+            rect.max_y,
+        );
         ui.label_centered_in_rect(label_rect, label, fg, font_scale);
         ui.icon_centered(
             Rect::from_pos_size(
@@ -786,7 +796,6 @@ fn mode_button(
     }
     clicked
 }
-
 
 fn draw_dirty_tiles_overlay(
     ui: &mut GuiContext<'_>,
@@ -855,9 +864,9 @@ fn draw_dirty_tiles_overlay(
 fn draw_viewport_render_menu(ui: &mut GuiContext<'_>, state: &mut UiState, anchor: Rect) {
     let menu_w = 300.0;
     let menu_h = if state.viewport_render.advanced_open {
-        520.0
+        790.0
     } else {
-        280.0
+        560.0
     };
     let rect = Rect::from_pos_size(
         (anchor.max_x - menu_w).max(8.0),
@@ -865,7 +874,9 @@ fn draw_viewport_render_menu(ui: &mut GuiContext<'_>, state: &mut UiState, ancho
         menu_w,
         menu_h,
     );
-    let mut scroll = 0.0;
+    // Scroll offset must persist across frames — a per-frame `0.0` local would
+    // snap the panel back to the top every frame, defeating wheel and thumb drag.
+    let mut scroll = state.viewport_render.menu_scroll;
     let was_open = state.viewport_render.menu_open;
     let mut open = was_open;
     if ui.begin_window(
@@ -876,7 +887,10 @@ fn draw_viewport_render_menu(ui: &mut GuiContext<'_>, state: &mut UiState, ancho
         &mut scroll,
     ) {
         let vr = &mut state.viewport_render;
-        let mode_labels: Vec<&str> = ViewportRendererMode::ALL.iter().map(|m| m.label()).collect();
+        let mode_labels: Vec<&str> = ViewportRendererMode::ALL
+            .iter()
+            .map(|m| m.label())
+            .collect();
         let mut mode_idx = ViewportRendererMode::ALL
             .iter()
             .position(|m| *m == vr.mode)
@@ -885,6 +899,7 @@ fn draw_viewport_render_menu(ui: &mut GuiContext<'_>, state: &mut UiState, ancho
             vr.mode = ViewportRendererMode::ALL[mode_idx];
             if vr.mode == ViewportRendererMode::ProgressiveRayTraced {
                 state.lighting_preset = LightingPreset::Progressive;
+                state.lighting_customized = false;
             }
         }
 
@@ -909,6 +924,25 @@ fn draw_viewport_render_menu(ui: &mut GuiContext<'_>, state: &mut UiState, ancho
         checkbox(ui, "Denoise", &mut vr.denoise);
 
         ui.separator();
+        section_header(ui, "Lighting");
+        let mut lighting_edited = false;
+        lighting_edited |= slider_f32(ui, "Sun azimuth °", &mut vr.sun_azimuth_deg, 0.0, 360.0);
+        lighting_edited |= slider_f32(ui, "Sun elevation °", &mut vr.sun_elevation_deg, 0.0, 90.0);
+        lighting_edited |= slider_f32(ui, "Sun intensity", &mut vr.sun_intensity, 0.0, 3.0);
+        lighting_edited |= slider_f32(ui, "Exposure", &mut vr.exposure, 0.1, 4.0);
+        lighting_edited |= slider_f32(ui, "Sky R", &mut vr.sky_color[0], 0.0, 1.0);
+        lighting_edited |= slider_f32(ui, "Sky G", &mut vr.sky_color[1], 0.0, 1.0);
+        lighting_edited |= slider_f32(ui, "Sky B", &mut vr.sky_color[2], 0.0, 1.0);
+        section_header(ui, "Raster shading");
+        lighting_edited |= slider_f32(ui, "Ambient", &mut vr.ambient_strength, 0.0, 2.0);
+        lighting_edited |= slider_f32(ui, "Shadow", &mut vr.shadow_strength, 0.0, 1.0);
+        lighting_edited |= slider_f32(ui, "Fog", &mut vr.fog_strength, 0.0, 2.0);
+        if lighting_edited {
+            // Any lighting edit detaches from the named preset (blank preset field).
+            state.lighting_customized = true;
+        }
+
+        ui.separator();
         if button_toggle_advanced(ui, &mut vr.advanced_open) {
             // toggled in helper
         }
@@ -926,8 +960,20 @@ fn draw_viewport_render_menu(ui: &mut GuiContext<'_>, state: &mut UiState, ancho
             if slider_i32(ui, "Max bounces", &mut bounces, 1, 8) {
                 vr.max_bounces_refining = bounces as u32;
             }
-            slider_f32(ui, "Min internal scale", &mut vr.min_internal_scale, 0.25, 1.0);
-            slider_f32(ui, "Max internal scale", &mut vr.max_internal_scale, 0.25, 1.0);
+            slider_f32(
+                ui,
+                "Min internal scale",
+                &mut vr.min_internal_scale,
+                0.25,
+                1.0,
+            );
+            slider_f32(
+                ui,
+                "Max internal scale",
+                &mut vr.max_internal_scale,
+                0.25,
+                1.0,
+            );
             slider_f32(ui, "History clamp", &mut vr.history_clamp_k, 0.5, 3.0);
             slider_f32(ui, "Converge fraction", &mut vr.converge_fraction, 0.5, 1.0);
             let mut settling_spp = vr.settling_spp as i32;
@@ -935,13 +981,7 @@ fn draw_viewport_render_menu(ui: &mut GuiContext<'_>, state: &mut UiState, ancho
                 vr.settling_spp = settling_spp as u32;
             }
             section_header(ui, "Developer");
-            let debug_labels = [
-                "Final",
-                "Noisy",
-                "Variance",
-                "Samples",
-                "History",
-            ];
+            let debug_labels = ["Final", "Noisy", "Variance", "Samples", "History"];
             let mut debug_idx = vr.debug_viz_mode.min(4) as usize;
             if combo(ui, "Debug viz", &mut debug_idx, &debug_labels) {
                 vr.debug_viz_mode = debug_idx as u32;
@@ -949,6 +989,7 @@ fn draw_viewport_render_menu(ui: &mut GuiContext<'_>, state: &mut UiState, ancho
         }
         ui.end_window(&mut scroll);
     }
+    state.viewport_render.menu_scroll = scroll;
     state.viewport_render.menu_open = open;
     // Persist render prefs when the panel closes after edits.
     if !open && was_open {
@@ -981,7 +1022,11 @@ fn button_toggle_advanced(ui: &mut GuiContext<'_>, open: &mut bool) -> bool {
     ui.label_at(
         row.min_x + 8.0,
         row.min_y + 4.0,
-        if *open { "Advanced ▲" } else { "Advanced ▼" },
+        if *open {
+            "Advanced ▲"
+        } else {
+            "Advanced ▼"
+        },
         style::TEXT_DIM,
         FONT_SCALE * TYPE_LABEL,
     );
@@ -1020,6 +1065,7 @@ fn draw_lighting_menu(ui: &mut GuiContext<'_>, state: &mut UiState, anchor: Rect
         }
         if ui.input.primary_released && ui.state.is_active(id) && hovered {
             state.lighting_preset = *preset;
+            state.lighting_customized = false;
             if preset.is_progressive() {
                 state.viewport_render.mode =
                     terra_render::ViewportRendererMode::ProgressiveRayTraced;
@@ -1565,4 +1611,64 @@ fn toolbar_button(ui: &mut GuiContext<'_>, id: Id, rect: Rect, label: &str, acti
     );
     ui.label_centered_in_rect(rect, label, style::TEXT, FONT_SCALE * TYPE_LABEL);
     clicked
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use terra_gui::{GuiContext, GuiInput, GuiState};
+
+    /// Drive one frame of the render panel exactly as the mode bar does:
+    /// inside an overlay layer, through `with_menu_input`.
+    fn render_menu_frame(gs: &mut GuiState, ui_state: &mut UiState, input: GuiInput, anchor: Rect) {
+        let mut ctx = GuiContext::begin(1200.0, 800.0, 1.0, input, gs);
+        ctx.begin_overlay();
+        ctx.with_menu_input(|ctx| draw_viewport_render_menu(ctx, ui_state, anchor));
+        ctx.end_overlay();
+        ctx.end();
+    }
+
+    /// Regression guard: the advanced render panel's scroll offset must survive
+    /// across frames. A frame-local `let mut scroll = 0.0` would snap it back to
+    /// the top every frame, so the wheel (and thumb drag) would never move.
+    #[test]
+    fn render_panel_scroll_persists_across_frames() {
+        let mut gs = GuiState::default();
+        let mut ui_state = UiState::default();
+        ui_state.viewport_render.menu_open = true;
+        ui_state.viewport_render.advanced_open = true;
+
+        // Anchor (the Render button): max_x = 900, max_y = 60 → window at (600, 64) 300x520.
+        let anchor = Rect::from_pos_size(836.0, 40.0, 64.0, 20.0);
+        let content_pt = (750.0, 338.0); // inside the panel's scrollable body
+
+        // Frame 1: settle so the overflow (scroll_max) is measured for the wheel gate.
+        render_menu_frame(
+            &mut gs,
+            &mut ui_state,
+            GuiInput {
+                pointer: Some(content_pt),
+                ..Default::default()
+            },
+            anchor,
+        );
+
+        // Frame 2: wheel down over the panel body.
+        render_menu_frame(
+            &mut gs,
+            &mut ui_state,
+            GuiInput {
+                pointer: Some(content_pt),
+                scroll_delta: -3.0,
+                ..Default::default()
+            },
+            anchor,
+        );
+
+        assert!(
+            ui_state.viewport_render.menu_scroll > 0.0,
+            "advanced render panel must retain scroll offset across frames, got {}",
+            ui_state.viewport_render.menu_scroll
+        );
+    }
 }

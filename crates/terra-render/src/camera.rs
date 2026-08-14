@@ -169,7 +169,10 @@ mod tests {
         // yaw=0, pitch=0 → offset=(1,0,0), forward=(-1,0,0)
         let before = cam.target;
         cam.fly(1.0, 0.0, 0.0, 1.0, false);
-        assert!(cam.target.x < before.x, "W should move along look (toward -X)");
+        assert!(
+            cam.target.x < before.x,
+            "W should move along look (toward -X)"
+        );
     }
 
     #[test]

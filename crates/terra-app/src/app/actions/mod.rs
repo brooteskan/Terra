@@ -4,11 +4,12 @@ mod biomes;
 mod layers;
 mod masks;
 mod scenarios;
+mod settings;
 mod tools;
 mod world_rules;
 
-use terra_core::layer::LayerId;
 use crate::ui::PanelAction;
+use terra_core::layer::LayerId;
 
 use super::TerraApp;
 
@@ -42,27 +43,44 @@ impl TerraApp {
                 Ok(()) => continue,
                 Err(a) => a,
             };
-            if ctx.continue_loop { continue; }
+            if ctx.continue_loop {
+                continue;
+            }
             let action = match masks::try_apply(self, action, &mut ctx) {
                 Ok(()) => continue,
                 Err(a) => a,
             };
-            if ctx.continue_loop { continue; }
+            if ctx.continue_loop {
+                continue;
+            }
             let action = match biomes::try_apply(self, action, &mut ctx) {
                 Ok(()) => continue,
                 Err(a) => a,
             };
-            if ctx.continue_loop { continue; }
+            if ctx.continue_loop {
+                continue;
+            }
             let action = match world_rules::try_apply(self, action, &mut ctx) {
                 Ok(()) => continue,
                 Err(a) => a,
             };
-            if ctx.continue_loop { continue; }
+            if ctx.continue_loop {
+                continue;
+            }
             let action = match scenarios::try_apply(self, action, &mut ctx) {
                 Ok(()) => continue,
                 Err(a) => a,
             };
-            if ctx.continue_loop { continue; }
+            if ctx.continue_loop {
+                continue;
+            }
+            let action = match settings::try_apply(self, action, &mut ctx) {
+                Ok(()) => continue,
+                Err(a) => a,
+            };
+            if ctx.continue_loop {
+                continue;
+            }
             match tools::try_apply(self, action, &mut ctx) {
                 Ok(()) => {}
                 Err(_a) => {
@@ -98,30 +116,7 @@ impl TerraApp {
                     );
                 self.scheduler.evaluator.mark_dirty_from(&preview, id);
                 self.track_worker_dirty_from(&preview, id);
-                if let Some((x, y, width, height)) = sculpt_dirty_rect {
-                    let resolution = self
-                        .scheduler
-                        .quality
-                        .resolution(
-                            self.session.document.preview_resolution.min(8192),
-                            self.session.document.export_resolution,
-                        )
-                        .max(1) as f32;
-                    if let Some(rect) = terra_core::NormalizedRect::new(
-                        x as f32 / resolution,
-                        y as f32 / resolution,
-                        (x + width) as f32 / resolution,
-                        (y + height) as f32 / resolution,
-                    ) {
-                        self.terrain_runtime.invalidate_layer_regions(
-                            &preview,
-                            id,
-                            terra_core::RegionSet::from_rect(rect),
-                        );
-                    }
-                } else {
-                    self.terrain_runtime.invalidate_layer(&preview, id);
-                }
+                self.terrain_runtime.advance_output_revision();
                 if let Some(gpu) = self.gpu_engine.as_mut() {
                     if sculpt_only {
                         gpu.mark_dirty(id);

@@ -46,7 +46,10 @@ fn no_detail_without_geomorphic_gate() {
             max_d = max_d.max((out.height.get(i, j) - hf.get(i, j)).abs());
         }
     }
-    assert!(max_d < 0.05, "flat terrain should not grow soup detail, max_d={max_d}");
+    assert!(
+        max_d < 0.05,
+        "flat terrain should not grow soup detail, max_d={max_d}"
+    );
 }
 
 #[test]

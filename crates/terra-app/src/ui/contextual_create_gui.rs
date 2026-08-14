@@ -1,10 +1,10 @@
 //! Viewport / hierarchy contextual Create-here menus.
 
+use crate::ui::style::{self, FONT_SCALE, TYPE_BODY, TYPE_LABEL};
 use terra_core::contextual_create::{
     available_kinds, propose_owner, CreateContext, CreateKind, CreateOwner, CreateWorkspace,
 };
 use terra_core::document::TerrainDocument;
-use crate::ui::style::{self, FONT_SCALE, TYPE_BODY, TYPE_LABEL};
 use terra_gui::{GuiContext, Id, Rect};
 
 use crate::ui::actions::PanelAction;
@@ -72,7 +72,7 @@ pub fn build_create_context(
     CreateContext::from_document(
         doc,
         workspace_to_create(ui.active_workspace),
-        ui.layout.auto_switch_workspace_on_create,
+        ui.auto_switch_workspace_on_create,
     )
     .with_cursor(menu.uv)
 }
@@ -288,7 +288,7 @@ pub fn hierarchy_add_actions(
     let mut ctx = CreateContext::from_document(
         doc,
         workspace_to_create(ui_state.active_workspace),
-        ui_state.layout.auto_switch_workspace_on_create,
+        ui_state.auto_switch_workspace_on_create,
     );
     match owner {
         CreateOwner::Biome(id) => {

@@ -41,14 +41,16 @@ impl Default for UpliftMode {
 /// Drainage outlet / base-level boundary behaviour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum BoundaryMode {
-    /// Cells at or below sea / base level act as fixed outlets.
+    /// Cells at or below sea / base level are fixed; the rim remains a
+    /// routing-only outlet so above-sea edge samples may evolve.
     #[default]
     SeaLevel,
-    /// Domain border cells are fixed elevation outlets.
+    /// The one-cell domain rim is both a drainage outlet and elevation-locked.
     Fixed,
-    /// Border cells drain freely (open) without fixing height.
+    /// The one-cell rim terminates drainage without locking its elevation.
     OpenDrainage,
-    /// User outlet mask (1 = fixed outlet). Falls back to SeaLevel if absent.
+    /// User outlet mask (`> 0.5` = fixed outlet). A missing mask falls back to
+    /// SeaLevel; an empty supplied mask gets a routing-only rim fallback.
     OutletMask,
 }
 
@@ -110,6 +112,13 @@ pub struct LandscapeEvolutionParams {
 
     // ── Advanced scientific ──────────────────────────────────────────────
     /// Stream-power erodibility \(K\).
+    ///
+    /// Acts on **world-metric** slope (drop per dx/dz metres) and rain-scaled
+    /// discharge Q — see [`effective_k`](Self::effective_k) and the shared
+    /// [`crate::hydro::spe_increment`]. **Not** numerically comparable with
+    /// [`crate::layer::StreamPowerParams`]'s `k` (grid-relative slope, world-m²
+    /// area); unifying them would retune saved projects and needs a versioned
+    /// document migration (station D1).
     #[serde(default = "default_k")]
     pub k: f32,
     /// Area exponent \(m\) (Tzathas default ~0.4; classic ~0.5).
@@ -290,19 +299,26 @@ impl LandscapeEvolutionParams {
     }
 
     /// Effective stream-power \(K\) after artist scales.
+    ///
+    /// Artist erosion at or below zero is an exact no-incision limit. It must
+    /// remain zero so solvers can select their finite no-advection path rather
+    /// than approximating the limit with a tiny positive speed.
     pub fn effective_k(&self) -> f32 {
+        let e = self.erosion.max(0.0);
+        if e == 0.0 {
+            return 0.0;
+        }
         let base = if self.k > 0.0 {
             self.k
         } else {
             self.incision_k.max(1e-8)
         };
-        let e = self.erosion.max(0.0);
         let inc = 0.35 + 0.65 * self.river_incision.clamp(0.0, 2.0);
         // Interactive authoring boost: scientific K (~2e-5) is calibrated for
         // multi-Myr; artist erosion/incision scales bring visible organisation
         // into the age slider range without changing the SPE form.
         let interactive = 1.0 + 2.5 * e.min(1.5);
-        (base * e * inc * interactive).max(1e-12)
+        (base * e * inc * interactive).max(0.0)
     }
 
     /// Effective area / slope exponents (prefer advanced; fall back to legacy).
@@ -327,7 +343,14 @@ impl LandscapeEvolutionParams {
     }
 
     /// Peak uplift rate (m / year) after artist amplitude.
+    ///
+    /// Artist uplift at or below zero is an exact no-uplift limit, including
+    /// for documents carrying the legacy `uplift_rate` alias.
     pub fn peak_uplift_rate(&self) -> f32 {
+        let amp = self.uplift.max(0.0);
+        if amp == 0.0 {
+            return 0.0;
+        }
         let legacy = self.uplift_rate.max(0.0);
         // Convert legacy m/step into a rate relative to dt when uplift slider is default-ish.
         let from_legacy = if self.dt > 0.0 {
@@ -336,7 +359,6 @@ impl LandscapeEvolutionParams {
             legacy * 1e-5
         };
         let scientific = 1e-3; // ~1 mm/yr reference (Tzathas Table 1)
-        let amp = self.uplift.max(0.0);
         (scientific * amp + from_legacy * 0.25).max(0.0)
     }
 
@@ -355,5 +377,28 @@ impl LandscapeEvolutionParams {
         let base = self.fixed_point_iters.max(1);
         // Slightly more passes as age increases (network reorganisation).
         (base as f32 * (0.7 + 0.5 * age)).round() as u32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LandscapeEvolutionParams;
+
+    #[test]
+    fn zero_artist_erosion_is_exact_no_incision() {
+        let mut p = LandscapeEvolutionParams::default();
+        p.erosion = 0.0;
+        assert_eq!(p.effective_k(), 0.0);
+    }
+
+    #[test]
+    fn zero_artist_uplift_overrides_legacy_default() {
+        let mut p = LandscapeEvolutionParams::default();
+        p.uplift = 0.0;
+        assert!(
+            p.uplift_rate > 0.0,
+            "fixture must exercise the legacy alias"
+        );
+        assert_eq!(p.peak_uplift_rate(), 0.0);
     }
 }

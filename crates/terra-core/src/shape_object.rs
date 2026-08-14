@@ -3,7 +3,7 @@
 use crate::authoring::{
     SculptPoint, TerrainConstraint, TerrainConstraintKind, TerrainConstraintParams,
 };
-use crate::layer::LayerId;
+use crate::ids::LayerId;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 

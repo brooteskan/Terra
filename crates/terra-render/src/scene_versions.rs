@@ -174,12 +174,13 @@ impl CameraSnapshot {
             .abs()
             .max((self.pitch - prev.pitch).abs());
         let fov = (self.fov_y - prev.fov_y).abs();
-        let near_rel = ((self.near - prev.near).abs() / prev.near.max(1e-3)).max(
-            (self.far - prev.far).abs() / prev.far.max(1e-3),
-        );
+        let near_rel = ((self.near - prev.near).abs() / prev.near.max(1e-3))
+            .max((self.far - prev.far).abs() / prev.far.max(1e-3));
         let aspect = (self.aspect - prev.aspect).abs();
 
-        if fov > thresholds.fov_rad || near_rel > thresholds.near_far_rel || aspect > thresholds.aspect_abs
+        if fov > thresholds.fov_rad
+            || near_rel > thresholds.near_far_rel
+            || aspect > thresholds.aspect_abs
         {
             return Some(InvalidationReason::ProjectionChanged);
         }
@@ -251,7 +252,11 @@ impl SceneVersionRegistry {
     }
 
     /// Compare camera against last snapshot; notify if changed beyond thresholds.
-    pub fn update_camera(&mut self, camera: &OrbitCamera, aspect: f32) -> Option<InvalidationReason> {
+    pub fn update_camera(
+        &mut self,
+        camera: &OrbitCamera,
+        aspect: f32,
+    ) -> Option<InvalidationReason> {
         let snap = CameraSnapshot::from_camera(camera, aspect);
         let reason = snap.detect_change(self.last_camera, &self.camera_thresholds);
         self.last_camera = Some(snap);
@@ -273,7 +278,9 @@ mod tests {
         let mut b = a;
         b.eye.x += 0.001;
         b.target.x += 0.001;
-        assert!(b.detect_change(Some(a), &CameraChangeThresholds::default()).is_none());
+        assert!(b
+            .detect_change(Some(a), &CameraChangeThresholds::default())
+            .is_none());
     }
 
     #[test]

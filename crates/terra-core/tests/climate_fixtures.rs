@@ -3,7 +3,7 @@
 
 use terra_core::climate::{apply_root_cohesion, bake_climate};
 use terra_core::heightfield::{Heightfield, HeightfieldMetrics};
-use terra_core::layer::{BiomesParams, ClimateParams};
+use terra_core::layer::{BiomesParams, ClimateParams, OPEN_HEIGHT_MAX, OPEN_HEIGHT_MIN};
 use terra_core::mask::MaskField;
 use terra_core::surface::bake_biomes_climate;
 
@@ -178,4 +178,30 @@ fn legacy_height_bands_still_work() {
     let coast = (maps.biomes.get(0, 0) * 16.0).round() as u32;
     assert_eq!(alpine, 1);
     assert_eq!(coast, 3);
+}
+
+#[test]
+fn finite_open_biome_bounds_match_infinite_reference_at_supported_extremes() {
+    let finite = BiomesParams::height_bands();
+    let mut infinite = finite.clone();
+    for band in &mut infinite.bands {
+        if band.min_height == OPEN_HEIGHT_MIN {
+            band.min_height = f32::NEG_INFINITY;
+        }
+        if band.max_height == OPEN_HEIGHT_MAX {
+            band.max_height = f32::INFINITY;
+        }
+    }
+
+    for height in [-200_000.0, 0.0, 200_000.0] {
+        let metrics = HeightfieldMetrics::new(4, 4, 4.0, 4.0);
+        let hf = Heightfield::filled(metrics, height);
+        let finite_maps = bake_biomes_climate(&hf, &finite, None, None);
+        let infinite_maps = bake_biomes_climate(&hf, &infinite, None, None);
+        assert_eq!(
+            finite_maps.biomes.data(),
+            infinite_maps.biomes.data(),
+            "height={height}"
+        );
+    }
 }

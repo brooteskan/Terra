@@ -3,23 +3,23 @@
 //! Presentation adapts emphasis to the active workspace. Artist concept folders
 //! and Advanced Placement are presentation-only.
 
+use crate::ui::actions::PanelAction;
 use crate::ui::hierarchy_view::{
     self, advanced_placement_id, biome_section_artist_label, biome_summary_meta,
     concept_for_category, concept_for_top_level, concept_row_id, mask_stack_row_id,
     sim_status_label, world_rule_entity_meta, world_rules_meta, ArtistConcept, TERRAIN_ROOT,
     TERRAIN_SCOPE_KEY,
 };
-use crate::ui::actions::PanelAction;
+use crate::ui::style::{
+    self, FONT_SCALE, LAYER_ROW_H, LAYER_ROW_H_COMPACT, LAYER_THUMB_SZ, PAD, TYPE_BODY,
+    TYPE_CAPTION, TYPE_LABEL,
+};
 use crate::ui::thumbnails::ThumbnailCache;
 use crate::ui::{EditorTool, UiState, WorkspaceId};
 use terra_core::document::TerrainDocument;
 use terra_core::domain::DomainRole;
 use terra_core::layer::{BlendMode, LayerId, LayerKind, LayerStack, StackNode};
 use terra_core::mask::MaskId;
-use crate::ui::style::{
-    self, FONT_SCALE, LAYER_ROW_H, LAYER_ROW_H_COMPACT, LAYER_THUMB_SZ, PAD, TYPE_BODY,
-    TYPE_CAPTION, TYPE_LABEL,
-};
 use terra_gui::{icon_button, Color, DrawList, GuiContext, Icon, Id, Rect};
 
 // —— Layout constants ————————————————————————————————————————————————
@@ -85,7 +85,6 @@ pub(crate) fn blend_mode_at(idx: usize) -> BlendMode {
     BLEND_MODES[idx.min(BLEND_MODES.len() - 1)]
 }
 
-
 /// Drag source for layer reorder / nest.
 #[derive(Debug, Clone)]
 pub struct LayerDragSource {
@@ -136,7 +135,6 @@ impl LayerPresentationState {
             self.collapsed_groups.push(id);
         }
     }
-
 }
 
 #[derive(Debug)]
@@ -282,10 +280,7 @@ fn row_can_collapse(role: TreeRole) -> bool {
 
 #[inline]
 fn row_name_toggles_collapse(role: TreeRole) -> bool {
-    matches!(
-        role,
-        TreeRole::BiomeSection | TreeRole::ConceptFolder
-    )
+    matches!(role, TreeRole::BiomeSection | TreeRole::ConceptFolder)
 }
 
 fn collapse_widget_id(role: TreeRole, id: LayerId) -> Id {
@@ -374,12 +369,7 @@ pub fn draw_layers_gui(
         .is_some_and(|l| l.kind.is_sculpt_base());
 
     // —— Footer ————————————————————————————————————————————————
-    let footer = Rect::from_pos_size(
-        panel.min_x,
-        panel.max_y - FOOTER_H,
-        panel.width(),
-        FOOTER_H,
-    );
+    let footer = Rect::from_pos_size(panel.min_x, panel.max_y - FOOTER_H, panel.width(), FOOTER_H);
     ui.panel(footer, style::SURFACE);
     ui.panel(
         Rect::from_pos_size(footer.min_x, footer.min_y, footer.width(), 1.0),
@@ -455,7 +445,11 @@ pub fn draw_layers_gui(
     };
     ui.label_at(
         filter_hit.min_x,
-        label_y(filter_hit.min_y, filter_hit.height(), FONT_SCALE * TYPE_CAPTION),
+        label_y(
+            filter_hit.min_y,
+            filter_hit.height(),
+            FONT_SCALE * TYPE_CAPTION,
+        ),
         filter_label,
         if state.presentation.show_only_relevant {
             style::ACCENT
@@ -503,10 +497,7 @@ pub fn draw_layers_gui(
         .map(|mut row| {
             let dimmed = row_dimmed_for_workspace(ui_state, &row);
             let h = ui_state.workspace_def().hierarchy;
-            if h.dim_unrelated
-                && !dimmed
-                && !matches!(row.role, TreeRole::SectionLabel)
-            {
+            if h.dim_unrelated && !dimmed && !matches!(row.role, TreeRole::SectionLabel) {
                 row.focus_highlight = true;
                 if matches!(row.role, TreeRole::ConceptFolder) {
                     row.workspace_badge = "Focus".into();
@@ -528,11 +519,10 @@ pub fn draw_layers_gui(
             TreeRole::MaskStack | TreeRole::AdvancedSection => {
                 doc.selected == Some(row_selection_id(&row_data))
             }
-            TreeRole::MaskAsset => {
-                ui_state.selected_mask == Some(MaskId(row_data.id.0))
-            }
+            TreeRole::MaskAsset => ui_state.selected_mask == Some(MaskId(row_data.id.0)),
             TreeRole::WorldRuleEntity => {
-                doc.world_rules.selected == Some(terra_core::world_rules::WorldRuleId(row_data.id.0))
+                doc.world_rules.selected
+                    == Some(terra_core::world_rules::WorldRuleId(row_data.id.0))
             }
             TreeRole::SimulationScenarioEntity => {
                 doc.simulation_scenarios.selected
@@ -558,7 +548,10 @@ pub fn draw_layers_gui(
                 | TreeRole::WorldRuleEntity
                 | TreeRole::SimulationScenarioEntity
         );
-        let dragging_this = state.drag_from.as_ref().is_some_and(|d| d.id == row_data.id);
+        let dragging_this = state
+            .drag_from
+            .as_ref()
+            .is_some_and(|d| d.id == row_data.id);
         let subtitle = row_list_subtitle(&row_data, is_section, is_plain_header);
         let has_subtitle = !subtitle.is_empty();
         let row_h = if is_section {
@@ -589,11 +582,8 @@ pub fn draw_layers_gui(
         } else if selected
             && matches!(
                 row_data.role,
-                TreeRole::Layer
-                    | TreeRole::Foundation
-                    | TreeRole::Group
-                    | TreeRole::Biome
-                )
+                TreeRole::Layer | TreeRole::Foundation | TreeRole::Group | TreeRole::Biome
+            )
         {
             ui.panel_rounded(row, style::SELECTED_BG, style::RADIUS_SM);
             ui.panel(
@@ -641,7 +631,10 @@ pub fn draw_layers_gui(
                     });
                 }
             }
-            let grip_active = state.drag_from.as_ref().is_some_and(|d| d.id == row_data.id);
+            let grip_active = state
+                .drag_from
+                .as_ref()
+                .is_some_and(|d| d.id == row_data.id);
             ui.icon_at(
                 grip.min_x + (GRIP_COL - 12.0) * 0.5,
                 grip.min_y + (row_h - 12.0) * 0.5,
@@ -719,18 +712,9 @@ pub fn draw_layers_gui(
                         );
                     }
                 } else if let Some(moving) = src_id {
-                    let nest_into = drop_should_nest_into(
-                        doc,
-                        moving,
-                        row_data.id,
-                        row_data.role,
-                        nest_zone,
-                    );
-                    let place_before_visual = if nest_into {
-                        false
-                    } else {
-                        rel_y < 0.5
-                    };
+                    let nest_into =
+                        drop_should_nest_into(doc, moving, row_data.id, row_data.role, nest_zone);
+                    let place_before_visual = if nest_into { false } else { rel_y < 0.5 };
                     // Shape / Mask / Sim folders render bottom→top of the stack.
                     let place_before = if row_data.list_reversed && !nest_into {
                         !place_before_visual
@@ -785,12 +769,7 @@ pub fn draw_layers_gui(
                 icon_size,
                 icon_size,
             );
-            if show_thumbs
-                && matches!(
-                    row_data.role,
-                    TreeRole::Layer | TreeRole::Foundation
-                )
-            {
+            if show_thumbs && matches!(row_data.role, TreeRole::Layer | TreeRole::Foundation) {
                 let thumb = state.thumbnails.request_or_get(row_data.id);
                 ui.image(icon_r, thumb.width, thumb.height, &thumb.rgba);
                 if !row_data.enabled {
@@ -803,8 +782,10 @@ pub fn draw_layers_gui(
             } else if matches!(row_data.role, TreeRole::Layer | TreeRole::Foundation) {
                 ui.panel_rounded(icon_r, style::SURFACE, style::RADIUS_SM);
             }
-            if matches!(row_data.role, TreeRole::Layer | TreeRole::Foundation | TreeRole::Group | TreeRole::Biome)
-            {
+            if matches!(
+                row_data.role,
+                TreeRole::Layer | TreeRole::Foundation | TreeRole::Group | TreeRole::Biome
+            ) {
                 let status = layer_status_color(&row_data);
                 ui.panel_rounded(
                     Rect::from_pos_size(icon_r.max_x - 7.0, icon_r.max_y - 7.0, 5.0, 5.0),
@@ -818,8 +799,7 @@ pub fn draw_layers_gui(
                 16.0
             };
             if glyph > 0.0
-                && !(show_thumbs
-                    && matches!(row_data.role, TreeRole::Layer | TreeRole::Foundation))
+                && !(show_thumbs && matches!(row_data.role, TreeRole::Layer | TreeRole::Foundation))
             {
                 ui.icon_at(
                     icon_r.min_x + (icon_size - glyph) * 0.5,
@@ -913,10 +893,7 @@ pub fn draw_layers_gui(
         // Region / layer visibility.
         let show_eye = matches!(
             row_data.role,
-            TreeRole::Foundation
-                | TreeRole::Layer
-                | TreeRole::Biome
-                | TreeRole::Group
+            TreeRole::Foundation | TreeRole::Layer | TreeRole::Biome | TreeRole::Group
         ) && !row_data.is_base;
         if show_eye {
             rx -= CTRL_SLOT;
@@ -1079,8 +1056,10 @@ pub fn draw_layers_gui(
         if hit_hov && ui.input.primary_pressed {
             ui.state.active = Some(name_id);
         }
-        let name_clicked =
-            !collapse_toggled && ui.input.primary_released && ui.state.is_active(name_id) && hit_hov;
+        let name_clicked = !collapse_toggled
+            && ui.input.primary_released
+            && ui.state.is_active(name_id)
+            && hit_hov;
         if name_clicked {
             if row_name_toggles_collapse(row_data.role) {
                 toggle_row_collapse(state, row_data.role, row_data.id);
@@ -1237,11 +1216,7 @@ pub fn draw_layers_gui(
                 let block_h = name_h + 2.0 + sub_h;
                 let block_y = row.min_y + (row_h - block_h) * 0.5;
                 ui.label_at(label_x, block_y, &clipped, name_color, name_scale);
-                let sub_clipped = DrawList::truncate_to_width(
-                    subtitle,
-                    sub_scale,
-                    name_max_w,
-                );
+                let sub_clipped = DrawList::truncate_to_width(subtitle, sub_scale, name_max_w);
                 ui.label_at(
                     label_x,
                     block_y + name_h + 2.0,
@@ -1279,10 +1254,12 @@ pub fn draw_layers_gui(
             )
         {
             if let Some((px, py)) = ui.input.pointer {
-                if can_rename || matches!(
-                    row_data.role,
-                    TreeRole::Layer | TreeRole::Foundation | TreeRole::Group | TreeRole::Biome
-                ) {
+                if can_rename
+                    || matches!(
+                        row_data.role,
+                        TreeRole::Layer | TreeRole::Foundation | TreeRole::Group | TreeRole::Biome
+                    )
+                {
                     actions.push(PanelAction::Select(row_data.id));
                     if matches!(row_data.role, TreeRole::Biome) {
                         actions.push(PanelAction::SetActiveBiome(row_data.id));
@@ -1364,7 +1341,12 @@ fn draw_layer_drag_ghost(ui: &mut GuiContext<'_>, state: &LayersGuiState) {
     ui.begin_overlay();
     // Soft shadow under the floating card.
     ui.panel_rounded(
-        Rect::from_pos_size(ghost.min_x + 2.0, ghost.min_y + 3.0, ghost.width(), ghost.height()),
+        Rect::from_pos_size(
+            ghost.min_x + 2.0,
+            ghost.min_y + 3.0,
+            ghost.width(),
+            ghost.height(),
+        ),
         Color::rgba(0.0, 0.0, 0.0, 0.35),
         style::RADIUS_SM,
     );
@@ -1380,11 +1362,8 @@ fn draw_layer_drag_ghost(ui: &mut GuiContext<'_>, state: &LayersGuiState) {
         style::TEXT,
         16.0,
     );
-    let label = DrawList::truncate_to_width(
-        &drag.name,
-        FONT_SCALE * TYPE_BODY,
-        ghost.width() - 44.0,
-    );
+    let label =
+        DrawList::truncate_to_width(&drag.name, FONT_SCALE * TYPE_BODY, ghost.width() - 44.0);
     ui.label_at(
         ghost.min_x + 34.0,
         label_y(ghost.min_y, ghost_h, FONT_SCALE * TYPE_BODY),
@@ -1722,11 +1701,7 @@ fn emit_concept_stack(
     }
 }
 
-fn emit_biome_layer_rows(
-    doc: &TerrainDocument,
-    depth: u8,
-    out: &mut Vec<LayerRow>,
-) {
+fn emit_biome_layer_rows(doc: &TerrainDocument, depth: u8, out: &mut Vec<LayerRow>) {
     for layer in &doc.biome_layers {
         let mut row = blank_row(
             LayerId(layer.id.0),
@@ -1744,11 +1719,7 @@ fn emit_biome_layer_rows(
     }
 }
 
-fn emit_mask_asset_rows(
-    doc: &TerrainDocument,
-    depth: u8,
-    out: &mut Vec<LayerRow>,
-) {
+fn emit_mask_asset_rows(doc: &TerrainDocument, depth: u8, out: &mut Vec<LayerRow>) {
     for asset in &doc.masks {
         let mut row = blank_row(
             LayerId(asset.id.0),
@@ -1886,11 +1857,9 @@ fn walk_node_flat(
             out.push(row);
         }
         StackNode::Group(g) => {
-            let is_category = matches!(
-                g.group_kind,
-                terra_core::layer::GroupKind::CategoryFolder
-            ) || (matches!(g.group_kind, terra_core::layer::GroupKind::Generic)
-                && g.category.is_some());
+            let is_category = matches!(g.group_kind, terra_core::layer::GroupKind::CategoryFolder)
+                || (matches!(g.group_kind, terra_core::layer::GroupKind::Generic)
+                    && g.category.is_some());
 
             if is_category {
                 for ci in (0..g.children.len()).rev() {
@@ -2384,11 +2353,16 @@ fn draw_layer_context_menu(
             ("cache", "Toggle Cache"),
         ]);
     }
-    if is_mask || group.is_some_and(|g| !g.is_biome() && !matches!(
-        g.group_kind,
-        terra_core::layer::GroupKind::BiomeSection(_)
-            | terra_core::layer::GroupKind::CategoryFolder
-    )) {
+    if is_mask
+        || group.is_some_and(|g| {
+            !g.is_biome()
+                && !matches!(
+                    g.group_kind,
+                    terra_core::layer::GroupKind::BiomeSection(_)
+                        | terra_core::layer::GroupKind::CategoryFolder
+                )
+        })
+    {
         if !items.iter().any(|(k, _)| *k == "del") {
             items.push(("del", "Delete"));
         }
@@ -2738,7 +2712,8 @@ mod hierarchy_tests {
             "WC terrain folder order: {concepts:?}"
         );
         assert!(
-            rows.iter().any(|r| r.name == "Terrain" && r.role == TreeRole::SectionLabel),
+            rows.iter()
+                .any(|r| r.name == "Terrain" && r.role == TreeRole::SectionLabel),
             "Terrain root required"
         );
     }
@@ -2758,10 +2733,7 @@ mod hierarchy_tests {
             if row.depth <= depth {
                 break;
             }
-            if matches!(
-                row.role,
-                TreeRole::AdvancedSection | TreeRole::BiomeSection
-            ) {
+            if matches!(row.role, TreeRole::AdvancedSection | TreeRole::BiomeSection) {
                 names.push(row.name.as_str());
             }
         }
@@ -2827,7 +2799,9 @@ mod hierarchy_tests {
         assert_eq!(a, b);
         let snap = hierarchy_presentation_snapshot(&doc, &state);
         assert!(!a.is_empty());
-        assert!(snap.iter().any(|r| r.2 == "layer" || r.2 == "biome" || r.2 == "concept"));
+        assert!(snap
+            .iter()
+            .any(|r| r.2 == "layer" || r.2 == "biome" || r.2 == "concept"));
     }
 
     #[test]
@@ -2865,8 +2839,7 @@ mod hierarchy_tests {
         let mut state = default_state();
         let rows = collect_rows(&doc, &state, &[]);
         let Some(dim_row) = rows.iter().find(|r| {
-            row_dimmed_for_workspace(&ui, r)
-                && !matches!(r.role, TreeRole::SectionLabel)
+            row_dimmed_for_workspace(&ui, r) && !matches!(r.role, TreeRole::SectionLabel)
         }) else {
             // Default doc may have only shape-relevant rows in Sculpt — still ok.
             return;
@@ -2918,7 +2891,9 @@ mod hierarchy_tests {
             .collect();
         // Default world usually has Shape and/or Biomes under a region.
         assert!(
-            concepts.iter().any(|c| *c == "Shape Layers" || *c == "Biomes"),
+            concepts
+                .iter()
+                .any(|c| *c == "Shape Layers" || *c == "Biomes"),
             "concepts={concepts:?}"
         );
     }
@@ -2956,10 +2931,7 @@ mod hierarchy_tests {
 
     #[test]
     fn domain_ownership_rejects_shape_under_biome_masks() {
-        let err = DomainView::validate_ownership(
-            DomainRole::ShapeLayer,
-            DomainParent::BiomeMasks,
-        );
+        let err = DomainView::validate_ownership(DomainRole::ShapeLayer, DomainParent::BiomeMasks);
         assert!(err.is_err());
     }
 
@@ -3033,4 +3005,3 @@ mod hierarchy_tests {
         );
     }
 }
-

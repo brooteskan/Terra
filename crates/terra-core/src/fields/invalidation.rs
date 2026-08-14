@@ -29,7 +29,10 @@ pub fn fields_invalidated_by(changed: &FieldId) -> Vec<FieldId> {
                 FieldId::SoilMoisture,
             ]
         }
-        FieldId::Hardness | FieldId::Lithology | FieldId::Erodibility | FieldId::StrataMaterialId => {
+        FieldId::Hardness
+        | FieldId::Lithology
+        | FieldId::Erodibility
+        | FieldId::StrataMaterialId => {
             vec![
                 FieldId::ErosionRate,
                 FieldId::DepositionRate,

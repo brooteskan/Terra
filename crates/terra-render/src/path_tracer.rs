@@ -105,7 +105,12 @@ fn clear_texture_zeros(
     );
 }
 
-fn create_outputs(device: &wgpu::Device, queue: &wgpu::Queue, width: u32, height: u32) -> OutputTextures {
+fn create_outputs(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    width: u32,
+    height: u32,
+) -> OutputTextures {
     let (r0, rv0) = make_storage_view(
         device,
         "path-radiance-0",
@@ -438,7 +443,9 @@ impl PathTracer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
-                    resource: wgpu::BindingResource::TextureView(&self.outputs.radiance_view[write]),
+                    resource: wgpu::BindingResource::TextureView(
+                        &self.outputs.radiance_view[write],
+                    ),
                 },
                 wgpu::BindGroupEntry {
                     binding: 5,

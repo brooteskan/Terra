@@ -3,7 +3,7 @@
 use super::geom::{dist_point_segment, point_in_polygon};
 use super::{MaskCombine, MaskField, MaskId, MaskRef};
 use crate::heightfield::{Heightfield, HeightfieldMetrics};
-use crate::layer::WorleyMetric;
+use crate::noise::WorleyMetric;
 use crate::noise::{perlin2, worley2};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;

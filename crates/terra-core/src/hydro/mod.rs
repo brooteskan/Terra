@@ -1,441 +1,36 @@
-//! Flow routing, watersheds, river carving, and stream-power incision.
+//! River carving and stream-power incision oracles.
 //!
-//! Phase 2 geomorphology primitives (depression handling, FlowGraph, Strahler
-//! streams, multi-scale derivatives) live in [`crate::geomorph`]. This module
-//! keeps the SPE / river-carve oracles and the historical free functions used by
-//! processors.
+//! Flow routing (D8 / D∞), accumulation, depression handling, watersheds, and
+//! Strahler streams live in [`crate::geomorph`]. This module keeps the CPU
+//! stream-power / river-carve oracles used by the erosion processors; their
+//! drainage prep builds on the geomorph [`crate::geomorph::FlowGraph`].
 
-use std::cmp::Ordering;
-use std::collections::{BinaryHeap, VecDeque};
+use std::collections::VecDeque;
 
 use crate::fields::erodibility_at_strata_depth;
+use crate::geomorph::{
+    accumulate_drainage_area, accumulate_drainage_area_d8, build_flow_graph, priority_flood_fill,
+    D8Drainage, FlowModel, Precipitation,
+};
 use crate::heightfield::Heightfield;
 use crate::layer::{RiverCarveParams, Stratum, StreamPowerParams};
 use crate::mask::MaskField;
 
-/// Sentinel used by D8 routing for a cell without a downhill neighbor.
-pub const NO_FLOW: u8 = u8::MAX;
-
-#[derive(Clone, Copy)]
-struct FloodCell {
-    height: f32,
-    index: usize,
-}
-
-impl PartialEq for FloodCell {
-    fn eq(&self, other: &Self) -> bool {
-        self.index == other.index && self.height.to_bits() == other.height.to_bits()
-    }
-}
-
-impl Eq for FloodCell {}
-
-impl PartialOrd for FloodCell {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for FloodCell {
-    fn cmp(&self, other: &Self) -> Ordering {
-        // Reverse the comparison so BinaryHeap acts as a min-heap by elevation.
-        other
-            .height
-            .total_cmp(&self.height)
-            .then_with(|| other.index.cmp(&self.index))
-    }
-}
-
-#[derive(Clone, Copy)]
-pub struct FlowDir {
-    di: i32,
-    dj: i32,
-    fraction: f32,
-}
-
 /// Fill enclosed depressions to their lowest spill elevation using Priority-Flood.
 ///
-/// Boundary cells are preserved as drainage outlets; every interior pit is raised
-/// only enough to connect to one of those outlets.
+/// Delegates to [`crate::geomorph::priority_flood_fill`]: boundary cells are
+/// preserved as drainage outlets and every interior pit is raised only enough to
+/// connect to one of them.
 pub fn fill_depressions(hf: &Heightfield) -> Heightfield {
-    let w = hf.metrics.width as usize;
-    let h = hf.metrics.height as usize;
-    if w == 0 || h == 0 {
-        return hf.clone();
-    }
-
-    let mut out = hf.clone();
-    let mut visited = vec![false; w * h];
-    let mut queue = BinaryHeap::new();
-
-    for j in 0..h {
-        for i in 0..w {
-            if i != 0 && j != 0 && i + 1 != w && j + 1 != h {
-                continue;
-            }
-            let index = j * w + i;
-            if visited[index] {
-                continue;
-            }
-            visited[index] = true;
-            queue.push(FloodCell {
-                height: hf.get(i as u32, j as u32),
-                index,
-            });
-        }
-    }
-
-    while let Some(cell) = queue.pop() {
-        let i = cell.index % w;
-        let j = cell.index / w;
-        for dj in -1i32..=1 {
-            for di in -1i32..=1 {
-                if di == 0 && dj == 0 {
-                    continue;
-                }
-                let ni = i as i32 + di;
-                let nj = j as i32 + dj;
-                if ni < 0 || nj < 0 || ni >= w as i32 || nj >= h as i32 {
-                    continue;
-                }
-                let nindex = nj as usize * w + ni as usize;
-                if visited[nindex] {
-                    continue;
-                }
-
-                visited[nindex] = true;
-                let filled_height = hf.get(ni as u32, nj as u32).max(cell.height);
-                out.set(ni as u32, nj as u32, filled_height);
-                queue.push(FloodCell {
-                    height: filled_height,
-                    index: nindex,
-                });
-            }
-        }
-    }
-
-    out
+    priority_flood_fill(hf)
 }
 
-/// D8 flow direction (steepest descent). No downhill neighbor is `NO_FLOW`.
-pub fn flow_direction_d8(hf: &Heightfield) -> (Vec<u8>, MaskField) {
-    let w = hf.metrics.width as usize;
-    let h = hf.metrics.height as usize;
-    let mut dirs = vec![0u8; w * h];
-    let mut mask = MaskField::zeros(hf.metrics);
-    let offsets: [(i32, i32); 8] = [
-        (1, 0),
-        (1, 1),
-        (0, 1),
-        (-1, 1),
-        (-1, 0),
-        (-1, -1),
-        (0, -1),
-        (1, -1),
-    ];
-    for j in 0..h {
-        for i in 0..w {
-            let h0 = hf.get(i as u32, j as u32);
-            let mut best = NO_FLOW;
-            let mut best_s = 0.0f32;
-            for (k, &(di, dj)) in offsets.iter().enumerate() {
-                let ni = i as i32 + di;
-                let nj = j as i32 + dj;
-                if ni < 0 || nj < 0 || ni >= w as i32 || nj >= h as i32 {
-                    continue;
-                }
-                let dist = if di != 0 && dj != 0 {
-                    std::f32::consts::SQRT_2
-                } else {
-                    1.0
-                };
-                let slope = (h0 - hf.get(ni as u32, nj as u32)) / dist;
-                if slope > best_s {
-                    best_s = slope;
-                    best = k as u8;
-                }
-            }
-            dirs[j * w + i] = best;
-            mask.set(
-                i as u32,
-                j as u32,
-                if best == NO_FLOW {
-                    -1.0
-                } else {
-                    best as f32 / 7.0
-                },
-            );
-        }
-    }
-    (dirs, mask)
-}
-
-/// D∞ (Tarboton): partition flow between two steepest downhill neighbors.
-pub fn flow_direction_dinfinity(hf: &Heightfield) -> Vec<Vec<FlowDir>> {
-    let w = hf.metrics.width as usize;
-    let h = hf.metrics.height as usize;
-    let mut out = vec![Vec::new(); w * h];
-    let offsets: [(i32, i32); 8] = [
-        (1, 0),
-        (1, 1),
-        (0, 1),
-        (-1, 1),
-        (-1, 0),
-        (-1, -1),
-        (0, -1),
-        (1, -1),
-    ];
-    let dx = hf.metrics.dx();
-    let dz = hf.metrics.dz();
-
-    for j in 0..h {
-        for i in 0..w {
-            let h0 = hf.get(i as u32, j as u32);
-            let mut best_slope = 0.0f32;
-            let mut best_dirs = Vec::new();
-
-            // Tarboton D-infinity evaluates the plane on each triangular facet
-            // formed by adjacent D8 neighbours. The downslope vector is routed
-            // only to the two cells bounding the winning facet.
-            for facet in 0..8 {
-                let (di1, dj1) = offsets[facet];
-                let (di2, dj2) = offsets[(facet + 1) % 8];
-                let ni1 = i as i32 + di1;
-                let nj1 = j as i32 + dj1;
-                let ni2 = i as i32 + di2;
-                let nj2 = j as i32 + dj2;
-                if ni1 < 0
-                    || nj1 < 0
-                    || ni2 < 0
-                    || nj2 < 0
-                    || ni1 >= w as i32
-                    || nj1 >= h as i32
-                    || ni2 >= w as i32
-                    || nj2 >= h as i32
-                {
-                    continue;
-                }
-
-                let v1 = (di1 as f32 * dx, dj1 as f32 * dz);
-                let v2 = (di2 as f32 * dx, dj2 as f32 * dz);
-                let z1 = hf.get(ni1 as u32, nj1 as u32) - h0;
-                let z2 = hf.get(ni2 as u32, nj2 as u32) - h0;
-                let drop1 = -z1;
-                let drop2 = -z2;
-                let det = v1.0 * v2.1 - v1.1 * v2.0;
-                if det.abs() <= f32::EPSILON {
-                    continue;
-                }
-
-                let gx = (z1 * v2.1 - z2 * v1.1) / det;
-                let gz = (v1.0 * z2 - v2.0 * z1) / det;
-                let downhill = (-gx, -gz);
-                let c1 = (downhill.0 * v2.1 - downhill.1 * v2.0) / det;
-                let c2 = (v1.0 * downhill.1 - v1.1 * downhill.0) / det;
-                let mut facet_dirs = Vec::new();
-                let mut facet_slope = 0.0;
-
-                if c1 >= -1e-6 && c2 >= -1e-6 {
-                    let mut weight1 = c1.max(0.0) * v1.0.hypot(v1.1);
-                    let mut weight2 = c2.max(0.0) * v2.0.hypot(v2.1);
-                    if drop1 <= 0.0 {
-                        weight1 = 0.0;
-                    }
-                    if drop2 <= 0.0 {
-                        weight2 = 0.0;
-                    }
-                    let total = weight1 + weight2;
-                    if total > f32::EPSILON {
-                        facet_slope = downhill.0.hypot(downhill.1);
-                        if weight1 > 0.0 {
-                            facet_dirs.push(FlowDir {
-                                di: di1,
-                                dj: dj1,
-                                fraction: weight1 / total,
-                            });
-                        }
-                        if weight2 > 0.0 {
-                            facet_dirs.push(FlowDir {
-                                di: di2,
-                                dj: dj2,
-                                fraction: weight2 / total,
-                            });
-                        }
-                    }
-                }
-
-                // If the facet gradient falls outside its angular wedge, clamp
-                // to the steeper bounding edge, as in the Tarboton construction.
-                if facet_dirs.is_empty() {
-                    let slope1 = (drop1 / v1.0.hypot(v1.1)).max(0.0);
-                    let slope2 = (drop2 / v2.0.hypot(v2.1)).max(0.0);
-                    if slope1 > 0.0 || slope2 > 0.0 {
-                        if slope1 >= slope2 {
-                            facet_slope = slope1;
-                            facet_dirs.push(FlowDir {
-                                di: di1,
-                                dj: dj1,
-                                fraction: 1.0,
-                            });
-                        } else {
-                            facet_slope = slope2;
-                            facet_dirs.push(FlowDir {
-                                di: di2,
-                                dj: dj2,
-                                fraction: 1.0,
-                            });
-                        }
-                    }
-                }
-
-                if facet_slope > best_slope {
-                    best_slope = facet_slope;
-                    best_dirs = facet_dirs;
-                }
-            }
-            out[j * w + i] = best_dirs;
-        }
-    }
-    out
-}
-
-pub fn flow_accumulation_d8(hf: &Heightfield, dirs: &[u8]) -> Vec<f32> {
-    let w = hf.metrics.width as usize;
-    let h = hf.metrics.height as usize;
-    let mut acc = vec![1.0f32; w * h];
-    let offsets: [(i32, i32); 8] = [
-        (1, 0),
-        (1, 1),
-        (0, 1),
-        (-1, 1),
-        (-1, 0),
-        (-1, -1),
-        (0, -1),
-        (1, -1),
-    ];
-    // Process cells high→low
-    let mut order: Vec<(u32, u32, f32)> = Vec::with_capacity(w * h);
-    for j in 0..h as u32 {
-        for i in 0..w as u32 {
-            order.push((i, j, hf.get(i, j)));
-        }
-    }
-    order.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
-    for &(i, j, _) in &order {
-        let idx = j as usize * w + i as usize;
-        let d = dirs[idx] as usize;
-        if d >= offsets.len() {
-            continue;
-        }
-        let (di, dj) = offsets[d];
-        let ni = i as i32 + di;
-        let nj = j as i32 + dj;
-        if ni >= 0 && nj >= 0 && ni < w as i32 && nj < h as i32 {
-            let nidx = nj as usize * w + ni as usize;
-            acc[nidx] += acc[idx];
-        }
-    }
-    acc
-}
-
-pub fn flow_accumulation_dinfinity(hf: &Heightfield, dirs: &[Vec<FlowDir>]) -> Vec<f32> {
-    let w = hf.metrics.width as usize;
-    let h = hf.metrics.height as usize;
-    let mut acc = vec![1.0f32; w * h];
-    let mut order: Vec<(u32, u32, f32)> = Vec::with_capacity(w * h);
-    for j in 0..h as u32 {
-        for i in 0..w as u32 {
-            order.push((i, j, hf.get(i, j)));
-        }
-    }
-    order.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
-    for &(i, j, _) in &order {
-        let idx = j as usize * w + i as usize;
-        for fd in &dirs[idx] {
-            let ni = i as i32 + fd.di;
-            let nj = j as i32 + fd.dj;
-            if ni >= 0 && nj >= 0 && ni < w as i32 && nj < h as i32 {
-                let nidx = nj as usize * w + ni as usize;
-                acc[nidx] += acc[idx] * fd.fraction;
-            }
-        }
-    }
-    acc
-}
-
-/// Simple watershed labels by following flow to sink.
-pub fn watersheds(hf: &Heightfield, dirs: &[u8]) -> Vec<u32> {
-    let w = hf.metrics.width as usize;
-    let h = hf.metrics.height as usize;
-    let offsets: [(i32, i32); 8] = [
-        (1, 0),
-        (1, 1),
-        (0, 1),
-        (-1, 1),
-        (-1, 0),
-        (-1, -1),
-        (0, -1),
-        (1, -1),
-    ];
-    let mut labels = vec![0u32; w * h];
-    let mut next_label = 1u32;
-
-    for j in 0..h {
-        for i in 0..w {
-            let mut path = Vec::new();
-            let mut ci = i as i32;
-            let mut cj = j as i32;
-            let mut guard = 0;
-            loop {
-                let idx = cj as usize * w + ci as usize;
-                if labels[idx] != 0 {
-                    let lab = labels[idx];
-                    for (pi, pj) in path {
-                        labels[pj as usize * w + pi as usize] = lab;
-                    }
-                    break;
-                }
-                path.push((ci, cj));
-                let direction = dirs[idx] as usize;
-                if direction >= offsets.len() {
-                    let lab = next_label;
-                    next_label += 1;
-                    for (pi, pj) in path {
-                        labels[pj as usize * w + pi as usize] = lab;
-                    }
-                    break;
-                }
-                let (di, dj) = offsets[direction];
-                let ni = ci + di;
-                let nj = cj + dj;
-                if ni < 0 || nj < 0 || ni >= w as i32 || nj >= h as i32 || guard > w * h {
-                    let lab = next_label;
-                    next_label += 1;
-                    for (pi, pj) in path {
-                        labels[pj as usize * w + pi as usize] = lab;
-                    }
-                    break;
-                }
-                // Local sink
-                if hf.get(ni as u32, nj as u32) >= hf.get(ci as u32, cj as u32) {
-                    let lab = next_label;
-                    next_label += 1;
-                    for (pi, pj) in path {
-                        labels[pj as usize * w + pi as usize] = lab;
-                    }
-                    break;
-                }
-                ci = ni;
-                cj = nj;
-                guard += 1;
-            }
-        }
-    }
-    labels
-}
-
-/// Strahler-like stream order from accumulation threshold.
-pub fn stream_order(acc: &[f32], w: usize, h: usize, threshold: f32) -> Vec<u32> {
+/// Log2 stream-order bucket for the published `STREAM_ORDER` aux overlay.
+///
+/// This is a visualisation bucketing, `1 + floor(log2(acc / threshold))`, **not**
+/// Horton–Strahler order — see [`crate::geomorph::strahler_order`] for the real
+/// donor-graph ordering carried by `analyze_terrain`'s `StreamNetwork`.
+pub fn stream_order_log2(acc: &[f32], w: usize, h: usize, threshold: f32) -> Vec<u32> {
     let mut order = vec![0u32; w * h];
     for j in 0..h {
         for i in 0..w {
@@ -456,16 +51,14 @@ pub fn carve_rivers(
     let w = input.metrics.width as usize;
     let h = input.metrics.height as usize;
     let filled = fill_depressions(input);
-    let (flow_mask, acc_vec) = if p.use_dinfinity {
-        let dirs = flow_direction_dinfinity(&filled);
-        let acc = flow_accumulation_dinfinity(&filled, &dirs);
-        let (_, fm) = flow_direction_d8(&filled);
-        (fm, acc)
+    let model = if p.use_dinfinity {
+        FlowModel::DInfinity
     } else {
-        let (dirs, fm) = flow_direction_d8(&filled);
-        let acc = flow_accumulation_d8(&filled, &dirs);
-        (fm, acc)
+        FlowModel::D8
     };
+    let graph = build_flow_graph(&filled, model);
+    let flow_mask = graph.direction_mask.clone();
+    let acc_vec = accumulate_drainage_area(&graph, &Precipitation::uniform(1.0));
 
     let boost = p.guide_boost.max(0.0);
     let mut effective = acc_vec.clone();
@@ -559,6 +152,23 @@ const D8_OFFSETS: [(i32, i32); 8] = [
 /// Ridges are local maxima (higher than all 8 neighbors). Distance is a multi-source
 /// BFS in grid steps. This is **not** a full Dendry network authoring pass.
 pub fn ridge_distance_valley_seed(hf: &Heightfield, strength: f32) -> Heightfield {
+    ridge_distance_valley_seed_impl(hf, strength, None)
+}
+
+/// Landscape-evolution variant that never carves elevation-locked cells.
+pub(crate) fn ridge_distance_valley_seed_with_locks(
+    hf: &Heightfield,
+    strength: f32,
+    elevation_locks: &MaskField,
+) -> Heightfield {
+    ridge_distance_valley_seed_impl(hf, strength, Some(elevation_locks))
+}
+
+fn ridge_distance_valley_seed_impl(
+    hf: &Heightfield,
+    strength: f32,
+    elevation_locks: Option<&MaskField>,
+) -> Heightfield {
     if strength <= 1e-6 {
         return hf.clone();
     }
@@ -636,6 +246,12 @@ pub fn ridge_distance_valley_seed(hf: &Heightfield, strength: f32) -> Heightfiel
     let mut out = hf.clone();
     for j in 0..h {
         for i in 0..w {
+            if elevation_locks
+                .map(|locks| locks.get(i as u32, j as u32) > 0.5)
+                .unwrap_or(false)
+            {
+                continue;
+            }
             let d = dist[j * w + i];
             let t = if d == i32::MAX { 1.0 } else { d as f32 / max_d };
             let carve = strength * t * relief * 0.05;
@@ -689,16 +305,60 @@ fn max_local_slope(hf: &Heightfield, i: u32, j: u32) -> f32 {
     best.max(0.0)
 }
 
-/// Stream-power incision with Priority-Flood drainage (CPU oracle).
+/// Per-cell stream-power increment shared by the hydro oracles and the
+/// `landscape_evolution` iterative solver.
+///
+/// `rate = k · q_or_area^m · slope^n · soft`; `step = (rate · dt)` capped first by
+/// `slope_cap` then by `max_step`. Callers pass their own conventions explicitly,
+/// because the same K/m/n vocabulary encodes **different physics per module**:
+///
+/// - `hydro` (this module): `q_or_area` is world-m² drainage area from a
+///   Priority-Flood D8/D∞ accumulation; `slope` is grid-relative (drop per
+///   1 / √2 cells, via `slope_along_d8`); caps `slope * 2.0`, then `50.0`.
+/// - `landscape_evolution::iterative`: `q_or_area` is rain-scaled discharge Q;
+///   `slope` is world-metric (drop per dx/dz metres); caps
+///   `slope * ((dx + dz) / 2) * 4.0`, then `80.0`.
+///
+/// The two K's are therefore not interchangeable — see the notes on
+/// [`crate::layer::StreamPowerParams`] and
+/// [`crate::landscape_evolution::LandscapeEvolutionParams`]. The Tzathas analytical
+/// solver and the mass-wasting fluvial term are separate cited models that do not
+/// route through here; the GPU shader is a declared approximation (station C1).
+///
+/// Returns `(rate, step)`: the un-capped incision rate (for the erosion aux) and
+/// the capped per-step incision depth.
+#[allow(clippy::too_many_arguments)]
+pub fn spe_increment(
+    q_or_area: f32,
+    slope: f32,
+    k: f32,
+    m: f32,
+    n: f32,
+    soft: f32,
+    dt: f32,
+    slope_cap: f32,
+    max_step: f32,
+) -> (f32, f32) {
+    let rate = k * q_or_area.powf(m) * slope.powf(n) * soft;
+    let step = (rate * dt).min(slope_cap).min(max_step);
+    (rate, step)
+}
+
+/// Stream-power incision with Priority-Flood drainage (CPU oracle core).
 ///
 /// Each iteration: optional fill → D8/D∞ accumulation →
 /// \(z \mathrel{-}= K\,A^{m}\,S^{n}\,(1-K_{\mathrm{hard}})\,\Delta t\), then optional uplift.
 /// Interactive Draft may reuse drainage across iters (`drainage_reuse_stride`) and
 /// the GPU path runs an approximate multi-pass D8 solver (no Priority-Flood).
-pub fn stream_power_erode(
+///
+/// `soft_at(i, j, current_height)` yields the per-cell erodibility (1 = fully
+/// soft): constant/mask hardness for the plain oracle, depth-aware strata lookup
+/// for the strata oracle. This is the single incision loop behind both public
+/// entry points ([`stream_power_erode`], [`stream_power_erode_with_strata`]).
+fn stream_power_erode_impl(
     input: &Heightfield,
     p: &StreamPowerParams,
-    hardness: &MaskField,
+    soft_at: impl Fn(u32, u32, f32) -> f32,
 ) -> StreamPowerResult {
     let w = input.metrics.width as usize;
     let h = input.metrics.height as usize;
@@ -720,10 +380,15 @@ pub fn stream_power_erode(
     let mut last_acc = vec![1.0f32; w * h];
     let mut last_flow_mask = MaskField::zeros(input.metrics);
     let mut last_dirs = vec![0u8; w * h];
+    // Reused across D8 refreshes so the drainage graph is not reallocated each
+    // SPE iteration (issue #27): flat receiver + topo arrays in place of the
+    // general graph's per-cell `Vec`s. D∞ still needs the multi-receiver
+    // `FlowGraph`, so it stays on `build_flow_graph` below.
+    let mut d8_cache: Option<D8Drainage> = None;
 
     for iter in 0..iters {
         let refresh_drainage = iter == 0 || p.refill_each_iter || iter % drainage_stride == 0;
-        let (dirs, _flow_mask, acc_vec, route) = if refresh_drainage {
+        let (dirs, acc_vec, route) = if refresh_drainage {
             let filled = if iter == 0 || p.refill_each_iter {
                 fill_depressions(&out)
             } else {
@@ -731,28 +396,30 @@ pub fn stream_power_erode(
                 out.clone()
             };
 
-            let (dirs, flow_mask, acc_vec) = if p.use_dinfinity {
-                let din = flow_direction_dinfinity(&filled);
-                let acc = flow_accumulation_dinfinity(&filled, &din);
-                let (d8, fm) = flow_direction_d8(&filled);
-                (d8, fm, acc)
+            let (dirs, acc_vec, flow_mask) = if p.use_dinfinity {
+                let graph = build_flow_graph(&filled, FlowModel::DInfinity);
+                let acc_vec = accumulate_drainage_area(&graph, &Precipitation::uniform(1.0));
+                (graph.d8_dir.clone(), acc_vec, graph.direction_mask.clone())
             } else {
-                let (d8, fm) = flow_direction_d8(&filled);
-                let acc = flow_accumulation_d8(&filled, &d8);
-                (d8, fm, acc)
+                // Lean flat-D8 path: bit-identical to the general graph (guarded
+                // by `flat_d8_drainage_matches_flow_graph`), reusing buffers.
+                if d8_cache.is_none() {
+                    d8_cache = Some(D8Drainage::build(&filled));
+                } else {
+                    d8_cache.as_mut().unwrap().rebuild(&filled);
+                }
+                let cache = d8_cache.as_ref().unwrap();
+                let acc_vec = accumulate_drainage_area_d8(cache, &Precipitation::uniform(1.0));
+                (cache.d8_dir.clone(), acc_vec, cache.direction_mask.clone())
             };
+
             last_acc = acc_vec.clone();
-            last_flow_mask = flow_mask.clone();
+            last_flow_mask = flow_mask;
             last_dirs = dirs.clone();
-            (dirs, flow_mask, acc_vec, filled)
+            (dirs, acc_vec, filled)
         } else {
             // Cached drainage reuse across SPE iters (Draft preview; export keeps stride=1).
-            (
-                last_dirs.clone(),
-                last_flow_mask.clone(),
-                last_acc.clone(),
-                out.clone(),
-            )
+            (last_dirs.clone(), last_acc.clone(), out.clone())
         };
 
         // Cell area in world units² so K is resolution-aware enough for previews.
@@ -773,11 +440,11 @@ pub fn stream_power_erode(
                     }
                 }
                 .max(1e-6);
-                let soft = (1.0 - hardness.get(i, j).clamp(0.0, 1.0)).max(0.0);
-                let power = k * area.powf(m_exp) * slope.powf(n_exp) * soft * dt;
-                // Cap per-step incision to keep Draft previews stable.
-                let step = power.min(slope * 2.0).min(50.0);
                 let cur = out.get(i, j);
+                let soft = soft_at(i, j, cur);
+                // Cap per-step incision to keep Draft previews stable.
+                let (_rate, step) =
+                    spe_increment(area, slope, k, m_exp, n_exp, soft, dt, slope * 2.0, 50.0);
                 let next = (cur - step + p.uplift_rate).max(base);
                 incision[idx] += (cur - next).max(0.0);
                 out.set(i, j, next);
@@ -793,7 +460,7 @@ pub fn stream_power_erode(
         }
     }
 
-    let order = stream_order(&last_acc, w, h, p.stream_threshold.max(1.0));
+    let order = stream_order_log2(&last_acc, w, h, p.stream_threshold.max(1.0));
     let max_order = order.iter().copied().max().unwrap_or(1).max(1) as f32;
     let mut order_mask = MaskField::zeros(input.metrics);
     for j in 0..h {
@@ -802,12 +469,10 @@ pub fn stream_power_erode(
         }
     }
 
-    let mut incision_mask = MaskField::zeros(input.metrics);
-    for j in 0..h {
-        for i in 0..w {
-            incision_mask.set(i as u32, j as u32, incision[j * w + i]);
-        }
-    }
+    // Incision is a physical depth in metres, not a normalized display mask.
+    // Preserve the raw values so downstream material ledgers can reconcile the
+    // terrain removed by stream power, including cells incised by more than 1 m.
+    let incision_mask = MaskField::from_raw(input.metrics, &incision);
 
     StreamPowerResult {
         height: out,
@@ -818,7 +483,24 @@ pub fn stream_power_erode(
     }
 }
 
+/// Stream-power incision with constant or mask-driven bedrock hardness (CPU oracle).
+///
+/// See [`stream_power_erode_impl`] for the shared algorithm; `hardness` supplies a
+/// per-cell \(K_{\mathrm{hard}} \in [0,1]\) (soft rock incises faster).
+pub fn stream_power_erode(
+    input: &Heightfield,
+    p: &StreamPowerParams,
+    hardness: &MaskField,
+) -> StreamPowerResult {
+    stream_power_erode_impl(input, p, |i, j, _cur| {
+        (1.0 - hardness.get(i, j).clamp(0.0, 1.0)).max(0.0)
+    })
+}
+
 /// SPE with depth-aware strata hardness (soft cap strips before hard base resists).
+///
+/// See [`stream_power_erode_impl`] for the shared algorithm; erodibility is looked
+/// up per cell from `strata` at the depth already incised below `reference`.
 pub fn stream_power_erode_with_strata(
     input: &Heightfield,
     p: &StreamPowerParams,
@@ -826,137 +508,16 @@ pub fn stream_power_erode_with_strata(
     strata: &[Stratum],
     default_hardness: f32,
 ) -> StreamPowerResult {
-    let w = input.metrics.width as usize;
-    let h = input.metrics.height as usize;
-    let mut out = if p.dendritic_seed > 0.0 {
-        ridge_distance_valley_seed(input, p.dendritic_seed)
-    } else {
-        input.clone()
-    };
-
-    let mut incision = vec![0.0f32; w * h];
-    let iters = p.iterations.max(1);
-    let k = p.k.max(0.0);
-    let m_exp = p.m.max(0.0);
-    let n_exp = p.n.max(0.0);
-    let dt = p.dt.max(0.0);
-    let base = p.base_level;
-    let drainage_stride = p.drainage_reuse_stride.max(1);
-
-    let mut last_acc = vec![1.0f32; w * h];
-    let mut last_flow_mask = MaskField::zeros(input.metrics);
-    let mut last_dirs = vec![0u8; w * h];
-
-    for iter in 0..iters {
-        let refresh_drainage = iter == 0 || p.refill_each_iter || iter % drainage_stride == 0;
-        let (dirs, acc_vec, route) = if refresh_drainage {
-            let filled = if iter == 0 || p.refill_each_iter {
-                fill_depressions(&out)
-            } else {
-                out.clone()
-            };
-
-            let (dirs, flow_mask, acc_vec) = if p.use_dinfinity {
-                let din = flow_direction_dinfinity(&filled);
-                let acc = flow_accumulation_dinfinity(&filled, &din);
-                let (d8, fm) = flow_direction_d8(&filled);
-                (d8, fm, acc)
-            } else {
-                let (d8, fm) = flow_direction_d8(&filled);
-                let acc = flow_accumulation_d8(&filled, &d8);
-                (d8, fm, acc)
-            };
-            last_acc = acc_vec.clone();
-            last_flow_mask = flow_mask;
-            last_dirs = dirs.clone();
-            (dirs, acc_vec, filled)
-        } else {
-            (last_dirs.clone(), last_acc.clone(), out.clone())
-        };
-
-        let cell_area = (input.metrics.world_size_x / input.metrics.width.max(1) as f32)
-            * (input.metrics.world_size_z / input.metrics.height.max(1) as f32);
-        let cell_area = cell_area.max(1e-6);
-
-        for j in 0..h as u32 {
-            for i in 0..w as u32 {
-                let idx = j as usize * w + i as usize;
-                let area = (acc_vec[idx] * cell_area).max(cell_area);
-                let slope = {
-                    let s_flow = slope_along_d8(&route, i, j, dirs[idx]);
-                    if s_flow > 1e-8 {
-                        s_flow
-                    } else {
-                        max_local_slope(&route, i, j)
-                    }
-                }
-                .max(1e-6);
-                let cur = out.get(i, j);
-                let depth = (reference.get(i, j) - cur).max(0.0);
-                let soft = erodibility_at_strata_depth(strata, depth, default_hardness);
-                let power = k * area.powf(m_exp) * slope.powf(n_exp) * soft * dt;
-                let step = power.min(slope * 2.0).min(50.0);
-                let next = (cur - step + p.uplift_rate).max(base);
-                incision[idx] += (cur - next).max(0.0);
-                out.set(i, j, next);
-            }
-        }
-    }
-
-    let max_acc = last_acc.iter().cloned().fold(0.0f32, f32::max).max(1.0);
-    let mut acc_mask = MaskField::zeros(input.metrics);
-    for j in 0..h {
-        for i in 0..w {
-            acc_mask.set(i as u32, j as u32, last_acc[j * w + i] / max_acc);
-        }
-    }
-
-    let order = stream_order(&last_acc, w, h, p.stream_threshold.max(1.0));
-    let max_order = order.iter().copied().max().unwrap_or(1).max(1) as f32;
-    let mut order_mask = MaskField::zeros(input.metrics);
-    for j in 0..h {
-        for i in 0..w {
-            order_mask.set(i as u32, j as u32, order[j * w + i] as f32 / max_order);
-        }
-    }
-
-    let mut incision_mask = MaskField::zeros(input.metrics);
-    for j in 0..h {
-        for i in 0..w {
-            incision_mask.set(i as u32, j as u32, incision[j * w + i]);
-        }
-    }
-
-    StreamPowerResult {
-        height: out,
-        flow_direction: last_flow_mask,
-        flow_accumulation: acc_mask,
-        stream_order: order_mask,
-        spe_incision: incision_mask,
-    }
+    stream_power_erode_impl(input, p, |i, j, cur| {
+        let depth = (reference.get(i, j) - cur).max(0.0);
+        erodibility_at_strata_depth(strata, depth, default_hardness)
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::heightfield::HeightfieldMetrics;
-
-    #[test]
-    fn pyramid_flows_outward_down() {
-        let m = HeightfieldMetrics::new(9, 9, 9.0, 9.0);
-        let mut hf = Heightfield::zeros(m);
-        for j in 0..9 {
-            for i in 0..9 {
-                let d = (i as i32 - 4).abs() + (j as i32 - 4).abs();
-                hf.set(i, j, 10.0 - d as f32);
-            }
-        }
-        let (dirs, _) = flow_direction_d8(&hf);
-        let acc = flow_accumulation_d8(&hf, &dirs);
-        // Center should have low accumulation; corners higher paths end lower
-        assert!(acc[0] >= 1.0);
-        assert!(acc.iter().any(|&a| a > 5.0));
-    }
 
     #[test]
     fn fill_depressions_raises_enclosed_pit_to_spill_height() {
@@ -968,19 +529,6 @@ mod tests {
 
         assert_eq!(filled.get(1, 1), 5.0);
         assert_eq!(filled.get(0, 0), 5.0);
-    }
-
-    #[test]
-    fn d8_marks_local_sink_as_no_flow() {
-        let m = HeightfieldMetrics::new(3, 3, 3.0, 3.0);
-        let mut hf = Heightfield::filled(m, 2.0);
-        hf.set(1, 1, 1.0);
-
-        let (dirs, _) = flow_direction_d8(&hf);
-        let acc = flow_accumulation_d8(&hf, &dirs);
-
-        assert_eq!(dirs[4], NO_FLOW);
-        assert_eq!(acc[4], 9.0);
     }
 
     #[test]
@@ -1081,62 +629,5 @@ mod tests {
             after <= before * 0.85 + 1.0,
             "fill volume before={before} after={after}"
         );
-    }
-
-    #[test]
-    fn downhill_flow_single_outlet_sanity() {
-        let m = HeightfieldMetrics::new(9, 9, 90.0, 90.0);
-        let mut hf = Heightfield::zeros(m);
-        for j in 0..9 {
-            for i in 0..9 {
-                hf.set(i, j, 20.0 - j as f32);
-            }
-        }
-        let filled = fill_depressions(&hf);
-        let (dirs, _) = flow_direction_d8(&filled);
-        let acc = flow_accumulation_d8(&filled, &dirs);
-        // Bottom row should collect the most water.
-        let top: f32 = (0..9).map(|i| acc[i]).sum();
-        let bot: f32 = (0..9).map(|i| acc[8 * 9 + i]).sum();
-        assert!(bot > top);
-        // Interior cells should generally flow south (dir index 2 = (0,1)).
-        let south = dirs.iter().filter(|&&d| d == 2).count();
-        assert!(south > 20);
-    }
-
-    #[test]
-    fn dinfinity_routes_within_the_winning_facet() {
-        let m = HeightfieldMetrics::new(5, 5, 5.0, 5.0);
-        let mut hf = Heightfield::zeros(m);
-        for j in 0..5 {
-            for i in 0..5 {
-                hf.set(i, j, 100.0 - i as f32 - 0.5 * j as f32);
-            }
-        }
-
-        let routed = flow_direction_dinfinity(&hf);
-        let center = &routed[2 * 5 + 2];
-        assert_eq!(center.len(), 2);
-        assert!(center.iter().any(|d| (d.di, d.dj) == (1, 0)));
-        assert!(center.iter().any(|d| (d.di, d.dj) == (1, 1)));
-        let total: f32 = center.iter().map(|d| d.fraction).sum();
-        assert!((total - 1.0).abs() < 1e-6);
-        assert!(center.iter().all(|d| d.fraction > 0.0));
-    }
-
-    #[test]
-    fn dinfinity_cardinal_plane_does_not_split_sideways() {
-        let m = HeightfieldMetrics::new(5, 5, 5.0, 5.0);
-        let mut hf = Heightfield::zeros(m);
-        for j in 0..5 {
-            for i in 0..5 {
-                hf.set(i, j, 20.0 - i as f32);
-            }
-        }
-        let routed = flow_direction_dinfinity(&hf);
-        let center = &routed[2 * 5 + 2];
-        assert_eq!(center.len(), 1);
-        assert_eq!((center[0].di, center[0].dj), (1, 0));
-        assert!((center[0].fraction - 1.0).abs() < 1e-6);
     }
 }

@@ -17,7 +17,10 @@ use std::path::{Path, PathBuf};
 const MAGIC: &[u8; 4] = b"TCS1";
 // Bump whenever terrain processors change in a way that makes baked outputs stale.
 // Version 2 invalidates checkpoints produced by the pre-fidelity procedural generators.
-const VERSION: u32 = 2;
+// Version 3 invalidates procedural outputs created before 64-bit seed canonicalization.
+// Version 4 invalidates checkpoints where loose_sediment could contain coarse debris
+// while sediment_depth held the actual fine-sediment inventory.
+const VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DiskMeta {
@@ -232,6 +235,7 @@ fn read_f32_blob(path: &Path) -> Result<Vec<f32>, EvalError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fields::{keys, AuxMaps};
     use crate::heightfield::HeightfieldMetrics;
     use std::collections::HashMap;
 
@@ -261,6 +265,52 @@ mod tests {
         assert!((loaded.height.get(3, 4) - 12.5).abs() < 1e-5);
         assert!((loaded.aux["flow_acc"].get(1, 1) - 0.75).abs() < 1e-5);
         assert!(!loaded.dirty);
+        cache.clear_all();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn layered_inventories_roundtrip_with_canonical_cache_keys() {
+        let dir = std::env::temp_dir().join(format!(
+            "terra_smart_cache_layers_test_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let cache = DiskSmartCache::new(&dir);
+        let metrics = HeightfieldMetrics::new(4, 4, 40.0, 40.0);
+        let mut maps = AuxMaps::new();
+        maps.insert(
+            keys::BEDROCK_HEIGHT,
+            MaskField::from_raw(metrics, &[6.0; 16]),
+        );
+        maps.insert(keys::DEBRIS_DEPTH, MaskField::from_raw(metrics, &[2.0; 16]));
+        maps.insert(
+            keys::SEDIMENT_DEPTH,
+            MaskField::from_raw(metrics, &[3.0; 16]),
+        );
+        let aux = maps.to_hashmap();
+        assert!(aux.contains_key(keys::SEDIMENT_THICKNESS));
+        assert!(!aux.contains_key(keys::SEDIMENT_DEPTH));
+        assert!(!aux.contains_key(keys::LOOSE_SEDIMENT));
+
+        let id = LayerId::new();
+        cache
+            .spill(
+                id,
+                &CachedOutput {
+                    height: Heightfield::filled(metrics, 11.0),
+                    generation: 9,
+                    dirty: false,
+                    aux,
+                    strata: None,
+                },
+            )
+            .unwrap();
+        let loaded = cache.load(id, metrics).unwrap().expect("disk hit");
+        let restored = AuxMaps::from_hashmap(&loaded.aux);
+        assert_eq!(restored.bedrock_height.as_ref().unwrap().get(0, 0), 6.0);
+        assert_eq!(restored.get(keys::DEBRIS_DEPTH).unwrap().get(0, 0), 2.0);
+        assert_eq!(restored.sediment_thickness.as_ref().unwrap().get(0, 0), 3.0);
+
         cache.clear_all();
         let _ = fs::remove_dir_all(&dir);
     }

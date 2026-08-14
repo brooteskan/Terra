@@ -3,6 +3,28 @@
 use terra_core::layer::{Layer, LayerId, LayerKind};
 use terra_core::mask::{MaskAsset, MaskId, MaskPaintTool};
 
+#[derive(Debug, Default)]
+pub struct TerrainSettingsUpdate {
+    pub export_resolution: Option<u32>,
+    pub preview_resolution: Option<u32>,
+    pub precision: Option<f32>,
+    pub world_scale: Option<f32>,
+    pub max_level: Option<u32>,
+    pub high_detail: Option<terra_core::analyze::HighDetailMode>,
+    pub show_hd_outline: Option<bool>,
+}
+
+impl TerrainSettingsUpdate {
+    pub fn is_empty(&self) -> bool {
+        self.export_resolution.is_none()
+            && self.preview_resolution.is_none()
+            && self.precision.is_none()
+            && self.world_scale.is_none()
+            && self.max_level.is_none()
+            && self.high_detail.is_none()
+            && self.show_hd_outline.is_none()
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub enum MaskEditAction {
@@ -16,6 +38,7 @@ pub enum MaskEditAction {
 
 #[derive(Debug)]
 pub enum PanelAction {
+    UpdateTerrainSettings(TerrainSettingsUpdate),
     AddLayer(Layer),
     /// Add a layer into a specific World Creator—style category folder.
     AddLayerToCategory {

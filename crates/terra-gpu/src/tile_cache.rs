@@ -236,6 +236,17 @@ impl GpuTileAtlas {
         })
     }
 
+    /// Invalidate all document-owned residency without reallocating atlas resources.
+    ///
+    /// Texture contents may remain in physical pages because the page table is made
+    /// entirely invalid before streaming can be enabled for the next document.
+    pub fn clear(&mut self, queue: &wgpu::Queue) {
+        self.residency.clear();
+        self.handles.clear();
+        let invalid_entries = vec![GpuPageTableEntry::zeroed(); self.max_pages as usize];
+        queue.write_buffer(&self.page_table, 0, bytemuck::cast_slice(&invalid_entries));
+    }
+
     pub fn lookup(&mut self, key: &TerrainTileKey) -> Option<TilePageHandle> {
         self.residency.get(key).map(|entry| entry.handle)
     }
@@ -304,6 +315,40 @@ mod tests {
     use super::*;
     use terra_core::{FieldId, LayerId, TileId};
 
+    fn read_page_table(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        atlas: &GpuTileAtlas,
+    ) -> Vec<GpuPageTableEntry> {
+        let size = std::mem::size_of::<GpuPageTableEntry>() as u64 * u64::from(atlas.max_pages());
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("tile-page-table-test-readback"),
+            size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("tile-page-table-test-readback-encoder"),
+        });
+        encoder.copy_buffer_to_buffer(atlas.page_table_buffer(), 0, &staging, 0, size);
+        queue.submit(Some(encoder.finish()));
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+        device.poll(wgpu::Maintain::Wait);
+        rx.recv()
+            .expect("map callback")
+            .expect("page-table readback mapping");
+        let mapped = slice.get_mapped_range();
+        let entries = bytemuck::cast_slice(&mapped).to_vec();
+        drop(mapped);
+        staging.unmap();
+        entries
+    }
+
     #[test]
     fn page_entry_carries_generation_and_virtual_identity() {
         let key = TerrainTileKey {
@@ -334,5 +379,62 @@ mod tests {
         assert_eq!(entry.level, 5);
         assert_eq!((entry.tile_x, entry.tile_z), (1, 1));
         assert_eq!((entry.revision_hi, entry.revision_lo), (1, 2));
+    }
+
+    #[test]
+    fn clear_invalidates_page_table_and_atlas_remains_uploadable() {
+        let Some(gpu) = terra_test_gpu::headless() else {
+            return;
+        };
+        let mut atlas = GpuTileAtlas::new(&gpu.device, 8, 1, 2).unwrap();
+        let metrics = terra_core::heightfield::HeightfieldMetrics {
+            width: 8,
+            height: 8,
+            world_size_x: 8.0,
+            world_size_z: 8.0,
+            tile_size: 8,
+            halo: 1,
+        };
+        let old_key = TerrainTileKey {
+            layer: Some(LayerId::new()),
+            field: FieldId::Height,
+            level: 0,
+            tile: TileId { tx: 0, tz: 0 },
+        };
+        let tile = HeightTile::new(old_key.tile, &metrics);
+        let old = atlas
+            .upload_height_tile(&gpu.queue, old_key, &tile, 1, 1)
+            .unwrap()
+            .handle;
+        assert_eq!(
+            read_page_table(&gpu.device, &gpu.queue, &atlas)[old.slot as usize].valid,
+            1
+        );
+
+        atlas.clear(&gpu.queue);
+
+        assert_eq!(atlas.residency().stats().resident_tiles, 0);
+        assert_eq!(atlas.residency().resolve_handle(old), None);
+        assert!(read_page_table(&gpu.device, &gpu.queue, &atlas)
+            .iter()
+            .all(|entry| entry.valid == 0));
+
+        let new_key = TerrainTileKey {
+            layer: Some(LayerId::new()),
+            field: FieldId::Height,
+            level: 0,
+            tile: TileId { tx: 0, tz: 0 },
+        };
+        let new = atlas
+            .upload_height_tile(&gpu.queue, new_key.clone(), &tile, 2, 2)
+            .unwrap()
+            .handle;
+        assert_eq!(new.slot, old.slot);
+        assert_ne!(new.generation, old.generation);
+        assert_eq!(atlas.residency().resolve_handle(old), None);
+        assert_eq!(atlas.residency().resolve_handle(new), Some(&new_key));
+        let entries = read_page_table(&gpu.device, &gpu.queue, &atlas);
+        assert_eq!(entries[new.slot as usize].valid, 1);
+        assert_eq!(entries[new.slot as usize].generation, new.generation);
     }
 }

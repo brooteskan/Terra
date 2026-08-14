@@ -157,7 +157,9 @@ impl LayerKind {
                 FieldId::Vegetation,
                 FieldId::SoilMoisture,
             ],
-            LayerKind::HydraulicErosion(_) | LayerKind::ThermalErosion(_) | LayerKind::DebrisFlow(_) => {
+            LayerKind::HydraulicErosion(_)
+            | LayerKind::ThermalErosion(_)
+            | LayerKind::DebrisFlow(_) => {
                 vec![
                     FieldId::Hardness,
                     FieldId::Rainfall,
@@ -204,7 +206,7 @@ impl LayerKind {
                 FieldId::Hardness,
                 FieldId::Named(crate::fields::keys::SCULPT_PROTECTION.into()),
                 FieldId::Named(crate::fields::keys::UPLIFT_RATE.into()),
-                FieldId::Named(crate::fields::keys::SEDIMENT_DEPTH.into()),
+                FieldId::SedimentThickness,
                 FieldId::Named(crate::fields::keys::EDIT_REGION.into()),
             ],
             LayerKind::TerrainConstraints(_) => vec![
@@ -228,7 +230,7 @@ impl LayerKind {
                 FieldId::Erosion,
                 FieldId::Deposition,
                 FieldId::WaterDischarge,
-                FieldId::Named(crate::fields::keys::SEDIMENT_DEPTH.into()),
+                FieldId::SedimentThickness,
                 FieldId::Named(crate::fields::keys::UPLIFT_RATE.into()),
                 FieldId::Named(crate::fields::keys::TECTONIC_BASE.into()),
             ],
@@ -300,6 +302,7 @@ impl LayerKind {
                     FieldId::Hardness,
                     FieldId::BedrockHeight,
                     FieldId::DebrisDepth,
+                    FieldId::SedimentThickness,
                     FieldId::TalusStability,
                     FieldId::Instability,
                 ]
@@ -486,6 +489,19 @@ mod tests {
         let k = LayerKind::HydraulicErosion(HydraulicErosionParams::default());
         assert_eq!(k.category(), OperationCategory::Simulation);
         assert!(k.produced_fields().contains(&FieldId::Wetness));
+    }
+
+    #[test]
+    fn erosion_family_declares_distinct_debris_and_sediment_fields() {
+        for kind in [
+            LayerKind::ThermalErosion(Default::default()),
+            LayerKind::DebrisFlow(Default::default()),
+        ] {
+            assert!(kind.optional_fields().contains(&FieldId::DebrisDepth));
+            assert!(kind.optional_fields().contains(&FieldId::SedimentThickness));
+            assert!(kind.produced_fields().contains(&FieldId::DebrisDepth));
+            assert!(kind.produced_fields().contains(&FieldId::SedimentThickness));
+        }
     }
 
     #[test]

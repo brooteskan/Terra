@@ -266,9 +266,10 @@ impl ViewportQualityManager {
         if !matches!(preset, QualityPreset::Quality) {
             self.config.mode = mode;
         }
-        self.internal_scale = self
-            .internal_scale
-            .clamp(self.config.min_internal_scale, self.config.max_internal_scale);
+        self.internal_scale = self.internal_scale.clamp(
+            self.config.min_internal_scale,
+            self.config.max_internal_scale,
+        );
     }
 
     pub fn observe_gpu_frame_ms(&mut self, gpu_ms: f32) {
@@ -301,8 +302,7 @@ impl ViewportQualityManager {
         self.history_cap = self.config.history_cap_for_state(state);
         self.terrain_compute_budget_us = state.terrain_budget_us();
 
-        if self.config.dynamic_resolution_enabled
-            && self.config.mode.uses_progressive_path_tracer()
+        if self.config.dynamic_resolution_enabled && self.config.mode.uses_progressive_path_tracer()
         {
             let target = self.target_gpu_ms();
             if self.smoothed_gpu_ms > target * 1.05 {

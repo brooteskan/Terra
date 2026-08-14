@@ -5,15 +5,16 @@
 //! in the Layers hierarchy / Inspector. Tools = pick / drag layer kinds and brushes.
 
 use crate::ui::actions::PanelAction;
-use crate::ui::tool_catalog::{tools_for_workspace, ToolAction, ToolDef, ToolGroup};
-use crate::ui::workspace::{workspace_definition, WorkspaceId};
-use crate::ui::{EditorTool, UiState};
-use terra_core::document::TerrainDocument;
-use terra_core::layer::Layer;
-use terra_core::mask::{MaskAsset, MaskId};
 use crate::ui::style::{
     self, FONT_SCALE, MODE_ROW_H, PAD, TOOL_CARD_GAP, TOOL_CARD_H, TOOL_THUMB_SIZE, TYPE_CAPTION,
 };
+use crate::ui::tool_catalog::{
+    instantiate_layer_preset, tools_for_workspace, ToolAction, ToolDef, ToolGroup,
+};
+use crate::ui::workspace::{workspace_definition, WorkspaceId};
+use crate::ui::{EditorTool, UiState};
+use terra_core::document::TerrainDocument;
+use terra_core::mask::{MaskAsset, MaskId};
 use terra_gui::{Color, DrawList, GuiContext, Icon, Id, Rect};
 
 #[derive(Debug, Default)]
@@ -477,9 +478,9 @@ fn tool_card(
         ToolAction::AddLayer { name, .. } => {
             ui_state.tool_drag.as_ref().is_some_and(|d| d.name == *name)
         }
-        ToolAction::CreateBiome { .. }
-        | ToolAction::AddMask { .. }
-        | ToolAction::BakeSelected => false,
+        ToolAction::CreateBiome { .. } | ToolAction::AddMask { .. } | ToolAction::BakeSelected => {
+            false
+        }
     };
 
     if hovered {
@@ -706,11 +707,8 @@ fn apply_sculpt_tool(
                 .map(|entry| entry.mask.id)
         });
         let mask_id = selected_painted.or(bound_painted).unwrap_or_else(|| {
-            let asset = MaskAsset::new_painted(
-                MaskId::new(),
-                format!("Mask {}", doc.masks.len() + 1),
-                512,
-            );
+            let asset =
+                MaskAsset::new_painted(MaskId::new(), format!("Mask {}", doc.masks.len() + 1), 512);
             let id = asset.id;
             actions.push(PanelAction::AddMask(asset));
             if let Some(target) = doc.selected {
@@ -748,7 +746,7 @@ fn finish_tool_drag(
                 .pointer
                 .is_some_and(|(x, y)| ui.tool_panel_rect().contains(x, y));
             if over_vp || over_tools {
-                let layer = Layer::new(drag.name, drag.kind);
+                let layer = instantiate_layer_preset(drag.name, &drag.kind);
                 if drag.force_shape_folder {
                     actions.push(PanelAction::AddLayerToCategory {
                         category: terra_core::layer::StackCategory::Shape,

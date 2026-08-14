@@ -141,25 +141,22 @@ fn build_solid_grid(res: u32) -> (Vec<GridVertex>, Vec<u32>, u32, Vec<u32>) {
     // Dedicated wall verts (do not share with the surface) so face/normals stay correct.
     let mut wall_top_of = vec![u32::MAX; (res * res) as usize];
     let mut wall_bot_of = vec![u32::MAX; (res * res) as usize];
-    let mark_wall = |verts: &mut Vec<GridVertex>,
-                     idx: u32,
-                     cache: &mut [u32],
-                     use_base: f32|
-     -> u32 {
-        let i = idx as usize;
-        if cache[i] != u32::MAX {
-            return cache[i];
-        }
-        let uv = verts[i].uv;
-        let sid = verts.len() as u32;
-        verts.push(GridVertex {
-            uv,
-            face: 1.0,
-            use_base,
-        });
-        cache[i] = sid;
-        sid
-    };
+    let mark_wall =
+        |verts: &mut Vec<GridVertex>, idx: u32, cache: &mut [u32], use_base: f32| -> u32 {
+            let i = idx as usize;
+            if cache[i] != u32::MAX {
+                return cache[i];
+            }
+            let uv = verts[i].uv;
+            let sid = verts.len() as u32;
+            verts.push(GridVertex {
+                uv,
+                face: 1.0,
+                use_base,
+            });
+            cache[i] = sid;
+            sid
+        };
 
     // Walk each border CCW (from +Y) so outward = right of travel → correct backface winding.
     let edge_chains: [[(u32, u32); 2]; 4] = [

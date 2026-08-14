@@ -1,9 +1,9 @@
 //! Thin bottom status bar with mesh stats, backend, and processing feedback.
 
+use crate::ui::style::{self, FONT_SCALE, PAD, STATUS_STRIP_H, TYPE_LABEL};
 use crate::ui::UiState;
 use terra_core::document::TerrainDocument;
 use terra_core::eval::PreviewQuality;
-use crate::ui::style::{self, FONT_SCALE, PAD, STATUS_STRIP_H, TYPE_LABEL};
 use terra_gui::{DrawList, GuiContext, Id, Rect};
 
 #[derive(Debug, Default)]

@@ -2,9 +2,11 @@
 
 mod arena;
 mod tile;
+mod world_space;
 
 pub use arena::FloatArena;
 pub use tile::{HeightTile, TileId};
+pub use world_space::{metres_to_texels, texels_to_metres, world_radius_texels};
 
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -227,10 +229,12 @@ impl Heightfield {
         self.refresh_halos_for(&ids);
     }
 
-    /// Incremental ghost exchange for a dirty tile set (Wave D).
+    /// Incremental ghost exchange for a destination tile set (Wave D).
     ///
-    /// Only listed tiles have their halo rings rewritten; callers should include
-    /// 8-neighbors when an interior stencil may have changed shared edges.
+    /// Only listed destinations have their halo rings rewritten. Callers that
+    /// start from changed interior sources must include every destination whose
+    /// halo can read those sources. [`crate::tiling::TileScheduler::sync_dirty`]
+    /// performs that source-to-destination expansion.
     pub fn refresh_halos_for(&mut self, tile_ids: &[TileId]) {
         if tile_ids.is_empty() {
             return;

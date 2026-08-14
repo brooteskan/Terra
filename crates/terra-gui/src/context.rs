@@ -95,6 +95,9 @@ pub struct GuiContext<'a> {
 struct PendingComboMenu {
     id: Id,
     rect: Rect,
+    /// The combo's own field. The press that opens a combo lands here, so it must
+    /// be excluded from the click-outside dismiss (mirrors a menu's anchor).
+    owner: Rect,
     items: Vec<String>,
     selected: usize,
 }
@@ -247,8 +250,11 @@ impl<'a> GuiContext<'a> {
                 // Match context menus: dismiss on press outside the popup.
                 // Must run inside `with_menu_input` — `suspend_pointer_edges`
                 // clears `primary_pressed` for background chrome while open.
+                // Exclude the owner field too: the very press that opens the
+                // combo lands on it, and would otherwise close it the same frame.
                 if (ui.input.primary_pressed || ui.input.secondary_pressed)
                     && !ui.pointer_in(menu.rect)
+                    && !ui.pointer_in(menu.owner)
                 {
                     ui.state.open_combo = None;
                 }
@@ -509,7 +515,7 @@ impl<'a> GuiContext<'a> {
             return changed;
         }
 
-        // Left chrome | viewport splitter (tools panel, or Mask-view dock).
+        // Left chrome | viewport splitter (tools panel, or full-height left dock).
         if self.state.layout.left_dock_w.is_some() || !self.state.layout.tool_panel_collapsed {
             let x = self.state.layout.left_chrome_w();
             let hit = Rect::from_pos_size(x - SPLITTER_HIT * 0.5, top, SPLITTER_HIT, bottom - top);
@@ -1163,10 +1169,18 @@ impl<'a> GuiContext<'a> {
         scroll::scrollbar_x(self, id, viewport, content_w, scroll_x);
     }
 
-    pub(crate) fn queue_combo_menu(&mut self, id: Id, rect: Rect, items: &[&str], selected: usize) {
+    pub(crate) fn queue_combo_menu(
+        &mut self,
+        id: Id,
+        rect: Rect,
+        owner: Rect,
+        items: &[&str],
+        selected: usize,
+    ) {
         self.pending_combo_menu = Some(PendingComboMenu {
             id,
             rect,
+            owner,
             items: items.iter().map(|s| (*s).to_string()).collect(),
             selected,
         });

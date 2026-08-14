@@ -5,7 +5,7 @@
 
 use lucide_icons::Icon as LucideIcon;
 
-/// Curated Lucide icons used by Terra's editor chrome.
+/// Curated Lucide icons used by the editor chrome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u16)]
 pub enum Icon {

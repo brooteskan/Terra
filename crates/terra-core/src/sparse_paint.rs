@@ -1,7 +1,7 @@
 //! Sparse world-space paint pages for biome placement.
 
 use crate::biome_paint::BiomeLayerId;
-use crate::layer::LayerId;
+use crate::ids::LayerId;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use uuid::Uuid;
@@ -368,7 +368,7 @@ impl Default for PaintStrokeId {
 mod tests {
     use super::*;
     use crate::biome_paint::BiomeLayerId;
-    use crate::layer::LayerId;
+    use crate::ids::LayerId;
 
     fn key() -> SparsePaintChannelKey {
         SparsePaintChannelKey {

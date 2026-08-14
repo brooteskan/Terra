@@ -195,6 +195,23 @@ impl TileResidencyCache {
         true
     }
 
+    /// Remove all residency while preserving the cache budget and slot generations.
+    ///
+    /// Advancing every allocated slot is required at document boundaries: rebuilding
+    /// the cache from scratch would allow an old generation-1 handle to resolve again
+    /// when the same physical slot is reused by the next document.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.used_bytes = 0;
+        self.free_slots.clear();
+        self.free_slots.reserve(self.slots.len());
+        for (index, slot) in self.slots.iter_mut().enumerate() {
+            slot.key = None;
+            slot.generation = slot.generation.wrapping_add(1).max(1);
+            self.free_slots.push(index as u32);
+        }
+    }
+
     pub fn pin(&mut self, key: &TerrainTileKey) -> bool {
         self.entries.get_mut(key).is_some_and(|entry| {
             entry.pin_count = entry.pin_count.saturating_add(1);
@@ -331,6 +348,42 @@ mod tests {
         assert_ne!(old.generation, new.generation);
         assert_eq!(cache.resolve_handle(old), None);
         assert_eq!(cache.resolve_handle(new), Some(&b));
+    }
+
+    #[test]
+    fn clear_invalidates_handles_and_preserves_reusable_capacity() {
+        let layer = LayerId::new();
+        let mut cache = TileResidencyCache::new(16);
+        let a = key(layer, 0);
+        let b = key(layer, 1);
+        let ah = cache.insert(a.clone(), 8, 1, 1).unwrap().handle;
+        let bh = cache.insert(b.clone(), 8, 1, 1).unwrap().handle;
+        assert!(cache.pin(&a));
+
+        cache.clear();
+
+        let stats = cache.stats();
+        assert_eq!(stats.budget_bytes, 16);
+        assert_eq!(stats.used_bytes, 0);
+        assert_eq!(stats.resident_tiles, 0);
+        assert_eq!(stats.pinned_tiles, 0);
+        assert_eq!(cache.resolve_handle(ah), None);
+        assert_eq!(cache.resolve_handle(bh), None);
+
+        let replacement = key(layer, 2);
+        let new = cache.insert(replacement.clone(), 8, 2, 2).unwrap().handle;
+        assert!(new.slot == ah.slot || new.slot == bh.slot);
+        assert_ne!(
+            new.generation,
+            if new.slot == ah.slot {
+                ah.generation
+            } else {
+                bh.generation
+            }
+        );
+        assert_eq!(cache.resolve_handle(ah), None);
+        assert_eq!(cache.resolve_handle(bh), None);
+        assert_eq!(cache.resolve_handle(new), Some(&replacement));
     }
 
     #[test]

@@ -693,8 +693,8 @@ fn material_rule(name: &str, id: u32, tint: [f32; 3], hardness: f32) -> Material
         min_slope_deg: 0.0,
         max_slope_deg: 90.0,
         // Finite bounds — serde_json cannot roundtrip ±Infinity as f32.
-        min_height: -1.0e6,
-        max_height: 1.0e6,
+        min_height: crate::layer::OPEN_HEIGHT_MIN,
+        max_height: crate::layer::OPEN_HEIGHT_MAX,
         mask: MaskSource::None,
         hardness,
         tint,

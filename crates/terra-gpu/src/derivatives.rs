@@ -5,11 +5,11 @@
 //! gradient / laplacian / aspect at a world-space texel radius.
 
 use bytemuck::{Pod, Zeroable};
+use terra_core::heightfield::world_radius_texels;
 use terra_core::heightfield::Heightfield;
 use terra_core::mask::MaskField;
-use terra_core::terrain_eval::world_radius_texels;
 
-use crate::{readback_f32, GpuContext, GpuError};
+use crate::{readback_f32, GpuError};
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -35,7 +35,8 @@ pub enum GpuDerivativeMode {
 
 /// Run a local derivative kernel on `height` (full-field upload / readback).
 pub fn run_derivative_gpu(
-    ctx: &GpuContext,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
     height: &Heightfield,
     radius_m: f32,
     mode: GpuDerivativeMode,
@@ -45,72 +46,64 @@ pub fn run_derivative_gpu(
     let h = m.height;
     let radius_texels = world_radius_texels(radius_m, m).round().max(1.0) as u32;
 
-    let shader = ctx
-        .device
-        .create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("derivatives"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/derivatives.wgsl").into()),
-        });
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("derivatives"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("shaders/derivatives.wgsl").into()),
+    });
 
-    let bgl = ctx
-        .device
-        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("derivatives-bgl"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
+    let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("derivatives-bgl"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
                 },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
                 },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::StorageTexture {
-                        access: wgpu::StorageTextureAccess::WriteOnly,
-                        format: wgpu::TextureFormat::R32Float,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                    },
-                    count: None,
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::StorageTexture {
+                    access: wgpu::StorageTextureAccess::WriteOnly,
+                    format: wgpu::TextureFormat::R32Float,
+                    view_dimension: wgpu::TextureViewDimension::D2,
                 },
-            ],
-        });
+                count: None,
+            },
+        ],
+    });
 
-    let pipeline_layout = ctx
-        .device
-        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("derivatives-pl"),
-            bind_group_layouts: &[&bgl],
-            push_constant_ranges: &[],
-        });
-    let pipeline = ctx
-        .device
-        .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("derivatives-pipe"),
-            layout: Some(&pipeline_layout),
-            module: &shader,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("derivatives-pl"),
+        bind_group_layouts: &[&bgl],
+        push_constant_ranges: &[],
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("derivatives-pipe"),
+        layout: Some(&pipeline_layout),
+        module: &shader,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
 
-    let src = create_r32_texture(&ctx.device, "deriv-src", w, h);
-    let dst = create_r32_texture_storage(&ctx.device, "deriv-dst", w, h);
-    upload_height(&ctx.queue, &src, height);
+    let src = create_r32_texture(device, "deriv-src", w, h);
+    let dst = create_r32_texture_storage(device, "deriv-dst", w, h);
+    upload_height(queue, &src, height);
 
     let uniforms = DerivativeUniforms {
         width: w,
@@ -122,18 +115,17 @@ pub fn run_derivative_gpu(
         _pad0: 0.0,
         _pad1: 0.0,
     };
-    let ubuf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+    let ubuf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("deriv-uniform"),
         size: std::mem::size_of::<DerivativeUniforms>() as u64,
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    ctx.queue
-        .write_buffer(&ubuf, 0, bytemuck::bytes_of(&uniforms));
+    queue.write_buffer(&ubuf, 0, bytemuck::bytes_of(&uniforms));
 
     let src_view = src.create_view(&wgpu::TextureViewDescriptor::default());
     let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
-    let bind = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+    let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("deriv-bg"),
         layout: &bgl,
         entries: &[
@@ -152,11 +144,9 @@ pub fn run_derivative_gpu(
         ],
     });
 
-    let mut encoder = ctx
-        .device
-        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("deriv-enc"),
-        });
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("deriv-enc"),
+    });
     {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("deriv-pass"),
@@ -167,11 +157,16 @@ pub fn run_derivative_gpu(
         pass.dispatch_workgroups(w.div_ceil(8), h.div_ceil(8), 1);
     }
 
-    let n = (w * h) as usize;
-    let readback = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+    // `copy_texture_to_buffer` requires each row to start on a
+    // `COPY_BYTES_PER_ROW_ALIGNMENT` (256) boundary, so the readback buffer is
+    // sized for a padded stride and the padding is dropped after mapping.
+    let unpadded = w * 4;
+    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let padded = unpadded.div_ceil(align) * align;
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("deriv-readback"),
-        size: (n * 4) as u64,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        size: (padded * h) as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
     encoder.copy_texture_to_buffer(
@@ -185,7 +180,7 @@ pub fn run_derivative_gpu(
             buffer: &readback,
             layout: wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(w * 4),
+                bytes_per_row: Some(padded),
                 rows_per_image: Some(h),
             },
         },
@@ -195,9 +190,15 @@ pub fn run_derivative_gpu(
             depth_or_array_layers: 1,
         },
     );
-    ctx.queue.submit(Some(encoder.finish()));
+    queue.submit(Some(encoder.finish()));
 
-    let data = readback_f32(&ctx.device, &ctx.queue, &readback, n)?;
+    let row_floats = (padded / 4) as usize;
+    let padded_f32 = readback_f32(device, queue, &readback, row_floats * h as usize)?;
+    let mut data = Vec::with_capacity((w * h) as usize);
+    for y in 0..h as usize {
+        let start = y * row_floats;
+        data.extend_from_slice(&padded_f32[start..start + w as usize]);
+    }
     Ok(MaskField::from_raw(m, &data))
 }
 
@@ -272,12 +273,11 @@ pub fn cpu_slope_oracle(height: &Heightfield, radius_m: f32) -> MaskField {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::GpuError;
     use terra_core::heightfield::HeightfieldMetrics;
 
     #[test]
     fn derivative_shader_compiles_when_adapter_available() {
-        let Ok(ctx) = GpuContext::new() else {
+        let Some(gpu) = terra_test_gpu::headless() else {
             return;
         };
         let m = HeightfieldMetrics::new(32, 32, 320.0, 320.0);
@@ -287,18 +287,17 @@ mod tests {
                 hf.set(i, j, i as f32 * 10.0);
             }
         }
-        match run_derivative_gpu(&ctx, &hf, 0.0, GpuDerivativeMode::Slope) {
-            Ok(gpu) => {
+        match run_derivative_gpu(&gpu.device, &gpu.queue, &hf, 0.0, GpuDerivativeMode::Slope) {
+            Ok(slope) => {
                 let cpu = cpu_slope_oracle(&hf, 0.0);
                 let mut max_err = 0.0f32;
                 for j in 2..30 {
                     for i in 2..30 {
-                        max_err = max_err.max((gpu.get(i, j) - cpu.get(i, j)).abs());
+                        max_err = max_err.max((slope.get(i, j) - cpu.get(i, j)).abs());
                     }
                 }
                 assert!(max_err < 0.05, "gpu/cpu slope err={max_err}");
             }
-            Err(GpuError::NoAdapter) => {}
             Err(e) => panic!("{e}"),
         }
     }

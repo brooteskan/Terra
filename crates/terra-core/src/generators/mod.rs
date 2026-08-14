@@ -278,6 +278,7 @@ pub fn island(metrics: HeightfieldMetrics, p: &IslandParams) -> IslandResult {
         remap_min: -1.0,
         remap_max: 1.0,
     };
+    let seed_phase = noise::canonical_seed32(p.seed) as f32;
 
     heights
         .par_iter_mut()
@@ -300,8 +301,8 @@ pub fn island(metrics: HeightfieldMetrics, p: &IslandParams) -> IslandResult {
                     p.seed ^ 0xA17C_9E5D,
                 ) * 0.22;
             let theta = (zr / radius_z).atan2(xr / radius_x);
-            let lobes = (theta * 3.0 + p.seed as f32 * 0.013).sin() * 0.22
-                + (theta * 5.0 - p.seed as f32 * 0.007).sin() * 0.12;
+            let lobes = (theta * 3.0 + seed_phase * 0.013).sin() * 0.22
+                + (theta * 5.0 - seed_phase * 0.007).sin() * 0.12;
             let edge_scale = (1.0 + coast_warp * (coastline_noise + lobes)).max(0.58);
             let mut rho = ((xr / radius_x).powi(2) + (zr / radius_z).powi(2)).sqrt() / edge_scale;
 
@@ -747,12 +748,10 @@ pub fn seed_dune_sand(
             let ph = directional_phasor(x, z, freq, ang, lin, seed);
             let lobe = (0.5 + 0.5 * ph).clamp(0.0, 1.0);
             let shaped = lobe.powf(0.55 + sharp * 1.1);
-            let ripple = noise::perlin2(
-                along * freq * 5.5,
-                across * freq * 1.1,
-                seed ^ 0x51F7_E001,
-            ) * 0.06
-                * shaped;
+            let ripple =
+                noise::perlin2(along * freq * 5.5, across * freq * 1.1, seed ^ 0x51F7_E001)
+                    * 0.06
+                    * shaped;
             let secondary = if lin < 0.85 {
                 let ang2 = ang + std::f32::consts::FRAC_PI_2 * (1.0 - lin);
                 let ph2 = directional_phasor(x, z, freq * 0.92, ang2, lin, seed ^ 0xA11C);
@@ -760,11 +759,9 @@ pub fn seed_dune_sand(
             } else {
                 0.0
             };
-            let profile =
-                (shaped * (0.65 + 0.35 * lin) + secondary + ripple.abs()).clamp(0.0, 1.0);
+            let profile = (shaped * (0.65 + 0.35 * lin) + secondary + ripple.abs()).clamp(0.0, 1.0);
             let idx = (j * metrics.width + i) as usize;
-            sand[idx] =
-                base_cover + height * supply * profile * (0.55 + 0.45 * supply.min(1.0));
+            sand[idx] = base_cover + height * supply * profile * (0.55 + 0.45 * supply.min(1.0));
         }
     }
     sand
@@ -773,11 +770,12 @@ pub fn seed_dune_sand(
 pub fn canyons(metrics: HeightfieldMetrics, p: &CanyonParams) -> Heightfield {
     let base_width = p.width.max(1e-3);
     let longitudinal_freq = 1.0 / (base_width * 11.0).max(1.0);
+    let seed_phase = noise::canonical_seed32(p.seed) as f32;
     fill_world(metrics, |x, z| {
-        let broad = noise::perlin2(z * longitudinal_freq, p.seed as f32 * 0.017, p.seed);
+        let broad = noise::perlin2(z * longitudinal_freq, seed_phase * 0.017, p.seed);
         let detail = noise::perlin2(
             z * longitudinal_freq * 3.1,
-            p.seed as f32 * 0.043,
+            seed_phase * 0.043,
             p.seed ^ 0x9E37,
         );
         let meander = broad * 0.72 + detail * 0.28;
@@ -786,7 +784,7 @@ pub fn canyons(metrics: HeightfieldMetrics, p: &CanyonParams) -> Heightfield {
 
         let width_noise = noise::perlin2(
             z * longitudinal_freq * 0.83 + 13.0,
-            p.seed as f32 * 0.007,
+            seed_phase * 0.007,
             p.seed ^ 0x7F4A_71C2,
         );
         let local_width = base_width * (1.0 + width_noise * 0.28).max(0.45);
@@ -1260,12 +1258,13 @@ pub(super) fn box_blur_height(input: &Heightfield, radius: u32) -> Heightfield {
 pub fn effect_filter(input: &Heightfield, p: &EffectFilterParams) -> Heightfield {
     let filtered = match p.kind {
         EffectFilterKind::Smooth => {
-            // Edge-aware bilateral smoothing (Tomasi & Manduchi) with mild iteration.
+            // Low-pass (box) blur: attenuates high-frequency detail and isolated
+            // spikes alike. Edge-preserving smoothing lives in `Denoise`
+            // (bilateral) — which by design keeps sharp features, including a
+            // lone spike, intact and so is the wrong tool for reducing spikes.
             let mut h = input.clone();
-            let sigma_s = (p.radius.max(1) as f32) * 0.65;
-            let sigma_r = p.amount.max(1.0);
             for _ in 0..p.iterations.max(1).min(4) {
-                h = filter_kernels::bilateral(&h, p.radius.max(1), sigma_s, sigma_r);
+                h = filter_kernels::box_blur(&h, p.radius.max(1));
             }
             h
         }
@@ -1954,6 +1953,61 @@ pub fn fluid_simulation(input: &Heightfield, p: &FluidSimParams) -> (Heightfield
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn field_bits(height: &Heightfield) -> Vec<u32> {
+        height
+            .to_dense()
+            .iter()
+            .map(|value| value.to_bits())
+            .collect()
+    }
+
+    #[test]
+    fn high_seed_bits_change_generators_and_seeded_effect_filters() {
+        let low = 7;
+        let high = low + (1u64 << 32);
+        let metrics = HeightfieldMetrics::new(48, 48, 768.0, 768.0);
+
+        let mut island_low = IslandParams::default();
+        island_low.seed = low;
+        let mut island_high = island_low.clone();
+        island_high.seed = high;
+        assert_ne!(
+            field_bits(&island(metrics, &island_low).height),
+            field_bits(&island(metrics, &island_high).height)
+        );
+
+        let mut canyon_low = CanyonParams::default();
+        canyon_low.seed = low;
+        let mut canyon_high = canyon_low.clone();
+        canyon_high.seed = high;
+        assert_ne!(
+            field_bits(&canyons(metrics, &canyon_low)),
+            field_bits(&canyons(metrics, &canyon_high))
+        );
+
+        let input = Heightfield::filled(metrics, 25.0);
+        for kind in [
+            EffectFilterKind::NoiseGabor,
+            EffectFilterKind::NoiseWhite,
+            EffectFilterKind::ScatterDetail,
+        ] {
+            let low_params = EffectFilterParams {
+                kind,
+                seed: low,
+                ..EffectFilterParams::default()
+            };
+            let high_params = EffectFilterParams {
+                seed: high,
+                ..low_params.clone()
+            };
+            assert_ne!(
+                field_bits(&effect_filter(&input, &low_params)),
+                field_bits(&effect_filter(&input, &high_params)),
+                "{kind:?} still aliases seeds separated by 2^32"
+            );
+        }
+    }
 
     #[test]
     fn island_has_submerged_border_single_landmass_scale_and_semantic_fields() {

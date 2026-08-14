@@ -13,4 +13,6 @@ glam = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
 profiling = { workspace = true }
-pollster = { workspace = true }
+
+[dev-dependencies]
+terra-test-gpu = { workspace = true }

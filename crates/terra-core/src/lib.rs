@@ -22,6 +22,7 @@ pub mod generators;
 pub mod geomorph;
 pub mod heightfield;
 pub mod hydro;
+pub mod ids;
 pub mod landscape_blueprint;
 pub mod landscape_evolution;
 pub mod landscape_style;
@@ -30,6 +31,7 @@ pub mod mask;
 pub mod matter_sim;
 pub mod noise;
 pub mod operation_placement;
+pub mod quality;
 pub mod realism_benchmark;
 pub mod rebuild_feedback;
 pub mod scatter;
@@ -40,7 +42,6 @@ pub mod simulation_scenario;
 pub mod sparse_paint;
 pub mod surface;
 pub mod terrain;
-pub mod terrain_eval;
 pub mod terrain_recipe;
 pub mod tiling;
 pub mod volumetric;
@@ -49,16 +50,10 @@ pub mod world_rules;
 
 pub use fields::{
     fields_invalidated_by, height_dependents, shared_physical_fields, AuxMaps, FieldId,
-    IterativeFieldGuard, TerrainContext,
+    IterativeFieldGuard,
 };
 pub use geomorph::{
     analyze_terrain, bake_debug_field, GeomorphAnalysis, GeomorphDebugField, GeomorphOptions,
-};
-pub use terrain_eval::{
-    compile_eval_graph, metres_to_texels, sample_seed, texels_to_metres, world_radius_texels,
-    DerivedFieldCache, EvalDiagnostics, EvalGraph, EvalMode, FieldLifetime, FieldRevision,
-    FieldStorage, GpuKernelId, LayerOperatorAdapter, OperatorDescriptor, OperatorId, ScaleBand,
-    TerrainFieldSet, TerrainOperator, TerrainState, TileEvalSpec,
 };
 pub use terrain_recipe::{
     build_terrain_recipe_from_stack, recipe_matches_stack, RecipeItem, RecipeItemKind,
@@ -75,34 +70,33 @@ pub use biome_paint::{
 pub use document::{EditorSession, MaskPaintStrokeUndo, PaintStrokeUndo, TerrainDocument};
 pub use domain::{
     authoring_order_is_arbitrary, behavioural_differences, classify_in_context,
-    classify_layer_kind, evaluation_eval_stage_order, evaluation_pipeline_order,
-    incomplete_project_diagnostics, workflow_stage_metadata_order, world_eval_outline,
-    DomainBiomeRef, DomainLayerRef, DomainParent, DomainRole, DomainView, RebuildReason,
-    SoftDiagnostic, TerrainPipelineExecutor, TerrainPipelineStage,
+    classify_layer_kind, evaluation_eval_stage_order, incomplete_project_diagnostics,
+    workflow_stage_metadata_order, world_eval_outline, DomainBiomeRef, DomainLayerRef,
+    DomainParent, DomainRole, DomainView, SoftDiagnostic,
 };
 pub use heightfield::{HeightTile, Heightfield, HeightfieldMetrics, TileId};
 pub use landscape_blueprint::{
     preview_resolution_for_world_size, ArchetypeId, EvalStage, LandscapeBlueprint,
 };
 pub use landscape_evolution::{
-    evaluate_landscape_evolution, asymmetric_belt, synthesise_uplift, BoundaryMode,
+    asymmetric_belt, evaluate_landscape_evolution, synthesise_uplift, BoundaryMode,
     EvolutionSolverMode, LandscapeEvolutionInput, LandscapeEvolutionOperator,
     LandscapeEvolutionOutput, LandscapeEvolutionParams, UpliftMode,
 };
 pub use landscape_style::{LandscapeStyle, LandscapeStyleParams};
 pub use layer::{
-    AccentCategory, BlendMode, BuildStatus, CachePolicy, GroupEvalMode, GroupInputMode, Layer,
-    LayerCapabilities, LayerGroup, LayerId, LayerInstanceMeta, LayerKind, LayerStack,
-    LayerTypeMeta, LayerTypeRegistry, MaskCompatibility, OperationCategory, StackCategory,
-    WorkflowStage, biome_destination_section, is_shape_kind,
-};
-pub use realism_benchmark::{
-    measure_document, validate_benchmark_structure, BenchmarkExpectations, RealismBenchmark,
+    biome_destination_section, is_shape_kind, AccentCategory, BlendMode, BuildStatus, CachePolicy,
+    GroupEvalMode, GroupInputMode, Layer, LayerCapabilities, LayerGroup, LayerId,
+    LayerInstanceMeta, LayerKind, LayerStack, LayerTypeMeta, LayerTypeRegistry, MaskCompatibility,
+    OperationCategory, StackCategory, WorkflowStage,
 };
 pub use matter_sim::{
     diagnose_matter_sim, outputs_for_consumer, sync_scenario_outputs_from_matter,
     MatterAdvancedParams, MatterArtistControls, MatterArtistSource, MatterOutputConsumer,
     MatterSimConfig, MatterType,
+};
+pub use realism_benchmark::{
+    measure_document, validate_benchmark_structure, BenchmarkExpectations, RealismBenchmark,
 };
 pub use shape_object::{ShapeKind, ShapeObject, ShapeObjectId, ShapeObjectStore, WorldBounds};
 pub use simulation_scenario::{
@@ -115,12 +109,10 @@ pub use sparse_paint::{
     PaintPage, PaintPageCoord, PaintStrokeId, SparsePaintChannelKey, SparsePaintStore,
 };
 pub use terrain::{
-    DirtyEvent, EditorRefinementState, FrequencyBand, InvalidationKey, InvalidationSet,
-    NormalizedRect, OperationDescriptor, OperationLocality, PyramidConfig, RefinementController,
-    RefinementTimings, RegionSet, ResidentTile, TerrainCacheKey, TerrainLevel, TerrainPyramid, TerrainRuntime,
-    TerrainRuntimeStats, TerrainTileKey, TerrainWorkItem, TerrainWorkKind, TerrainWorkScheduler,
-    TileCacheError, TileCacheInsert, TileCacheStats, TilePageHandle, TileRecord, TileResidencyCache,
-    TileState, WorkPriority, WorkSchedulerStats,
+    EditorRefinementState, NormalizedRect, PyramidConfig, RefinementController, RefinementTimings,
+    RegionSet, ResidentTile, TerrainCacheKey, TerrainLevel, TerrainPyramid, TerrainRuntime,
+    TerrainTileKey, TileCacheError, TileCacheInsert, TileCacheStats, TilePageHandle, TileRecord,
+    TileResidencyCache,
 };
 pub use world_archetype::{
     alpine_world, badlands_world, blank_world_design, build_world, coastal_world, desert_world,

@@ -1,19 +1,25 @@
 //! Application shell: window, eval, project I/O, paint, and UI action dispatch.
 
 mod actions;
-mod helpers;
 mod eval;
+mod helpers;
 mod lifecycle;
 mod paint;
+pub mod prefs;
 mod project;
 mod redraw;
 mod shapes;
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::{mpsc, Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Instant;
 
+use crate::ui::{
+    layers_from_project_template, ChromeGuiState, DockGuiState, InspectorGuiState, LayersGuiState,
+    NewWorldSettings, Preview2dMode, ProjectHomeGuiState, ProjectPrefs, ToolsGuiState, UiState,
+    WindowsGuiState,
+};
 use terra_core::document::EditorSession;
 use terra_core::eval::{EvalScheduler, EvalWorker, PreviewQuality};
 use terra_core::heightfield::{Heightfield, TileId};
@@ -22,9 +28,6 @@ use terra_gpu::{GpuTerrainEngine, GpuTileAtlas};
 use terra_gui::{GuiRenderer, GuiState, Rect, WidgetLabState};
 use terra_io::{BackgroundExporter, BackgroundProjectIo};
 use terra_render::TerrainRenderer;
-use crate::ui::{
-    layers_from_project_template, ChromeGuiState, DockGuiState, InspectorGuiState, LayersGuiState, NewWorldSettings, Preview2dMode, ProjectHomeGuiState, ProjectPrefs, ToolsGuiState, UiState, WindowsGuiState,
-};
 use winit::event::MouseButton;
 use winit::window::Window;
 
@@ -121,10 +124,14 @@ pub(crate) struct LayerPointDrag {
 pub struct TerraApp {
     window: Option<Arc<Window>>,
     renderer: Option<TerrainRenderer>,
+    /// App-owned GPU handles. Every GPU consumer (renderer, tile atlas, terrain
+    /// engine, GUI) shares clones of this instead of sourcing device/queue
+    /// through the renderer.
+    gpu: Option<terra_render::GpuContext>,
     session: EditorSession,
     ui_state: UiState,
     scheduler: EvalScheduler,
-    /// Sparse multi-resolution invalidation and prioritized terrain work metadata.
+    /// Final-output tile residency, revisioning, and progressive refinement state.
     terrain_runtime: terra_core::TerrainRuntime,
     runtime_started: Instant,
 
@@ -153,6 +160,7 @@ pub struct TerraApp {
     modifiers_shift: bool,
     modifiers_alt: bool,
     modifiers_ctrl: bool,
+    modifiers_super: bool,
     /// Held WASD/QE for continuous camera fly (game-engine viewport).
     camera_keys: CameraKeys,
     /// Last time WASD fly was applied (for dt).
@@ -169,7 +177,7 @@ pub struct TerraApp {
     last_eval_fully_gpu: bool,
     /// Progressive final-output tile atlas used by the LOD renderer migration.
     tile_atlas: Option<GpuTileAtlas>,
-    /// (runtime revision, pyramid level, tile) awaiting a frame-budgeted GPU upload.
+    /// (output revision, pyramid level, tile) awaiting a frame-budgeted GPU upload.
     pending_tile_uploads: VecDeque<(u64, u8, TileId)>,
     gui_renderer: Option<GuiRenderer>,
     gui_state: GuiState,
@@ -239,6 +247,7 @@ pub struct TerraApp {
     overhang_upload_fp: u64,
     /// Detect lighting preset changes for progressive invalidation.
     last_lighting_preset: crate::ui::LightingPreset,
+    last_lighting_customized: bool,
     /// Last mask id uploaded to the viewport overlay (detect enter/leave paint mode).
     last_mask_overlay_id: Option<terra_core::mask::MaskId>,
     /// Region Mask Editor session â€” paint/op edits invalidate mask cache only.
@@ -250,13 +259,15 @@ pub struct TerraApp {
 impl Default for TerraApp {
     fn default() -> Self {
         let now = Instant::now();
-        let layout = load_layout_prefs();
+        let prefs = crate::app::prefs::load_editor_prefs();
         let mut gui_state = GuiState::default();
-        gui_state.layout = layout.clone();
+        gui_state.layout = prefs.layout.clone();
         let mut ui_state = UiState::default();
-        ui_state.layout = layout;
         ui_state.viewport_render =
-            crate::ui::ViewportRenderSettings::from_prefs(&ui_state.layout.viewport_render);
+            crate::ui::ViewportRenderSettings::from_prefs(&prefs.viewport_render);
+        ui_state.preferred_workspace = prefs.preferred_workspace;
+        ui_state.auto_switch_workspace_on_create = prefs.auto_switch_workspace_on_create;
+        ui_state.layout = prefs.layout;
         ui_state.apply_preferred_workspace_from_prefs();
         let session = EditorSession::new();
         let metrics = session.document.metrics;
@@ -268,6 +279,7 @@ impl Default for TerraApp {
         Self {
             window: None,
             renderer: None,
+            gpu: None,
             session,
             ui_state,
             scheduler: EvalScheduler::new(),
@@ -290,6 +302,7 @@ impl Default for TerraApp {
             modifiers_shift: false,
             modifiers_alt: false,
             modifiers_ctrl: false,
+            modifiers_super: false,
             camera_keys: CameraKeys::default(),
             last_camera_move: now,
             needs_height_upload: false,
@@ -344,34 +357,17 @@ impl Default for TerraApp {
             veg_upload_fp: u64::MAX,
             overhang_upload_fp: u64::MAX,
             last_lighting_preset: crate::ui::LightingPreset::Studio,
+            last_lighting_customized: false,
             last_mask_overlay_id: None,
             mask_paint_stroke_before: None,
         }
     }
 }
 
-pub(crate) fn layout_prefs_path() -> PathBuf {
-    std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join("terra_layout.json")
-}
-
 pub(crate) fn project_prefs_path() -> PathBuf {
     std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
         .join("terra_projects.json")
-}
-
-pub(crate) fn load_layout_prefs() -> terra_gui::LayoutPrefs {
-    let path = layout_prefs_path();
-    if let Ok(bytes) = std::fs::read(&path) {
-        if let Ok(prefs) = serde_json::from_slice::<terra_gui::LayoutPrefs>(&bytes) {
-            let mut prefs = prefs;
-            prefs.clamp_mut();
-            return prefs;
-        }
-    }
-    terra_gui::LayoutPrefs::default()
 }
 
 pub(crate) fn load_project_prefs() -> ProjectPrefs {
@@ -389,31 +385,6 @@ pub(crate) fn save_project_prefs(prefs: &ProjectPrefs) {
     if let Ok(json) = serde_json::to_vec_pretty(prefs) {
         let _ = std::fs::write(path, json);
     }
-}
-
-/// Queue layout persistence without placing filesystem latency on the render/UI thread.
-/// The worker drains queued snapshots before each write so splitter drags coalesce naturally.
-pub(crate) fn save_layout_prefs(prefs: &terra_gui::LayoutPrefs) {
-    static TX: OnceLock<mpsc::Sender<terra_gui::LayoutPrefs>> = OnceLock::new();
-    let tx = TX.get_or_init(|| {
-        let (tx, rx) = mpsc::channel::<terra_gui::LayoutPrefs>();
-        std::thread::Builder::new()
-            .name("terra-layout-save".into())
-            .spawn(move || {
-                while let Ok(mut latest) = rx.recv() {
-                    while let Ok(newer) = rx.try_recv() {
-                        latest = newer;
-                    }
-                    let path = layout_prefs_path();
-                    if let Ok(json) = serde_json::to_vec_pretty(&latest) {
-                        let _ = std::fs::write(path, json);
-                    }
-                }
-            })
-            .expect("spawn layout save worker");
-        tx
-    });
-    let _ = tx.send(prefs.clone());
 }
 
 /// `Documents/Terra` (falls back to `./Terra` if Documents is unavailable).
@@ -453,13 +424,18 @@ pub(crate) fn project_name_from_path(path: &std::path::Path) -> String {
 }
 
 /// `Documents/Terra/<name>/<name>.json`, creating the project folder as needed.
-pub(crate) fn prepare_project_path(projects_root: &std::path::Path, name: &str) -> std::io::Result<PathBuf> {
+pub(crate) fn prepare_project_path(
+    projects_root: &std::path::Path,
+    name: &str,
+) -> std::io::Result<PathBuf> {
     let project_dir = projects_root.join(name);
     std::fs::create_dir_all(&project_dir)?;
     Ok(project_dir.join(format!("{name}.json")))
 }
 
-pub(crate) fn document_from_template(template_id: &str) -> Option<terra_core::document::TerrainDocument> {
+pub(crate) fn document_from_template(
+    template_id: &str,
+) -> Option<terra_core::document::TerrainDocument> {
     match template_id {
         "blank" => Some(terra_core::blank_world_design(8192.0, 512)),
         "tropical_island" => Some(terra_core::tropical_island_world(10_000.0, 512)),
@@ -602,4 +578,3 @@ pub(crate) fn ensure_surface_processes(doc: &mut terra_core::document::TerrainDo
         ));
     }
 }
-

@@ -1,8 +1,8 @@
-use super::{fade, hash2, lerp};
+use super::{canonical_seed32, fade, hash2, lerp};
 
 /// Classic gradient (Perlin-style) noise in roughly \[-1, 1\].
 pub fn perlin2(x: f32, z: f32, seed: u64) -> f32 {
-    let seed = seed as u32;
+    let seed = canonical_seed32(seed);
     let x0 = x.floor() as i32;
     let z0 = z.floor() as i32;
     let fx = x - x0 as f32;

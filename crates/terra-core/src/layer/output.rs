@@ -1,25 +1,8 @@
 //! Named published outputs from layers and groups.
 
 use crate::fields::FieldId;
-use crate::layer::LayerId;
+use crate::ids::{LayerId, OutputId};
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
-
-/// Stable identity for a published output (survives display-name renames).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct OutputId(pub Uuid);
-
-impl OutputId {
-    pub fn new() -> Self {
-        Self(Uuid::new_v4())
-    }
-}
-
-impl Default for OutputId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 /// Declaration that a layer/group publishes a named field for later reference.
 #[derive(Debug, Clone, Serialize, Deserialize)]

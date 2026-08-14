@@ -221,7 +221,9 @@ impl FieldId {
             "height" => FieldId::Height,
             "base_elevation" => FieldId::BaseElevation,
             keys::BEDROCK_HEIGHT => FieldId::BedrockHeight,
-            keys::SEDIMENT_THICKNESS | keys::LOOSE_SEDIMENT => FieldId::SedimentThickness,
+            keys::SEDIMENT_THICKNESS | keys::SEDIMENT_DEPTH | keys::LOOSE_SEDIMENT => {
+                FieldId::SedimentThickness
+            }
             keys::SOIL_DEPTH => FieldId::SoilDepth,
             "soil_thickness" => FieldId::SoilThickness,
             keys::HARDNESS => FieldId::Hardness,
@@ -461,6 +463,21 @@ mod tests {
         ] {
             let key = id.cache_key();
             assert_eq!(FieldId::from_cache_key(&key).cache_key(), key);
+        }
+    }
+
+    #[test]
+    fn legacy_sediment_keys_resolve_to_the_canonical_field() {
+        for key in [
+            keys::SEDIMENT_THICKNESS,
+            keys::SEDIMENT_DEPTH,
+            keys::LOOSE_SEDIMENT,
+        ] {
+            assert_eq!(FieldId::from_cache_key(key), FieldId::SedimentThickness);
+            assert_eq!(
+                FieldId::from_cache_key(key).cache_key(),
+                keys::SEDIMENT_THICKNESS
+            );
         }
     }
 }

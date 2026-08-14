@@ -1,7 +1,7 @@
 use std::time::Instant;
 
-use terra_core::layer::LayerKind;
 use crate::ui::PanelAction;
+use terra_core::layer::LayerKind;
 
 use super::{LayerPointDrag, LayerPointKind, TerraApp, PAINT_DEBOUNCE_MS};
 impl TerraApp {
@@ -337,6 +337,4 @@ impl TerraApp {
             }
         }
     }
-
-
 }

@@ -1,28 +1,18 @@
-//! Progressive, spatial terrain-evaluation primitives.
-//!
-//! These types deliberately sit beside the legacy whole-field evaluator. They provide the
-//! shared vocabulary for migrating Terra to layer x level x tile work without exposing a node
-//! graph to artists or forcing an all-at-once engine rewrite.
+//! Final-output tile residency, viewport regions, and progressive refinement.
 
 mod cache;
-mod executor;
-mod invalidation;
 mod pyramid;
+mod refinement;
+mod region;
 mod runtime;
-mod work;
+mod tile;
 
 pub use cache::{
     ResidentTile, TerrainCacheKey, TileCacheError, TileCacheInsert, TileCacheStats, TilePageHandle,
     TileResidencyCache,
 };
-pub use executor::{execute_vector_height_tile, TileExecutionError, TileExecutionOutput};
-pub use invalidation::{
-    DirtyEvent, FrequencyBand, InvalidationKey, InvalidationSet, NormalizedRect,
-    OperationDescriptor, OperationLocality, RegionSet,
-};
-pub use pyramid::{PyramidConfig, TerrainLevel, TerrainPyramid, TileRecord, TileState};
-pub use runtime::{TerrainRuntime, TerrainRuntimeStats};
-pub use work::{
-    EditorRefinementState, RefinementController, RefinementTimings, TerrainTileKey, TerrainWorkItem,
-    TerrainWorkKind, TerrainWorkScheduler, WorkPriority, WorkSchedulerStats,
-};
+pub use pyramid::{PyramidConfig, TerrainLevel, TerrainPyramid, TileRecord};
+pub use refinement::{EditorRefinementState, RefinementController, RefinementTimings};
+pub use region::{NormalizedRect, RegionSet};
+pub use runtime::TerrainRuntime;
+pub use tile::TerrainTileKey;

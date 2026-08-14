@@ -13,6 +13,7 @@ mod scale;
 mod stack;
 mod workflow;
 
+pub use crate::ids::{LayerId, OutputId};
 pub use binding::{
     BindingCombine, BindingCurve, BindingSource, ParamBinding, ParamPath, RemapRange,
 };
@@ -29,39 +30,15 @@ pub use metadata::{
     LayerTypeMeta, MaskCompatibility,
 };
 pub use operation::{FieldContract, OperationCategory};
-pub use output::{NamedOutputDecl, OutputId, OutputRef, PublishedOutput};
+pub use output::{NamedOutputDecl, OutputRef, PublishedOutput};
 pub use registry::LayerTypeRegistry;
 pub use scale::ScaleBand;
-pub use stack::{
-    biome_destination_section, is_shape_kind, LayerGroup, LayerStack, StackNode,
-};
+pub use stack::{biome_destination_section, is_shape_kind, LayerGroup, LayerStack, StackNode};
 pub use workflow::WorkflowStage;
 
 use crate::mask::Distribution;
 use crate::operation_placement::OperationPlacement;
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
-
-/// Stable layer identity for undo/reorder/caching.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct LayerId(pub Uuid);
-
-impl LayerId {
-    pub fn new() -> Self {
-        Self(Uuid::new_v4())
-    }
-
-    /// Stable sentinel id for UI virtual rows (not persisted as stack nodes).
-    pub fn from_u128(v: u128) -> Self {
-        Self(Uuid::from_u128(v))
-    }
-}
-
-impl Default for LayerId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 /// Parameters shared by every layer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,9 +66,6 @@ pub struct LayerCommon {
     /// Explicit cache policy (v3+). When absent, derived from `cached`.
     #[serde(default)]
     pub cache_policy: Option<CachePolicy>,
-    /// Optional seed override for deterministic ops.
-    #[serde(default)]
-    pub seed: Option<u64>,
     /// Named outputs published for later mask / binding references.
     #[serde(default)]
     pub outputs: Vec<NamedOutputDecl>,
@@ -123,7 +97,6 @@ impl LayerCommon {
             color_tag: 0,
             cached: false,
             cache_policy: None,
-            seed: None,
             outputs: Vec::new(),
             param_bindings: Vec::new(),
             shape_transform: None,

@@ -1,10 +1,10 @@
 //! Floating editor windows (mask / content / export / preview / profiler).
 
 use crate::ui::presets::builtin_presets;
-use crate::ui::{FrameUiOutput, Preview2dMode, UiState};
+use crate::ui::style::{self, GAP, PAD};
+use crate::ui::{FrameUiOutput, Preview2dMode, TerrainSettingsUpdate, UiState};
 use terra_core::document::TerrainDocument;
 use terra_core::mask::{MaskAsset, MaskId, MaskOp, MaskSource, PaintBuffer};
-use crate::ui::style::{self, GAP, PAD};
 use terra_gui::{
     button, button_id, checkbox, combo, label, label_dim, section_header, selectable, slider_f32,
     slider_f32_id, slider_i32, GuiContext, Id, Rect,
@@ -37,7 +37,7 @@ pub struct WindowsGuiState {
 
 pub fn draw_windows(
     ui: &mut GuiContext<'_>,
-    doc: &mut TerrainDocument,
+    doc: &TerrainDocument,
     ui_state: &mut UiState,
     win: &mut WindowsGuiState,
     out: &mut FrameUiOutput,
@@ -409,7 +409,7 @@ fn content_browser(ui: &mut GuiContext<'_>, actions: &mut Vec<PanelAction>) {
 
 fn export_panel(
     ui: &mut GuiContext<'_>,
-    doc: &mut TerrainDocument,
+    doc: &TerrainDocument,
     ui_state: &mut UiState,
     out: &mut FrameUiOutput,
 ) {
@@ -425,26 +425,30 @@ fn export_panel(
 
     label(ui, "Resolution");
     let mut export_res = doc.export_resolution as i32;
+    let mut update = TerrainSettingsUpdate::default();
     if slider_i32(ui, "Export res", &mut export_res, 512, 8192) {
-        doc.export_resolution = export_res as u32;
+        update.export_resolution = Some(export_res as u32);
     }
     let mut preview_res = doc.preview_resolution as i32;
     if slider_i32(ui, "Preview res", &mut preview_res, 256, 8192) {
-        doc.preview_resolution = preview_res as u32;
+        update.preview_resolution = Some(preview_res as u32);
     }
     ui.separator();
     label(ui, "LEVEL STEPS (Terrain)");
     let levels =
-        terra_core::analyze::LevelStepSettings::level_count_for_resolution(doc.preview_resolution);
+        terra_core::analyze::LevelStepSettings::level_count_for_resolution(preview_res as u32);
     label(ui, &format!("Upsample levels at preview: {levels}"));
-    changed_slider_terrain(doc, ui);
+    changed_slider_terrain(doc, ui, &mut update);
     label(
         ui,
         &format!(
             "Export uses {}x{} at export quality (not Draft).",
-            doc.export_resolution, doc.export_resolution
+            export_res, export_res
         ),
     );
+    if !update.is_empty() {
+        out.actions.push(PanelAction::UpdateTerrainSettings(update));
+    }
     ui.separator();
 
     label(ui, "Outputs (per Start Export)");
@@ -625,28 +629,32 @@ fn profiler_panel(ui: &mut GuiContext<'_>, ui_state: &UiState) {
     }
 }
 
-fn changed_slider_terrain(doc: &mut TerrainDocument, ui: &mut GuiContext<'_>) {
+fn changed_slider_terrain(
+    doc: &TerrainDocument,
+    ui: &mut GuiContext<'_>,
+    update: &mut TerrainSettingsUpdate,
+) {
     let mut precision = doc.level_steps.precision;
     if slider_f32(ui, "Precision", &mut precision, 0.25, 4.0) {
-        doc.level_steps.precision = precision;
+        update.precision = Some(precision);
     }
     let mut world = doc.level_steps.world_scale;
     if slider_f32(ui, "World Scale", &mut world, 0.1, 10.0) {
-        doc.level_steps.world_scale = world;
+        update.world_scale = Some(world);
     }
     let mut max_level = doc.level_steps.max_level as i32;
     if slider_i32(ui, "Max Level (0=auto)", &mut max_level, 0, 12) {
-        doc.level_steps.max_level = max_level as u32;
+        update.max_level = Some(max_level as u32);
     }
     if button_id(
         ui,
         Id::new("hd_mode_cycle"),
         &format!("HD Preview: {}", doc.level_steps.high_detail.label()),
     ) {
-        doc.level_steps.high_detail = doc.level_steps.high_detail.cycle();
+        update.high_detail = Some(doc.level_steps.high_detail.cycle());
     }
     let mut outline = doc.level_steps.show_hd_outline;
     if checkbox(ui, "Show HD Outline", &mut outline) {
-        doc.level_steps.show_hd_outline = outline;
+        update.show_hd_outline = Some(outline);
     }
 }

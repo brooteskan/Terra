@@ -6,12 +6,12 @@
 
 use crate::ui::actions::PanelAction;
 use crate::ui::panels::viewport_float_rect;
+use crate::ui::style::{self, FONT_SCALE, PAD, ROW_H};
 use crate::ui::{LayerDragSource, UiState};
 use terra_core::document::TerrainDocument;
 use terra_core::terrain_recipe::{
     build_terrain_recipe_from_stack, RecipeItem, RecipeItemKind, RecipeRebuildStatus,
 };
-use crate::ui::style::{self, FONT_SCALE, PAD, ROW_H};
 use terra_gui::{button_id, label, DrawList, GuiContext, Icon, Id, Rect};
 
 const INDENT: f32 = 14.0;

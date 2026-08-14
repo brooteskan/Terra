@@ -3,21 +3,35 @@
 //! Layer-type metadata (names, icons, creatable flags) should prefer
 //! [`terra_core::layer::LayerTypeRegistry`] as the source of truth. This catalog
 //! still owns sculpt/mask/brush actions that are not layer types; when adding a
-//! new `LayerKind`, register it in the core registry first, then expose it here.
+//! new `LayerKind`, register it in the core registry; coverage tests require every
+//! creatable type to receive one canonical live route.
 
 use crate::ui::workspace::WorkspaceMode;
 use crate::ui::EditorTool;
 use terra_core::layer::{
-    BedGeometry, BiomesParams, CoastalParams, DebrisFlowParams, DuneParams, EffectFilterParams,
-    FluidSimParams, GeomorphicDetailParams, HydraulicErosionParams, HydrologyRepairParams,
-    ImportHeightmapParams, LandscapeEvolutionParams, LayerKind, MaterialRule, MaterialsParams,
-    MultiScaleAmplifyParams, RiverCarveParams, SandSimParams, ThermalErosionParams,
-    VegetationParams,
+    BedGeometry, DuneParams, EffectFilterParams, FluidSimParams, HydraulicErosionParams,
+    ImportHeightmapParams, Layer, LayerKind, LayerTypeRegistry, MaterialRule, MaterialsParams,
+    ThermalErosionParams, VegetationParams, OPEN_HEIGHT_MAX, OPEN_HEIGHT_MIN,
 };
 use terra_core::mask::{DistNode, DistNodeKind, Distribution, MaskId, MaskSource};
 use terra_gui::Icon;
 
 use std::sync::OnceLock;
+
+#[derive(Debug, Clone, Copy)]
+struct LayerExposureReplacement {
+    type_id: &'static str,
+    replacement_tool_id: &'static str,
+    reason: &'static str,
+}
+
+/// Compatibility-only registry kinds intentionally omitted from live create UI.
+const LAYER_EXPOSURE_REPLACEMENTS: &[LayerExposureReplacement] = &[LayerExposureReplacement {
+    type_id: "uplift",
+    replacement_tool_id: "sim.landscape_evolution",
+    reason: "Landscape Evolution includes coupled uplift and is the supported authoring workflow.",
+}];
+
 /// What activating a catalog entry does.
 #[derive(Debug, Clone)]
 pub enum ToolAction {
@@ -47,6 +61,9 @@ pub struct ToolDef {
     pub action: ToolAction,
     pub description: &'static str,
     pub shortcut: Option<&'static str>,
+    /// Registry type id when this is the canonical default route for a layer type.
+    /// Curated presets deliberately leave this unset and retain their embedded kind.
+    pub registry_type_id: Option<&'static str>,
 }
 
 impl ToolDef {
@@ -55,6 +72,16 @@ impl ToolDef {
     }
 }
 
+/// Create a fresh layer from an explicit catalog preset.
+///
+/// The supplied `LayerKind` is authoritative. Looking it up by type id in the
+/// registry would replace curated parameters with that type's default factory.
+pub(crate) fn instantiate_layer_preset(name: &str, kind: &LayerKind) -> Layer {
+    Layer::new(name, kind.clone())
+}
+
+/// Build an explicitly curated preset whose presentation and parameters may
+/// intentionally differ from the registered type defaults.
 fn add(
     id: &'static str,
     label: &'static str,
@@ -72,6 +99,59 @@ fn add(
         action: ToolAction::AddLayer { name, kind },
         description,
         shortcut: None,
+        registry_type_id: None,
+    }
+}
+
+fn icon_from_registry_key(key: &str) -> Icon {
+    match key {
+        "pencil" => Icon::Pencil,
+        "image" => Icon::Image,
+        "activity" => Icon::Activity,
+        "mountain" => Icon::Mountain,
+        "waves" => Icon::Waves,
+        "blend" => Icon::Blend,
+        "sparkles" => Icon::Sparkles,
+        "box" => Icon::Box,
+        "droplets" => Icon::Droplets,
+        "layers" => Icon::Layers,
+        other => panic!("unsupported layer registry icon key: {other}"),
+    }
+}
+
+fn builtin_layer_registry() -> &'static LayerTypeRegistry {
+    static REGISTRY: OnceLock<LayerTypeRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(LayerTypeRegistry::builtin)
+}
+
+/// Build the canonical default UI route for a registered layer type.
+///
+/// Names, icon, description, and the default factory all come from the registry;
+/// this catalog supplies only UI placement and the stable tool id.
+fn registered_layer_tool(id: &'static str, mode: WorkspaceMode, type_id: &'static str) -> ToolDef {
+    let registry = builtin_layer_registry();
+    let meta = registry
+        .get(type_id)
+        .unwrap_or_else(|| panic!("catalog references unknown layer type {type_id}"));
+    assert!(
+        meta.capabilities.user_creatable,
+        "catalog exposes non-creatable layer type {type_id}"
+    );
+    let layer = registry
+        .create(type_id)
+        .unwrap_or_else(|| panic!("registered layer type {type_id} has no factory"));
+    ToolDef {
+        id,
+        label: meta.display_name,
+        icon: icon_from_registry_key(meta.icon_key),
+        mode,
+        action: ToolAction::AddLayer {
+            name: meta.display_name,
+            kind: layer.kind,
+        },
+        description: meta.description,
+        shortcut: None,
+        registry_type_id: Some(meta.type_id),
     }
 }
 
@@ -92,6 +172,7 @@ fn sculpt(
         action: ToolAction::Sculpt(tool),
         description,
         shortcut,
+        registry_type_id: None,
     }
 }
 
@@ -111,6 +192,7 @@ fn biome_brush(
         action: ToolAction::BiomeBrush(brush),
         description,
         shortcut,
+        registry_type_id: None,
     }
 }
 
@@ -130,6 +212,7 @@ fn add_mask(
         action: ToolAction::AddMask { name, source },
         description,
         shortcut: None,
+        registry_type_id: None,
     }
 }
 
@@ -181,69 +264,67 @@ pub fn all_tools() -> Vec<ToolDef> {
     let mut tools = Vec::new();
 
     // —— Terrain: Shape Layer types (WC-style) ——————————————————————
-    tools.push(add(
+    tools.push(registered_layer_tool(
         "shape.sculpt",
-        "Sculpt",
-        Icon::Pencil,
         WorkspaceMode::Terrain,
-        "Sculpt Layer",
-        LayerKind::SculptStrokes(terra_core::layer::SculptStrokeParams::default()),
-        "Editable sculpt strokes — raise, lower, smooth, stamps.",
+        "sculpt_strokes",
     ));
-    tools.push(add(
+    tools.push(registered_layer_tool(
         "shape.stamp_2d",
-        "2D Stamp",
-        Icon::Image,
         WorkspaceMode::Terrain,
-        "2D Stamp",
-        LayerKind::Stamp2d(terra_core::layer::Stamp2dParams::default()),
-        "Stamp a heightmap into the terrain with blend & transform.",
+        "stamp_2d",
     ));
-    tools.push(add(
+    tools.push(registered_layer_tool(
         "shape.stamp_3d",
-        "3D Stamp",
-        Icon::Box,
         WorkspaceMode::Terrain,
-        "3D Stamp",
-        LayerKind::Stamp3d(terra_core::layer::Stamp3dParams::default()),
-        "Stamp a mesh (OBJ) or height image — procedural rock when empty.",
+        "stamp_3d",
     ));
-    tools.push(add(
+    tools.push(registered_layer_tool(
         "shape.procedural",
-        "Procedural",
-        Icon::Mountain,
         WorkspaceMode::Terrain,
-        "Procedural Shape",
-        LayerKind::ProceduralShape(terra_core::layer::ProceduralShapeParams::default()),
-        "Procedural landform — pick Mountain, Hills, Mesa, Noise, …",
+        "procedural_shape",
     ));
-    tools.push(add(
+    tools.push(registered_layer_tool(
         "shape.polygon",
-        "Polygon",
-        Icon::Layers,
         WorkspaceMode::Terrain,
-        "Polygon",
-        LayerKind::PolygonHeight(terra_core::layer::PolygonHeightParams::default()),
-        "Raise or carve a closed polygon region.",
+        "polygon_height",
     ));
-    tools.push(add(
+    tools.push(registered_layer_tool(
         "shape.path",
-        "Path",
-        Icon::Activity,
         WorkspaceMode::Terrain,
-        "Path",
-        LayerKind::Path(terra_core::layer::PathParams::default()),
-        "Spline path for ridges, valleys, or roads.",
+        "path",
     ));
-    tools.push(add(
+    tools.push(registered_layer_tool(
         "shape.heightmap",
-        "Heightmap",
-        Icon::Image,
         WorkspaceMode::Terrain,
-        "Heightmap",
-        LayerKind::ImportHeightmap(ImportHeightmapParams::default()),
-        "Import a heightmap as a shape layer (blend & reorder).",
+        "import_heightmap",
     ));
+
+    // Canonical default routes for registered shape/foundation kinds. Curated
+    // presets remain elsewhere in the catalog and may share the same kind.
+    for (id, type_id) in [
+        ("gen.flat", "flat"),
+        ("gen.ramp", "ramp"),
+        ("gen.noise_value", "noise_value"),
+        ("gen.noise_perlin", "noise_perlin"),
+        ("gen.noise_open_simplex", "noise_open_simplex"),
+        ("gen.noise_worley", "noise_worley"),
+        ("gen.fbm", "fbm"),
+        ("gen.ridged", "ridged"),
+        ("gen.domain_warp", "domain_warp"),
+        ("gen.mountain", "mountain"),
+        ("gen.volcano", "volcano"),
+        ("gen.mesa", "mesa"),
+        ("gen.island", "island"),
+        ("gen.canyon", "canyon"),
+        ("gen.dunes", "dunes"),
+        ("gen.plateau", "plateau"),
+        ("gen.voronoi", "voronoi"),
+        ("gen.terrain_constraints", "terrain_constraints"),
+        ("gen.gradient_reconstruct", "gradient_reconstruct"),
+    ] {
+        tools.push(registered_layer_tool(id, WorkspaceMode::Terrain, type_id));
+    }
 
     // —— Terrain: height brushes ————————————————————————————————————
     tools.push(sculpt(
@@ -456,81 +537,50 @@ pub fn all_tools() -> Vec<ToolDef> {
         action: ToolAction::CreateBiome { name: "Biome" },
         description: "Add a biome container under Biomes (Filters / Materials / Objects).",
         shortcut: None,
+        registry_type_id: None,
     });
-    tools.push(add(
+    tools.push(registered_layer_tool(
         "biome.climate",
-        "Climate Classification",
-        Icon::Sparkles,
         WorkspaceMode::Biomes,
-        "Climate Classification",
-        LayerKind::Biomes(BiomesParams::default()),
-        "Climate-driven classification LUT (not a biome container).",
+        "climate_biomes",
     ));
 
     // —— Simulation: processes —————————————————————————————————————
-    tools.push(add(
+    tools.push(registered_layer_tool(
         "sim.landscape_evolution",
-        "Landscape Evolution",
-        Icon::Mountain,
         WorkspaceMode::Simulation,
-        "Landscape Evolution",
-        LayerKind::LandscapeEvolution(LandscapeEvolutionParams::default()),
-        "Coupled uplift, stream-power incision, hillslope diffusion, and sediment transport.",
+        "landscape_evolution",
     ));
-    tools.push(add(
+    tools.push(registered_layer_tool(
         "sim.multi_scale_amplify",
-        "Multi-Scale Amplify",
-        Icon::Sparkles,
         WorkspaceMode::Simulation,
-        "Multi-Scale Amplify",
-        LayerKind::MultiScaleAmplify(MultiScaleAmplifyParams::default()),
-        "Add hydrologically aligned detail across scales while preserving ridges.",
+        "multi_scale_amplify",
     ));
-    tools.push(add(
+    tools.push(registered_layer_tool(
         "sim.hydrology_repair",
-        "Hydrology Repair",
-        Icon::Droplets,
         WorkspaceMode::Simulation,
-        "Hydrology Repair",
-        LayerKind::HydrologyRepair(HydrologyRepairParams::default()),
-        "Reconnect drainage and remove local pits with protected-feature retargeting.",
+        "hydrology_repair",
     ));
 
-    tools.push(add(
+    tools.push(registered_layer_tool(
         "sim.hydraulic",
-        "Hydraulic",
-        Icon::Droplets,
         WorkspaceMode::Simulation,
-        "Hydraulic Erosion",
-        LayerKind::HydraulicErosion(HydraulicErosionParams::default()),
-        "Simulate rainfall and sediment transport.",
+        "hydraulic_erosion",
     ));
-    tools.push(add(
+    tools.push(registered_layer_tool(
         "sim.thermal",
-        "Thermal",
-        Icon::Mountain,
         WorkspaceMode::Simulation,
-        "Thermal Erosion",
-        LayerKind::ThermalErosion(ThermalErosionParams::default()),
-        "Talus weathering with layered bedrock / debris.",
+        "thermal_erosion",
     ));
-    tools.push(add(
+    tools.push(registered_layer_tool(
         "sim.debris_flow",
-        "Debris Flow",
-        Icon::Activity,
         WorkspaceMode::Simulation,
-        "Debris Flow",
-        LayerKind::DebrisFlow(DebrisFlowParams::default()),
-        "Steep-slope debris-flow scars, cones, and fluvial coupling.",
+        "debris_flow",
     ));
-    tools.push(add(
+    tools.push(registered_layer_tool(
         "sim.wind",
-        "Wind",
-        Icon::Waves,
         WorkspaceMode::Simulation,
-        "Sand Simulation",
-        LayerKind::SandSimulation(SandSimParams::default()),
-        "Aeolian sand transport — saltation, sheltering, avalanching (progressive).",
+        "sand_simulation",
     ));
     tools.push(add(
         "sim.sediment",
@@ -576,24 +626,29 @@ pub fn all_tools() -> Vec<ToolDef> {
         "Bedrock weathering into loose debris (thermal).",
     ));
 
+    for (id, type_id) in [
+        ("sim.stream_power", "stream_power"),
+        ("sim.river_network", "river_network"),
+        ("sim.ecosystem_feedback", "ecosystem_feedback"),
+        ("sim.fluid", "fluid_simulation"),
+    ] {
+        tools.push(registered_layer_tool(
+            id,
+            WorkspaceMode::Simulation,
+            type_id,
+        ));
+    }
+
     // —— Simulation: hydrology —————————————————————————————————————
-    tools.push(add(
+    tools.push(registered_layer_tool(
         "sim.river",
-        "River",
-        Icon::Waves,
         WorkspaceMode::Simulation,
-        "River Carve",
-        LayerKind::RiverCarve(RiverCarveParams::default()),
-        "Carve a river channel.",
+        "river_carve",
     ));
-    tools.push(add(
+    tools.push(registered_layer_tool(
         "sim.coastal",
-        "Coastal",
-        Icon::Waves,
         WorkspaceMode::Simulation,
-        "Coast",
-        LayerKind::Coastal(CoastalParams::default()),
-        "Beach shelf and coastal flatten.",
+        "coastal",
     ));
     tools.push(add(
         "sim.lake",
@@ -768,14 +823,10 @@ pub fn all_tools() -> Vec<ToolDef> {
     ));
 
     // —— Materials —————————————————————————————————————————————————
-    tools.push(add(
+    tools.push(registered_layer_tool(
         "mat.material",
-        "Material Paint",
-        Icon::Paintbrush,
         WorkspaceMode::Materials,
-        "Materials",
-        LayerKind::Materials(MaterialsParams::default()),
-        "Add a materials / surface layer.",
+        "materials",
     ));
     tools.push(add(
         "mat.colour",
@@ -788,8 +839,8 @@ pub fn all_tools() -> Vec<ToolDef> {
             5,
             0.0,
             90.0,
-            f32::NEG_INFINITY,
-            f32::INFINITY,
+            OPEN_HEIGHT_MIN,
+            OPEN_HEIGHT_MAX,
             MaskSource::None,
             0.4,
             [0.55, 0.52, 0.48],
@@ -808,8 +859,8 @@ pub fn all_tools() -> Vec<ToolDef> {
             6,
             0.0,
             25.0,
-            f32::NEG_INFINITY,
-            f32::INFINITY,
+            OPEN_HEIGHT_MIN,
+            OPEN_HEIGHT_MAX,
             MaskSource::Wetness,
             0.15,
             [0.22, 0.32, 0.28],
@@ -829,7 +880,7 @@ pub fn all_tools() -> Vec<ToolDef> {
             0.0,
             48.0,
             180.0,
-            f32::INFINITY,
+            OPEN_HEIGHT_MAX,
             MaskSource::Snow,
             0.12,
             [0.86, 0.89, 0.93],
@@ -848,8 +899,8 @@ pub fn all_tools() -> Vec<ToolDef> {
             1,
             35.0,
             90.0,
-            f32::NEG_INFINITY,
-            f32::INFINITY,
+            OPEN_HEIGHT_MIN,
+            OPEN_HEIGHT_MAX,
             MaskSource::None,
             0.85,
             [0.45, 0.42, 0.38],
@@ -869,7 +920,7 @@ pub fn all_tools() -> Vec<ToolDef> {
             0.0,
             35.0,
             5.0,
-            f32::INFINITY,
+            OPEN_HEIGHT_MAX,
             MaskSource::None,
             0.2,
             [0.28, 0.48, 0.22],
@@ -879,14 +930,10 @@ pub fn all_tools() -> Vec<ToolDef> {
     ));
 
     // —— Objects (scatter) —————————————————————————————————————————
-    tools.push(add(
+    tools.push(registered_layer_tool(
         "obj.trees",
-        "Trees",
-        Icon::Package,
         WorkspaceMode::Objects,
-        "Trees",
-        LayerKind::Vegetation(VegetationParams::default()),
-        "Scatter trees / vegetation.",
+        "vegetation",
     ));
     tools.push(add(
         "obj.rocks",
@@ -1123,7 +1170,35 @@ pub fn all_tools() -> Vec<ToolDef> {
 
     // Utilities (Move / Measure) live on the viewport hotbar — no left-rail catalog entries.
 
+    for (id, type_id) in [
+        ("filter.general.effect_filter", "effect_filter"),
+        ("filter.general.blur", "blur"),
+        ("filter.general.overhang_stamp", "overhang_stamp"),
+        ("filter.general.local_sdf", "local_sdf"),
+        ("filter.terrace.core", "terrace"),
+    ] {
+        tools.push(registered_layer_tool(id, WorkspaceMode::Filters, type_id));
+    }
     tools.extend(wc_filter_catalog_tools());
+    let registry = builtin_layer_registry();
+    for replacement in LAYER_EXPOSURE_REPLACEMENTS {
+        let meta = registry
+            .get(replacement.type_id)
+            .expect("replacement policy references a registered layer type");
+        assert!(
+            !meta.capabilities.user_creatable,
+            "replacement policy type {} must not remain user-creatable",
+            replacement.type_id
+        );
+        assert!(!replacement.reason.is_empty());
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool.id == replacement.replacement_tool_id),
+            "replacement tool {} is not live",
+            replacement.replacement_tool_id
+        );
+    }
     tools
 }
 
@@ -1142,13 +1217,10 @@ pub fn wc_filter_catalog_tools() -> Vec<ToolDef> {
 
     vec![
         // —— General ————————————————————————————————————————————————
-        f(
+        registered_layer_tool(
             "filter.general.geomorphic_detail",
-            "Geomorphic Detail",
-            Icon::Sparkles,
-            "Geomorphic Detail",
-            LayerKind::GeomorphicDetail(GeomorphicDetailParams::default()),
-            "Slope- and drainage-aligned multi-octave relief detail.",
+            WorkspaceMode::Filters,
+            "geomorphic_detail",
         ),
         ef(
             "filter.general.add_set",
@@ -1871,6 +1943,30 @@ mod tests {
     use terra_core::mask::MaskSource;
 
     #[test]
+    fn material_and_biome_catalog_layers_round_trip_without_null_bounds() {
+        for tool in all_tools() {
+            let ToolAction::AddLayer { kind, .. } = tool.action else {
+                continue;
+            };
+            if !matches!(&kind, LayerKind::Materials(_) | LayerKind::Biomes(_)) {
+                continue;
+            }
+            let json = serde_json::to_string(&kind)
+                .unwrap_or_else(|error| panic!("{} must serialize: {error}", tool.id));
+            assert!(!json.contains("\"min_height\":null"), "{}", tool.id);
+            assert!(!json.contains("\"max_height\":null"), "{}", tool.id);
+            serde_json::from_str::<LayerKind>(&json)
+                .unwrap_or_else(|error| panic!("{} must reload: {error}", tool.id));
+        }
+    }
+
+    /// Modes whose tools live on the viewport hotbar, not the left-rail catalog.
+    /// `Utilities` (Move / Measure / camera navigation) is intentionally
+    /// catalog-empty; Bake was removed. These modes are exempt from the
+    /// "every mode has catalog tools" invariant and, conversely, must stay empty.
+    const HOTBAR_ONLY_MODES: &[WorkspaceMode] = &[WorkspaceMode::Utilities];
+
+    #[test]
     fn workspace_catalog_reuses_cached_definitions() {
         let cached = all_tools_cached();
         let visible = tools_for_workspace(crate::ui::workspace::WorkspaceId::Simulation);
@@ -1883,9 +1979,12 @@ mod tests {
     #[test]
     fn every_mode_has_tools() {
         for mode in WorkspaceMode::ALL {
+            if HOTBAR_ONLY_MODES.contains(&mode) {
+                continue;
+            }
             assert!(
                 !tools_for_mode(mode).is_empty(),
-                "{:?} should have tools",
+                "{:?} should have catalog tools",
                 mode
             );
         }
@@ -1901,7 +2000,7 @@ mod tests {
         assert!(ids.contains(&"shape.procedural"));
         assert!(ids.contains(&"shape.sculpt"));
         assert!(ids.contains(&"shape.heightmap"));
-        assert!(!ids.contains(&"gen.mountain"));
+        assert!(ids.contains(&"gen.mountain"));
         assert!(!ids.contains(&"paint.height"));
     }
 
@@ -1922,7 +2021,10 @@ mod tests {
             );
         }
         // Filter catalog entries must not claim the SHAPE LAYERS group.
-        for tool in all_tools().into_iter().filter(|t| t.id.starts_with("filter.")) {
+        for tool in all_tools()
+            .into_iter()
+            .filter(|t| t.id.starts_with("filter."))
+        {
             assert_ne!(tool.group(), ToolGroup::Landforms);
         }
     }
@@ -1952,11 +2054,14 @@ mod tests {
     }
 
     #[test]
-    fn utilities_catalog_is_empty() {
-        assert!(
-            tools_for_mode(WorkspaceMode::Utilities).is_empty(),
-            "Move/Measure live on the viewport hotbar; Bake was removed"
-        );
+    fn hotbar_only_modes_have_no_catalog_tools() {
+        for &mode in HOTBAR_ONLY_MODES {
+            assert!(
+                tools_for_mode(mode).is_empty(),
+                "{:?} tools live on the viewport hotbar; the left-rail catalog must stay empty",
+                mode
+            );
+        }
     }
 
     #[test]
@@ -1981,6 +2086,9 @@ mod tests {
     fn every_catalog_tool_has_a_thumbnail() {
         let missing: Vec<_> = all_tools()
             .into_iter()
+            // Registry-derived defaults deliberately fall back to their icon
+            // until bespoke artwork is available.
+            .filter(|t| t.registry_type_id.is_none())
             .filter(|t| crate::ui::tool_thumbs::thumb_for_tool(t.id).is_none())
             .map(|t| t.id)
             .collect();
@@ -2003,13 +2111,8 @@ mod tests {
         let missing: Vec<_> = EffectFilterKind::ALL
             .iter()
             .copied()
-            // Intentionally omitted from the WC Filters shelf (legacy / advanced-add only).
-            .filter(|k| {
-                !matches!(
-                    k,
-                    EffectFilterKind::Cliffs | EffectFilterKind::SpikeRemoval
-                )
-            })
+            // These EffectFilter presets are intentionally absent from the curated WC shelf.
+            .filter(|k| !matches!(k, EffectFilterKind::Cliffs | EffectFilterKind::SpikeRemoval))
             .filter(|k| !catalog_kinds.contains(k))
             .map(|k| k.label())
             .collect();
@@ -2020,16 +2123,94 @@ mod tests {
     }
 
     #[test]
-    fn island_and_crater_remain_in_add_menu_path() {
-        // Legacy landform kinds still exist for projects / Advanced Add Layer;
-        // Terrain tools use Procedural Shape + generator picker instead.
+    fn every_creatable_registry_type_has_one_canonical_live_route() {
+        let registry = LayerTypeRegistry::builtin();
+        let tools = quick_add_entries();
+        let mut routes: std::collections::HashMap<&str, Vec<&ToolDef>> =
+            std::collections::HashMap::new();
+        for tool in &tools {
+            if let Some(type_id) = tool.registry_type_id {
+                routes.entry(type_id).or_default().push(tool);
+            }
+        }
+
+        let mut missing = Vec::new();
+        let mut duplicate = Vec::new();
+        for meta in registry.creatable() {
+            match routes.get(meta.type_id).map(Vec::as_slice) {
+                None | Some([]) => missing.push(meta.type_id),
+                Some([_]) => {}
+                Some(found) => duplicate.push((meta.type_id, found.len())),
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "creatable types missing live routes: {missing:?}"
+        );
+        assert!(
+            duplicate.is_empty(),
+            "creatable types with duplicate canonical routes: {duplicate:?}"
+        );
+    }
+
+    #[test]
+    fn registered_tools_derive_metadata_and_factory_from_registry() {
+        let registry = LayerTypeRegistry::builtin();
+        for tool in all_tools()
+            .into_iter()
+            .filter(|tool| tool.registry_type_id.is_some())
+        {
+            let type_id = tool.registry_type_id.unwrap();
+            let meta = registry.get(type_id).expect("registered tool metadata");
+            let expected = registry.create(type_id).expect("registered tool factory");
+            assert_eq!(tool.label, meta.display_name, "label for {type_id}");
+            assert_eq!(
+                tool.description, meta.description,
+                "description for {type_id}"
+            );
+            assert_eq!(tool.icon, icon_from_registry_key(meta.icon_key));
+            let ToolAction::AddLayer { name, kind } = tool.action else {
+                panic!("registered tool {type_id} must add a layer");
+            };
+            assert_eq!(name, meta.display_name);
+            assert_eq!(kind.type_id(), type_id);
+            assert_eq!(
+                serde_json::to_value(kind).expect("serialize catalog kind"),
+                serde_json::to_value(expected.kind).expect("serialize registry kind"),
+                "factory defaults for {type_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn replacement_policy_is_explicit_and_live() {
+        let registry = LayerTypeRegistry::builtin();
         let tools = all_tools();
-        assert!(tools.iter().any(|t| t.id == "shape.procedural"));
-        let crater_proc = tools.iter().find(|t| t.id == "shape.procedural").unwrap();
+        for replacement in LAYER_EXPOSURE_REPLACEMENTS {
+            let meta = registry.get(replacement.type_id).expect("replacement type");
+            assert!(!meta.capabilities.user_creatable);
+            assert!(!replacement.reason.trim().is_empty());
+            assert!(
+                tools
+                    .iter()
+                    .any(|tool| tool.id == replacement.replacement_tool_id),
+                "missing replacement {} for {}",
+                replacement.replacement_tool_id,
+                replacement.type_id
+            );
+        }
+    }
+
+    #[test]
+    fn island_is_directly_creatable_from_quick_add() {
+        let island = quick_add_entries()
+            .into_iter()
+            .find(|tool| tool.registry_type_id == Some("island"))
+            .expect("Island should have a live Quick Add route");
         assert!(matches!(
-            crater_proc.action,
+            island.action,
             ToolAction::AddLayer {
-                kind: LayerKind::ProceduralShape(_),
+                kind: LayerKind::Island(_),
                 ..
             }
         ));
@@ -2111,7 +2292,9 @@ mod tests {
         assert!(ids.contains(&"filter.terrace.simple"));
         assert!(ids.contains(&"filter.basic.hydraulic"));
         assert!(tools.iter().all(|t| t.id.starts_with("filter.")));
-        assert!(tools.iter().all(|t| !t.id.starts_with("filter.experimental.")));
+        assert!(tools
+            .iter()
+            .all(|t| !t.id.starts_with("filter.experimental.")));
     }
 
     #[test]

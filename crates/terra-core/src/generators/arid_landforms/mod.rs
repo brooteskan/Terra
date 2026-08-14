@@ -22,9 +22,10 @@ use crate::geomorph::{
     Precipitation, StreamExtractParams,
 };
 use crate::heightfield::Heightfield;
-use crate::layer::{EffectFilterParams, FractalNoiseType, StreamPowerParams, WorleyMetric};
+use crate::layer::{EffectFilterParams, StreamPowerParams};
 use crate::mask::MaskField;
 use crate::noise;
+use crate::noise::{FractalNoiseType, WorleyMetric};
 
 use super::filter_kernels::{
     dilate, flow_accumulation_dinf, gradient, normalize_field, slope_deg, sparse_gabor,
@@ -140,7 +141,8 @@ pub fn detect_cliffs(
             let relief_n = (relief / (thr * m.dx().max(1.0) * r as f32 * 4.0)).clamp(0.0, 1.0);
             // slope_magnitude is already degrees/90 in [0,1].
             let s_deg = slope.get(i as u32, j as u32) * 90.0;
-            let slope_n = ((s_deg - slope_min_deg) / (90.0 - slope_min_deg).max(1.0)).clamp(0.0, 1.0);
+            let slope_n =
+                ((s_deg - slope_min_deg) / (90.0 - slope_min_deg).max(1.0)).clamp(0.0, 1.0);
             // Profile curvature is mapped to [0,1] with 0.5 = flat.
             let curv_n = ((profile.get(i as u32, j as u32) - 0.5).abs() * 2.0).clamp(0.0, 1.0);
             let score = relief_n * 0.45 + slope_n * 0.40 + curv_n * 0.15;
@@ -250,14 +252,14 @@ pub fn enhance_ridges(
     let amt = amount * if wide { 0.65 } else { 1.0 };
     let mut out = hf.clone();
 
-    let np = crate::layer::NoiseParams {
+    let np = crate::noise::NoiseParams {
         seed,
         frequency: freq,
         amplitude: 1.0,
         octaves: if wide { 3 } else { 4 },
         lacunarity: 2.0,
         persistence: 0.5,
-        ..crate::layer::NoiseParams::default()
+        ..crate::noise::NoiseParams::default()
     };
 
     for j in 0..m.height {
@@ -497,11 +499,7 @@ pub fn differential_erode(
         for j in 0..m.height {
             for i in 0..m.width {
                 let soft = 1.0 - hardness.get(i, j);
-                let protect = if protect_ridges {
-                    ridge.get(i, j)
-                } else {
-                    0.0
-                };
+                let protect = if protect_ridges { ridge.get(i, j) } else { 0.0 };
                 let strip = soft * (1.0 - protect * 0.85) * amt;
                 if strip < 1e-5 {
                     continue;
@@ -513,11 +511,7 @@ pub fn differential_erode(
                     for di in -1i32..=1 {
                         let ni = i as i32 + di;
                         let nj = j as i32 + dj;
-                        if ni < 0
-                            || nj < 0
-                            || ni >= m.width as i32
-                            || nj >= m.height as i32
-                        {
+                        if ni < 0 || nj < 0 || ni >= m.width as i32 || nj >= m.height as i32 {
                             continue;
                         }
                         sum += out.get(ni as u32, nj as u32);
@@ -536,7 +530,12 @@ pub fn differential_erode(
 }
 
 /// Build a hardness field from rock hardness + low-frequency lithology noise.
-pub fn lithology_hardness(hf: &Heightfield, rock_hardness: f32, frequency: f32, seed: u64) -> MaskField {
+pub fn lithology_hardness(
+    hf: &Heightfield,
+    rock_hardness: f32,
+    frequency: f32,
+    seed: u64,
+) -> MaskField {
     let m = hf.metrics;
     let base = rock_hardness.clamp(0.05, 0.98);
     let freq = frequency.max(1e-5);
@@ -645,7 +644,12 @@ pub fn apply_cliffs(hf: &Heightfield, p: &EffectFilterParams) -> Heightfield {
 
 /// Cliff/ridge detection + anisotropic fracture breakup (chips removed from faces).
 pub fn apply_chipped(hf: &Heightfield, p: &EffectFilterParams) -> Heightfield {
-    let cliffs = detect_cliffs(hf, p.radius.max(1) + 1, p.flow_threshold.max(0.08), p.slope_min);
+    let cliffs = detect_cliffs(
+        hf,
+        p.radius.max(1) + 1,
+        p.flow_threshold.max(0.08),
+        p.slope_min,
+    );
     let (ridge, _) = ridge_valley_likelihood(hf, 12.0);
     let hardness = lithology_hardness(hf, p.rock_hardness, p.frequency.max(0.02), p.seed);
     let frac = fracture_field(hf, p.frequency.max(0.04), p.seed ^ 0xC11F, 3);
@@ -736,7 +740,12 @@ pub fn apply_rocky_wide(hf: &Heightfield, p: &EffectFilterParams) -> Heightfield
         p.seed,
         true,
     );
-    let k = lithology_hardness(&enhanced, p.rock_hardness.max(0.4), p.frequency * 0.35, p.seed);
+    let k = lithology_hardness(
+        &enhanced,
+        p.rock_hardness.max(0.4),
+        p.frequency * 0.35,
+        p.seed,
+    );
     differential_erode(&enhanced, &k, p.amount * 0.18, 2, true)
 }
 
@@ -769,7 +778,12 @@ pub fn apply_rocky_layers(hf: &Heightfield, p: &EffectFilterParams) -> Heightfie
 /// Rocky Cliffs — cliff detect + multi-scale fracture + talus + fine erosion.
 pub fn apply_rocky_cliffs(hf: &Heightfield, p: &EffectFilterParams) -> Heightfield {
     let mut sharp = apply_rocky_sharp(hf, p);
-    let cliffs = detect_cliffs(&sharp, p.radius.max(1), p.flow_threshold.max(0.1), p.slope_min);
+    let cliffs = detect_cliffs(
+        &sharp,
+        p.radius.max(1),
+        p.flow_threshold.max(0.1),
+        p.slope_min,
+    );
     let frac = fracture_field(&sharp, p.frequency.max(0.03), p.seed ^ 0xA0CC_u64, 3);
     let hardness = lithology_hardness(&sharp, p.rock_hardness.max(0.5), p.frequency, p.seed);
     let w = hf.metrics.width as usize;
@@ -824,9 +838,20 @@ pub fn apply_rocky_hard(hf: &Heightfield, p: &EffectFilterParams) -> Heightfield
     p2.amount = p.amount * 1.15;
     p2.slope_min = p.slope_min.max(35.0);
     let cliffs = apply_rocky_cliffs(hf, &p2);
-    let k = lithology_hardness(&cliffs, p2.rock_hardness, p2.frequency * 0.5, p.seed ^ 0x85AD_u64);
+    let k = lithology_hardness(
+        &cliffs,
+        p2.rock_hardness,
+        p2.frequency * 0.5,
+        p.seed ^ 0x85AD_u64,
+    );
     // Stronger differential: strip soft surrounds, keep hard outcrops.
-    differential_erode(&cliffs, &k, p.amount * 0.35, p.iterations.max(2).min(5), true)
+    differential_erode(
+        &cliffs,
+        &k,
+        p.amount * 0.35,
+        p.iterations.max(2).min(5),
+        true,
+    )
 }
 
 /// Rocky Plateaus — preserve flats, scarp at margins, incision, talus, optional strata.
@@ -902,7 +927,11 @@ pub fn apply_rocky_plateaus(hf: &Heightfield, p: &EffectFilterParams) -> Heightf
 }
 
 /// Generic Rocky — soft drainage + rocky sharp mix.
-pub fn apply_rocky(hf: &Heightfield, p: &EffectFilterParams, soft_flows_fn: impl Fn(&Heightfield, &EffectFilterParams) -> Heightfield) -> Heightfield {
+pub fn apply_rocky(
+    hf: &Heightfield,
+    p: &EffectFilterParams,
+    soft_flows_fn: impl Fn(&Heightfield, &EffectFilterParams) -> Heightfield,
+) -> Heightfield {
     let flows = soft_flows_fn(hf, p);
     let rock = apply_rocky_sharp(&flows, p);
     let mut out = hf.clone();

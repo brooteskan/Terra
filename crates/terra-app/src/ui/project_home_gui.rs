@@ -4,8 +4,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use serde::{Deserialize, Serialize};
 use crate::ui::style::{self, FONT_SCALE, PAD, TYPE_LABEL};
+use serde::{Deserialize, Serialize};
 use terra_gui::{
     chip_button, chip_icon_button, icon_button, icon_toggle, segmented_button, Color, DrawList,
     GuiContext, Icon, Id, Rect, INSET_TOP,
@@ -1000,15 +1000,15 @@ pub fn draw_new_project_templates(
 
     let units_w = 188.0;
     let units_h = 28.0;
-    let units_r = Rect::from_pos_size(
-        panel.max_x - inset - units_w,
-        y,
-        units_w,
-        units_h,
-    );
+    let units_r = Rect::from_pos_size(panel.max_x - inset - units_w, y, units_w, units_h);
     ui.panel_rounded(units_r, style::INPUT_BG, style::RADIUS_SM);
     let half = units_w * 0.5;
-    let m_r = Rect::from_pos_size(units_r.min_x + 2.0, units_r.min_y + 2.0, half - 3.0, units_h - 4.0);
+    let m_r = Rect::from_pos_size(
+        units_r.min_x + 2.0,
+        units_r.min_y + 2.0,
+        half - 3.0,
+        units_h - 4.0,
+    );
     let k_r = Rect::from_pos_size(
         units_r.min_x + half + 1.0,
         units_r.min_y + 2.0,
@@ -1156,11 +1156,12 @@ fn draw_template_strip(
     } else {
         n as f32 * card_w + (n.saturating_sub(1) as f32) * gap
     };
-    let view_w = (strip.width() - if content_w > strip.width() + 1.0 {
-        chevron_w + style::SPACE_2
-    } else {
-        0.0
-    })
+    let view_w = (strip.width()
+        - if content_w > strip.width() + 1.0 {
+            chevron_w + style::SPACE_2
+        } else {
+            0.0
+        })
     .max(80.0);
     let viewport = Rect::from_pos_size(strip.min_x, strip.min_y, view_w, card_h);
     let max_scroll = (content_w - view_w).max(0.0);
@@ -1372,12 +1373,7 @@ fn paint_design_thumb(ui: &mut GuiContext<'_>, template_id: &str, thumb: Rect) {
         style::RADIUS_SM,
     );
     ui.icon_centered(
-        Rect::from_pos_size(
-            thumb.center_x() - 14.0,
-            thumb.center_y() - 14.0,
-            28.0,
-            28.0,
-        ),
+        Rect::from_pos_size(thumb.center_x() - 14.0, thumb.center_y() - 14.0, 28.0, 28.0),
         icon,
         Color::rgba(1.0, 1.0, 1.0, 0.55),
         20.0,

@@ -3,14 +3,14 @@
 //! Does **not** fork project state: one ownership tree, workspace-adapted emphasis.
 //! Technical DistNode / mask-stack chrome lives under Advanced Placement.
 
+use terra_core::biome_definition::BiomeLibrary;
 use terra_core::document::TerrainDocument;
+use terra_core::domain::classify_layer_kind;
 use terra_core::domain::{classify_in_context, DomainRole};
 use terra_core::layer::{
-    BiomeSection, BuildStatus, GroupKind, Layer, LayerGroup, LayerId, LayerKind,
-    StackCategory, StackNode,
+    BiomeSection, BuildStatus, GroupKind, Layer, LayerGroup, LayerId, LayerKind, StackCategory,
+    StackNode,
 };
-use terra_core::biome_definition::BiomeLibrary;
-use terra_core::domain::classify_layer_kind;
 use terra_gui::Icon;
 
 use crate::ui::workspace::{workspace_definition, WorkspaceId};
@@ -64,7 +64,6 @@ impl ArtistConcept {
     }
 
     /// World Creator terrain stack order (under Terrain root).
-    
 
     /// WC: Biomes → Biome Layers → Shape Layers → Mask Layers → Simulation Layers.
     pub fn terrain_order() -> &'static [ArtistConcept] {
@@ -168,7 +167,6 @@ pub fn mask_stack_row_id(biome_id: LayerId) -> LayerId {
     LayerId::from_u128(MASK_STACK_BASE ^ (biome_id.0.as_u128() & 0xFFFF_FFFF_FFFF_FFFF))
 }
 
-
 /// Biome summary line: coverage · enabled · priority · health.
 pub fn biome_summary_meta(
     g: &LayerGroup,
@@ -233,7 +231,9 @@ pub fn layer_build_status_with_outdated(layer: &Layer, outdated: &[LayerId]) -> 
 }
 
 /// Compact meta line for a simulation scenario row.
-pub fn simulation_scenario_meta(scenario: &terra_core::simulation_scenario::SimulationScenario) -> String {
+pub fn simulation_scenario_meta(
+    scenario: &terra_core::simulation_scenario::SimulationScenario,
+) -> String {
     let passes = scenario.enabled_passes().count();
     format!(
         "{} · {} pass{}",
@@ -377,9 +377,9 @@ pub fn concept_for_category(category: StackCategory) -> ArtistConcept {
 pub fn normalize_terrain_concept(concept: ArtistConcept) -> ArtistConcept {
     match concept {
         ArtistConcept::LocalSimulations => ArtistConcept::WorldSimulations,
-        ArtistConcept::GlobalMaterials
-        | ArtistConcept::Objects
-        | ArtistConcept::GlobalScatter => ArtistConcept::Biomes,
+        ArtistConcept::GlobalMaterials | ArtistConcept::Objects | ArtistConcept::GlobalScatter => {
+            ArtistConcept::Biomes
+        }
         ArtistConcept::WorldRules => ArtistConcept::Masks,
         other => other,
     }

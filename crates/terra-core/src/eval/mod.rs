@@ -6,9 +6,10 @@ mod scheduler;
 mod smart_cache;
 mod worker;
 
+pub use crate::quality::PreviewQuality;
 pub use cache::{CachedOutput, LayerCache};
 pub use processors::ProcessorRegistry;
-pub use scheduler::{EvalJob, EvalScheduler, PreviewQuality};
+pub use scheduler::{EvalJob, EvalScheduler};
 pub use smart_cache::DiskSmartCache;
 pub use worker::{EvalWorkRequest, EvalWorkResult, EvalWorker};
 
@@ -110,8 +111,13 @@ impl EvalContext {
     /// Insert an aux map into both typed and string stores.
     pub fn aux_insert(&mut self, key: impl Into<String>, field: MaskField) {
         let key = key.into();
-        self.aux_maps.insert(key.clone(), field.clone());
-        self.aux.insert(key, field);
+        let canonical = crate::fields::keys::canonical(&key).to_string();
+        self.aux_maps.insert(canonical.clone(), field.clone());
+        if canonical == crate::fields::keys::SEDIMENT_THICKNESS {
+            self.aux.remove(crate::fields::keys::SEDIMENT_DEPTH);
+            self.aux.remove(crate::fields::keys::LOOSE_SEDIMENT);
+        }
+        self.aux.insert(canonical, field);
     }
 
     /// Replace string aux and rebuild typed maps (worker / scheduler ingest).
@@ -119,7 +125,7 @@ impl EvalContext {
     pub fn set_aux_hashmap(&mut self, aux: HashMap<String, MaskField>) {
         let keep_strata = self.aux_maps.strata.take();
         self.aux_maps = AuxMaps::from_hashmap_preserving_strata(&aux, keep_strata);
-        self.aux = aux;
+        self.sync_aux_hashmap();
     }
 
     /// Push typed maps into the string HashMap adapter (strata stays on `aux_maps`).
@@ -134,21 +140,9 @@ impl EvalContext {
     }
 }
 
-pub trait LayerProcessor: Send + Sync {
-    fn id(&self) -> &'static str;
-    fn evaluate(
-        &self,
-        ctx: &EvalContext,
-        input: &Heightfield,
-        layer: &Layer,
-    ) -> Result<Heightfield, EvalError>;
-}
-
 pub struct StackEvaluator {
     pub registry: ProcessorRegistry,
     pub cache: LayerCache,
-    /// Last compiled operator graph (metadata; execution still uses processors).
-    pub last_graph: Option<crate::terrain_eval::EvalGraph>,
 }
 
 impl Default for StackEvaluator {
@@ -162,14 +156,7 @@ impl StackEvaluator {
         Self {
             registry: ProcessorRegistry::builtin(),
             cache: LayerCache::new(),
-            last_graph: None,
         }
-    }
-
-    /// Compile the artist stack into an internal multi-field operator graph.
-    pub fn compile_graph(&mut self, stack: &LayerStack, world_seed: u64) -> &crate::terrain_eval::EvalGraph {
-        self.last_graph = Some(crate::terrain_eval::compile_eval_graph(stack, world_seed));
-        self.last_graph.as_ref().expect("just set")
     }
 
     pub fn mark_dirty_from(&mut self, stack: &LayerStack, id: LayerId) {
@@ -243,19 +230,9 @@ impl StackEvaluator {
         ctx: &mut EvalContext,
     ) -> Result<Heightfield, EvalError> {
         profiling::scope!("rebuild_all");
-        let _ = self.compile_graph(stack, 0);
         self.cache.clear();
         let seed = Heightfield::zeros(ctx.metrics);
         self.evaluate_nodes(&stack.nodes, ctx, &seed)
-    }
-
-    /// Document-level rebuild: single terrain stack.
-    pub fn rebuild_document(
-        &mut self,
-        doc: &crate::document::TerrainDocument,
-        ctx: &mut EvalContext,
-    ) -> Result<Heightfield, EvalError> {
-        self.rebuild_all(&doc.stack, ctx)
     }
 
     /// Incremental rebuild from first dirty layer (Phase 4).
@@ -268,13 +245,7 @@ impl StackEvaluator {
         ctx: &mut EvalContext,
     ) -> Result<Heightfield, EvalError> {
         profiling::scope!("rebuild_incremental");
-        let _ = self.compile_graph(stack, 0);
-        if stack.has_scoped_groups()
-            || stack
-                .flatten_layers()
-                .iter()
-                .any(|layer| layer.common.solo)
-        {
+        if stack.requires_tree_evaluation() {
             let seed = Heightfield::zeros(ctx.metrics);
             return self.evaluate_nodes(&stack.nodes, ctx, &seed);
         }
@@ -373,29 +344,25 @@ impl StackEvaluator {
                         let aux_snapshot = ctx.aux_maps.clone();
                         let aux_hash_snapshot = ctx.aux.clone();
                         let descendant_ids = collect_descendant_layer_ids(&group.children);
-                        let (group_out, child_aux) =
-                            if let Some((height, aux)) = self.try_reuse_group_cache(
+                        let (group_out, child_aux) = if let Some((height, aux)) = self
+                            .try_reuse_group_cache(group.id, ctx, &descendant_ids, &private_seed)
+                        {
+                            record_subtree_cache_hits(ctx, &group.children);
+                            (height, aux)
+                        } else {
+                            let group_out =
+                                self.evaluate_nodes(&group.children, ctx, &private_seed)?;
+                            let child_aux = ctx.aux_maps.clone();
+                            self.store_group_cached(
                                 group.id,
-                                ctx,
-                                &descendant_ids,
+                                &group_out,
+                                &child_aux,
                                 &private_seed,
-                            ) {
-                                record_subtree_cache_hits(ctx, &group.children);
-                                (height, aux)
-                            } else {
-                                let group_out =
-                                    self.evaluate_nodes(&group.children, ctx, &private_seed)?;
-                                let child_aux = ctx.aux_maps.clone();
-                                self.store_group_cached(
-                                    group.id,
-                                    &group_out,
-                                    &child_aux,
-                                    &private_seed,
-                                    ctx,
-                                    group.cache_policy.to_legacy_cached(),
-                                );
-                                (group_out, child_aux)
-                            };
+                                ctx,
+                                group.cache_policy.to_legacy_cached(),
+                            );
+                            (group_out, child_aux)
+                        };
                         // Restore parent aux, then selectively merge published child aux
                         // under the group mask after height composite.
                         ctx.aux_maps = aux_snapshot;
@@ -438,7 +405,9 @@ impl StackEvaluator {
 
     /// Continue evaluating a flattened stack from a precomputed heightfield.
     ///
-    /// Used by the hybrid GPU preview path after it readbacks its compatible prefix.
+    /// `current` must be the height entering `start_index`, and `ctx` must contain the
+    /// equivalent auxiliary and published-output state produced by the skipped prefix.
+    /// Callers that cannot supply that complete checkpoint must restart from layer zero.
     pub fn evaluate_suffix(
         &mut self,
         stack: &LayerStack,
@@ -566,10 +535,7 @@ impl StackEvaluator {
         if self.cache.is_dirty(group_id) {
             return None;
         }
-        if descendant_ids
-            .iter()
-            .any(|&id| self.cache.is_dirty(id))
-        {
+        if descendant_ids.iter().any(|&id| self.cache.is_dirty(id)) {
             return None;
         }
         let cached = self.cache.get_or_load(group_id, ctx.metrics)?;
@@ -726,7 +692,7 @@ fn sample_binding_source(ctx: &EvalContext, source: &crate::layer::BindingSource
         BindingSource::LayerOutput(id) | BindingSource::GroupOutput(id) => {
             mean_mask(ctx.published_outputs.get(id))
         }
-        BindingSource::Field(field) => mean_mask(ctx.aux.get(&field.cache_key())),
+        BindingSource::Field(field) => mean_mask(ctx.aux_maps.get(&field.cache_key())),
     }
 }
 

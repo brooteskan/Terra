@@ -1,8 +1,8 @@
 //! Floating Bookmarks window — saved camera views (Ctrl/Alt+1–9).
 
 use crate::ui::panels::viewport_float_rect;
-use crate::ui::{FrameUiOutput, UiState};
 use crate::ui::style::{self, FONT_SCALE, TYPE_CAPTION, TYPE_LABEL};
+use crate::ui::{FrameUiOutput, UiState};
 use terra_gui::{button, label, label_dim, GuiContext, Id, Rect};
 
 pub fn draw_bookmarks_gui(

@@ -14,6 +14,7 @@ use crate::mask::MaskField;
 
 use super::cache::DrainageCache;
 use super::params::LandscapeEvolutionParams;
+use super::BoundaryMasks;
 
 const D8_OFFSETS: [(i32, i32); 8] = [
     (1, 0),
@@ -30,7 +31,7 @@ pub fn evolve_iterative(
     initial: &Heightfield,
     uplift: &MaskField,
     hardness: &MaskField,
-    boundary: &MaskField,
+    boundaries: &BoundaryMasks,
     p: &LandscapeEvolutionParams,
     steps: u32,
 ) -> (Heightfield, DrainageCache, Vec<f32>, Vec<f32>) {
@@ -51,8 +52,10 @@ pub fn evolve_iterative(
     let base = p.base_level;
     let invalidation = p.drainage_invalidation_m.max(0.1);
 
+    let routing_outlets = &boundaries.routing_outlets;
+    let elevation_locks = &boundaries.elevation_locks;
     let mut z = initial.clone();
-    let mut cache = DrainageCache::build(&z, true);
+    let mut cache = DrainageCache::build(&z, true, routing_outlets);
     let mut incision = vec![0.0f32; n];
     let mut erosion_rate = vec![0.0f32; n];
     let mut sediment = vec![0.0f32; n];
@@ -60,7 +63,7 @@ pub fn evolve_iterative(
     let steps = steps.max(1);
     for step in 0..steps {
         if step == 0 || cache.needs_rebuild(&z, invalidation) {
-            cache = DrainageCache::build(&z, true);
+            cache = DrainageCache::build(&z, true, routing_outlets);
         }
 
         // Discharge Q ≈ rain × drainage area.
@@ -75,15 +78,24 @@ pub fn evolve_iterative(
         for j in 0..h {
             for i in 0..w {
                 let idx = j * w + i;
-                if boundary.get(i as u32, j as u32) > 0.5 {
+                if elevation_locks.get(i as u32, j as u32) > 0.5 {
                     continue;
                 }
                 let soft = (1.0 - hardness.get(i as u32, j as u32).clamp(0.0, 1.0)).max(0.0);
                 let slope = slope_to_receiver(&z, i, j, &cache).max(1e-6);
-                let e =
-                    k * q[idx].powf(m_exp) * slope.powf(n_exp) * soft;
-                // Cap per-step incision relative to local relief for stability.
-                let e_step = (e * dt).min(slope * ((dx + dzm) * 0.5) * 4.0).min(80.0);
+                // Shared stream-power law (world-metric slope, discharge Q); the cap
+                // is relief-relative for stability. See crate::hydro::spe_increment.
+                let (e, e_step) = crate::hydro::spe_increment(
+                    q[idx],
+                    slope,
+                    k,
+                    m_exp,
+                    n_exp,
+                    soft,
+                    dt,
+                    slope * ((dx + dzm) * 0.5) * 4.0,
+                    80.0,
+                );
                 let u = uplift.get(i as u32, j as u32) * dt;
 
                 let mut dh = u - e_step;
@@ -109,7 +121,8 @@ pub fn evolve_iterative(
 
         // Lightweight discontinuity smooth along non-receiver neighbours (Cordonnier tree).
         if step % 3 == 2 {
-            smooth_tree_discontinuities(&mut z, &cache, boundary, 0.2);
+            smooth_tree_discontinuities(&mut z, &cache, elevation_locks, 0.2);
+            restore_locked(&mut z, initial, elevation_locks);
         }
 
         cache.max_abs_delta = max_delta;
@@ -120,6 +133,8 @@ pub fn evolve_iterative(
 
         let _ = prev; // kept for potential future residual diagnostics
     }
+
+    restore_locked(&mut z, initial, elevation_locks);
 
     // Publish raw accumulation for aux (normalised later by operator).
     (z, cache, incision, erosion_rate)
@@ -168,7 +183,7 @@ fn slope_to_receiver(z: &Heightfield, i: usize, j: usize, cache: &DrainageCache)
 fn smooth_tree_discontinuities(
     z: &mut Heightfield,
     cache: &DrainageCache,
-    boundary: &MaskField,
+    elevation_locks: &MaskField,
     strength: f32,
 ) {
     let w = z.metrics.width as usize;
@@ -178,7 +193,7 @@ fn smooth_tree_discontinuities(
     for j in 0..h {
         for i in 0..w {
             let idx = j * w + i;
-            if boundary.get(i as u32, j as u32) > 0.5 {
+            if elevation_locks.get(i as u32, j as u32) > 0.5 {
                 continue;
             }
             if cache.receiver[idx] == usize::MAX {
@@ -196,6 +211,9 @@ fn smooth_tree_discontinuities(
                 if ni < 0 || nj < 0 || ni >= w as i32 || nj >= h as i32 {
                     continue;
                 }
+                if elevation_locks.get(ni as u32, nj as u32) > 0.5 {
+                    continue;
+                }
                 let nidx = nj as usize * w + ni as usize;
                 if cache.receiver[idx] == nidx || cache.receiver[nidx] == idx {
                     continue;
@@ -209,6 +227,17 @@ fn smooth_tree_discontinuities(
                     z.set(i as u32, j as u32, cur - excess * 0.5);
                     z.set(ni as u32, nj as u32, other + excess * 0.5);
                 }
+            }
+        }
+    }
+}
+
+fn restore_locked(z: &mut Heightfield, original: &Heightfield, elevation_locks: &MaskField) {
+    let m = z.metrics;
+    for j in 0..m.height {
+        for i in 0..m.width {
+            if elevation_locks.get(i, j) > 0.5 {
+                z.set(i, j, original.get(i, j));
             }
         }
     }

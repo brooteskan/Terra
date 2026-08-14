@@ -8,8 +8,8 @@ use super::params::{LandscapeEvolutionParams, UpliftMode};
 
 /// Build a normalised uplift rate field in `[0, peak]` metres / year.
 ///
-/// Boundaries are forced toward zero so the SPE problem stays well-posed
-/// (Tzathas / Cordonnier: uplift vanishes at outlets).
+/// This synthesises the geological field only. The landscape-evolution
+/// operator applies its elevation-lock policy afterwards.
 pub fn synthesise_uplift(
     metrics: HeightfieldMetrics,
     p: &LandscapeEvolutionParams,
@@ -73,8 +73,6 @@ pub fn synthesise_uplift(
         }
     }
 
-    // Force outlets / domain rim toward zero uplift.
-    zero_boundary_uplift(&mut field, p.boundary);
     field
 }
 
@@ -144,31 +142,6 @@ fn fill_procedural(field: &mut MaskField, p: &LandscapeEvolutionParams, peak: f3
     }
 }
 
-fn zero_boundary_uplift(field: &mut MaskField, boundary: super::params::BoundaryMode) {
-    use super::params::BoundaryMode;
-    let m = field.metrics;
-    let margin = match boundary {
-        BoundaryMode::OpenDrainage => 1u32,
-        _ => 2u32,
-    };
-    for j in 0..m.height {
-        for i in 0..m.width {
-            let on_rim = i < margin
-                || j < margin
-                || i + margin >= m.width
-                || j + margin >= m.height;
-            if on_rim {
-                let edge = {
-                    let di = i.min(m.width.saturating_sub(1 + i));
-                    let dj = j.min(m.height.saturating_sub(1 + j));
-                    di.min(dj) as f32 / margin.max(1) as f32
-                };
-                field.set(i, j, field.get(i, j) * edge.clamp(0.0, 1.0));
-            }
-        }
-    }
-}
-
 /// Asymmetric uplift fixture (stronger on one side of a belt).
 pub fn asymmetric_belt(
     metrics: HeightfieldMetrics,
@@ -190,7 +163,11 @@ pub fn asymmetric_belt(
             let v = j as f32 / m.height.max(1) as f32 - 0.5;
             let across = -sa * u + ca * v;
             let side = (0.5 + 0.5 * across.signum() * bias.clamp(0.0, 1.0)).clamp(0.2, 1.5);
-            field.set(i, j, field.get(i, j) / p.peak_uplift_rate().max(1e-12) * peak * side);
+            field.set(
+                i,
+                j,
+                field.get(i, j) / p.peak_uplift_rate().max(1e-12) * peak * side,
+            );
         }
     }
     field

@@ -23,5 +23,7 @@ Rules that must hold on every shipping build. Violations are release blockers.
 - ALWAYS keep Fast / Raster modes available without progressive overhead.
 - ALWAYS map viewport mode to exactly one presentation backend (no dual progressive enable flags).
 - ALWAYS preserve temporal history when only lighting or atmosphere changed (signature policy).
+- ALWAYS replace renderer height/normal slots and evaluator working textures with the 8×8
+  resident baseline on document reset; existing size checks restore the next project dimensions.
 - ALWAYS document measured GPU pass timings in profiling reports before claiming performance targets.
 - ALWAYS fall back to the monolithic height texture on tile-stream page misses.

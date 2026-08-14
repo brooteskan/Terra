@@ -1,9 +1,9 @@
 //! LayerKind parameter editors.
 
 use crate::ui::actions::PanelAction;
+use crate::ui::style::{self, FONT_SCALE, ROW_H};
 use crate::ui::EditorTool;
 use terra_core::layer::*;
-use crate::ui::style::{self, FONT_SCALE, ROW_H};
 use terra_gui::{
     button_id, checkbox, combo, label, label_dim, section_header, slider_f32, slider_f32_id,
     slider_i32, slider_i32_id, GuiContext, Icon, Id, Rect,
@@ -34,7 +34,6 @@ impl KindEditPane {
     }
 }
 
-
 pub(crate) fn edit_kind(
     ui: &mut GuiContext<'_>,
     kind: &mut LayerKind,
@@ -53,28 +52,53 @@ pub(crate) fn edit_kind(
             changed |= slider_f32(ui, "Fill height", &mut p.fill_height, -100.0, 500.0);
         }
         LayerKind::SculptStrokes(p) => {
-            label(ui, &format!("{} editable semantic stroke(s)", p.strokes.len()));
+            label(
+                ui,
+                &format!("{} editable semantic stroke(s)", p.strokes.len()),
+            );
             changed |= slider_f32(ui, "Reconcile", &mut p.reconcile, 0.0, 1.0);
             if advanced {
-                label(ui, "Strokes preserve intent at every evaluation resolution.");
+                label(
+                    ui,
+                    "Strokes preserve intent at every evaluation resolution.",
+                );
             }
         }
         LayerKind::TerrainConstraints(p) => {
-            label(ui, &format!("{} terrain constraint(s)", p.constraints.len()));
+            label(
+                ui,
+                &format!("{} terrain constraint(s)", p.constraints.len()),
+            );
             changed |= slider_f32(ui, "Preview Strength", &mut p.preview_strength, 0.0, 1.0);
             if advanced {
-                label(ui, "Supports elevation, ridge, valley, river, coast, divide and protection.");
+                label(
+                    ui,
+                    "Supports elevation, ridge, valley, river, coast, divide and protection.",
+                );
             }
         }
         LayerKind::GradientReconstruct(p) => {
             let mut iterations = p.iterations as i32;
             if slider_i32(ui, "Solve Iterations", &mut iterations, 4, 400) {
-                p.iterations = iterations as u32; changed = true;
+                p.iterations = iterations as u32;
+                changed = true;
             }
             changed |= slider_f32(ui, "Screening", &mut p.screening, 0.0, 2.0);
-            changed |= slider_f32(ui, "Constraint Strength", &mut p.constraint_strength, 0.0, 24.0);
+            changed |= slider_f32(
+                ui,
+                "Constraint Strength",
+                &mut p.constraint_strength,
+                0.0,
+                24.0,
+            );
             if advanced {
-                changed |= slider_f32(ui, "Gradient Smoothing", &mut p.gradient_smoothing, 0.0, 1.0);
+                changed |= slider_f32(
+                    ui,
+                    "Gradient Smoothing",
+                    &mut p.gradient_smoothing,
+                    0.0,
+                    1.0,
+                );
             }
         }
         LayerKind::LandscapeEvolution(p) => {
@@ -83,7 +107,13 @@ pub(crate) fn edit_kind(
             changed |= slider_f32(ui, "Rainfall", &mut p.rainfall, 0.0, 3.0);
             changed |= slider_f32(ui, "River Incision", &mut p.river_incision, 0.0, 2.0);
             changed |= slider_f32(ui, "Geological Age", &mut p.geological_age, 0.0, 1.0);
-            changed |= slider_f32(ui, "Terrain Resistance", &mut p.terrain_resistance, 0.0, 1.0);
+            changed |= slider_f32(
+                ui,
+                "Terrain Resistance",
+                &mut p.terrain_resistance,
+                0.0,
+                1.0,
+            );
             changed |= slider_f32(ui, "Drainage Scale", &mut p.drainage_scale, 0.0, 1.0);
             // Solver mode toggle
             {
@@ -139,12 +169,36 @@ pub(crate) fn edit_kind(
                     p.iterations = iterations as u32;
                     changed = true;
                 }
-                changed |= slider_f32(ui, "Hillslope Diffusion", &mut p.hillslope_diffusion, 0.0, 1.0);
+                changed |= slider_f32(
+                    ui,
+                    "Hillslope Diffusion",
+                    &mut p.hillslope_diffusion,
+                    0.0,
+                    1.0,
+                );
                 changed |= slider_f32(ui, "Talus Angle", &mut p.talus_angle_deg, 15.0, 55.0);
-                changed |= slider_f32(ui, "Sediment Transport", &mut p.sediment_transport, 0.0, 1.0);
-                changed |= slider_f32(ui, "Constraint Lock", &mut p.constraint_preservation, 0.0, 1.0);
+                changed |= slider_f32(
+                    ui,
+                    "Sediment Transport",
+                    &mut p.sediment_transport,
+                    0.0,
+                    1.0,
+                );
+                changed |= slider_f32(
+                    ui,
+                    "Constraint Lock",
+                    &mut p.constraint_preservation,
+                    0.0,
+                    1.0,
+                );
                 changed |= slider_f32(ui, "Base Level", &mut p.base_level, -500.0, 1000.0);
-                changed |= slider_f32(ui, "Drainage Invalidate (m)", &mut p.drainage_invalidation_m, 0.1, 20.0);
+                changed |= slider_f32(
+                    ui,
+                    "Drainage Invalidate (m)",
+                    &mut p.drainage_invalidation_m,
+                    0.1,
+                    20.0,
+                );
                 {
                     use terra_core::layer::BoundaryMode;
                     let label = match p.boundary {
@@ -171,15 +225,24 @@ pub(crate) fn edit_kind(
         LayerKind::HydrologyRepair(p) => {
             let mut iterations = p.iterations as i32;
             if slider_i32(ui, "Repair Steps", &mut iterations, 1, 64) {
-                p.iterations = iterations as u32; changed = true;
+                p.iterations = iterations as u32;
+                changed = true;
             }
             changed |= slider_f32(ui, "Incision", &mut p.incision, 0.0, 0.15);
             changed |= slider_f32(ui, "Repair Radius", &mut p.repair_radius_m, 1.0, 2000.0);
-            changed |= slider_f32(ui, "Constraint Lock", &mut p.constraint_preservation, 0.0, 1.0);
+            changed |= slider_f32(
+                ui,
+                "Constraint Lock",
+                &mut p.constraint_preservation,
+                0.0,
+                1.0,
+            );
         }
         LayerKind::GeomorphicDetail(p) => {
             changed |= slider_f32(ui, "Meso Amplitude (m)", &mut p.amplitude, 0.0, 40.0);
-            let mut micro = p.micro_amplitude_m.unwrap_or((p.amplitude * 0.22).max(0.35));
+            let mut micro = p
+                .micro_amplitude_m
+                .unwrap_or((p.amplitude * 0.22).max(0.35));
             if slider_f32(ui, "Micro Amplitude (m)", &mut micro, 0.0, 12.0) {
                 p.micro_amplitude_m = Some(micro);
                 changed = true;
@@ -200,10 +263,17 @@ pub(crate) fn edit_kind(
         LayerKind::EcosystemFeedback(p) => {
             let mut passes = p.passes as i32;
             if slider_i32(ui, "Feedback Passes", &mut passes, 1, 12) {
-                p.passes = passes as u32; changed = true;
+                p.passes = passes as u32;
+                changed = true;
             }
             changed |= slider_f32(ui, "Root Cohesion", &mut p.root_cohesion, 0.0, 1.0);
-            changed |= slider_f32(ui, "Rain Interception", &mut p.rainfall_interception, 0.0, 1.0);
+            changed |= slider_f32(
+                ui,
+                "Rain Interception",
+                &mut p.rainfall_interception,
+                0.0,
+                1.0,
+            );
             changed |= slider_f32(ui, "Weathering", &mut p.weathering, 0.0, 1.0);
             changed |= slider_f32(ui, "Sediment Capture", &mut p.sediment_capture, 0.0, 1.0);
             changed |= slider_f32(ui, "Feedback Strength", &mut p.strength, 0.0, 1.0);
@@ -307,7 +377,13 @@ pub(crate) fn edit_kind(
                 changed |= slider_f32(ui, "Beach Height (m)", &mut p.beach_height, 0.5, 30.0);
                 changed |= slider_f32(ui, "Reef Width (m)", &mut p.reef_width, 0.0, 700.0);
                 changed |= slider_f32(ui, "Reef Depth (m)", &mut p.reef_depth, 0.5, 30.0);
-                changed |= slider_f32(ui, "Coast Frequency", &mut p.coastline_frequency, 0.0002, 0.006);
+                changed |= slider_f32(
+                    ui,
+                    "Coast Frequency",
+                    &mut p.coastline_frequency,
+                    0.0002,
+                    0.006,
+                );
                 changed |= slider_f32(ui, "Upland Power", &mut p.mountain_power, 0.4, 4.0);
                 changed |= slider_f32(ui, "Ridge Strength", &mut p.ridge_strength, 0.0, 1.0);
                 changed |= slider_f32(ui, "Ridge Frequency", &mut p.ridge_frequency, 0.0002, 0.012);
@@ -458,7 +534,13 @@ pub(crate) fn edit_kind(
             changed |= slider_f32(ui, "Talus Angle", &mut p.talus_angle_deg, 5.0, 60.0);
             changed |= slider_f32(ui, "Material Amount", &mut p.material_amount, 0.1, 40.0);
             changed |= slider_f32(ui, "Weathering Rate", &mut p.weathering_rate, 0.0, 4.0);
-            changed |= slider_f32(ui, "Transport Distance", &mut p.transport_distance, 1.0, 8.0);
+            changed |= slider_f32(
+                ui,
+                "Transport Distance",
+                &mut p.transport_distance,
+                1.0,
+                8.0,
+            );
             changed |= slider_f32(ui, "Bedrock Hardness", &mut p.hardness, 0.0, 1.0);
             changed |= materials_k_toggle(ui, &mut p.hardness_source);
             changed |= checkbox(ui, "Layered bedrock / debris", &mut p.layered_materials);
@@ -528,10 +610,16 @@ pub(crate) fn edit_kind(
                     changed = true;
                 }
                 changed |= named_source_toggle(
-                    ui, "Use Climate Rainfall", &mut p.rainfall_source, terra_core::fields::keys::RAINFALL,
+                    ui,
+                    "Use Climate Rainfall",
+                    &mut p.rainfall_source,
+                    terra_core::fields::keys::RAINFALL,
                 );
                 changed |= named_source_toggle(
-                    ui, "Protect Mountain Mass", &mut p.protection_source, terra_core::fields::keys::MOUNTAIN_MASK,
+                    ui,
+                    "Protect Mountain Mass",
+                    &mut p.protection_source,
+                    terra_core::fields::keys::MOUNTAIN_MASK,
                 );
                 changed |= slider_f32(ui, "Protection", &mut p.protection_strength, 0.0, 1.0);
                 changed |= edit_level_step_ex(
@@ -555,10 +643,16 @@ pub(crate) fn edit_kind(
                     changed = true;
                 }
                 changed |= named_source_toggle(
-                    ui, "Use Climate Rainfall", &mut p.rainfall_source, terra_core::fields::keys::RAINFALL,
+                    ui,
+                    "Use Climate Rainfall",
+                    &mut p.rainfall_source,
+                    terra_core::fields::keys::RAINFALL,
                 );
                 changed |= named_source_toggle(
-                    ui, "Protect Mountain Mass", &mut p.protection_source, terra_core::fields::keys::MOUNTAIN_MASK,
+                    ui,
+                    "Protect Mountain Mass",
+                    &mut p.protection_source,
+                    terra_core::fields::keys::MOUNTAIN_MASK,
                 );
                 changed |= slider_f32(ui, "Protection", &mut p.protection_strength, 0.0, 1.0);
                 changed |= edit_level_step_ex(
@@ -585,10 +679,7 @@ pub(crate) fn edit_kind(
                 p.guide = match &p.guide {
                     terra_core::mask::MaskSource::None => terra_core::mask::MaskSource::Wetness,
                     terra_core::mask::MaskSource::Wetness => {
-                        terra_core::mask::MaskSource::FlowAccumulation {
-                            min: 0.0,
-                            max: 1.0,
-                        }
+                        terra_core::mask::MaskSource::FlowAccumulation { min: 0.0, max: 1.0 }
                     }
                     _ => terra_core::mask::MaskSource::None,
                 };
@@ -688,10 +779,7 @@ pub(crate) fn edit_kind(
             changed |= slider_f32(ui, "Scale Min", &mut p.scale_min, 0.1, 4.0);
             changed |= slider_f32(ui, "Scale Max", &mut p.scale_max, 0.1, 4.0);
             changed |= slider_f32(ui, "Yaw Variation", &mut p.yaw_variation_deg, 0.0, 180.0);
-            label(
-                ui,
-                &format!("Coverage masks: {}", p.coverage.len()),
-            );
+            label(ui, &format!("Coverage masks: {}", p.coverage.len()));
             if advanced {
                 changed |= slider_f32(ui, "Min Dist", &mut p.min_distance, 1.0, 20.0);
                 changed |= slider_f32(ui, "Min Slope", &mut p.min_slope_deg, 0.0, 90.0);
@@ -748,14 +836,17 @@ pub(crate) fn edit_kind(
                     label(ui, "Albedo PNG:");
                     label(
                         ui,
-                        rule
-                            .albedo_path
+                        rule.albedo_path
                             .as_deref()
                             .filter(|p| !p.is_empty())
                             .unwrap_or("(tint only)"),
                     );
                     if rule.albedo_path.as_ref().is_some_and(|p| !p.is_empty())
-                        && button_id(ui, Id::new("mat_albedo_clear").with(i as u64), "Clear Albedo")
+                        && button_id(
+                            ui,
+                            Id::new("mat_albedo_clear").with(i as u64),
+                            "Clear Albedo",
+                        )
                     {
                         rule.albedo_path = None;
                         changed = true;
@@ -768,8 +859,8 @@ pub(crate) fn edit_kind(
                         id,
                         min_slope_deg: 0.0,
                         max_slope_deg: 90.0,
-                        min_height: f32::NEG_INFINITY,
-                        max_height: f32::INFINITY,
+                        min_height: OPEN_HEIGHT_MIN,
+                        max_height: OPEN_HEIGHT_MAX,
                         mask: terra_core::mask::MaskSource::None,
                         hardness: 0.5,
                         tint: [0.45, 0.42, 0.38],
@@ -1229,9 +1320,7 @@ pub(crate) fn edit_kind(
                 if arid_canyon || arid_cliffs {
                     changed |= slider_f32(ui, "Wall Steepness", &mut p.wall_steepness, 0.0, 1.0);
                 }
-                if arid_canyon
-                    || matches!(p.kind, EffectFilterKind::RockyPlateaus)
-                {
+                if arid_canyon || matches!(p.kind, EffectFilterKind::RockyPlateaus) {
                     changed |= slider_f32(ui, "Valley Floor", &mut p.valley_floor, 0.0, 1.0);
                 }
                 if matches!(
@@ -1283,7 +1372,8 @@ pub(crate) fn edit_kind(
                 p.nodes.clear();
                 changed = true;
             }
-            if button_id(ui, Id::new("insp_undo_path_node"), "Remove Last Node") && !p.nodes.is_empty()
+            if button_id(ui, Id::new("insp_undo_path_node"), "Remove Last Node")
+                && !p.nodes.is_empty()
             {
                 p.nodes.pop();
                 changed = true;
@@ -1299,7 +1389,11 @@ pub(crate) fn edit_kind(
                 changed = true;
             }
             label(ui, &format!("Springs: {}", p.springs.len()));
-            if button_id(ui, Id::new("insp_edit_springs"), "Place Springs in Viewport") {
+            if button_id(
+                ui,
+                Id::new("insp_edit_springs"),
+                "Place Springs in Viewport",
+            ) {
                 actions.push(PanelAction::SetEditorTool(EditorTool::EditRiverSpring));
             }
             if button_id(ui, Id::new("insp_clear_springs"), "Clear Springs") {
@@ -1359,14 +1453,30 @@ pub(crate) fn edit_kind(
             ui.gap(4.0);
             match p.generator {
                 ProceduralGenerator::Mountain => {
-                    changed |= slider_f32(ui, "Peak Height", &mut p.mountain.base.amplitude, 0.0, 1000.0);
-                    changed |= slider_f32(ui, "Ridge Sharpness", &mut p.mountain.ridge_sharpness, 0.5, 4.0);
-                    changed |= slider_f32(ui, "Crest Gouges", &mut p.mountain.crest_detail, 0.0, 120.0);
-                    changed |= slider_f32(ui, "Range Width", &mut p.mountain.range_width, 0.05, 0.8);
+                    changed |= slider_f32(
+                        ui,
+                        "Peak Height",
+                        &mut p.mountain.base.amplitude,
+                        0.0,
+                        1000.0,
+                    );
+                    changed |= slider_f32(
+                        ui,
+                        "Ridge Sharpness",
+                        &mut p.mountain.ridge_sharpness,
+                        0.5,
+                        4.0,
+                    );
+                    changed |=
+                        slider_f32(ui, "Crest Gouges", &mut p.mountain.crest_detail, 0.0, 120.0);
+                    changed |=
+                        slider_f32(ui, "Range Width", &mut p.mountain.range_width, 0.05, 0.8);
                 }
                 ProceduralGenerator::Hills | ProceduralGenerator::Plateau => {
-                    changed |= slider_f32(ui, "Amplitude", &mut p.hills.base.amplitude, 0.0, 1000.0);
-                    changed |= slider_f32(ui, "Frequency", &mut p.hills.base.frequency, 0.0005, 0.05);
+                    changed |=
+                        slider_f32(ui, "Amplitude", &mut p.hills.base.amplitude, 0.0, 1000.0);
+                    changed |=
+                        slider_f32(ui, "Frequency", &mut p.hills.base.frequency, 0.0005, 0.05);
                     if matches!(p.generator, ProceduralGenerator::Plateau) {
                         changed |= slider_f32(ui, "Low", &mut p.plateau.low, -200.0, 2000.0);
                         changed |= slider_f32(ui, "High", &mut p.plateau.high, -200.0, 2000.0);
@@ -1376,17 +1486,21 @@ pub(crate) fn edit_kind(
                 ProceduralGenerator::Mesa => {
                     changed |= slider_f32(ui, "Height", &mut p.mesa.height, 10.0, 800.0);
                     changed |= slider_f32(ui, "Radius", &mut p.mesa.radius, 0.05, 0.6);
-                    changed |= slider_f32(ui, "Edge Steepness", &mut p.mesa.edge_steepness, 1.0, 8.0);
+                    changed |=
+                        slider_f32(ui, "Edge Steepness", &mut p.mesa.edge_steepness, 1.0, 8.0);
                 }
                 ProceduralGenerator::Volcano => {
                     changed |= slider_f32(ui, "Height", &mut p.volcano.height, 50.0, 1200.0);
                     changed |= slider_f32(ui, "Radius", &mut p.volcano.radius, 0.05, 0.6);
-                    changed |= slider_f32(ui, "Crater Radius", &mut p.volcano.crater_radius, 0.0, 0.6);
-                    changed |= slider_f32(ui, "Crater Depth", &mut p.volcano.crater_depth, 0.0, 300.0);
+                    changed |=
+                        slider_f32(ui, "Crater Radius", &mut p.volcano.crater_radius, 0.0, 0.6);
+                    changed |=
+                        slider_f32(ui, "Crater Depth", &mut p.volcano.crater_depth, 0.0, 300.0);
                 }
                 ProceduralGenerator::Dunes => {
                     changed |= slider_f32(ui, "Amplitude", &mut p.dunes.base.amplitude, 0.0, 400.0);
-                    changed |= slider_f32(ui, "Frequency", &mut p.dunes.base.frequency, 0.0005, 0.05);
+                    changed |=
+                        slider_f32(ui, "Frequency", &mut p.dunes.base.frequency, 0.0005, 0.05);
                 }
                 ProceduralGenerator::Canyon => {
                     changed |= slider_f32(ui, "Depth", &mut p.canyon.depth, 10.0, 600.0);
@@ -1394,7 +1508,8 @@ pub(crate) fn edit_kind(
                 ProceduralGenerator::Crater => {
                     changed |= slider_f32(ui, "Strength", &mut p.crater.strength, 0.0, 1.0);
                     changed |= slider_f32(ui, "Amount", &mut p.crater.amount, 1.0, 120.0);
-                    changed |= slider_f32(ui, "Crater Radius", &mut p.crater.crater_radius, 0.05, 0.45);
+                    changed |=
+                        slider_f32(ui, "Crater Radius", &mut p.crater.crater_radius, 0.05, 0.45);
                 }
                 ProceduralGenerator::Noise => {
                     changed |= edit_noise(ui, &mut p.noise, advanced);
@@ -1462,8 +1577,11 @@ pub(crate) fn edit_kind(
                 p.points.clear();
                 changed = true;
             }
-            if button_id(ui, Id::new("insp_undo_polygon_vertex"), "Remove Last Vertex")
-                && !p.points.is_empty()
+            if button_id(
+                ui,
+                Id::new("insp_undo_polygon_vertex"),
+                "Remove Last Vertex",
+            ) && !p.points.is_empty()
             {
                 p.points.pop();
                 changed = true;
@@ -1552,7 +1670,12 @@ pub(crate) fn seed_row(ui: &mut GuiContext<'_>, id_key: &str, seed: &mut u64) ->
         style::TEXT,
         icon_sz,
     );
-    let text_r = Rect::from_pos_size(row.min_x + 30.0, row.min_y, row.width() - 40.0, row.height());
+    let text_r = Rect::from_pos_size(
+        row.min_x + 30.0,
+        row.min_y,
+        row.width() - 40.0,
+        row.height(),
+    );
     ui.label_in_rect(text_r, "Randomize seed", style::TEXT, FONT_SCALE);
     if refreshed {
         *seed = seed.wrapping_mul(1103515245).wrapping_add(12345) % 100_000;
@@ -1583,7 +1706,13 @@ pub(crate) fn edit_kind_noise(ui: &mut GuiContext<'_>, kind: &mut LayerKind) -> 
         }
         LayerKind::Island(p) => {
             let mut changed = seed_row(ui, "island_noise_seed", &mut p.seed);
-            changed |= slider_f32(ui, "Coast Frequency", &mut p.coastline_frequency, 0.0002, 0.006);
+            changed |= slider_f32(
+                ui,
+                "Coast Frequency",
+                &mut p.coastline_frequency,
+                0.0002,
+                0.006,
+            );
             changed |= slider_f32(ui, "Ridge Frequency", &mut p.ridge_frequency, 0.0002, 0.012);
             changed
         }
@@ -1608,7 +1737,10 @@ pub(crate) fn edit_kind_noise(ui: &mut GuiContext<'_>, kind: &mut LayerKind) -> 
 }
 
 /// Toggle erosion `hardness_source` between Materials aux \(K\) and constant hardness.
-pub(crate) fn materials_k_toggle(ui: &mut GuiContext<'_>, source: &mut terra_core::mask::MaskSource) -> bool {
+pub(crate) fn materials_k_toggle(
+    ui: &mut GuiContext<'_>,
+    source: &mut terra_core::mask::MaskSource,
+) -> bool {
     let mut use_mats = matches!(source, terra_core::mask::MaskSource::Hardness);
     if checkbox(ui, "Use Materials K", &mut use_mats) {
         *source = if use_mats {

@@ -1,8 +1,8 @@
 //! Explicit group evaluation and input modes.
 
 use super::operation::OperationCategory;
-use super::output::OutputId;
 use crate::fields::FieldId;
+use crate::ids::OutputId;
 use serde::{Deserialize, Serialize};
 
 /// Default biome swatch tint (muted olive green) shown in lists / overlays.

@@ -1,6 +1,6 @@
 //! Biome paint layers (WC Biome Layers) — splat weights + paint-while-sculpt.
 
-use crate::layer::LayerId;
+use crate::ids::LayerId;
 use crate::mask::PaintBuffer;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -611,7 +611,7 @@ impl HoleLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layer::LayerId;
+    use crate::ids::LayerId;
 
     #[test]
     fn world_to_local_centre_is_full_weight() {

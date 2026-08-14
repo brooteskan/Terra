@@ -1,0 +1,32 @@
+name: GPU parity
+
+on:
+  pull_request:
+  push:
+    branches: [master, wozzits-codex, "release/**"]
+
+jobs:
+  software-adapter-parity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      WGPU_BACKEND: vulkan
+      TERRA_TEST_GPU_FORCE_FALLBACK: "1"
+      LIBGL_ALWAYS_SOFTWARE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Mesa software Vulkan adapter
+        run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers vulkan-tools
+      - name: Select lavapipe ICD
+        shell: bash
+        run: |
+          icd="$(find /usr/share/vulkan/icd.d -name 'lvp_icd*.json' -print -quit)"
+          test -n "$icd"
+          echo "VK_ICD_FILENAMES=$icd" >> "$GITHUB_ENV"
+      - name: Report Vulkan adapter
+        run: vulkaninfo --summary
+      - name: Adapter-independent support matrix
+        run: cargo test -p terra-gpu --test support_matrix
+      - name: Required GPU parity matrix
+        run: cargo test -p terra-gpu --test parity_matrix

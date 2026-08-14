@@ -36,9 +36,6 @@ pub struct FlowReceiver {
     pub fraction: f32,
 }
 
-/// Alias matching the historical hydro `FlowDir` name.
-pub type FlowDir = FlowReceiver;
-
 /// Complete routing graph for a DEM.
 #[derive(Debug, Clone)]
 pub struct FlowGraph {
@@ -138,6 +135,144 @@ pub fn build_flow_graph(hf: &Heightfield, model: FlowModel) -> FlowGraph {
         donors,
         topo_order,
         direction_mask,
+    }
+}
+
+/// Lean D8 drainage: one receiver per cell as a flat `Vec<usize>`, no per-cell
+/// `Vec`s.
+///
+/// Produces the same routed products the SPE oracle consumes — `d8_dir`, a flat
+/// receiver array, an upstream→downstream topo order, and the direction mask — as
+/// [`build_flow_graph`] with [`FlowModel::D8`], but without the general graph's
+/// `Vec<Vec<FlowReceiver>>` receivers, `Vec<Vec<usize>>` donor lists, or
+/// `Vec`-per-pop topological pass. [`Self::rebuild`] reuses its buffers so a
+/// per-iteration SPE refresh does not reallocate the graph each pass (issue #27).
+///
+/// This is a *consumer* of [`flow_direction_d8`], not a second copy of it: D8 has
+/// exactly one receiver per cell, so the general path's per-pop `nexts.sort` is
+/// vacuous and this flat Kahn walk yields a **bit-identical** topo order and
+/// accumulation. D∞ genuinely needs the multi-receiver [`FlowGraph`]; this is
+/// D8-only by construction.
+#[derive(Debug, Clone)]
+pub struct D8Drainage {
+    pub width: usize,
+    pub height: usize,
+    /// D8 direction index per cell (`NO_FLOW` = sink), from [`flow_direction_d8`].
+    pub d8_dir: Vec<u8>,
+    /// Flat downstream neighbour index (`usize::MAX` = sink / no receiver).
+    pub receiver: Vec<usize>,
+    /// Upstream → downstream order; bit-identical to [`FlowGraph::topo_order`].
+    pub topo_order: Vec<usize>,
+    /// Normalised D8 direction mask (same as [`FlowGraph::direction_mask`]).
+    pub direction_mask: MaskField,
+    /// Donor counts, reused as the mutable `remaining` counter during the walk.
+    indegree: Vec<u32>,
+    /// Kahn frontier, reused across rebuilds.
+    queue: VecDeque<usize>,
+}
+
+impl D8Drainage {
+    /// Build a fresh lean D8 drainage for `hf`.
+    pub fn build(hf: &Heightfield) -> Self {
+        let w = hf.metrics.width as usize;
+        let h = hf.metrics.height as usize;
+        let n = w * h;
+        let mut d = Self {
+            width: w,
+            height: h,
+            d8_dir: Vec::new(),
+            receiver: Vec::with_capacity(n),
+            topo_order: Vec::with_capacity(n),
+            direction_mask: MaskField::zeros(hf.metrics),
+            indegree: Vec::with_capacity(n),
+            queue: VecDeque::new(),
+        };
+        d.rebuild(hf);
+        d
+    }
+
+    /// Recompute in place for `hf`, reusing existing buffers.
+    ///
+    /// `hf` must share the resolution the cache was built at.
+    pub fn rebuild(&mut self, hf: &Heightfield) {
+        let w = hf.metrics.width as usize;
+        let h = hf.metrics.height as usize;
+        let n = w * h;
+        debug_assert_eq!(
+            (w, h),
+            (self.width, self.height),
+            "D8Drainage::rebuild resolution mismatch"
+        );
+        self.width = w;
+        self.height = h;
+
+        // Reuses the single-lineage kernel; freshly allocates dirs + mask.
+        let (dirs, mask) = flow_direction_d8(hf);
+
+        // Flat single receiver + donor count (indegree) in one pass. With one
+        // receiver per cell each donor is pushed once, so this indegree matches
+        // the general `build_donors` length after its (here no-op) dedup.
+        self.receiver.clear();
+        self.receiver.resize(n, usize::MAX);
+        self.indegree.clear();
+        self.indegree.resize(n, 0);
+        for idx in 0..n {
+            let d = dirs[idx];
+            if d == NO_FLOW || d as usize >= D8_OFFSETS.len() {
+                continue;
+            }
+            let (di, dj) = D8_OFFSETS[d as usize];
+            let i = (idx % w) as i32;
+            let j = (idx / w) as i32;
+            let ni = i + di;
+            let nj = j + dj;
+            if ni < 0 || nj < 0 || ni >= w as i32 || nj >= h as i32 {
+                continue;
+            }
+            let nidx = nj as usize * w + ni as usize;
+            self.receiver[idx] = nidx;
+            self.indegree[nidx] += 1;
+        }
+
+        // Kahn walk mirroring `topological_order`: seeds in ascending index
+        // order, and — because each cell frees at most one successor — that
+        // successor is appended directly (the general path's `nexts.sort` over a
+        // ≤1-element list is a no-op), so the emitted order is identical.
+        self.queue.clear();
+        for idx in 0..n {
+            if self.indegree[idx] == 0 {
+                self.queue.push_back(idx);
+            }
+        }
+        self.topo_order.clear();
+        // `indegree` doubles as the mutable `remaining` counter from here on.
+        while let Some(idx) = self.queue.pop_front() {
+            self.topo_order.push(idx);
+            let r = self.receiver[idx];
+            if r != usize::MAX && self.indegree[r] > 0 {
+                self.indegree[r] -= 1;
+                if self.indegree[r] == 0 {
+                    self.queue.push_back(r);
+                }
+            }
+        }
+
+        // Cycles / flats: append any unvisited cells in index order (matches
+        // `topological_order`'s tail).
+        if self.topo_order.len() < n {
+            let mut seen = vec![false; n];
+            for &idx in &self.topo_order {
+                seen[idx] = true;
+            }
+            for idx in 0..n {
+                if !seen[idx] {
+                    self.topo_order.push(idx);
+                }
+            }
+        }
+
+        self.d8_dir = dirs;
+        self.direction_mask = mask;
     }
 }
 
@@ -388,6 +523,7 @@ fn topological_order(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::geomorph::{accumulate_drainage_area, Precipitation};
     use crate::heightfield::HeightfieldMetrics;
 
     #[test]
@@ -402,5 +538,89 @@ mod tests {
         let b = build_flow_graph(&hf, FlowModel::D8);
         assert_eq!(a.d8_dir, b.d8_dir);
         assert_eq!(a.topo_order, b.topo_order);
+    }
+
+    #[test]
+    fn pyramid_flows_outward_down() {
+        let m = HeightfieldMetrics::new(9, 9, 9.0, 9.0);
+        let mut hf = Heightfield::zeros(m);
+        for j in 0..9 {
+            for i in 0..9 {
+                let d = (i as i32 - 4).abs() + (j as i32 - 4).abs();
+                hf.set(i, j, 10.0 - d as f32);
+            }
+        }
+        let g = build_flow_graph(&hf, FlowModel::D8);
+        let acc = accumulate_drainage_area(&g, &Precipitation::uniform(1.0));
+        // Corners seed at least their own cell; some path collects several upstream.
+        assert!(acc[0] >= 1.0);
+        assert!(acc.iter().any(|&a| a > 5.0));
+    }
+
+    #[test]
+    fn d8_marks_local_sink_as_no_flow() {
+        let m = HeightfieldMetrics::new(3, 3, 3.0, 3.0);
+        let mut hf = Heightfield::filled(m, 2.0);
+        hf.set(1, 1, 1.0);
+        let g = build_flow_graph(&hf, FlowModel::D8);
+        let acc = accumulate_drainage_area(&g, &Precipitation::uniform(1.0));
+        // Center pit has no lower neighbour → sink; all 8 neighbours drain into it.
+        assert_eq!(g.d8_dir[4], NO_FLOW);
+        assert_eq!(acc[4], 9.0);
+    }
+
+    #[test]
+    fn downhill_flow_single_outlet_sanity() {
+        let m = HeightfieldMetrics::new(9, 9, 90.0, 90.0);
+        let mut hf = Heightfield::zeros(m);
+        for j in 0..9 {
+            for i in 0..9 {
+                hf.set(i, j, 20.0 - j as f32);
+            }
+        }
+        let g = build_flow_graph(&hf, FlowModel::D8);
+        let acc = accumulate_drainage_area(&g, &Precipitation::uniform(1.0));
+        // Bottom row collects the most water on a south-draining plane.
+        let top: f32 = (0..9).map(|i| acc[i]).sum();
+        let bot: f32 = (0..9).map(|i| acc[8 * 9 + i]).sum();
+        assert!(bot > top);
+        // Interior cells flow south (dir index 2 = (0, 1)).
+        let south = g.d8_dir.iter().filter(|&&d| d == 2).count();
+        assert!(south > 20);
+    }
+
+    #[test]
+    fn dinfinity_routes_within_the_winning_facet() {
+        let m = HeightfieldMetrics::new(5, 5, 5.0, 5.0);
+        let mut hf = Heightfield::zeros(m);
+        for j in 0..5 {
+            for i in 0..5 {
+                hf.set(i, j, 100.0 - i as f32 - 0.5 * j as f32);
+            }
+        }
+        let routed = flow_direction_dinfinity(&hf);
+        let center = &routed[2 * 5 + 2];
+        assert_eq!(center.len(), 2);
+        assert!(center.iter().any(|d| (d.di, d.dj) == (1, 0)));
+        assert!(center.iter().any(|d| (d.di, d.dj) == (1, 1)));
+        let total: f32 = center.iter().map(|d| d.fraction).sum();
+        assert!((total - 1.0).abs() < 1e-6);
+        assert!(center.iter().all(|d| d.fraction > 0.0));
+    }
+
+    #[test]
+    fn dinfinity_cardinal_plane_does_not_split_sideways() {
+        let m = HeightfieldMetrics::new(5, 5, 5.0, 5.0);
+        let mut hf = Heightfield::zeros(m);
+        for j in 0..5 {
+            for i in 0..5 {
+                hf.set(i, j, 20.0 - i as f32);
+            }
+        }
+        let routed = flow_direction_dinfinity(&hf);
+        let center = &routed[2 * 5 + 2];
+        assert_eq!(center.len(), 1);
+        assert_eq!((center[0].di, center[0].dj), (1, 0));
+        assert!((center[0].fraction - 1.0).abs() < 1e-6);
     }
 }

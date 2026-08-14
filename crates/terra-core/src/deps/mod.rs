@@ -262,14 +262,8 @@ mod tests {
     #[test]
     fn stack_order_is_acyclic() {
         let mut stack = LayerStack::new();
-        stack.push(Layer::new(
-            "A",
-            LayerKind::Flat(FlatParams { height: 1.0 }),
-        ));
-        stack.push(Layer::new(
-            "B",
-            LayerKind::Flat(FlatParams { height: 2.0 }),
-        ));
+        stack.push(Layer::new("A", LayerKind::Flat(FlatParams { height: 1.0 })));
+        stack.push(Layer::new("B", LayerKind::Flat(FlatParams { height: 2.0 })));
         let g = DependencyGraph::build_from_stack(&stack, &[]);
         assert!(g.detect_cycle().is_ok());
     }
@@ -277,15 +271,9 @@ mod tests {
     #[test]
     fn broken_mask_ref_is_reported() {
         let mut stack = LayerStack::new();
-        let mut layer = Layer::new(
-            "A",
-            LayerKind::Flat(FlatParams { height: 1.0 }),
-        );
+        let mut layer = Layer::new("A", LayerKind::Flat(FlatParams { height: 1.0 }));
         let missing = MaskId::new();
-        layer
-            .common
-            .masks
-            .push(crate::mask::MaskRef::new(missing));
+        layer.common.masks.push(crate::mask::MaskRef::new(missing));
         let layer_id = layer.id();
         stack.push(layer);
         let g = DependencyGraph::build_from_stack(&stack, &[]);

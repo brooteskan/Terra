@@ -154,7 +154,10 @@ fn shape_layer_lives_on_terrain_stack() {
     let layer = create_shape_layer("Clipped Shape");
     let id = layer.id();
     doc.add_shape_layer(layer);
-    assert!(doc.stack.find(id).is_some(), "Shape Layer owned by terrain stack");
+    assert!(
+        doc.stack.find(id).is_some(),
+        "Shape Layer owned by terrain stack"
+    );
 }
 
 #[test]

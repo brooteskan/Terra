@@ -4,6 +4,15 @@ All notable changes to Terra will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.0-beta.1] - 2026-08-14
+
+First beta binary release candidate for Windows.
+
+### Fixed
+- Default material and biome height ranges now save as finite JSON values, and projects previously written with `null` open bounds load and normalize on the next save.
+- Incremental dirty-tile synchronization now refreshes neighboring edge and corner ghosts, and seam metrics detect stale halos in both directions at every configured depth.
+- Layered hydraulic, debris-flow, and thermal stacks now preserve distinct canonical debris and fine-sediment inventories across aux and cache handoffs.
+
 ### Added
 - Phase 11 geological integration: shared typed AuxMaps (bedrock / sediment / soil /
   lithology), `ScaleBand::MultiScale` + `LayerKind::scale_band`, field invalidation
@@ -26,3 +35,14 @@ All notable changes to Terra will be documented in this file.
 - Shared geometry helpers in `terra-core::mask::geom`
 - Layer type registry documented as catalog source of truth; tool catalog points contributors there
 - Geomorphic Detail upgraded from isotropic-aligned polish to anti-soup structured amplification
+
+### Removed
+- Retired the unused terra-core evaluation graph, operator adapter, and duplicate GPU-support
+  metadata; CPU evaluation remains owned by `StackEvaluator` and GPU planning by `terra-gpu`.
+- Retired the unconsumed `TerrainContext` bridge and parallel `terrain_eval` state, derived-cache,
+  diagnostics, mode, determinism, and tiling scaffolding; live field helpers remain under
+  `fields`, `heightfield`, and `layer`.
+- Retired the unexecuted per-layer terrain work scheduler and vector tile executor; viewport
+  residency now records only payload-backed tiles produced by the live final-output upload path.
+- Retired the delegating `TerrainPipelineExecutor` and fictional ten-stage rebuild diagnostics;
+  final and export CPU evaluation now call the authored-tree `StackEvaluator` directly.

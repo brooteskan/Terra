@@ -1,11 +1,12 @@
 //! Global command palette and its editor-facing action bridge.
 
-use crate::ui::command_registry::{commands, fuzzy_match, CommandId};
 use crate::ui::actions::PanelAction;
-use crate::ui::tool_catalog::{all_tools_cached, ToolAction};
-use crate::ui::{AppWorkspace, Preview2dMode, UiState, WorkspaceId};
-use terra_core::layer::Layer;
+use crate::ui::command_registry::{
+    commands, format_shortcuts, fuzzy_match, resolve_workspace_command, CommandId,
+};
 use crate::ui::style::{self, FONT_SCALE, PAD, ROW_H};
+use crate::ui::tool_catalog::{all_tools_cached, instantiate_layer_preset, ToolAction};
+use crate::ui::{AppWorkspace, Preview2dMode, UiState};
 use terra_gui::{button_id, Color, GuiContext, Id, Rect};
 
 #[derive(Debug, Default)]
@@ -101,7 +102,7 @@ pub fn draw_command_palette(
         .into_iter()
         .filter(|command| fuzzy_match(&state.query, command.name))
     {
-        let shortcut = command.default_shortcut.unwrap_or("");
+        let shortcut = format_shortcuts(command.bindings);
         let label = format!(
             "{}  {}    {}",
             command.category.label(),
@@ -131,37 +132,14 @@ fn execute_command(
     ui_state: &mut UiState,
     actions: &mut Vec<PaletteAction>,
 ) {
+    if let Some(workspace) = resolve_workspace_command(id) {
+        ui_state.switch_workspace(workspace);
+        return;
+    }
+
     match id {
         CommandId::ADD_MOUNTAIN => add_catalog_layer("shape.procedural", actions),
         CommandId::ADD_HYDRAULIC_EROSION => add_catalog_layer("sim.hydraulic", actions),
-        CommandId::SCULPT | CommandId::GENERATE | CommandId::WORKSPACE_SCULPT => {
-            ui_state.switch_workspace(WorkspaceId::Sculpt);
-        }
-        CommandId::EROSION | CommandId::WORKSPACE_SIMULATION => {
-            ui_state.switch_workspace(WorkspaceId::Simulation);
-        }
-        CommandId::MASKS | CommandId::WORKSPACE_RULES => {
-            ui_state.switch_workspace(WorkspaceId::Rules);
-        }
-        CommandId::PAINT | CommandId::WORKSPACE_SURFACE => {
-            ui_state.switch_workspace(WorkspaceId::Surface);
-        }
-        CommandId::BIOMES | CommandId::WORKSPACE_BIOMES => {
-            ui_state.switch_workspace(WorkspaceId::Biomes);
-        }
-        CommandId::SCATTER | CommandId::WORKSPACE_OBJECTS => {
-            ui_state.switch_workspace(WorkspaceId::Objects);
-        }
-        CommandId::WORKSPACE_WORLD => {
-            ui_state.switch_workspace(WorkspaceId::World);
-        }
-        CommandId::WORKSPACE_DEVELOP => {
-            ui_state.switch_workspace(WorkspaceId::Develop);
-        }
-        CommandId::WORKSPACE_ALL_TOOLS => {
-            // All Tools removed â€” land on Objects (full-ish catalog without the old rail entry).
-            ui_state.switch_workspace(WorkspaceId::Objects);
-        }
         CommandId::FRAME_TERRAIN => actions.push(PaletteAction::CameraReset),
         CommandId::TOP_VIEW => actions.push(PaletteAction::CameraTopView),
         CommandId::FRAME_SELECTION => actions.push(PaletteAction::CameraFrameSelection),
@@ -232,7 +210,7 @@ fn add_catalog_layer(id: &str, actions: &mut Vec<PaletteAction>) {
     {
         match tool.action {
             ToolAction::AddLayer { name, kind } => {
-                let layer = Layer::new(name, kind);
+                let layer = instantiate_layer_preset(name, &kind);
                 if id.starts_with("shape.") {
                     actions.push(PaletteAction::Panel(PanelAction::AddLayerToCategory {
                         category: terra_core::layer::StackCategory::Shape,

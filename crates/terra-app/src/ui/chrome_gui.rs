@@ -1,8 +1,8 @@
 //! Top application bar — brand, menus, project chip, export, window caption.
 
+use crate::ui::style::{self, FONT_SCALE, PAD, TOOLBAR_BTN_H, TYPE_BODY, TYPE_LABEL};
 use crate::ui::{FrameUiOutput, UiState, WindowResizeEdge};
 use terra_core::document::TerrainDocument;
-use crate::ui::style::{self, FONT_SCALE, PAD, TOOLBAR_BTN_H, TYPE_BODY, TYPE_LABEL};
 use terra_gui::{
     checkbox, chip_button, icon_button, menu_button as menu_row, Color, DrawList, GuiContext, Icon,
     Id, Rect, INSET_TOP,
@@ -27,9 +27,24 @@ pub fn draw_caption_controls(
     let cluster_w = caption_controls_width();
     let cluster = Rect::from_pos_size(ui.screen_w - cluster_w, 0.0, cluster_w, INSET_TOP);
     let btn_y = y;
-    let close_r = Rect::from_pos_size(cluster.max_x - CAPTION_BTN_W, btn_y, CAPTION_BTN_W, TOOLBAR_BTN_H);
-    let max_r = Rect::from_pos_size(close_r.min_x - CAPTION_BTN_W, btn_y, CAPTION_BTN_W, TOOLBAR_BTN_H);
-    let min_r = Rect::from_pos_size(max_r.min_x - CAPTION_BTN_W, btn_y, CAPTION_BTN_W, TOOLBAR_BTN_H);
+    let close_r = Rect::from_pos_size(
+        cluster.max_x - CAPTION_BTN_W,
+        btn_y,
+        CAPTION_BTN_W,
+        TOOLBAR_BTN_H,
+    );
+    let max_r = Rect::from_pos_size(
+        close_r.min_x - CAPTION_BTN_W,
+        btn_y,
+        CAPTION_BTN_W,
+        TOOLBAR_BTN_H,
+    );
+    let min_r = Rect::from_pos_size(
+        max_r.min_x - CAPTION_BTN_W,
+        btn_y,
+        CAPTION_BTN_W,
+        TOOLBAR_BTN_H,
+    );
 
     caption_icon_button(
         ui,

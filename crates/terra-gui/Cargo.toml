@@ -13,3 +13,7 @@ log = { workspace = true }
 fontdue = "0.9"
 lucide-icons = "0.575"
 serde = { workspace = true }
+
+[dev-dependencies]
+terra-test-gpu = { workspace = true }
+serde_json = { workspace = true }

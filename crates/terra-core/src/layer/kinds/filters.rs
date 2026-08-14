@@ -1,4 +1,4 @@
-﻿//! Layer parameter kinds (split by family).
+//! Layer parameter kinds (split by family).
 
 use serde::{Deserialize, Serialize};
 
@@ -1158,4 +1158,3 @@ impl EffectFilterParams {
         }
     }
 }
-

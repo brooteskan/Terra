@@ -127,7 +127,7 @@ pub enum MaskSource {
     Named(String),
     /// Reference a published layer/group output by stable id.
     LayerOutput {
-        output_id: crate::layer::OutputId,
+        output_id: crate::ids::OutputId,
     },
 }
 

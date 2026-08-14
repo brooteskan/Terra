@@ -526,7 +526,10 @@ fn chipped_only_removes_from_faces() {
             }
         }
     }
-    assert!(face_removed, "chipped should erode chunks from the rock face");
+    assert!(
+        face_removed,
+        "chipped should erode chunks from the rock face"
+    );
 }
 
 #[test]
@@ -594,7 +597,8 @@ fn arid_params_serde_defaults() {
         "beach_width": 8.0,
         "crater_radius": 0.18
     }"#;
-    let p: EffectFilterParams = serde_json::from_str(json).expect("legacy params without arid fields");
+    let p: EffectFilterParams =
+        serde_json::from_str(json).expect("legacy params without arid fields");
     assert!((p.rock_hardness - 0.55).abs() < 1e-5);
     assert!((p.wall_steepness - 0.65).abs() < 1e-5);
     assert!((p.valley_floor - 0.25).abs() < 1e-5);
@@ -735,10 +739,7 @@ fn phase10_crater_has_rim_raise() {
         center_dh < -5.0,
         "crater center should excavate: dh={center_dh}"
     );
-    assert!(
-        rim_dh > 0.5,
-        "crater rim should raise: dh={rim_dh}"
-    );
+    assert!(rim_dh > 0.5, "crater rim should raise: dh={rim_dh}");
     assert!(center_dh < rim_dh);
 }
 

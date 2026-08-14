@@ -10,6 +10,4 @@ pub use strata::{
     expose_strata_height, sample_bed, strata_band_displace, strata_depth_m, strata_fields,
     strata_fields_with, stratum_at_depth, BedSample, StrataFieldParams,
 };
-pub use terrace::{
-    terrace_irregular, terrace_simple, terrace_steep, TerraceControls, TerraceMode,
-};
+pub use terrace::{terrace_irregular, terrace_simple, terrace_steep, TerraceControls, TerraceMode};

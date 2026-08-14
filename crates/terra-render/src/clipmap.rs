@@ -57,7 +57,13 @@ impl ClipmapRingLevel {
     }
 
     /// Snap ring origin so vertices stay aligned across levels (Losasso & Hoppe).
-    pub fn snap_origin(&self, camera_x: f32, camera_z: f32, world_x: f32, world_z: f32) -> (f32, f32) {
+    pub fn snap_origin(
+        &self,
+        camera_x: f32,
+        camera_z: f32,
+        world_x: f32,
+        world_z: f32,
+    ) -> (f32, f32) {
         let half = self.coverage() * 0.5;
         let snap = self.spacing.max(1e-6);
         let mut ox = ((camera_x - half) / snap).floor() * snap;
@@ -127,7 +133,13 @@ impl ClipmapConfig {
     }
 
     /// Recompute snapped origins for every ring from the camera-centre XZ.
-    pub fn ring_origins(&self, camera_x: f32, camera_z: f32, world_x: f32, world_z: f32) -> Vec<(f32, f32)> {
+    pub fn ring_origins(
+        &self,
+        camera_x: f32,
+        camera_z: f32,
+        world_x: f32,
+        world_z: f32,
+    ) -> Vec<(f32, f32)> {
         self.rings
             .iter()
             .map(|ring| ring.snap_origin(camera_x, camera_z, world_x, world_z))
@@ -387,12 +399,16 @@ mod tests {
     #[test]
     fn resident_plan_falls_back_without_leaving_holes() {
         let mut pyramid = TerrainPyramid::new(terra_core::PyramidConfig::new(1024, 4096.0, 4096.0));
-        pyramid.publish(
+        pyramid.publish_resident(
             TerrainTileKey {
                 layer: None,
                 field: FieldId::Height,
                 level: 0,
                 tile: terra_core::TileId { tx: 0, tz: 0 },
+            },
+            terra_core::TilePageHandle {
+                slot: 0,
+                generation: 1,
             },
             1,
             1,

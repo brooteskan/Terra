@@ -1,11 +1,11 @@
 //! Flow accumulation / discharge from precipitation fields.
 
 use crate::heightfield::HeightfieldMetrics;
-use crate::layer::{FractalNoiseType, NoiseParams};
 use crate::mask::MaskField;
 use crate::noise::fbm;
+use crate::noise::{FractalNoiseType, NoiseParams};
 
-use super::routing::FlowGraph;
+use super::routing::{D8Drainage, FlowGraph};
 
 /// How precipitation is sourced for accumulation.
 #[derive(Debug, Clone)]
@@ -134,6 +134,35 @@ pub fn accumulate_discharge(
         *v *= cell_area;
     }
     accumulate_with_weights(graph, &p)
+}
+
+/// Lean flat-D8 counterpart of [`accumulate_drainage_area`] for a [`D8Drainage`].
+///
+/// Bit-identical to the general path on D8 input: same topo order, same
+/// per-receiver addition sequence, single receiver whose fraction is `1.0`
+/// (`acc[r] += a` is the general path's `a * 1.0`). The single-lineage guard in
+/// `tests/dead_seams.rs` keeps this from drifting into a second copy of the D8
+/// accumulation logic.
+pub fn accumulate_drainage_area_d8(drainage: &D8Drainage, precip: &Precipitation) -> Vec<f32> {
+    let weights = precip.sample(drainage.direction_mask.metrics);
+    accumulate_flat_d8(drainage, &weights)
+}
+
+fn accumulate_flat_d8(drainage: &D8Drainage, weights: &[f32]) -> Vec<f32> {
+    let n = drainage.width * drainage.height;
+    assert_eq!(weights.len(), n);
+    let mut acc = weights.to_vec();
+    for &idx in &drainage.topo_order {
+        let a = acc[idx];
+        if a <= 0.0 {
+            continue;
+        }
+        let r = drainage.receiver[idx];
+        if r != usize::MAX {
+            acc[r] += a;
+        }
+    }
+    acc
 }
 
 fn accumulate_with_weights(graph: &FlowGraph, weights: &[f32]) -> Vec<f32> {

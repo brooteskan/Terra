@@ -1,0 +1,76 @@
+name: Windows CI
+
+on:
+  pull_request:
+  push:
+    branches: [master, wozzits-codex, "release/**"]
+
+permissions:
+  contents: read
+
+jobs:
+  release-gates:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run clippy
+        run: >
+          cargo clippy --workspace --all-targets --
+          -D warnings
+          -A clippy::absurd_extreme_comparisons
+          -A clippy::approx_constant
+          -A clippy::assertions_on_constants
+          -A clippy::cloned_ref_to_slice_refs
+          -A clippy::collapsible_if
+          -A clippy::collapsible_match
+          -A clippy::default_constructed_unit_structs
+          -A clippy::derivable_impls
+          -A clippy::disallowed_names
+          -A clippy::empty_line_after_doc_comments
+          -A clippy::excessive_precision
+          -A clippy::field_reassign_with_default
+          -A clippy::if_same_then_else
+          -A clippy::identity_op
+          -A clippy::iter_overeager_cloned
+          -A clippy::large_enum_variant
+          -A clippy::len_without_is_empty
+          -A clippy::len_zero
+          -A clippy::let_unit_value
+          -A clippy::manual_clamp
+          -A clippy::manual_contains
+          -A clippy::manual_div_ceil
+          -A clippy::needless_lifetimes
+          -A clippy::needless_range_loop
+          -A clippy::needless_borrow
+          -A clippy::needless_bool_assign
+          -A clippy::needless_return
+          -A clippy::needless_update
+          -A clippy::question_mark
+          -A clippy::redundant_closure
+          -A clippy::result_large_err
+          -A clippy::ptr_arg
+          -A clippy::single_match
+          -A clippy::too_many_arguments
+          -A clippy::type_complexity
+          -A clippy::unnecessary_lazy_evaluations
+          -A clippy::unusual_byte_groupings
+          -A clippy::unnecessary_unwrap
+          -A clippy::unnecessary_cast
+          -A clippy::useless_conversion
+          -A clippy::vec_init_then_push
+          -A clippy::items_after_test_module
+      - name: Run tests
+        run: cargo test --workspace
+      - name: Build release binary
+        run: cargo build --locked --release -p terra-app
+      - name: Smoke test release binary
+        shell: pwsh
+        run: |
+          .\target\release\terra.exe --version
+          .\target\release\terra.exe --self-check
