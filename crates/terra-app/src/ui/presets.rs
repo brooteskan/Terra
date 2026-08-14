@@ -1221,7 +1221,7 @@ pub fn builtin_presets() -> Vec<LayerPreset> {
                         talus_angle_deg: 33.0,
                         sediment_transport: 0.48,
                         constraint_preservation: 0.82,
-                        base_level: -240.0,
+                        base_level: 0.0,
                         use_dinfinity: true,
                         geological_age: 0.55,
                         rainfall: 1.8,

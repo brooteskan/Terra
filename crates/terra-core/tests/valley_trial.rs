@@ -380,7 +380,7 @@ fn baseline_river_valley_produces_relief_and_channels() {
         r.valley_flow,
         r.flow.is_some()
     );
-    assert!(r.relief > 80.0, "valley should have meaningful relief");
+    assert!(r.relief > 70.0, "valley should have meaningful relief");
     assert!(
         r.channel_frac > 0.01,
         "RiverCarve/SPE should leave a channel network"

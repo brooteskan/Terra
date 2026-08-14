@@ -4,6 +4,10 @@ use terra_app::app::TerraApp;
 use winit::event_loop::{ControlFlow, EventLoop};
 
 fn main() {
+    if let Some(exit_code) = handle_release_cli() {
+        std::process::exit(exit_code);
+    }
+
     harden_gpu_env();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
@@ -13,6 +17,53 @@ fn main() {
 
     let mut app = TerraApp::default();
     event_loop.run_app(&mut app).expect("run app");
+}
+
+fn handle_release_cli() -> Option<i32> {
+    let mut args = std::env::args().skip(1);
+    let first = args.next()?;
+    if args.next().is_some() {
+        eprintln!("unexpected extra arguments");
+        return Some(2);
+    }
+
+    match first.as_str() {
+        "--version" | "-V" => {
+            println!("Terra {}", env!("CARGO_PKG_VERSION"));
+            Some(0)
+        }
+        "--self-check" => {
+            if let Err(err) = run_self_check() {
+                eprintln!("Terra self-check failed: {err}");
+                Some(1)
+            } else {
+                println!("Terra {} self-check ok", env!("CARGO_PKG_VERSION"));
+                Some(0)
+            }
+        }
+        "--help" | "-h" => {
+            println!("Terra {}", env!("CARGO_PKG_VERSION"));
+            println!("Usage: terra [--version] [--self-check]");
+            Some(0)
+        }
+        _ => None,
+    }
+}
+
+fn run_self_check() -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|err| format!("current exe unavailable: {err}"))?;
+    if !exe.exists() {
+        return Err(format!(
+            "current exe path does not exist: {}",
+            exe.display()
+        ));
+    }
+
+    if env!("CARGO_PKG_VERSION").trim().is_empty() {
+        return Err("package version is empty".into());
+    }
+
+    Ok(())
 }
 
 /// Soften Vulkan capture-overlay damage when `WGPU_BACKEND=vulkan` is forced.

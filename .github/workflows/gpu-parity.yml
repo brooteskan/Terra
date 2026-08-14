@@ -3,7 +3,7 @@ name: GPU parity
 on:
   pull_request:
   push:
-    branches: [main, wozzits-codex]
+    branches: [master, wozzits-codex, "release/**"]
 
 jobs:
   software-adapter-parity:

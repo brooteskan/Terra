@@ -79,24 +79,24 @@ pub use landscape_blueprint::{
     preview_resolution_for_world_size, ArchetypeId, EvalStage, LandscapeBlueprint,
 };
 pub use landscape_evolution::{
-    evaluate_landscape_evolution, asymmetric_belt, synthesise_uplift, BoundaryMode,
+    asymmetric_belt, evaluate_landscape_evolution, synthesise_uplift, BoundaryMode,
     EvolutionSolverMode, LandscapeEvolutionInput, LandscapeEvolutionOperator,
     LandscapeEvolutionOutput, LandscapeEvolutionParams, UpliftMode,
 };
 pub use landscape_style::{LandscapeStyle, LandscapeStyleParams};
 pub use layer::{
-    AccentCategory, BlendMode, BuildStatus, CachePolicy, GroupEvalMode, GroupInputMode, Layer,
-    LayerCapabilities, LayerGroup, LayerId, LayerInstanceMeta, LayerKind, LayerStack,
-    LayerTypeMeta, LayerTypeRegistry, MaskCompatibility, OperationCategory, StackCategory,
-    WorkflowStage, biome_destination_section, is_shape_kind,
-};
-pub use realism_benchmark::{
-    measure_document, validate_benchmark_structure, BenchmarkExpectations, RealismBenchmark,
+    biome_destination_section, is_shape_kind, AccentCategory, BlendMode, BuildStatus, CachePolicy,
+    GroupEvalMode, GroupInputMode, Layer, LayerCapabilities, LayerGroup, LayerId,
+    LayerInstanceMeta, LayerKind, LayerStack, LayerTypeMeta, LayerTypeRegistry, MaskCompatibility,
+    OperationCategory, StackCategory, WorkflowStage,
 };
 pub use matter_sim::{
     diagnose_matter_sim, outputs_for_consumer, sync_scenario_outputs_from_matter,
     MatterAdvancedParams, MatterArtistControls, MatterArtistSource, MatterOutputConsumer,
     MatterSimConfig, MatterType,
+};
+pub use realism_benchmark::{
+    measure_document, validate_benchmark_structure, BenchmarkExpectations, RealismBenchmark,
 };
 pub use shape_object::{ShapeKind, ShapeObject, ShapeObjectId, ShapeObjectStore, WorldBounds};
 pub use simulation_scenario::{
@@ -109,10 +109,10 @@ pub use sparse_paint::{
     PaintPage, PaintPageCoord, PaintStrokeId, SparsePaintChannelKey, SparsePaintStore,
 };
 pub use terrain::{
-    EditorRefinementState, NormalizedRect, PyramidConfig, RefinementController,
-    RefinementTimings, RegionSet, ResidentTile, TerrainCacheKey, TerrainLevel, TerrainPyramid,
-    TerrainRuntime, TerrainTileKey,
-    TileCacheError, TileCacheInsert, TileCacheStats, TilePageHandle, TileRecord, TileResidencyCache,
+    EditorRefinementState, NormalizedRect, PyramidConfig, RefinementController, RefinementTimings,
+    RegionSet, ResidentTile, TerrainCacheKey, TerrainLevel, TerrainPyramid, TerrainRuntime,
+    TerrainTileKey, TileCacheError, TileCacheInsert, TileCacheStats, TilePageHandle, TileRecord,
+    TileResidencyCache,
 };
 pub use world_archetype::{
     alpine_world, badlands_world, blank_world_design, build_world, coastal_world, desert_world,

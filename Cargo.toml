@@ -12,11 +12,11 @@ members = [
 default-members = ["crates/terra-app"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.0-beta.1"
 edition = "2021"
 license = "MIT"
 authors = ["Terra Contributors"]
-repository = "https://github.com/local/terra"
+repository = "https://github.com/brooteskan/Terra"
 
 [workspace.dependencies]
 terra-core = { path = "crates/terra-core" }

@@ -3,7 +3,7 @@ name: CPU terrain contract
 on:
   pull_request:
   push:
-    branches: [main, wozzits-codex]
+    branches: [master, wozzits-codex, "release/**"]
 
 jobs:
   determinism-tiling-and-halos:

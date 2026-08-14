@@ -119,8 +119,10 @@ fn incomplete_project_serializes_and_reloads() {
     let mut mats = MaterialsParams::default();
     mats.rules.clear();
     mats.strata.clear();
-    doc.stack
-        .push(Layer::new("Premature Materials", LayerKind::Materials(mats)));
+    doc.stack.push(Layer::new(
+        "Premature Materials",
+        LayerKind::Materials(mats),
+    ));
 
     let json = doc.to_json().expect("serialize incomplete");
     let mut back = TerrainDocument::from_json(&json).expect("reload incomplete");
@@ -176,9 +178,7 @@ fn stack_without_shapes_evaluates() {
     doc.stack = terra_core::layer::LayerStack::new();
     let diags = incomplete_project_diagnostics(&doc.stack, &doc.biome_library, &doc.biome_layers);
     assert!(
-        diags
-            .iter()
-            .any(|d| d.code == "stack_without_shape_layers"),
+        diags.iter().any(|d| d.code == "stack_without_shape_layers"),
         "got {diags:?}"
     );
     let _ = eval_doc(&mut doc);

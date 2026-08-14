@@ -1,0 +1,155 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "brooteskan-v*"
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  windows-portable:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Verify release tag matches Cargo version
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          if (-not $tag.StartsWith("brooteskan-v")) {
+            throw "Release tags must start with brooteskan-v"
+          }
+          $tagVersion = $tag.Substring("brooteskan-v".Length)
+          $metadata = cargo metadata --format-version 1 --no-deps | ConvertFrom-Json
+          $app = $metadata.packages | Where-Object { $_.name -eq "terra-app" } | Select-Object -First 1
+          if ($null -eq $app) {
+            throw "terra-app package not found in Cargo metadata"
+          }
+          if ($app.version -ne $tagVersion) {
+            throw "Tag version $tagVersion does not match terra-app version $($app.version)"
+          }
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run clippy
+        run: >
+          cargo clippy --workspace --all-targets --
+          -D warnings
+          -A clippy::absurd_extreme_comparisons
+          -A clippy::approx_constant
+          -A clippy::assertions_on_constants
+          -A clippy::cloned_ref_to_slice_refs
+          -A clippy::collapsible_if
+          -A clippy::collapsible_match
+          -A clippy::default_constructed_unit_structs
+          -A clippy::derivable_impls
+          -A clippy::disallowed_names
+          -A clippy::empty_line_after_doc_comments
+          -A clippy::excessive_precision
+          -A clippy::field_reassign_with_default
+          -A clippy::if_same_then_else
+          -A clippy::identity_op
+          -A clippy::iter_overeager_cloned
+          -A clippy::large_enum_variant
+          -A clippy::len_without_is_empty
+          -A clippy::len_zero
+          -A clippy::let_unit_value
+          -A clippy::manual_clamp
+          -A clippy::manual_contains
+          -A clippy::manual_div_ceil
+          -A clippy::needless_lifetimes
+          -A clippy::needless_range_loop
+          -A clippy::needless_borrow
+          -A clippy::needless_bool_assign
+          -A clippy::needless_return
+          -A clippy::needless_update
+          -A clippy::question_mark
+          -A clippy::redundant_closure
+          -A clippy::result_large_err
+          -A clippy::ptr_arg
+          -A clippy::single_match
+          -A clippy::too_many_arguments
+          -A clippy::type_complexity
+          -A clippy::unnecessary_lazy_evaluations
+          -A clippy::unusual_byte_groupings
+          -A clippy::unnecessary_unwrap
+          -A clippy::unnecessary_cast
+          -A clippy::useless_conversion
+          -A clippy::vec_init_then_push
+          -A clippy::items_after_test_module
+      - name: Run tests
+        run: cargo test --workspace
+      - name: Build release binary
+        run: cargo build --locked --release -p terra-app
+
+      - name: Smoke test release binary
+        shell: pwsh
+        run: |
+          .\target\release\terra.exe --version
+          .\target\release\terra.exe --self-check
+
+      - name: Stage portable package
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $packageName = "terra-$tag-windows-x86_64"
+          $stage = Join-Path "dist" $packageName
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "target\release\terra.exe" $stage
+          Copy-Item "README.md" $stage
+          Copy-Item "CHANGELOG.md" $stage
+          Copy-Item "LICENSE" $stage
+
+          $metadata = cargo metadata --format-version 1 | ConvertFrom-Json
+          $licenseLines = $metadata.packages |
+            Sort-Object name |
+            ForEach-Object { "- $($_.name) $($_.version): $($_.license)" }
+          @(
+            "# Third-Party Licenses"
+            ""
+            "Generated from Cargo metadata for $tag."
+            ""
+          ) + $licenseLines | Set-Content -Encoding utf8 (Join-Path $stage "THIRD_PARTY_LICENSES.md")
+
+          Compress-Archive -Path "$stage\*" -DestinationPath "dist\$packageName.zip" -Force
+          Get-FileHash "dist\$packageName.zip" -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash.ToLowerInvariant())  $packageName.zip" } |
+            Set-Content -Encoding ascii "dist\$packageName.zip.sha256"
+
+      - name: Attest release archive
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/*.zip
+
+      - name: Create draft GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $notes = Join-Path $env:RUNNER_TEMP "release-notes.md"
+          @(
+            "Portable Windows beta build for Terra."
+            ""
+            "Artifact:"
+            "- terra-$tag-windows-x86_64.zip"
+            ""
+            "Verify the SHA256 checksum before running the binary."
+          ) | Set-Content -Encoding utf8 $notes
+          gh release create $tag `
+            --draft `
+            --verify-tag `
+            --title "Terra $tag" `
+            --notes-file $notes `
+            "dist\terra-$tag-windows-x86_64.zip" `
+            "dist\terra-$tag-windows-x86_64.zip.sha256"

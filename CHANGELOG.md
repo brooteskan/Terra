@@ -4,6 +4,10 @@ All notable changes to Terra will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.0-beta.1] - 2026-08-14
+
+First beta binary release candidate for Windows.
+
 ### Fixed
 - Default material and biome height ranges now save as finite JSON values, and projects previously written with `null` open bounds load and normalize on the next save.
 - Incremental dirty-tile synchronization now refreshes neighboring edge and corner ghosts, and seam metrics detect stale halos in both directions at every configured depth.
