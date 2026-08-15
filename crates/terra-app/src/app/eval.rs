@@ -300,7 +300,7 @@ impl TerraApp {
     }
 
     pub(crate) fn sync_tile_stream_to_renderer(&mut self) {
-        let (atlas_view, page_table, tile_size, halo, max_pages, _resident, budget_util) = {
+        let (atlas_view, page_table, tile_size, halo, max_pages) = {
             let Some(atlas) = self.tile_atlas.as_ref() else {
                 return;
             };
@@ -310,11 +310,8 @@ impl TerraApp {
                 atlas.tile_size(),
                 atlas.halo(),
                 atlas.max_pages(),
-                atlas.residency().stats().resident_tiles,
-                atlas.memory_budget().utilization(),
             )
         };
-        let _ = budget_util;
         let level = self
             .last_height
             .as_ref()

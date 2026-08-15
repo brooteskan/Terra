@@ -7,7 +7,6 @@ pub mod derivatives;
 pub mod effect_filter;
 pub mod engine;
 pub mod graph;
-pub mod memory;
 pub mod parity;
 pub mod tile_cache;
 

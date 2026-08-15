@@ -95,7 +95,6 @@ pub struct GpuTileAtlas {
     halo: u32,
     max_pages: u32,
     page_bytes: u64,
-    memory_budget: crate::memory::MemoryBudget,
 }
 
 impl GpuTileAtlas {
@@ -153,10 +152,6 @@ impl GpuTileAtlas {
                 | wgpu::BufferUsages::COPY_SRC,
         });
         let page_bytes = u64::from(page_extent) * u64::from(page_extent) * 4;
-        let mut memory_budget = crate::memory::MemoryBudget::new(
-            ((page_bytes * u64::from(max_pages)) / (1024 * 1024)).max(1) + 64,
-        );
-        let _ = memory_budget.try_alloc(page_bytes * u64::from(max_pages));
         Ok(Self {
             texture,
             view,
@@ -168,7 +163,6 @@ impl GpuTileAtlas {
             halo,
             max_pages,
             page_bytes,
-            memory_budget,
         })
     }
 
@@ -342,10 +336,6 @@ impl GpuTileAtlas {
         &self.residency
     }
 
-    pub fn memory_budget(&self) -> &crate::memory::MemoryBudget {
-        &self.memory_budget
-    }
-
     fn write_page_entry(&self, queue: &wgpu::Queue, slot: u32, entry: GpuPageTableEntry) {
         let offset = u64::from(slot) * std::mem::size_of::<GpuPageTableEntry>() as u64;
         queue.write_buffer(&self.page_table, offset, bytemuck::bytes_of(&entry));
@@ -422,6 +412,7 @@ mod tests {
         atlas.clear(&gpu.queue);
 
         assert_eq!(atlas.residency().stats().resident_tiles, 0);
+        assert_eq!(atlas.residency().stats().used_bytes, 0);
         assert_eq!(atlas.residency().resolve_handle(old), None);
         assert!(atlas
             .read_page_table_blocking(&gpu.device, &gpu.queue)
