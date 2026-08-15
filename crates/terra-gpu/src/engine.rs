@@ -3188,7 +3188,8 @@ mod smoke_tests {
             .flat_map(|j| (0..resolution).map(move |i| i as f32 * 0.5 + j as f32 * 0.25))
             .collect();
         let sculpt = SculptParams {
-            resolution,
+            width: resolution,
+            height: resolution,
             samples,
             fill_height: 0.0,
         };
@@ -3723,7 +3724,8 @@ mod smoke_tests {
         stack.push(Layer::new(
             "varying base",
             LayerKind::SculptBase(SculptParams {
-                resolution: 16,
+                width: 16,
+                height: 16,
                 samples,
                 fill_height: 0.0,
             }),
@@ -3758,7 +3760,8 @@ mod smoke_tests {
         stack.push(Layer::new(
             "peaked base",
             LayerKind::SculptBase(SculptParams {
-                resolution: 16,
+                width: 16,
+                height: 16,
                 samples,
                 fill_height: 0.0,
             }),

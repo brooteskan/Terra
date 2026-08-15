@@ -1500,6 +1500,8 @@ pub fn draw_editor_gui(
         || layers.context_menu.is_some()
         || layers.add_menu_open
         || inspector.more_menu_open
+        || inspector.has_resize_confirmation()
+        || ui_state.show_command_palette
         || ui_state.lighting_menu_open
         || ui_state.camera_speed_menu_open
         || ui_state.viewport_context_menu.is_some()
@@ -1557,7 +1559,9 @@ pub fn draw_editor_gui(
     out.actions
         .extend(draw_viewport_context_menu(ui, doc, ui_state));
     let mut command_palette = std::mem::take(&mut ui_state.command_palette);
-    for action in draw_command_palette(ui, doc, ui_state, &mut command_palette) {
+    let palette_actions =
+        ui.with_menu_input(|ui| draw_command_palette(ui, doc, ui_state, &mut command_palette));
+    for action in palette_actions {
         match action {
             PaletteAction::Panel(action) => out.actions.push(action),
             PaletteAction::Undo => out.request_undo = true,
@@ -1574,7 +1578,14 @@ pub fn draw_editor_gui(
         }
     }
     ui_state.command_palette = command_palette;
-    draw_export_unsupported_modal(ui, &mut ui_state.show_export_unsupported);
+    if let Some(action) =
+        ui.with_menu_input(|ui| inspector::draw_resize_confirmation_modal(ui, inspector))
+    {
+        out.actions.push(action);
+    }
+    ui.with_menu_input(|ui| {
+        draw_export_unsupported_modal(ui, &mut ui_state.show_export_unsupported)
+    });
     out.selected = doc.selected;
     out
 }

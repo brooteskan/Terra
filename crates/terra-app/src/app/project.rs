@@ -699,10 +699,17 @@ impl TerraApp {
             self.ui_state.status = "Undid biome paint stroke".into();
             return;
         }
-        if let Some(id) = self.session.history.undo(&mut self.session.document.stack) {
-            self.mark_dirty_from(id);
-        } else {
-            self.mark_all_layers_dirty();
+        match self.session.history.undo_document(
+            &mut self.session.document.stack,
+            &mut self.session.document.masks,
+        ) {
+            Some(terra_core::command::CommandImpact::Layer(id)) => self.mark_dirty_from(id),
+            Some(terra_core::command::CommandImpact::Masks) => {
+                self.mark_all_layers_dirty();
+                self.mask_overlay_dirty = true;
+                self.preview_dirty = true;
+            }
+            _ => self.mark_all_layers_dirty(),
         }
         self.mark_document_dirty();
         self.request_rebuild();
@@ -721,10 +728,17 @@ impl TerraApp {
             self.ui_state.status = "Redid Scenario edit".into();
             return;
         }
-        if let Some(id) = self.session.history.redo(&mut self.session.document.stack) {
-            self.mark_dirty_from(id);
-        } else {
-            self.mark_all_layers_dirty();
+        match self.session.history.redo_document(
+            &mut self.session.document.stack,
+            &mut self.session.document.masks,
+        ) {
+            Some(terra_core::command::CommandImpact::Layer(id)) => self.mark_dirty_from(id),
+            Some(terra_core::command::CommandImpact::Masks) => {
+                self.mark_all_layers_dirty();
+                self.mask_overlay_dirty = true;
+                self.preview_dirty = true;
+            }
+            _ => self.mark_all_layers_dirty(),
         }
         self.mark_document_dirty();
         self.request_rebuild();

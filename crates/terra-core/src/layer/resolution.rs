@@ -5,21 +5,50 @@
 //! hand-maintained catalog of layer behavior.
 
 use super::LayerKind;
+use crate::raster::GridDimensions;
 
-/// Dimensions of a stored or imported raster grid.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct GridDimensions {
-    pub width: u32,
-    pub height: u32,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffectiveDetailLimit {
+    Matched,
+    SourceLimited,
+    EvaluationLimited,
+    MixedLimited,
 }
 
-impl GridDimensions {
-    pub const fn new(width: u32, height: u32) -> Self {
-        Self { width, height }
+impl EffectiveDetailLimit {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Matched => "matched",
+            Self::SourceLimited => "source-limited",
+            Self::EvaluationLimited => "evaluation-limited",
+            Self::MixedLimited => "mixed-limited",
+        }
     }
+}
 
-    pub const fn square(resolution: u32) -> Self {
-        Self::new(resolution, resolution)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EffectiveDetail {
+    pub dimensions: GridDimensions,
+    pub limit: EffectiveDetailLimit,
+}
+
+pub fn effective_detail(source: GridDimensions, evaluation: GridDimensions) -> EffectiveDetail {
+    let source_x = source.width < evaluation.width;
+    let source_y = source.height < evaluation.height;
+    let evaluation_x = evaluation.width < source.width;
+    let evaluation_y = evaluation.height < source.height;
+    let limit = if source == evaluation {
+        EffectiveDetailLimit::Matched
+    } else if (source_x || source_y) && (evaluation_x || evaluation_y) {
+        EffectiveDetailLimit::MixedLimited
+    } else if source_x || source_y {
+        EffectiveDetailLimit::SourceLimited
+    } else {
+        EffectiveDetailLimit::EvaluationLimited
+    };
+    EffectiveDetail {
+        dimensions: source.component_min(evaluation),
+        limit,
     }
 }
 
@@ -64,7 +93,7 @@ impl LayerKind {
 
         match self {
             SculptBase(params) => LayerResolutionSemantics {
-                source: Source::FixedRaster(GridDimensions::square(params.resolution)),
+                source: Source::FixedRaster(params.dimensions()),
                 behavior: Behavior::Resampled,
             },
             ImportHeightmap(params) => LayerResolutionSemantics {
@@ -166,6 +195,24 @@ mod tests {
                 source: LayerResolutionSource::FixedRaster(GridDimensions::square(384)),
                 behavior: EvaluationResolutionBehavior::Resampled,
             }
+        );
+    }
+
+    #[test]
+    fn effective_detail_is_component_wise_and_classifies_mixed_limits() {
+        assert_eq!(
+            effective_detail(
+                GridDimensions::new(512, 4096),
+                GridDimensions::new(2048, 1024)
+            ),
+            EffectiveDetail {
+                dimensions: GridDimensions::new(512, 1024),
+                limit: EffectiveDetailLimit::MixedLimited,
+            }
+        );
+        assert_eq!(
+            effective_detail(GridDimensions::square(512), GridDimensions::square(4096)).limit,
+            EffectiveDetailLimit::SourceLimited
         );
     }
 

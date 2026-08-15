@@ -4,7 +4,10 @@ mod edit_kind;
 mod resolution;
 
 use self::edit_kind::{edit_kind, kind_display_name, KindEditPane};
-use self::resolution::{draw_layer_resolution, draw_painted_mask_resolution, ImportedSourceCache};
+pub(super) use self::resolution::draw_resize_confirmation_modal;
+use self::resolution::{
+    draw_layer_resolution, draw_painted_mask_resolution, ImportedSourceCache, PendingRasterResize,
+};
 use crate::ui::actions::PanelAction;
 use crate::ui::dist_kinds::{dist_base_kinds, dist_effect_kinds};
 use crate::ui::presets::contextual_presets;
@@ -211,6 +214,7 @@ pub struct InspectorGuiState {
     pub details: DetailsExpandState,
     /// Header-only metadata for the currently inspected imported raster.
     source_metadata: ImportedSourceCache,
+    pending_source_downsize: Option<PendingRasterResize>,
 }
 
 impl Default for InspectorGuiState {
@@ -223,15 +227,21 @@ impl Default for InspectorGuiState {
             rename_buffer: None,
             details: DetailsExpandState::default(),
             source_metadata: ImportedSourceCache::default(),
+            pending_source_downsize: None,
         }
     }
 }
 
 impl InspectorGuiState {
+    pub(crate) fn has_resize_confirmation(&self) -> bool {
+        self.pending_source_downsize.is_some()
+    }
+
     /// Reset Details sections to the project-entry default (all collapsed).
     pub fn reset_expand_for_project(&mut self) {
         self.details = DetailsExpandState::default();
         self.source_metadata = ImportedSourceCache::default();
+        self.pending_source_downsize = None;
     }
 }
 
@@ -353,14 +363,14 @@ pub fn draw_inspector_gui(
         .and_then(|id| doc.stack.find(id))
         .is_some_and(|l| l.kind.is_sculpt_base());
     if ui_state.editor_tool == EditorTool::PaintMask {
-        draw_mask_tool_inspector(ui, doc, ui_state, &mut actions);
+        draw_mask_tool_inspector(ui, doc, ui_state, state, &mut actions);
         ui.end_panel_scrolled(&mut state.scroll_y);
         return actions;
     }
     if ui_state.editor_tool.is_sculpt() && (selected_is_base || doc.selected.is_none()) {
         draw_tool_inspector(ui, doc, ui_state);
         if let Some(layer) = doc.selected.and_then(|id| doc.stack.find(id)) {
-            draw_layer_resolution(ui, doc, ui_state, state, layer);
+            draw_layer_resolution(ui, doc, ui_state, state, layer, &mut actions);
         }
         ui.end_panel_scrolled(&mut state.scroll_y);
         return actions;
@@ -764,7 +774,7 @@ pub fn draw_inspector_gui(
 
     // Resolution is selection context, so keep it visible regardless of the active tab.
     ui.gap(4.0);
-    draw_layer_resolution(ui, doc, ui_state, state, &layer);
+    draw_layer_resolution(ui, doc, ui_state, state, &layer, &mut actions);
     ui.separator();
 
     let tab_icons: Vec<Icon> = tabs.iter().map(|t| t.icon()).collect();
@@ -1263,6 +1273,7 @@ fn draw_mask_tool_inspector(
     ui: &mut GuiContext<'_>,
     doc: &TerrainDocument,
     ui_state: &mut UiState,
+    state: &mut InspectorGuiState,
     actions: &mut Vec<PanelAction>,
 ) {
     use terra_core::mask::MaskPaintTool;
@@ -1320,7 +1331,7 @@ fn draw_mask_tool_inspector(
         }
     }
 
-    draw_painted_mask_resolution(ui, doc, ui_state);
+    draw_painted_mask_resolution(ui, doc, ui_state, state, actions);
 
     let mut overlay = ui_state.viewport_overlays.mask_overlay;
     if checkbox(ui, "Show mask overlay", &mut overlay) {

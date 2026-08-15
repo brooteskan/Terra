@@ -23,7 +23,7 @@ use std::collections::HashMap;
 /// authored identity and semantics. Persisted enum tags are additive (renames
 /// require aliases or migration), and every new persisted field requires a Serde
 /// default or an explicit migration. Writers always stamp this current version.
-pub const DOCUMENT_VERSION: u32 = 2;
+pub const DOCUMENT_VERSION: u32 = 3;
 
 /// Presentation lighting for the 3D viewport, saved with the project so a custom
 /// look is restored on load. Angles are degrees; strengths are renderer multipliers.

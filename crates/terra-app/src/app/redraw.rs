@@ -431,6 +431,10 @@ impl TerraApp {
             );
             self.viewport_rect = gui.viewport_rect();
 
+            if self.pending_project_action.is_some() || self.show_new_template_picker {
+                gui.suspend_pointer_edges();
+            }
+
             let mut home_actions = Vec::new();
             let ui_out = if self.screen == AppScreen::Home {
                 let mut out = crate::ui::FrameUiOutput::default();
@@ -457,18 +461,20 @@ impl TerraApp {
             };
 
             let discard_choice = if self.pending_project_action.is_some() {
-                draw_discard_confirm(&mut gui)
+                gui.with_menu_input(draw_discard_confirm)
             } else {
                 None
             };
 
             let template_choice =
                 if self.show_new_template_picker && self.pending_project_action.is_none() {
-                    draw_new_project_templates(
-                        &mut gui,
-                        &mut self.new_template_selected,
-                        &mut self.new_world_settings,
-                    )
+                    gui.with_menu_input(|gui| {
+                        draw_new_project_templates(
+                            gui,
+                            &mut self.new_template_selected,
+                            &mut self.new_world_settings,
+                        )
+                    })
                 } else {
                     None
                 };

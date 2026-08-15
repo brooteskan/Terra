@@ -43,7 +43,10 @@ fn assert_fixture_semantics(doc: &TerrainDocument, expected_name: &str) {
     let LayerKind::SculptBase(params) = &base.kind else {
         panic!("legacy base kind changed");
     };
-    assert_eq!(params.resolution, 2);
+    assert_eq!(
+        params.dimensions(),
+        terra_core::layer::GridDimensions::square(2)
+    );
     assert_eq!(params.samples, [12.5; 4]);
     assert_eq!(params.fill_height, 12.5);
 
@@ -363,4 +366,41 @@ fn genuinely_future_version_is_rejected_clearly() {
         DOCUMENT_VERSION + 1
     )));
     assert!(message.contains(&format!("latest supported {DOCUMENT_VERSION}")));
+}
+
+#[test]
+fn rectangular_sculpt_sources_round_trip_in_version_3() {
+    let mut document = TerrainDocument::default();
+    let base = document
+        .stack
+        .flatten_layers_mut()
+        .into_iter()
+        .find(|layer| layer.kind.is_sculpt_base())
+        .expect("default base");
+    base.kind = LayerKind::SculptBase(terra_core::layer::SculptParams::filled_grid(
+        terra_core::layer::GridDimensions::new(128, 256),
+        17.0,
+    ));
+
+    let json = document.to_json().expect("rectangular source saves");
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(value["version"], 3);
+    assert!(json.contains("\"width\":128"));
+    assert!(json.contains("\"height\":256"));
+
+    let loaded = TerrainDocument::from_json(&json).expect("rectangular source reloads");
+    let base = loaded
+        .stack
+        .flatten_layers()
+        .into_iter()
+        .find(|layer| layer.kind.is_sculpt_base())
+        .unwrap();
+    let LayerKind::SculptBase(params) = &base.kind else {
+        unreachable!()
+    };
+    assert_eq!(
+        params.dimensions(),
+        terra_core::layer::GridDimensions::new(128, 256)
+    );
+    assert_eq!(params.samples.len(), 128 * 256);
 }

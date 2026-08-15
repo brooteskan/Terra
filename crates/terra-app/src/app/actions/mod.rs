@@ -3,6 +3,7 @@
 mod biomes;
 mod layers;
 mod masks;
+mod resolution;
 mod scenarios;
 mod settings;
 mod tools;
@@ -19,6 +20,7 @@ pub(crate) struct ApplyCtx {
     pub sculpt_dirty_rect: Option<(u32, u32, u32, u32)>,
     pub doc_mutated: bool,
     pub mask_assets_mutated: bool,
+    pub deferred_rebuild: bool,
     pub continue_loop: bool,
 }
 
@@ -29,6 +31,7 @@ impl ApplyCtx {
             sculpt_dirty_rect: None,
             doc_mutated: false,
             mask_assets_mutated: false,
+            deferred_rebuild: false,
             continue_loop: false,
         }
     }
@@ -39,6 +42,10 @@ impl TerraApp {
         let mut ctx = ApplyCtx::new();
         for action in actions {
             ctx.continue_loop = false;
+            let action = match resolution::try_apply(self, action, &mut ctx) {
+                Ok(()) => continue,
+                Err(a) => a,
+            };
             let action = match layers::try_apply(self, action, &mut ctx) {
                 Ok(()) => continue,
                 Err(a) => a,
@@ -124,7 +131,7 @@ impl TerraApp {
                         gpu.mark_dirty_from(&preview, id);
                     }
                 }
-                if sculpt_stamp {
+                if sculpt_stamp || ctx.deferred_rebuild {
                     self.request_rebuild();
                 } else {
                     // Add/reorder/param: present Draft on the next tick (WC realtime).

@@ -1,4 +1,7 @@
 use super::MaskField;
+use crate::raster::{
+    resample_f32_grid, GridDimensions, RasterResizeError, RasterResizeLimits, RasterSemantic,
+};
 use serde::{Deserialize, Serialize};
 
 /// Viewport editing tools for a reusable painted mask layer.
@@ -46,6 +49,29 @@ impl PaintBuffer {
             height,
             samples: vec![0.0; (width * height) as usize],
         }
+    }
+
+    pub const fn dimensions(&self) -> GridDimensions {
+        GridDimensions::new(self.width, self.height)
+    }
+
+    pub fn resized(
+        &self,
+        dimensions: GridDimensions,
+        limits: RasterResizeLimits,
+    ) -> Result<Self, RasterResizeError> {
+        let samples = resample_f32_grid(
+            &self.samples,
+            self.dimensions(),
+            dimensions,
+            RasterSemantic::Mask,
+            limits,
+        )?;
+        Ok(Self {
+            width: dimensions.width,
+            height: dimensions.height,
+            samples,
+        })
     }
 
     /// Backwards-compatible paint/erase stamp.

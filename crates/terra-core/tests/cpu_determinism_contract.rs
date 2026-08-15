@@ -91,7 +91,8 @@ fn sculpt_fixture() -> SculptParams {
         })
         .collect();
     SculptParams {
-        resolution,
+        width: resolution,
+        height: resolution,
         samples,
         fill_height: 12.0,
     }

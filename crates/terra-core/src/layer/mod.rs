@@ -15,6 +15,7 @@ mod stack;
 mod workflow;
 
 pub use crate::ids::{LayerId, OutputId};
+pub use crate::raster::GridDimensions;
 pub use binding::{
     BindingCombine, BindingCurve, BindingSource, ParamBinding, ParamPath, RemapRange,
 };
@@ -34,7 +35,8 @@ pub use operation::{FieldContract, OperationCategory};
 pub use output::{NamedOutputDecl, OutputRef, PublishedOutput};
 pub use registry::LayerTypeRegistry;
 pub use resolution::{
-    EvaluationResolutionBehavior, GridDimensions, LayerResolutionSemantics, LayerResolutionSource,
+    effective_detail, EffectiveDetail, EffectiveDetailLimit, EvaluationResolutionBehavior,
+    LayerResolutionSemantics, LayerResolutionSource,
 };
 pub use scale::ScaleBand;
 pub use stack::{biome_destination_section, is_shape_kind, LayerGroup, LayerStack, StackNode};

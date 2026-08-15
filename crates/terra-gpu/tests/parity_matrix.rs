@@ -72,7 +72,8 @@ fn patterned_sculpt(width: u32, height: u32) -> SculptParams {
         })
         .collect();
     SculptParams {
-        resolution: width,
+        width,
+        height,
         samples,
         fill_height: 0.0,
     }
