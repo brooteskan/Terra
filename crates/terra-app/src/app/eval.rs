@@ -326,11 +326,14 @@ impl TerraApp {
                     .position(|candidate| candidate.resolution == height.metrics.width)
             })
             .unwrap_or(0) as u8;
+        // Pages just uploaded carry this revision; the shader gate rejects any
+        // page-table row that does not match it.
+        let revision = self.terrain_runtime.output_revision();
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
         renderer.set_tile_stream_resources(
-            atlas_view, page_table, tile_size, halo, max_pages, level,
+            atlas_view, page_table, tile_size, halo, max_pages, level, revision,
             // Streamed height is primary; shader falls back to monolithic on miss.
             true,
         );

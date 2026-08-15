@@ -123,6 +123,9 @@ struct FrameUniforms {
     shadow: [f32; 4],
     /// Raster shading controls: x=ambient_strength, y=shadow_strength, z=fog_strength, w=unused
     raster: [f32; 4],
+    /// Streamed-page revision gate: x=revision_lo, y=revision_hi (u32 bits via
+    /// bitcast; the shader compares them against each page-table row), z/w unused.
+    stream2: [f32; 4],
 }
 
 /// Viewport false-color / analysis shading (mode bar).
@@ -318,6 +321,10 @@ pub struct TerrainRenderer {
     tile_stream_halo: f32,
     tile_stream_max_pages: f32,
     tile_stream_level: f32,
+    /// Output revision of the pages currently streamed. The shader rejects any
+    /// page-table row whose revision differs, so a stale page can never resolve
+    /// even if an invalidation site is missed (defence-in-depth for #86).
+    tile_stream_revision: u64,
 }
 
 /// Environment lighting used for Lit viewport presentation.
@@ -1018,6 +1025,7 @@ impl TerrainRenderer {
             tile_stream_halo: 2.0,
             tile_stream_max_pages: 1.0,
             tile_stream_level: 0.0,
+            tile_stream_revision: 0,
         }
     }
 
@@ -1575,6 +1583,7 @@ impl TerrainRenderer {
         halo: u32,
         max_pages: u32,
         level: u8,
+        revision: u64,
         enable: bool,
     ) {
         self.tile_atlas_view = atlas_view;
@@ -1583,6 +1592,7 @@ impl TerrainRenderer {
         self.tile_stream_halo = halo as f32;
         self.tile_stream_max_pages = max_pages.max(1) as f32;
         self.tile_stream_level = level as f32;
+        self.tile_stream_revision = revision;
         // Streaming samples resident pages; the shader falls back to the monolithic
         // height texture on page misses so presentation stays continuous.
         self.use_tile_stream = enable;
@@ -1952,6 +1962,15 @@ impl TerrainRenderer {
                 self.lighting.ambient_strength,
                 self.lighting.shadow_strength,
                 self.lighting.fog_strength,
+                0.0,
+            ],
+            // Carry the revision as raw u32 bits. The value is a small monotonic
+            // counter, so it never reaches the f32 NaN range (~2.1e9) that a
+            // load+bitcast could canonicalize; the bits survive the round trip.
+            stream2: [
+                f32::from_bits(self.tile_stream_revision as u32),
+                f32::from_bits((self.tile_stream_revision >> 32) as u32),
+                0.0,
                 0.0,
             ],
         };

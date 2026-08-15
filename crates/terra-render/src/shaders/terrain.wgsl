@@ -25,6 +25,8 @@ struct FrameUniforms {
     shadow: vec4<f32>,
     // Raster shading: x=ambient_strength, y=shadow_strength, z=fog_strength, w=unused
     raster: vec4<f32>,
+    // Streamed-page revision gate: x=revision_lo, y=revision_hi (u32 via bitcast)
+    stream2: vec4<f32>,
 };
 
 /// Physical page-table row (must match `GpuPageTableEntry`, 48 bytes).
@@ -175,9 +177,14 @@ fn sample_height_monolithic(uv: vec2<f32>) -> f32 {
 
 fn find_tile_page(level: u32, tile_x: u32, tile_z: u32) -> i32 {
     let max_pages = u32(max(u.stream.w, 1.0));
+    // Reject pages from a prior output revision, so a stale page cannot resolve
+    // even if app-side invalidation was missed (defence-in-depth for #86).
+    let rev_lo = bitcast<u32>(u.stream2.x);
+    let rev_hi = bitcast<u32>(u.stream2.y);
     for (var i = 0u; i < max_pages; i = i + 1u) {
         let e = page_table[i];
-        if (e.valid != 0u && e.level == level && e.tile_x == tile_x && e.tile_z == tile_z) {
+        if (e.valid != 0u && e.level == level && e.tile_x == tile_x && e.tile_z == tile_z
+            && e.revision_lo == rev_lo && e.revision_hi == rev_hi) {
             return i32(i);
         }
     }
