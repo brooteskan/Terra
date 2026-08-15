@@ -248,7 +248,7 @@ fn run_cpu_job(
     if let Some(strata) = &job.strata {
         ctx.aux_maps.strata = Some(strata.clone());
     }
-    // Bake masks against the prior composed DEM (same as EvalScheduler), not zeros.
+    // Bake masks against the prior composed DEM, not zeros.
     let reference;
     let reference_ref: &Heightfield = match &job.mask_reference {
         Some(prev)

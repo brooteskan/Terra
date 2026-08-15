@@ -9,7 +9,7 @@ mod worker;
 pub use crate::quality::PreviewQuality;
 pub use cache::{CachedOutput, LayerCache};
 pub use processors::ProcessorRegistry;
-pub use scheduler::{EvalJob, EvalScheduler};
+pub use scheduler::EvalScheduler;
 pub use smart_cache::DiskSmartCache;
 pub use worker::{
     EvalWorkFailure, EvalWorkRequest, EvalWorkResult, EvalWorker, EvalWorkerEvent,
@@ -20,7 +20,7 @@ use crate::field_data::AuxMaps;
 use crate::heightfield::{Heightfield, HeightfieldMetrics};
 use crate::layer::{blend_heights, Layer, LayerId, LayerStack, StackNode};
 use crate::mask::{MaskAsset, MaskField, MaskId};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
@@ -1016,22 +1016,24 @@ fn gate_aux_by_mask(ctx: &mut EvalContext, mask: &MaskField) {
     }
 }
 
-/// Helper used by tests to count processor invocations.
-pub fn dirty_suffix_ids(stack: &LayerStack, from: LayerId) -> HashSet<LayerId> {
-    let ids = stack.layer_ids();
-    let mut set = HashSet::new();
-    if let Some(start) = ids.iter().position(|&x| x == from) {
-        for &id in &ids[start..] {
-            set.insert(id);
-        }
-    }
-    set
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::layer::{BlendMode, FlatParams, LayerKind, NoiseParams};
+    use std::collections::HashSet;
+
+    /// Layer ids from `from` to the top of the stack (inclusive). Test-only
+    /// mirror of the dirty suffix `mark_dirty_from` propagates over.
+    fn dirty_suffix_ids(stack: &LayerStack, from: LayerId) -> HashSet<LayerId> {
+        let ids = stack.layer_ids();
+        let mut set = HashSet::new();
+        if let Some(start) = ids.iter().position(|&x| x == from) {
+            for &id in &ids[start..] {
+                set.insert(id);
+            }
+        }
+        set
+    }
 
     #[test]
     fn source_import_error_maps_to_io_keeping_path_and_cause() {

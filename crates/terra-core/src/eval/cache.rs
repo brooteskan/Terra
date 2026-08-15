@@ -121,16 +121,6 @@ impl LayerCache {
         self.generation = self.generation.wrapping_add(1);
     }
 
-    /// Mark an existing cached result as a clean baked checkpoint and spill to disk.
-    pub fn pin_baked(&mut self, id: LayerId) {
-        if let Some(e) = self.entries.get_mut(&id) {
-            e.dirty = false;
-        }
-        if let (Some(disk), Some(e)) = (&self.disk, self.entries.get(&id)) {
-            let _ = disk.spill(id, e);
-        }
-    }
-
     pub fn is_dirty(&self, id: LayerId) -> bool {
         match self.entries.get(&id) {
             Some(e) => e.dirty,

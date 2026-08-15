@@ -435,15 +435,6 @@ impl TerrainDocument {
         crate::domain::DomainView::from_stack(&self.stack)
     }
 
-    /// Evaluate final height from the single terrain stack.
-    pub fn evaluate_final_height(
-        &mut self,
-        ctx: &mut crate::eval::EvalContext,
-    ) -> Result<crate::heightfield::Heightfield, crate::eval::EvalError> {
-        let mut evaluator = crate::eval::StackEvaluator::new();
-        evaluator.rebuild_all(&self.stack, ctx)
-    }
-
     /// Add a layer via context-aware stack routing.
     pub fn add_layer(&mut self, layer: Layer) -> LayerId {
         let id = layer.id();

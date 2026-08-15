@@ -1,9 +1,12 @@
 //! B1 evaluator-authority ratchet (audit B1-G1; protects B1-D1 through B1-D4).
 //!
 //! `StackEvaluator` is terra-core's sole CPU layer-stack execution authority.
-//! `EvalScheduler` and `EvalWorker` are approved orchestration wrappers: they
-//! may retain state, schedule work, and route results, but they must delegate
-//! terrain production to `StackEvaluator` rather than own a second dispatcher.
+//! `EvalWorker` is the approved orchestration wrapper: it may retain state,
+//! schedule work, and route results, but it must delegate terrain production to
+//! `StackEvaluator` rather than own a second dispatcher. (`EvalScheduler` is
+//! interactive eval-session state — token mint, quality ladder, last-good — not
+//! an execution seam; B1-D5 removed its only orchestration method, so it no
+//! longer appears on this surface.)
 //!
 //! This source-level guard deliberately uses a small lexical scanner rather
 //! than a Rust parser. It enforces four review tripwires:
@@ -22,7 +25,7 @@
 //! the explicit single-authority assertion below, making that architectural
 //! decision visible in review.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -65,7 +68,7 @@ const APPROVED_EXECUTION_SEAMS: &[ApprovedSeam] = &[
         role: SeamRole::Authority,
         justification: "sole CPU authority; owns ProcessorRegistry and performs the authored LayerStack tree walk",
         production_caller: SourceEvidence {
-            path: "crates/terra-core/src/document/mod.rs",
+            path: "crates/terra-io/src/lib.rs",
             needle: "StackEvaluator::new",
         },
         result_test: ResultTestEvidence {
@@ -73,22 +76,6 @@ const APPROVED_EXECUTION_SEAMS: &[ApprovedSeam] = &[
             test_name: "tropical_island_evaluates_with_biome_content",
             seam_needle: "StackEvaluator::new",
             result_needle: "height.min_max",
-        },
-    },
-    ApprovedSeam {
-        name: "EvalScheduler",
-        definition: "crates/terra-core/src/eval/scheduler.rs",
-        role: SeamRole::Orchestrator,
-        justification: "quality, cancellation, last-good, and cache orchestration around its owned StackEvaluator",
-        production_caller: SourceEvidence {
-            path: "crates/terra-app/src/app/eval.rs",
-            needle: "self.scheduler.evaluator.evaluate_suffix",
-        },
-        result_test: ResultTestEvidence {
-            path: "crates/terra-core/tests/evaluator_authority.rs",
-            test_name: "eval_scheduler_routes_a_returned_terrain_result",
-            seam_needle: "EvalScheduler::new",
-            result_needle: "result.get(4, 4)",
         },
     },
     ApprovedSeam {
@@ -273,40 +260,6 @@ fn retired_evaluator_generations_stay_absent() {
         "retired evaluator generation returned:\n  {}",
         violations.join("\n  ")
     );
-}
-
-/// Result-level proof that the approved scheduler wrapper returns terrain made
-/// by its `StackEvaluator`, rather than isolated scheduling metadata.
-#[test]
-fn eval_scheduler_routes_a_returned_terrain_result() {
-    use terra_core::analyze::LevelStepSettings;
-    use terra_core::eval::EvalScheduler;
-    use terra_core::heightfield::HeightfieldMetrics;
-    use terra_core::layer::{FlatParams, Layer, LayerKind, LayerStack};
-
-    let mut stack = LayerStack::new();
-    stack.push(Layer::new(
-        "Flat authority fixture",
-        LayerKind::Flat(FlatParams { height: 17.0 }),
-    ));
-
-    let mut scheduler = EvalScheduler::new();
-    let token = scheduler.request_rebuild();
-    let result = scheduler
-        .run_step(
-            &stack,
-            HeightfieldMetrics::new(8, 8, 80.0, 80.0),
-            8,
-            8,
-            token,
-            &LevelStepSettings::default(),
-            &[],
-            &HashMap::new(),
-        )
-        .expect("scheduled evaluation")
-        .expect("scheduled terrain result");
-
-    assert_eq!(result.get(4, 4), 17.0);
 }
 
 #[test]

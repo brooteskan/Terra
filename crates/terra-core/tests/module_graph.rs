@@ -169,7 +169,6 @@ const MODULE_DEPENDENCIES: &[(&str, &[&str])] = &[
             "command",
             "deps",
             "domain",
-            "eval",
             "heightfield",
             "landscape_blueprint",
             "layer",

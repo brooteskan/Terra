@@ -63,7 +63,7 @@ for layer L in bottom→top:
   H_i = mix(H_{i-1}, blend(H_{i-1}, G), opacity * M)
 ```
 
-Phase 1 used full rebuilds. Incremental rebuild uses `LayerCache` + `mark_dirty_from`. Progressive preview walks `Draft → Medium → Full` via `EvalScheduler`.
+Phase 1 used full rebuilds. Incremental rebuild uses `LayerCache` + `mark_dirty_from`. Progressive preview walks `Draft → Medium → Full`: the app advances the quality ladder held on `EvalScheduler` (the interactive eval-session state) and runs each pass on the background `EvalWorker`.
 
 ## Tiles & ghosts
 

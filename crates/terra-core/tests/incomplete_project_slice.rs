@@ -30,7 +30,8 @@ fn eval_doc(doc: &mut TerrainDocument) -> terra_core::Heightfield {
     ctx.quality = PreviewQuality::Draft;
     let seed = terra_core::Heightfield::zeros(m);
     ctx.masks = bake_mask_assets(&doc.masks, &seed, m, &HashMap::new());
-    doc.evaluate_final_height(&mut ctx)
+    let mut eval = StackEvaluator::new();
+    eval.rebuild_all(&doc.stack, &mut ctx)
         .expect("incomplete projects must evaluate")
 }
 
