@@ -51,6 +51,15 @@ impl EvalError {
     }
 }
 
+/// Source-import failures from `generators` surface to evaluator callers as
+/// `Io`, keeping the public `EvalError` surface unchanged. The path/cause detail
+/// carried by `SourceImportError` is preserved in the message.
+impl From<crate::generators::SourceImportError> for EvalError {
+    fn from(err: crate::generators::SourceImportError) -> Self {
+        Self::Io(err.to_string())
+    }
+}
+
 fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
     if let Some(message) = payload.downcast_ref::<&str>() {
         (*message).to_string()
@@ -1023,6 +1032,19 @@ pub fn dirty_suffix_ids(stack: &LayerStack, from: LayerId) -> HashSet<LayerId> {
 mod tests {
     use super::*;
     use crate::layer::{BlendMode, FlatParams, LayerKind, NoiseParams};
+
+    #[test]
+    fn source_import_error_maps_to_io_keeping_path_and_cause() {
+        let src = crate::generators::SourceImportError::Image {
+            path: "textures/ridge.png".into(),
+            message: "decode failed".into(),
+        };
+        let err = EvalError::from(src);
+        assert!(matches!(err, EvalError::Io(_)));
+        let text = err.to_string();
+        assert!(text.contains("textures/ridge.png"), "lost the path: {text}");
+        assert!(text.contains("decode failed"), "lost the cause: {text}");
+    }
 
     #[test]
     fn disabled_layer_noop() {

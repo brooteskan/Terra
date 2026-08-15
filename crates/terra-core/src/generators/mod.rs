@@ -25,12 +25,12 @@ pub use terrain_params::{
 };
 
 use crate::analyze;
-use crate::eval::EvalError;
 use crate::heightfield::{HeightTile, Heightfield, HeightfieldMetrics, TileId};
 use crate::mask::{dist_point_segment, point_in_polygon, MaskField};
 use crate::noise::{self, domain_warp_fbm, fbm, ridged_mf, sample_worley};
 use crate::noise::{FractalNoiseType, NoiseParams, WorleyFeature, WorleyMetric, WorleyParams};
 use rayon::prelude::*;
+use thiserror::Error;
 
 pub fn flat(metrics: HeightfieldMetrics, height: f32) -> Heightfield {
     Heightfield::filled(metrics, height)
@@ -852,14 +852,31 @@ pub fn voronoi_regions(metrics: HeightfieldMetrics, p: &VoronoiParams) -> Height
     })
 }
 
+/// Failure loading an external heightmap image or OBJ mesh for a generator.
+///
+/// Generator-owned so `generators` need not depend on `eval`; the evaluator
+/// boundary maps this into `EvalError` via `From` (see `eval::EvalError`).
+#[derive(Debug, Error)]
+pub enum SourceImportError {
+    #[error("failed to load heightmap image \"{path}\": {message}")]
+    Image { path: String, message: String },
+    #[error("failed to read OBJ \"{path}\": {message}")]
+    ObjRead { path: String, message: String },
+    #[error("OBJ \"{path}\" has no vertices")]
+    ObjNoVertices { path: String },
+}
+
 pub fn import_heightmap(
     metrics: HeightfieldMetrics,
     p: &ImportHeightmapParams,
-) -> Result<Heightfield, EvalError> {
+) -> Result<Heightfield, SourceImportError> {
     if p.path.is_empty() {
         return Ok(Heightfield::zeros(metrics));
     }
-    let img = image::open(&p.path).map_err(|e| EvalError::Io(e.to_string()))?;
+    let img = image::open(&p.path).map_err(|e| SourceImportError::Image {
+        path: p.path.clone(),
+        message: e.to_string(),
+    })?;
     let g = img.to_luma16();
     let (iw, ih) = g.dimensions();
     let mut hf = Heightfield::zeros(metrics);
@@ -877,7 +894,10 @@ pub fn import_heightmap(
 }
 
 /// 3D stamp: OBJ mesh→height, image heightmap, or procedural rock when empty/unreadable.
-pub fn stamp_3d(metrics: HeightfieldMetrics, p: &Stamp3dParams) -> Result<Heightfield, EvalError> {
+pub fn stamp_3d(
+    metrics: HeightfieldMetrics,
+    p: &Stamp3dParams,
+) -> Result<Heightfield, SourceImportError> {
     if p.path.is_empty() {
         return Ok(procedural_rock_stamp(metrics, p));
     }
@@ -928,8 +948,11 @@ fn procedural_rock_stamp(metrics: HeightfieldMetrics, p: &Stamp3dParams) -> Heig
 fn stamp_3d_from_obj(
     metrics: HeightfieldMetrics,
     p: &Stamp3dParams,
-) -> Result<Heightfield, EvalError> {
-    let text = std::fs::read_to_string(&p.path).map_err(|e| EvalError::Io(e.to_string()))?;
+) -> Result<Heightfield, SourceImportError> {
+    let text = std::fs::read_to_string(&p.path).map_err(|e| SourceImportError::ObjRead {
+        path: p.path.clone(),
+        message: e.to_string(),
+    })?;
     let mut verts: Vec<[f32; 3]> = Vec::new();
     for line in text.lines() {
         let line = line.trim();
@@ -956,7 +979,9 @@ fn stamp_3d_from_obj(
         verts.push([x, y, z]);
     }
     if verts.is_empty() {
-        return Err(EvalError::Io("OBJ has no vertices".into()));
+        return Err(SourceImportError::ObjNoVertices {
+            path: p.path.clone(),
+        });
     }
     let mut min_x = f32::INFINITY;
     let mut max_x = f32::NEG_INFINITY;
@@ -1973,6 +1998,73 @@ mod tests {
             .iter()
             .map(|value| value.to_bits())
             .collect()
+    }
+
+    #[test]
+    fn import_heightmap_missing_file_reports_image_error_with_path() {
+        let metrics = HeightfieldMetrics::new(8, 8, 64.0, 64.0);
+        let p = ImportHeightmapParams {
+            path: "does/not/exist.png".into(),
+            ..ImportHeightmapParams::default()
+        };
+        let err = import_heightmap(metrics, &p).expect_err("missing image must error");
+        assert!(matches!(err, SourceImportError::Image { .. }));
+        assert!(
+            err.to_string().contains("does/not/exist.png"),
+            "message must keep the source path: {err}"
+        );
+    }
+
+    #[test]
+    fn import_heightmap_empty_path_yields_zero_field() {
+        let metrics = HeightfieldMetrics::new(8, 8, 64.0, 64.0);
+        let hf = import_heightmap(metrics, &ImportHeightmapParams::default())
+            .expect("empty path is not an import error");
+        assert!(field_bits(&hf).iter().all(|&bits| bits == 0.0f32.to_bits()));
+    }
+
+    #[test]
+    fn stamp_3d_from_obj_missing_file_reports_obj_read_error_with_path() {
+        let metrics = HeightfieldMetrics::new(8, 8, 64.0, 64.0);
+        let path = std::env::temp_dir()
+            .join(format!("terra_stamp3d_missing_{}.obj", uuid::Uuid::new_v4()));
+        let p = Stamp3dParams {
+            path: path.to_string_lossy().into_owned(),
+            ..Stamp3dParams::default()
+        };
+        let err = stamp_3d_from_obj(metrics, &p).expect_err("missing OBJ must error");
+        assert!(matches!(err, SourceImportError::ObjRead { .. }));
+        assert!(
+            err.to_string().contains(p.path.as_str()),
+            "message must keep the source path: {err}"
+        );
+    }
+
+    #[test]
+    fn stamp_3d_from_obj_without_vertices_reports_no_vertices() {
+        let metrics = HeightfieldMetrics::new(8, 8, 64.0, 64.0);
+        let path = std::env::temp_dir()
+            .join(format!("terra_stamp3d_empty_{}.obj", uuid::Uuid::new_v4()));
+        std::fs::write(&path, "# comment only\nvn 0 1 0\nvt 0 0\n").expect("write temp obj");
+        let p = Stamp3dParams {
+            path: path.to_string_lossy().into_owned(),
+            ..Stamp3dParams::default()
+        };
+        let err = stamp_3d_from_obj(metrics, &p).expect_err("vertexless OBJ must error");
+        let _ = std::fs::remove_file(&path);
+        assert!(matches!(err, SourceImportError::ObjNoVertices { .. }));
+        assert!(err.to_string().contains(p.path.as_str()));
+    }
+
+    #[test]
+    fn stamp_3d_swallows_source_failure_and_falls_back_to_procedural() {
+        let metrics = HeightfieldMetrics::new(8, 8, 64.0, 64.0);
+        let p = Stamp3dParams {
+            path: "does/not/exist.obj".into(),
+            ..Stamp3dParams::default()
+        };
+        let hf = stamp_3d(metrics, &p).expect("stamp_3d never surfaces the import error");
+        assert_eq!(hf.metrics.width, metrics.width);
     }
 
     #[test]

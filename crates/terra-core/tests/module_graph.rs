@@ -55,10 +55,6 @@ use std::sync::OnceLock;
 /// removes in the same commit. Sorted for readable diffs.
 const CYCLIC_EDGES: &[(&str, &str)] = &[
     ("document", "rebuild_feedback"),
-    ("eval", "generators"),
-    ("eval", "layer"),
-    ("generators", "eval"),
-    ("layer", "generators"),
     ("rebuild_feedback", "document"),
 ];
 
@@ -75,9 +71,11 @@ const CLEAN_MODULES: &[&str] = &[
     "contextual_create",
     "deps",
     "domain",
+    "eval",
     "field_data",
     "filter_params",
     "fields",
+    "generators",
     "geology",
     "geomorph",
     "heightfield",
@@ -87,6 +85,7 @@ const CLEAN_MODULES: &[&str] = &[
     "landscape_blueprint",
     "landscape_style",
     "landscape_evolution",
+    "layer",
     "matter_sim",
     "mask",
     "mask_execution",

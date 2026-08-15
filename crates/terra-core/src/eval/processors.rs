@@ -231,10 +231,14 @@ impl ProcessorRegistry {
             }
             LayerKind::Canyons(p) => Ok(generators::canyons(ctx.metrics, p)),
             LayerKind::VoronoiRegions(p) => Ok(generators::voronoi_regions(ctx.metrics, p)),
-            LayerKind::ImportHeightmap(p) => generators::import_heightmap(ctx.metrics, p),
+            LayerKind::ImportHeightmap(p) => {
+                generators::import_heightmap(ctx.metrics, p).map_err(EvalError::from)
+            }
             LayerKind::ProceduralShape(p) => Ok(generators::procedural_shape(ctx.metrics, p)),
-            LayerKind::Stamp2d(p) => generators::import_heightmap(ctx.metrics, &p.heightmap),
-            LayerKind::Stamp3d(p) => generators::stamp_3d(ctx.metrics, p),
+            LayerKind::Stamp2d(p) => {
+                generators::import_heightmap(ctx.metrics, &p.heightmap).map_err(EvalError::from)
+            }
+            LayerKind::Stamp3d(p) => generators::stamp_3d(ctx.metrics, p).map_err(EvalError::from),
             LayerKind::PolygonHeight(p) => Ok(generators::polygon_height(input, p)),
             LayerKind::ThermalErosion(p) => {
                 let base = match ctx.quality {
