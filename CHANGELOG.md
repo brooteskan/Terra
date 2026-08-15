@@ -8,6 +8,7 @@ All notable changes to Terra will be documented in this file.
 - Progressive Draft-to-Full evaluation now resamples carried auxiliary mask fields to the active grid, preventing boundary panics in masked CPU filters such as Crater.
 - Evaluation panics are reported as recoverable layer failures, unexpected worker disconnects restart the worker, and the editor keeps the last-good terrain visible with a persistent Retry status.
 - Creating a filter or reopening a project with populated biome sections now expands the relevant `Biomes -> biome -> Filters` hierarchy paths, keeping filters discoverable in Layers even when another layer was saved as selected.
+- Long inspector drop-downs, including the Effect Filter type picker, are now viewport-bounded and mouse-wheel scrollable instead of rendering rows beyond the screen and selecting an unintended filter.
 
 ## [0.1.0-beta.1] - 2026-08-14
 

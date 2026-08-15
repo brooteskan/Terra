@@ -240,6 +240,17 @@ impl<'a> GuiContext<'a> {
         list.set_clip(self.clip);
     }
 
+    /// Temporarily clip the current draw layer. Used by scrollable popup content.
+    pub(crate) fn set_active_clip(&mut self, clip: Option<Rect>) {
+        self.clip = clip;
+        let list = if self.drawing_overlay {
+            &mut self.overlay
+        } else {
+            &mut self.draw
+        };
+        list.set_clip(clip);
+    }
+
     /// Call once after building UI for the frame.
     pub fn end(&mut self) {
         let had_combo_menu = self.pending_combo_menu.is_some();

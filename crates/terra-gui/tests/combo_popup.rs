@@ -265,3 +265,61 @@ fn combo_in_plain_panel_stays_open_after_click() {
         "plain-panel combo should also stay open after a click"
     );
 }
+
+#[test]
+fn long_combo_is_bounded_scrollable_and_selects_the_scrolled_row() {
+    let panel = Rect::from_pos_size(200.0, 120.0, 300.0, 400.0);
+    let field = first_panel_combo_field_point(panel);
+    let menu_min_y = field.1 + 16.0 + 2.0;
+    let scrolled_row = (field.0, menu_min_y + 28.0 * 2.0 + 14.0);
+    let labels: Vec<String> = (0..60).map(|i| format!("Filter {i}")).collect();
+    let items: Vec<&str> = labels.iter().map(String::as_str).collect();
+    let mut state = GuiState::default();
+    let mut selected = 0usize;
+    let mut picked = None;
+
+    let mut frame = |state: &mut GuiState, input: GuiInput| {
+        let mut scroll = 0.0;
+        let mut ctx = GuiContext::begin(SW, SH, 1.0, input, state);
+        ctx.begin_panel_scrolled(
+            Id::new("long_combo_panel"),
+            panel,
+            terra_gui::Color::rgb(0.1, 0.1, 0.1),
+            &mut scroll,
+        );
+        if combo(&mut ctx, "Filter", &mut selected, &items) {
+            picked = Some(selected);
+        }
+        ctx.end_panel_scrolled(&mut scroll);
+        ctx.end();
+    };
+
+    frame(
+        &mut state,
+        GuiInput {
+            pointer: Some(field),
+            ..Default::default()
+        },
+    );
+    frame(&mut state, press_frame(field));
+    frame(
+        &mut state,
+        GuiInput {
+            pointer: Some(scrolled_row),
+            scroll_delta: -20.0,
+            ..Default::default()
+        },
+    );
+    frame(&mut state, press_frame(scrolled_row));
+    frame(
+        &mut state,
+        GuiInput {
+            pointer: Some(scrolled_row),
+            ..Default::default()
+        },
+    );
+
+    assert_eq!(picked, Some(19));
+    assert_eq!(selected, 19);
+    assert!(selected < items.len());
+}
