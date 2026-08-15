@@ -5,15 +5,13 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use flexi_logger::{
-    Cleanup, Criterion, DeferredNow, Duplicate, FileSpec, LogSpecification, Logger, LoggerHandle,
-    Naming, Record,
+    DeferredNow, Duplicate, FileSpec, LogSpecification, Logger, LoggerHandle, Record,
 };
 use terra_core::eval::PreviewQuality;
 
-pub const MAX_LOG_FILE_BYTES: u64 = 5 * 1024 * 1024;
-pub const RETAINED_ROTATED_FILES: usize = 5;
-pub const DEFAULT_LOG_FILTER: &str = "info";
-pub const CURRENT_LOG_FILE_NAME: &str = "terra_rCURRENT.log";
+pub const RETAINED_LOG_FILES: usize = 6;
+pub const DEFAULT_LOG_FILTER: &str = "warn,terra_app=info,terra_core=info,terra_gpu=info,terra_render=info,terra_io=info,terra_gui=info";
+pub const LOG_FILE_PREFIX: &str = "log-";
 
 /// Keeps the active logger alive until application shutdown.
 pub struct LoggingGuard {
@@ -38,9 +36,9 @@ pub fn init() -> LoggingGuard {
     let mut startup_warning = None;
     let file_logger = match prepare_log_destination(log_directory()) {
         LogDestination::File(directory) => start_file_logger(&directory)
-            .map(|(handle, filter_warning)| {
+            .map(|(handle, filter_warning, log_file)| {
                 startup_warning = filter_warning;
-                (handle, directory.join(CURRENT_LOG_FILE_NAME))
+                (handle, log_file)
             })
             .map_err(|error| format!("could not open persistent log file: {error}")),
         LogDestination::ConsoleOnly(error) => Err(error),
@@ -80,11 +78,10 @@ pub fn init() -> LoggingGuard {
     if let Some(path) = log_file.as_deref() {
         log::info!(
             target: "terra_app::logging",
-            "Terra {} starting; log_file={}; filter={active_filter:?}; rotation_bytes={}; retained_rotated_files={}",
+            "Terra {} starting; log_file={}; filter={active_filter:?}; retained_launch_logs={}",
             env!("CARGO_PKG_VERSION"),
             path.display(),
-            MAX_LOG_FILE_BYTES,
-            RETAINED_ROTATED_FILES
+            RETAINED_LOG_FILES
         );
     } else {
         log::info!(
@@ -130,32 +127,77 @@ fn configured_logger() -> (Logger, Option<String>) {
     match Logger::try_with_env_or_str(DEFAULT_LOG_FILTER) {
         Ok(logger) => (logger, None),
         Err(error) => (
-            Logger::with(LogSpecification::info()),
+            Logger::with(
+                LogSpecification::parse(DEFAULT_LOG_FILTER)
+                    .unwrap_or_else(|_| LogSpecification::warn()),
+            ),
             Some(format!("invalid RUST_LOG filter: {error}")),
         ),
     }
 }
 
-fn start_file_logger(directory: &Path) -> Result<(LoggerHandle, Option<String>), String> {
+fn launch_timestamp() -> String {
+    let mut now = DeferredNow::new();
+    now.format("%Y-%m-%d_%H-%M-%S-%3f").to_string()
+}
+
+fn unique_log_path(directory: &Path, timestamp: &str) -> PathBuf {
+    let initial = directory.join(format!("{LOG_FILE_PREFIX}{timestamp}.log"));
+    if !initial.exists() {
+        return initial;
+    }
+    for suffix in 2_u32.. {
+        let candidate = directory.join(format!("{LOG_FILE_PREFIX}{timestamp}-{suffix}.log"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    unreachable!("the log filename suffix space is inexhaustible")
+}
+
+fn is_launch_log(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with(LOG_FILE_PREFIX) && name.ends_with(".log"))
+}
+
+fn cleanup_old_launch_logs(directory: &Path, active_log: &Path) -> Result<(), String> {
+    let mut previous = std::fs::read_dir(directory)
+        .map_err(|error| format!("could not scan {}: {error}", directory.display()))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path != active_log && is_launch_log(path))
+        .map(|path| {
+            let modified = std::fs::metadata(&path)
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            (modified, path)
+        })
+        .collect::<Vec<_>>();
+    previous.sort();
+
+    let remove_count = (previous.len() + 1).saturating_sub(RETAINED_LOG_FILES);
+    for (_, path) in previous.into_iter().take(remove_count) {
+        std::fs::remove_file(&path)
+            .map_err(|error| format!("could not remove old log {}: {error}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn start_file_logger(directory: &Path) -> Result<(LoggerHandle, Option<String>, PathBuf), String> {
     let (logger, filter_warning) = configured_logger();
+    let log_file = unique_log_path(directory, &launch_timestamp());
+    let file_spec = FileSpec::try_from(&log_file).map_err(|error| error.to_string())?;
     let handle = logger
-        .log_to_file(
-            FileSpec::default()
-                .directory(directory)
-                .basename("terra")
-                .suppress_timestamp(),
-        )
-        .append()
+        .log_to_file(file_spec)
         .duplicate_to_stderr(Duplicate::All)
         .format(log_format)
-        .rotate(
-            Criterion::Size(MAX_LOG_FILE_BYTES),
-            Naming::Numbers,
-            Cleanup::KeepLogFiles(RETAINED_ROTATED_FILES),
-        )
         .start()
         .map_err(|error| error.to_string())?;
-    Ok((handle, filter_warning))
+    if let Err(error) = cleanup_old_launch_logs(directory, &log_file) {
+        log::warn!(target: "terra_app::logging", "log retention cleanup failed: {error}");
+    }
+    Ok((handle, filter_warning, log_file))
 }
 
 fn start_console_logger() -> Result<(LoggerHandle, Option<String>), String> {
@@ -337,8 +379,14 @@ mod tests {
 
     #[test]
     fn retention_policy_is_bounded_and_documentable() {
-        assert_eq!(MAX_LOG_FILE_BYTES, 5 * 1024 * 1024);
-        assert_eq!(RETAINED_ROTATED_FILES, 5);
+        assert_eq!(RETAINED_LOG_FILES, 6);
+        assert!(DEFAULT_LOG_FILTER.starts_with("warn,"));
+        assert!(DEFAULT_LOG_FILTER.contains("terra_app=info"));
+        let specification =
+            LogSpecification::parse(DEFAULT_LOG_FILTER).expect("valid default log filter");
+        assert!(specification.enabled(log::Level::Info, "terra_app::logging"));
+        assert!(specification.enabled(log::Level::Warn, "wgpu_hal::dx12::device"));
+        assert!(!specification.enabled(log::Level::Info, "wgpu_hal::dx12::device"));
     }
 
     #[test]
@@ -359,49 +407,51 @@ mod tests {
     }
 
     #[test]
-    fn file_writer_rotation_and_cleanup_are_bounded() {
-        use flexi_logger::writers::{FileLogWriter, LogWriter};
-        use flexi_logger::LogfileSelector;
-
-        let temp = TestDirectory::new("logging-rotation");
-        let writer = FileLogWriter::builder(
-            FileSpec::default()
-                .directory(temp.path())
-                .basename("rotation-test")
-                .suppress_timestamp(),
-        )
-        .cleanup_in_background_thread(false)
-        .rotate(
-            Criterion::Size(128),
-            Naming::Numbers,
-            Cleanup::KeepLogFiles(2),
-        )
-        .try_build()
-        .expect("rotating writer");
-
-        for _ in 0..12 {
-            let record = log::Record::builder()
-                .args(format_args!(
-                    "a deliberately long test record that forces size rotation immediately"
-                ))
-                .level(log::Level::Info)
-                .target("terra_app::logging::test")
-                .build();
-            writer
-                .write(&mut DeferredNow::new(), &record)
-                .expect("write test record");
-        }
-        writer.flush().expect("flush logs");
-        let files = writer
-            .existing_log_files(&LogfileSelector::default().with_r_current())
-            .expect("list log files");
-        assert!(
-            files.len() <= 3,
-            "two retained files plus current should be the upper bound: {files:?}"
+    fn launch_log_paths_are_timestamped_and_collision_safe() {
+        let temp = TestDirectory::new("launch-log-name");
+        let timestamp = "2026-08-14_20-30-01-123";
+        let generated_timestamp = launch_timestamp();
+        assert_eq!(generated_timestamp.len(), timestamp.len());
+        assert!(generated_timestamp
+            .chars()
+            .all(|character| character.is_ascii_digit() || character == '-' || character == '_'));
+        let first = unique_log_path(temp.path(), timestamp);
+        assert_eq!(
+            first.file_name().and_then(|name| name.to_str()),
+            Some("log-2026-08-14_20-30-01-123.log")
         );
-        assert!(files.iter().any(|path| {
-            path.file_name().and_then(|name| name.to_str()) == Some("rotation-test_rCURRENT.log")
-        }));
-        writer.shutdown();
+        std::fs::write(&first, b"first launch").expect("write first launch log");
+        assert_eq!(
+            unique_log_path(temp.path(), timestamp)
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("log-2026-08-14_20-30-01-123-2.log")
+        );
+    }
+
+    #[test]
+    fn cleanup_keeps_six_launch_logs_and_ignores_other_files() {
+        let temp = TestDirectory::new("launch-log-cleanup");
+        let active = temp.path().join("log-2026-08-14_20-30-09-000.log");
+        for index in 1..=8 {
+            let path = temp
+                .path()
+                .join(format!("log-2026-08-14_20-30-0{index}-000.log"));
+            std::fs::write(path, format!("launch {index}")).expect("write launch log");
+        }
+        std::fs::write(temp.path().join("notes.txt"), b"keep me").expect("write unrelated file");
+        std::fs::write(&active, b"active launch").expect("write active log");
+
+        cleanup_old_launch_logs(temp.path(), &active).expect("cleanup launch logs");
+
+        let launch_logs = std::fs::read_dir(temp.path())
+            .expect("read test directory")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| is_launch_log(path))
+            .count();
+        assert_eq!(launch_logs, RETAINED_LOG_FILES);
+        assert!(active.exists());
+        assert!(temp.path().join("notes.txt").exists());
     }
 }
