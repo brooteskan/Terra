@@ -104,6 +104,14 @@ use crate::ui::chrome_gui::{draw_menu_bar, draw_menu_overlays};
 use crate::ui::dock_gui::draw_bottom_dock;
 use crate::ui::viewport_gui::draw_viewport_overlays;
 
+#[derive(Debug, Clone)]
+pub struct EvaluationFailureStatus {
+    pub layer_name: Option<String>,
+    pub quality: PreviewQuality,
+    pub message: String,
+    pub worker_restarted: bool,
+}
+
 #[derive(Default)]
 pub struct UiState {
     pub show_mask_editor: bool,
@@ -150,6 +158,8 @@ pub struct UiState {
     /// `Some(0..=1)` while a background export is running.
     pub export_progress: Option<f32>,
     pub status: String,
+    /// Persistent evaluation failure; cleared only by a successful current build or reset.
+    pub evaluation_failure: Option<EvaluationFailureStatus>,
     pub refining: bool,
     /// Best-effort progressive-build completion, from 0.0 through 1.0.
     pub build_progress: Option<f32>,
@@ -1428,6 +1438,8 @@ pub struct FrameUiOutput {
     pub camera_frame_selection: bool,
     /// Cancel the in-flight evaluation / refine job.
     pub request_cancel_build: bool,
+    /// Retry after a persistent evaluation failure.
+    pub request_retry_evaluation: bool,
     /// Force a full-quality rebuild (EXPORT button).
     pub request_full_build: bool,
     /// Save the current camera into the next free bookmark slot.

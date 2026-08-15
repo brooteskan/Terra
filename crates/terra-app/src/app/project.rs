@@ -360,6 +360,9 @@ impl TerraApp {
         // Editor chrome starts minimized on create/open.
         self.layers_gui
             .reset_collapse_for_project(Some(&self.session.document));
+        self.layers_gui
+            .reveal_populated_biome_sections(&self.session.document);
+        self.layers_gui.reveal_selection(&self.session.document);
         self.tools_gui.collapse_all_categories();
         self.inspector_gui.reset_expand_for_project();
 
@@ -393,6 +396,7 @@ impl TerraApp {
         self.needs_height_upload = false;
         self.preview_dirty = true;
         self.ui_state.refining = false;
+        self.ui_state.evaluation_failure = None;
         self.ui_state.build_progress = None;
         self.ui_state.draft_displayed = false;
         self.ui_state.quality = PreviewQuality::Draft;

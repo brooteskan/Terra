@@ -186,6 +186,152 @@ impl LayersGuiState {
             seed_collapsed_defaults(doc, self);
         }
     }
+
+    /// Expand the hierarchy path that owns the document's current stack selection.
+    ///
+    /// New tools are selected immediately so their inspector opens.  Since newly
+    /// discovered folders default to collapsed, the selection would otherwise be
+    /// valid but invisible under Biomes -> biome -> Filters until every ancestor was
+    /// opened manually.
+    pub fn reveal_selection(&mut self, doc: &TerrainDocument) {
+        let Some(selected) = doc.selected else {
+            return;
+        };
+        seed_collapsed_defaults(doc, self);
+
+        let mut group_path = Vec::new();
+        let Some(concept) = concept_and_group_path_for_id(doc, selected, &mut group_path) else {
+            return;
+        };
+        let concept_id = concept_row_id(TERRAIN_SCOPE_KEY, concept);
+        self.presentation
+            .collapsed_groups
+            .retain(|id| *id != concept_id && !group_path.contains(id));
+
+        // The selected filter's canonical path is near the top of the Biomes tree.
+        // Returning there also prevents an expanded row from remaining off-screen
+        // after the user created it while scrolled elsewhere.
+        self.scroll_y = 0.0;
+    }
+
+    /// Expand populated biome branches when a project is opened.
+    ///
+    /// Collapse state is editor-only and is reset on every load.  Keeping all
+    /// biome containers collapsed makes persisted filters effectively invisible
+    /// whenever the saved selection belongs to Shape or another concept.
+    pub fn reveal_populated_biome_sections(&mut self, doc: &TerrainDocument) {
+        seed_collapsed_defaults(doc, self);
+        let mut populated_groups = Vec::new();
+        if collect_populated_biome_group_ids(&doc.stack.nodes, &mut populated_groups) {
+            let biomes = concept_row_id(TERRAIN_SCOPE_KEY, ArtistConcept::Biomes);
+            self.presentation
+                .collapsed_groups
+                .retain(|id| *id != biomes && !populated_groups.contains(id));
+        }
+    }
+}
+
+fn collect_populated_biome_group_ids(nodes: &[StackNode], out: &mut Vec<LayerId>) -> bool {
+    let mut found = false;
+    for node in nodes {
+        let StackNode::Group(group) = node else {
+            continue;
+        };
+        if group.is_biome() {
+            found |= collect_nonempty_group_ids(group, out);
+        } else {
+            found |= collect_populated_biome_group_ids(&group.children, out);
+        }
+    }
+    found
+}
+
+fn collect_nonempty_group_ids(
+    group: &terra_core::layer::LayerGroup,
+    out: &mut Vec<LayerId>,
+) -> bool {
+    let mut has_authored_content = false;
+    for child in &group.children {
+        match child {
+            StackNode::Layer(_) => has_authored_content = true,
+            StackNode::Group(child_group) => {
+                has_authored_content |= collect_nonempty_group_ids(child_group, out);
+            }
+        }
+    }
+    if has_authored_content {
+        out.push(group.id);
+    }
+    has_authored_content
+}
+
+fn concept_and_group_path_for_id(
+    doc: &TerrainDocument,
+    target: LayerId,
+    group_path: &mut Vec<LayerId>,
+) -> Option<ArtistConcept> {
+    for node in &doc.stack.nodes {
+        let mut candidate_path = Vec::new();
+        if !collect_group_path(node, target, &mut candidate_path) {
+            continue;
+        }
+        *group_path = candidate_path;
+        return Some(match node {
+            StackNode::Group(group)
+                if matches!(
+                    group.group_kind,
+                    terra_core::layer::GroupKind::CategoryFolder
+                ) || (matches!(group.group_kind, terra_core::layer::GroupKind::Generic)
+                    && group.category.is_some()) =>
+            {
+                let selected_is_in_biome = group.children.iter().any(|child| {
+                    matches!(child, StackNode::Group(child_group) if child_group.is_biome())
+                        && node_contains_id(child, target)
+                });
+                if selected_is_in_biome {
+                    ArtistConcept::Biomes
+                } else {
+                    group
+                        .category
+                        .map(concept_for_category)
+                        .unwrap_or(ArtistConcept::Shape)
+                }
+            }
+            _ => concept_for_top_level(node, false),
+        });
+    }
+    None
+}
+
+fn collect_group_path(node: &StackNode, target: LayerId, out: &mut Vec<LayerId>) -> bool {
+    match node {
+        StackNode::Layer(layer) => layer.id() == target,
+        StackNode::Group(group) => {
+            if group.id == target {
+                return true;
+            }
+            for child in &group.children {
+                if collect_group_path(child, target, out) {
+                    out.push(group.id);
+                    return true;
+                }
+            }
+            false
+        }
+    }
+}
+
+fn node_contains_id(node: &StackNode, target: LayerId) -> bool {
+    match node {
+        StackNode::Layer(layer) => layer.id() == target,
+        StackNode::Group(group) => {
+            group.id == target
+                || group
+                    .children
+                    .iter()
+                    .any(|child| node_contains_id(child, target))
+        }
+    }
 }
 
 fn seed_collapsed_defaults(doc: &TerrainDocument, state: &mut LayersGuiState) {
@@ -2715,6 +2861,71 @@ mod hierarchy_tests {
             rows.iter()
                 .any(|r| r.name == "Terrain" && r.role == TreeRole::SectionLabel),
             "Terrain root required"
+        );
+    }
+
+    #[test]
+    fn reveal_selection_expands_new_filter_hierarchy_path() {
+        let mut doc = TerrainDocument::new_default();
+        let filter = terra_core::layer::Layer::new(
+            "Selected Crater",
+            LayerKind::EffectFilter(terra_core::layer::EffectFilterParams::crater()),
+        );
+        let filter_id = filter.id();
+        doc.stack.push_routed(filter, doc.active_biome, false);
+        doc.selected = Some(filter_id);
+
+        let mut state = default_state();
+        state.reset_collapse_for_project(Some(&doc));
+        assert!(
+            !hierarchy_presentation_snapshot(&doc, &state)
+                .iter()
+                .any(|row| row.0 == filter_id),
+            "the collapsed project starts with the selected filter hidden"
+        );
+
+        state.reveal_selection(&doc);
+
+        let rows = hierarchy_presentation_snapshot(&doc, &state);
+        let filter_row = rows
+            .iter()
+            .find(|row| row.0 == filter_id)
+            .expect("selected filter should be revealed in Layers");
+        assert_eq!(filter_row.1, "Selected Crater");
+        assert_eq!(filter_row.2, "layer");
+        assert_eq!(filter_row.4, Some(ArtistConcept::Biomes));
+    }
+
+    #[test]
+    fn project_open_reveals_filters_when_a_shape_layer_is_selected() {
+        let mut doc = TerrainDocument::new_default();
+        let shape_id = doc
+            .stack
+            .layer_ids()
+            .into_iter()
+            .next()
+            .expect("default shape layer");
+        let filter = terra_core::layer::Layer::new(
+            "Persisted Crater",
+            LayerKind::EffectFilter(terra_core::layer::EffectFilterParams::crater()),
+        );
+        let filter_id = filter.id();
+        doc.stack.push_routed(filter, doc.active_biome, false);
+        doc.selected = Some(shape_id);
+
+        let mut state = default_state();
+        state.reset_collapse_for_project(Some(&doc));
+        state.reveal_populated_biome_sections(&doc);
+        state.reveal_selection(&doc);
+
+        let rows = hierarchy_presentation_snapshot(&doc, &state);
+        assert!(
+            rows.iter().any(|row| row.0 == shape_id),
+            "saved shape selection should still be revealed"
+        );
+        assert!(
+            rows.iter().any(|row| row.0 == filter_id),
+            "persisted filter should remain discoverable when it is not selected"
         );
     }
 

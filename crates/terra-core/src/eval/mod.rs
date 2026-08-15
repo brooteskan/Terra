@@ -36,6 +36,29 @@ pub enum EvalError {
     Cancelled,
     #[error("io: {0}")]
     Io(String),
+    #[error("layer \"{layer}\" panicked: {message}")]
+    LayerPanicked { layer: String, message: String },
+    #[error("evaluation panicked: {0}")]
+    Panicked(String),
+}
+
+impl EvalError {
+    pub fn layer_name(&self) -> Option<&str> {
+        match self {
+            Self::LayerPanicked { layer, .. } => Some(layer),
+            _ => None,
+        }
+    }
+}
+
+fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".into()
+    }
 }
 
 /// How a layer contributed to a particular evaluation pass.
@@ -126,6 +149,10 @@ impl EvalContext {
     /// Replace string aux and rebuild typed maps (worker / scheduler ingest).
     /// Preserves any strata already on `aux_maps` when the HashMap has none.
     pub fn set_aux_hashmap(&mut self, aux: HashMap<String, MaskField>) {
+        let aux = aux
+            .into_iter()
+            .map(|(key, field)| (key, field.into_resampled_nearest(self.metrics)))
+            .collect::<HashMap<_, _>>();
         let keep_strata = self.aux_maps.strata.take();
         self.aux_maps = AuxMaps::from_hashmap_preserving_strata(&aux, keep_strata);
         self.sync_aux_hashmap();
@@ -467,6 +494,24 @@ impl StackEvaluator {
     }
 
     fn evaluate_layer(
+        &mut self,
+        ctx: &mut EvalContext,
+        input: &Heightfield,
+        layer: &Layer,
+    ) -> Result<Heightfield, EvalError> {
+        let layer_name = layer.common.name.clone();
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.evaluate_layer_inner(ctx, input, layer)
+        })) {
+            Ok(result) => result,
+            Err(payload) => Err(EvalError::LayerPanicked {
+                layer: layer_name,
+                message: panic_payload_message(payload),
+            }),
+        }
+    }
+
+    fn evaluate_layer_inner(
         &mut self,
         ctx: &mut EvalContext,
         input: &Heightfield,

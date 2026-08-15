@@ -721,7 +721,7 @@ fn eval_node_base(
         DistNodeKind::Climate { channel } => {
             if let Some(aux) = ctx.aux {
                 if let Some(field) = aux.get(channel.aux_key()) {
-                    return field.clone();
+                    return field.resampled_nearest(metrics);
                 }
             }
             // No climate data yet: full coverage so region masks stay identity-safe.
@@ -851,7 +851,7 @@ fn eval_mask_ref(
     let field = ctx
         .masks
         .get(&mask.id)
-        .cloned()
+        .map(|field| field.resampled_nearest(metrics))
         .unwrap_or_else(|| MaskField::ones(metrics));
     let mut out = MaskField::zeros(metrics);
     for j in 0..metrics.height {
@@ -1471,6 +1471,31 @@ mod tests {
             .push(DistNode::new(DistNodeKind::EffectBlur { radius: 1 }));
         let height = DistNode::height(0.0, 200.0);
         height_combine_test(metrics, &ctx, slope, height);
+    }
+
+    #[test]
+    fn climate_node_resamples_aux_to_distribution_metrics() {
+        let source = HeightfieldMetrics::new(2, 2, 40.0, 40.0);
+        let target = HeightfieldMetrics::new(4, 4, 40.0, 40.0);
+        let masks = HashMap::new();
+        let aux = HashMap::from([("temperature".into(), MaskField::filled(source, 0.625))]);
+        let ctx = DistBakeContext {
+            height: None,
+            slope_deg: None,
+            curvature: None,
+            flow: None,
+            masks: &masks,
+            aux: Some(&aux),
+        };
+        let nodes = [DistNode::new(DistNodeKind::Climate {
+            channel: ClimateMaskChannel::Temperature,
+        })];
+
+        let baked = bake_dist_nodes(&nodes, target, &ctx);
+
+        assert_eq!(baked.metrics.width, 4);
+        assert_eq!(baked.metrics.height, 4);
+        assert_eq!(baked.get(3, 3), 0.625);
     }
 
     fn height_combine_test(

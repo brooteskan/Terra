@@ -99,7 +99,7 @@ impl EvalScheduler {
                 &owned_zero
             }
         };
-        ctx.masks = bake_mask_assets(mask_assets, reference, metrics, aux);
+        ctx.masks = bake_mask_assets(mask_assets, reference, metrics, &ctx.aux);
         let hf = self.evaluator.rebuild_incremental(stack, &mut ctx)?;
         if token != self.current_token {
             return Err(EvalError::Cancelled);

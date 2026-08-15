@@ -111,12 +111,20 @@ impl EvalWorker {
                             if job.token != live {
                                 continue;
                             }
-                            publish_job_result(
-                                &result_tx,
-                                job.token,
-                                job.quality,
-                                run_cpu_job(&mut evaluator, &job, &token_flag),
-                            );
+                            let result =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    run_cpu_job(&mut evaluator, &job, &token_flag)
+                                }));
+                            let result = match result {
+                                Ok(result) => result,
+                                Err(payload) => {
+                                    // A job-level panic may leave cache state partially updated.
+                                    // Start subsequent requests from a fresh evaluator.
+                                    evaluator = StackEvaluator::new();
+                                    Err(EvalError::Panicked(super::panic_payload_message(payload)))
+                                }
+                            };
+                            publish_job_result(&result_tx, job.token, job.quality, result);
                         }
                     }
                 }
@@ -172,6 +180,12 @@ impl EvalWorker {
 
     pub fn shutdown(&self) {
         let _ = self.tx.send(WorkerMsg::Shutdown);
+    }
+
+    /// Replace the worker thread and its evaluator/cache after an unexpected disconnect.
+    pub fn restart(&mut self) {
+        self.shutdown();
+        *self = Self::spawn();
     }
 }
 
@@ -252,7 +266,7 @@ fn run_cpu_job(
             &reference
         }
     };
-    ctx.masks = bake_mask_assets(&job.masks, reference_ref, metrics, &job.aux);
+    ctx.masks = bake_mask_assets(&job.masks, reference_ref, metrics, &ctx.aux);
 
     // Cooperative cancel between layers.
     let hf = {
@@ -299,7 +313,7 @@ fn resample_height_nearest(src: &Heightfield, dst: HeightfieldMetrics) -> Height
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layer::{BlendMode, FlatParams, Layer, LayerKind};
+    use crate::layer::{BlendMode, EffectFilterParams, FlatParams, Layer, LayerKind};
 
     #[test]
     fn worker_produces_heightfield() {
@@ -425,6 +439,91 @@ mod tests {
     }
 
     #[test]
+    fn draft_aux_mask_is_resampled_before_full_crater_composite() {
+        use crate::mask::{MaskAsset, MaskId, MaskRef, MaskSource};
+
+        let source_metrics = HeightfieldMetrics::new(512, 512, 1024.0, 1024.0);
+        let mask_id = MaskId::new();
+        let asset = MaskAsset::new(mask_id, "Wetness", MaskSource::Wetness);
+        let mut stack = LayerStack::new();
+        stack.push(Layer::new(
+            "Base",
+            LayerKind::Flat(FlatParams { height: 100.0 }),
+        ));
+        let mut crater = Layer::new(
+            "Crater",
+            LayerKind::EffectFilter(EffectFilterParams::crater()),
+        );
+        crater.common.masks.push(MaskRef::new(mask_id));
+        stack.push(crater);
+
+        let mut worker = EvalWorker::spawn();
+        worker
+            .submit(EvalWorkRequest {
+                token: 40,
+                quality: PreviewQuality::Draft,
+                stack: stack.clone(),
+                masks: vec![asset.clone()],
+                base_metrics: source_metrics,
+                level_steps: crate::analyze::LevelStepSettings::default(),
+                preview_res: 1024,
+                export_res: 1024,
+                aux: HashMap::from([("wetness".into(), MaskField::filled(source_metrics, 0.75))]),
+                strata: None,
+                mask_reference: None,
+                dirty_from: None,
+                mark_all_dirty: true,
+            })
+            .expect("submit Draft worker job");
+
+        let draft = wait_for_result(&mut worker, 40);
+        assert_eq!(draft.height.metrics.width, 512);
+
+        worker
+            .submit(EvalWorkRequest {
+                token: 41,
+                quality: PreviewQuality::Full,
+                stack,
+                masks: vec![asset],
+                base_metrics: source_metrics,
+                level_steps: crate::analyze::LevelStepSettings::default(),
+                preview_res: 1024,
+                export_res: 1024,
+                aux: draft.aux,
+                strata: draft.strata,
+                mask_reference: Some(Arc::new(draft.height)),
+                dirty_from: None,
+                mark_all_dirty: false,
+            })
+            .expect("submit Full worker job");
+
+        let full = wait_for_result(&mut worker, 41);
+        assert_eq!(full.height.metrics.width, 1024);
+        assert!(full.height.get(1023, 1023).is_finite());
+        let wetness = full.aux.get("wetness").expect("wetness aux");
+        assert_eq!(wetness.metrics.width, 1024);
+        assert_eq!(wetness.metrics.height, 1024);
+        assert_eq!(wetness.get(1023, 1023), 0.75);
+    }
+
+    fn wait_for_result(worker: &mut EvalWorker, token: u64) -> EvalWorkResult {
+        for _ in 0..2_000 {
+            if let Some(event) = worker.try_recv_event() {
+                match event {
+                    EvalWorkerEvent::Completed(result) if result.token == token => return result,
+                    EvalWorkerEvent::Failed(failure) if failure.token == token => {
+                        panic!("worker failed unexpectedly: {}", failure.error)
+                    }
+                    EvalWorkerEvent::Disconnected => panic!("worker disconnected unexpectedly"),
+                    EvalWorkerEvent::Completed(_) | EvalWorkerEvent::Failed(_) => {}
+                }
+            }
+            thread::sleep(std::time::Duration::from_millis(2));
+        }
+        panic!("worker did not complete token {token}")
+    }
+
+    #[test]
     fn persistent_worker_evaluator_reuses_clean_stack() {
         let metrics = HeightfieldMetrics::new(32, 32, 320.0, 320.0);
         let mut stack = LayerStack::new();
@@ -509,6 +608,93 @@ mod tests {
     }
 
     #[test]
+    fn layer_panic_becomes_failure_and_worker_accepts_later_job() {
+        use crate::mask::{MaskAsset, MaskId, MaskRef, MaskSource};
+
+        let metrics = HeightfieldMetrics::new(128, 128, 128.0, 128.0);
+        let malformed: MaskField = serde_json::from_value(serde_json::json!({
+            "metrics": metrics,
+            "data": []
+        }))
+        .expect("deserialize malformed test field");
+        let mask_id = MaskId::new();
+        let asset = MaskAsset::new(mask_id, "Wetness", MaskSource::Wetness);
+        let mut crater = Layer::new(
+            "Crater",
+            LayerKind::EffectFilter(EffectFilterParams::crater()),
+        );
+        crater.common.masks.push(MaskRef::new(mask_id));
+        let mut crashing_stack = LayerStack::new();
+        crashing_stack.push(Layer::new(
+            "Base",
+            LayerKind::Flat(FlatParams { height: 10.0 }),
+        ));
+        crashing_stack.push(crater);
+
+        let mut worker = EvalWorker::spawn();
+        worker
+            .submit(EvalWorkRequest {
+                token: 50,
+                quality: PreviewQuality::Full,
+                stack: crashing_stack,
+                masks: vec![asset],
+                base_metrics: metrics,
+                level_steps: crate::analyze::LevelStepSettings::default(),
+                preview_res: 128,
+                export_res: 128,
+                aux: HashMap::from([("wetness".into(), malformed)]),
+                strata: None,
+                mask_reference: None,
+                dirty_from: None,
+                mark_all_dirty: true,
+            })
+            .expect("submit panicking job");
+
+        let mut failure = None;
+        for _ in 0..1_000 {
+            if let Some(event) = worker.try_recv_event() {
+                match event {
+                    EvalWorkerEvent::Failed(found) if found.token == 50 => {
+                        failure = Some(found);
+                        break;
+                    }
+                    EvalWorkerEvent::Disconnected => panic!("worker must contain layer panic"),
+                    _ => {}
+                }
+            }
+            thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let failure = failure.expect("panic failure event");
+        assert!(matches!(failure.error, EvalError::LayerPanicked { .. }));
+
+        let mut valid_stack = LayerStack::new();
+        valid_stack.push(Layer::new(
+            "Recovered",
+            LayerKind::Flat(FlatParams { height: 23.0 }),
+        ));
+        worker
+            .submit(EvalWorkRequest {
+                token: 51,
+                quality: PreviewQuality::Full,
+                stack: valid_stack,
+                masks: Vec::new(),
+                base_metrics: metrics,
+                level_steps: crate::analyze::LevelStepSettings::default(),
+                preview_res: 128,
+                export_res: 128,
+                aux: HashMap::new(),
+                strata: None,
+                mask_reference: None,
+                dirty_from: None,
+                mark_all_dirty: true,
+            })
+            .expect("worker should accept a later job");
+
+        let recovered = wait_for_result(&mut worker, 51);
+        assert_eq!(recovered.height.get(127, 127), 23.0);
+    }
+
+    #[test]
     fn disconnection_is_reported_only_once_and_rejects_new_work() {
         let mut worker = EvalWorker::spawn();
         worker.shutdown();
@@ -540,5 +726,31 @@ mod tests {
         };
         assert_eq!(worker.submit(request), Err(EvalWorkerSubmitError));
         assert!(!worker.busy);
+
+        worker.restart();
+        let mut stack = LayerStack::new();
+        stack.push(Layer::new(
+            "Recovered",
+            LayerKind::Flat(FlatParams { height: 9.0 }),
+        ));
+        worker
+            .submit(EvalWorkRequest {
+                token: 20,
+                quality: PreviewQuality::Draft,
+                stack,
+                masks: Vec::new(),
+                base_metrics: HeightfieldMetrics::preview_default(),
+                level_steps: crate::analyze::LevelStepSettings::default(),
+                preview_res: 128,
+                export_res: 128,
+                aux: HashMap::new(),
+                strata: None,
+                mask_reference: None,
+                dirty_from: None,
+                mark_all_dirty: true,
+            })
+            .expect("restarted worker accepts work");
+        let recovered = wait_for_result(&mut worker, 20);
+        assert_eq!(recovered.height.get(0, 0), 9.0);
     }
 }

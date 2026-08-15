@@ -64,6 +64,48 @@ impl MaskField {
         &mut self.data
     }
 
+    /// Return this field sampled onto `target` using normalized nearest-neighbour lookup.
+    ///
+    /// Evaluation auxiliary maps can survive a Draft -> Full quality transition.  Their
+    /// stored grid must be adapted before a target-resolution compositor indexes them.
+    /// Nearest sampling is deliberately conservative here: `MaskField` is also used for
+    /// categorical and unclamped simulation state, so interpolation and `set` clamping
+    /// would both be lossy for some callers.
+    pub fn resampled_nearest(&self, target: HeightfieldMetrics) -> Self {
+        if self.metrics.width == target.width && self.metrics.height == target.height {
+            let mut field = self.clone();
+            field.metrics = target;
+            return field;
+        }
+
+        let mut out = Self::zeros(target);
+        if self.metrics.width == 0 || self.metrics.height == 0 {
+            return out;
+        }
+        for j in 0..target.height {
+            for i in 0..target.width {
+                let u = (i as f32 + 0.5) / target.width.max(1) as f32;
+                let v = (j as f32 + 0.5) / target.height.max(1) as f32;
+                let si = ((u * self.metrics.width as f32) as u32).min(self.metrics.width - 1);
+                let sj = ((v * self.metrics.height as f32) as u32).min(self.metrics.height - 1);
+                let dst = (j * target.width + i) as usize;
+                out.data[dst] = self.get(si, sj);
+            }
+        }
+        out
+    }
+
+    /// Owned variant of [`Self::resampled_nearest`] that avoids cloning an already
+    /// matching field when an evaluation context takes ownership of auxiliary maps.
+    pub fn into_resampled_nearest(mut self, target: HeightfieldMetrics) -> Self {
+        if self.metrics.width == target.width && self.metrics.height == target.height {
+            self.metrics = target;
+            self
+        } else {
+            self.resampled_nearest(target)
+        }
+    }
+
     pub fn from_height_range(hf: &Heightfield, min: f32, max: f32) -> Self {
         let metrics = hf.metrics;
         let mut m = Self::zeros(metrics);
@@ -91,5 +133,26 @@ impl MaskField {
     pub fn scale_in_place(&mut self, s: f32) {
         crate::simd_ops::scale_slice_in_place(self.data_mut(), s);
         crate::simd_ops::clamp_slice_in_place(self.data_mut(), 0.0, 1.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nearest_resample_matches_target_and_preserves_raw_values() {
+        let source_metrics = HeightfieldMetrics::new(2, 2, 20.0, 20.0);
+        let source = MaskField::from_raw(source_metrics, &[0.0, 2.0, 4.0, 8.0]);
+        let target = HeightfieldMetrics::new(4, 4, 20.0, 20.0);
+
+        let resized = source.resampled_nearest(target);
+
+        assert_eq!(resized.metrics.width, 4);
+        assert_eq!(resized.metrics.height, 4);
+        assert_eq!(resized.get(0, 0), 0.0);
+        assert_eq!(resized.get(3, 0), 2.0);
+        assert_eq!(resized.get(0, 3), 4.0);
+        assert_eq!(resized.get(3, 3), 8.0);
     }
 }

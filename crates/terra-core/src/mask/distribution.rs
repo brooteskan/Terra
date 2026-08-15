@@ -236,7 +236,7 @@ pub fn bake_distribution_with_context(
         let field = ctx
             .masks
             .get(&entry.mask.id)
-            .cloned()
+            .map(|field| field.resampled_nearest(metrics))
             .unwrap_or_else(|| MaskField::ones(metrics));
         for j in 0..metrics.height {
             for i in 0..metrics.width {
@@ -316,5 +316,20 @@ mod tests {
         let baked = bake_distribution(&dist, &masks, metrics);
         // ones * 0.5 = 0.5, then max(0.5, 0.8) = 0.8
         assert!((baked.get(0, 0) - 0.8).abs() < 1e-5);
+    }
+
+    #[test]
+    fn legacy_entry_resamples_referenced_mask_to_target_metrics() {
+        let source = HeightfieldMetrics::new(2, 2, 40.0, 40.0);
+        let target = HeightfieldMetrics::new(4, 4, 40.0, 40.0);
+        let id = MaskId::new();
+        let masks = HashMap::from([(id, MaskField::filled(source, 0.375))]);
+        let dist = Distribution::from_refs(vec![MaskRef::new(id)]);
+
+        let baked = bake_distribution(&dist, &masks, target);
+
+        assert_eq!(baked.metrics.width, 4);
+        assert_eq!(baked.metrics.height, 4);
+        assert_eq!(baked.get(3, 3), 0.375);
     }
 }

@@ -471,6 +471,7 @@ impl ApplicationHandler for TerraApp {
             while let Some(event) = self.eval_worker.try_recv_event() {
                 match event {
                     EvalWorkerEvent::Completed(result) if result.token == self.eval_token => {
+                        self.ui_state.evaluation_failure = None;
                         let quality = result.quality;
                         let height = result.height;
                         self.scheduler.last_aux = result.aux;
@@ -549,16 +550,25 @@ impl ApplicationHandler for TerraApp {
                         );
                     }
                     EvalWorkerEvent::Failed(failure) => {
-                        self.handle_evaluation_failure(
+                        let layer_name = failure.error.layer_name().map(str::to_owned);
+                        self.handle_evaluation_failure_details(
                             failure.token,
                             failure.quality,
+                            layer_name,
+                            false,
                             format!("evaluation worker failed: {}", failure.error),
                         );
                     }
                     EvalWorkerEvent::Disconnected => {
-                        self.handle_evaluation_failure(
+                        self.eval_worker.restart();
+                        self.eval_worker.set_token(self.eval_token);
+                        self.worker_mark_all_dirty = true;
+                        self.worker_dirty_from = None;
+                        self.handle_evaluation_failure_details(
                             self.eval_token,
                             self.scheduler.quality,
+                            None,
+                            true,
                             "evaluation worker disconnected or panicked",
                         );
                     }

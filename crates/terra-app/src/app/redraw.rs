@@ -641,6 +641,11 @@ impl TerraApp {
                 self.ui_state.refining_layer_name = None;
                 self.ui_state.status = "Build cancelled".into();
             }
+            if ui_out.request_retry_evaluation {
+                self.worker_mark_all_dirty = true;
+                self.worker_dirty_from = None;
+                self.request_rebuild();
+            }
             if ui_out.request_save_bookmark {
                 let slot = self
                     .ui_state

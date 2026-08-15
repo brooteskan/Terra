@@ -39,6 +39,7 @@ impl ApplyCtx {
 
 impl TerraApp {
     pub(crate) fn apply_actions(&mut self, actions: Vec<PanelAction>) {
+        let selection_before = self.session.document.selected;
         let mut ctx = ApplyCtx::new();
         for action in actions {
             ctx.continue_loop = false;
@@ -145,6 +146,9 @@ impl TerraApp {
         }
         if doc_mutated || dirty_from.is_some() || sculpt_stamp {
             self.mark_document_dirty();
+        }
+        if self.session.document.selected != selection_before {
+            self.layers_gui.reveal_selection(&self.session.document);
         }
     }
 }

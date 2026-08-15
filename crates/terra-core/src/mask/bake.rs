@@ -74,7 +74,7 @@ fn bake_source(
                 "sediment_depth" | "loose_sediment" => aux.get("sediment_thickness"),
                 _ => None,
             })
-            .cloned()
+            .map(|field| field.resampled_nearest(hf.metrics))
             .unwrap_or_else(|| MaskField::ones(hf.metrics)),
         MaskSource::Constant(v) => MaskField::filled(hf.metrics, *v),
         MaskSource::Height { min, max } => MaskField::from_height_range(hf, *min, *max),
@@ -150,12 +150,13 @@ fn bake_source(
         }
         MaskSource::FlowDirection => aux
             .get("flow_direction")
-            .cloned()
+            .map(|field| field.resampled_nearest(hf.metrics))
             .unwrap_or_else(|| MaskField::ones(hf.metrics)),
         MaskSource::FlowAccumulation { min, max } => {
             let Some(acc) = aux.get("flow_accumulation") else {
                 return MaskField::ones(hf.metrics);
             };
+            let acc = acc.resampled_nearest(hf.metrics);
             let mut m = MaskField::zeros(hf.metrics);
             for j in 0..hf.metrics.height {
                 for i in 0..hf.metrics.width {
@@ -168,51 +169,51 @@ fn bake_source(
         }
         MaskSource::Wetness => aux
             .get("wetness")
-            .cloned()
+            .map(|field| field.resampled_nearest(hf.metrics))
             .unwrap_or_else(|| MaskField::ones(hf.metrics)),
         MaskSource::Sediment => aux
             .get("sediment")
-            .cloned()
+            .map(|field| field.resampled_nearest(hf.metrics))
             .unwrap_or_else(|| MaskField::ones(hf.metrics)),
         MaskSource::Erosion => aux
             .get("erosion")
-            .cloned()
+            .map(|field| field.resampled_nearest(hf.metrics))
             .unwrap_or_else(|| MaskField::ones(hf.metrics)),
         MaskSource::Deposition => aux
             .get("deposition")
-            .cloned()
+            .map(|field| field.resampled_nearest(hf.metrics))
             .unwrap_or_else(|| MaskField::ones(hf.metrics)),
         MaskSource::Hardness => aux
             .get("hardness")
-            .cloned()
+            .map(|field| field.resampled_nearest(hf.metrics))
             .unwrap_or_else(|| MaskField::filled(hf.metrics, 0.0)),
         MaskSource::Temperature => aux
             .get("temperature")
-            .cloned()
+            .map(|field| field.resampled_nearest(hf.metrics))
             .unwrap_or_else(|| MaskField::ones(hf.metrics)),
         MaskSource::Rainfall => aux
             .get("rainfall")
-            .cloned()
+            .map(|field| field.resampled_nearest(hf.metrics))
             .unwrap_or_else(|| MaskField::ones(hf.metrics)),
         MaskSource::Humidity => aux
             .get("humidity")
-            .cloned()
+            .map(|field| field.resampled_nearest(hf.metrics))
             .unwrap_or_else(|| MaskField::ones(hf.metrics)),
         MaskSource::Snow => aux
             .get("snow")
-            .cloned()
+            .map(|field| field.resampled_nearest(hf.metrics))
             .unwrap_or_else(|| MaskField::zeros(hf.metrics)),
         MaskSource::SoilMoisture => aux
             .get("soil_moisture")
-            .cloned()
+            .map(|field| field.resampled_nearest(hf.metrics))
             .unwrap_or_else(|| MaskField::ones(hf.metrics)),
         MaskSource::WindExposure => aux
             .get("wind_exposure")
-            .cloned()
+            .map(|field| field.resampled_nearest(hf.metrics))
             .unwrap_or_else(|| MaskField::ones(hf.metrics)),
         MaskSource::LayerOutput { output_id } => published
             .get(output_id)
-            .cloned()
+            .map(|field| field.resampled_nearest(hf.metrics))
             .unwrap_or_else(|| MaskField::zeros(hf.metrics)),
     }
 }
@@ -306,5 +307,29 @@ mod tests {
 
         let baked = bake_mask_assets(&assets, &Heightfield::zeros(metrics), metrics, &aux);
         assert!((baked[&id].get(0, 0) - 0.625).abs() < 1e-6);
+    }
+
+    #[test]
+    fn dynamic_aux_source_is_resampled_to_bake_metrics() {
+        let source_metrics = HeightfieldMetrics::new(2, 2, 4.0, 4.0);
+        let target_metrics = HeightfieldMetrics::new(4, 4, 4.0, 4.0);
+        let id = MaskId::new();
+        let assets = [MaskAsset::new(id, "Wetness", MaskSource::Wetness)];
+        let aux = HashMap::from([(
+            "wetness".into(),
+            MaskField::from_raw(source_metrics, &[0.0, 0.25, 0.5, 1.0]),
+        )]);
+
+        let baked = bake_mask_assets(
+            &assets,
+            &Heightfield::zeros(target_metrics),
+            target_metrics,
+            &aux,
+        );
+
+        let field = &baked[&id];
+        assert_eq!(field.metrics.width, 4);
+        assert_eq!(field.metrics.height, 4);
+        assert_eq!(field.get(3, 3), 1.0);
     }
 }

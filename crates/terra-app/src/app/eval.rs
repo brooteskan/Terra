@@ -145,9 +145,15 @@ impl TerraApp {
                 if self.worker_dirty_from.is_none() {
                     self.worker_dirty_from = dirty_from;
                 }
-                self.handle_evaluation_failure(
+                self.eval_worker.restart();
+                self.eval_worker.set_token(self.eval_token);
+                self.worker_mark_all_dirty = true;
+                self.worker_dirty_from = None;
+                self.handle_evaluation_failure_details(
                     self.eval_token,
                     quality,
+                    None,
+                    true,
                     format!("evaluation worker submission failed: {error}"),
                 );
             }
@@ -166,22 +172,36 @@ impl TerraApp {
             .to_string()
     }
 
-    pub(crate) fn handle_evaluation_failure(
+    pub(crate) fn handle_evaluation_failure_details(
         &mut self,
         token: u64,
         quality: PreviewQuality,
+        layer_name: Option<String>,
+        worker_restarted: bool,
         message: impl std::fmt::Display,
     ) {
+        let message = message.to_string();
         let context = self.evaluation_log_context(token, quality);
         log::error!(target: "terra_app::evaluation", "{message}; {context}");
         if token != self.eval_token {
             return;
         }
+        let layer_name = layer_name.or_else(|| self.ui_state.refining_layer_name.clone());
         self.worker_refine_pending = false;
         self.ui_state.refining = false;
         self.ui_state.build_progress = None;
         self.ui_state.refining_layer_name = None;
-        self.ui_state.status = "Terrain evaluation failed; see log for details".into();
+        self.ui_state.status = if worker_restarted {
+            "Terrain evaluation failed; worker restarted".into()
+        } else {
+            "Terrain evaluation failed; last good preview retained".into()
+        };
+        self.ui_state.evaluation_failure = Some(crate::ui::EvaluationFailureStatus {
+            layer_name,
+            quality,
+            message,
+            worker_restarted,
+        });
     }
 
     pub(crate) fn queue_final_tile_uploads(&mut self) {
@@ -1162,13 +1182,28 @@ mod tests {
         ));
         app.scheduler.last_good = Some(Arc::clone(&last_good));
 
-        app.handle_evaluation_failure(23, PreviewQuality::Full, "synthetic worker failure");
+        app.handle_evaluation_failure_details(
+            23,
+            PreviewQuality::Full,
+            None,
+            false,
+            "synthetic worker failure",
+        );
 
         assert!(!app.worker_refine_pending);
         assert!(!app.ui_state.refining);
         assert_eq!(app.ui_state.build_progress, None);
         assert_eq!(app.ui_state.refining_layer_name, None);
-        assert!(app.ui_state.status.contains("see log"));
+        assert!(app.ui_state.status.contains("last good preview"));
+        let failure = app
+            .ui_state
+            .evaluation_failure
+            .as_ref()
+            .expect("persistent evaluation failure");
+        assert_eq!(failure.layer_name.as_deref(), Some("Hydraulic Erosion"));
+        assert_eq!(failure.quality, PreviewQuality::Full);
+        assert!(failure.message.contains("synthetic worker failure"));
+        assert!(!failure.worker_restarted);
         assert!(Arc::ptr_eq(
             app.scheduler.last_good.as_ref().expect("last good"),
             &last_good
@@ -1183,10 +1218,49 @@ mod tests {
         app.ui_state.refining = true;
         app.ui_state.build_progress = Some(0.25);
 
-        app.handle_evaluation_failure(30, PreviewQuality::Draft, "stale failure");
+        app.handle_evaluation_failure_details(
+            30,
+            PreviewQuality::Draft,
+            None,
+            false,
+            "stale failure",
+        );
 
         assert!(app.worker_refine_pending);
         assert!(app.ui_state.refining);
         assert_eq!(app.ui_state.build_progress, Some(0.25));
+        assert!(app.ui_state.evaluation_failure.is_none());
+    }
+
+    #[test]
+    fn restarted_worker_failure_is_actionable_and_preserves_last_good() {
+        let mut app = TerraApp::default();
+        app.eval_token = 44;
+        let last_good = Arc::new(Heightfield::filled(
+            HeightfieldMetrics::new(8, 8, 80.0, 80.0),
+            6.0,
+        ));
+        app.scheduler.last_good = Some(Arc::clone(&last_good));
+
+        app.handle_evaluation_failure_details(
+            44,
+            PreviewQuality::Medium,
+            Some("Crater".into()),
+            true,
+            "worker disconnected",
+        );
+
+        let failure = app
+            .ui_state
+            .evaluation_failure
+            .as_ref()
+            .expect("persistent failure");
+        assert_eq!(failure.layer_name.as_deref(), Some("Crater"));
+        assert!(failure.worker_restarted);
+        assert!(app.ui_state.status.contains("worker restarted"));
+        assert!(Arc::ptr_eq(
+            app.scheduler.last_good.as_ref().expect("last good"),
+            &last_good
+        ));
     }
 }
