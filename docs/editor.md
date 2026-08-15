@@ -26,6 +26,10 @@ The inspector shows the selected layer or group:
 - Shared chrome: name, enable, lock, solo, opacity, blend, distribution
 - Kind-specific parameters (Simple vs Advanced where available)
 - **Apply Where** for ops inside biomes
+- **Resolution** shows the selected source's stored/imported detail, the active
+  Draft/Medium/Full/Export evaluation grid, and whether Terra resamples,
+  rasterizes, generates, processes, or simulates at that grid size. A larger
+  evaluation grid does not add source detail to a smaller fixed raster.
 
 Prefer changing blend and distribution before inventing extra layers when a single contribution should simply be weaker or more localized.
 

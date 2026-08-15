@@ -9,6 +9,7 @@ mod metadata;
 mod operation;
 mod output;
 mod registry;
+mod resolution;
 mod scale;
 mod stack;
 mod workflow;
@@ -32,6 +33,9 @@ pub use metadata::{
 pub use operation::{FieldContract, OperationCategory};
 pub use output::{NamedOutputDecl, OutputRef, PublishedOutput};
 pub use registry::LayerTypeRegistry;
+pub use resolution::{
+    EvaluationResolutionBehavior, GridDimensions, LayerResolutionSemantics, LayerResolutionSource,
+};
 pub use scale::ScaleBand;
 pub use stack::{biome_destination_section, is_shape_kind, LayerGroup, LayerStack, StackNode};
 pub use workflow::WorkflowStage;

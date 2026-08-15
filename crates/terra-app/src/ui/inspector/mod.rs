@@ -1,8 +1,10 @@
 //! Inspector panel drawn with `terra-gui` (replaces egui right panel content).
 
 mod edit_kind;
+mod resolution;
 
 use self::edit_kind::{edit_kind, kind_display_name, KindEditPane};
+use self::resolution::{draw_layer_resolution, draw_painted_mask_resolution, ImportedSourceCache};
 use crate::ui::actions::PanelAction;
 use crate::ui::dist_kinds::{dist_base_kinds, dist_effect_kinds};
 use crate::ui::presets::contextual_presets;
@@ -207,6 +209,8 @@ pub struct InspectorGuiState {
     pub rename_buffer: Option<String>,
     /// Collapsible Details sections.
     pub details: DetailsExpandState,
+    /// Header-only metadata for the currently inspected imported raster.
+    source_metadata: ImportedSourceCache,
 }
 
 impl Default for InspectorGuiState {
@@ -218,6 +222,7 @@ impl Default for InspectorGuiState {
             more_menu_open: false,
             rename_buffer: None,
             details: DetailsExpandState::default(),
+            source_metadata: ImportedSourceCache::default(),
         }
     }
 }
@@ -226,6 +231,7 @@ impl InspectorGuiState {
     /// Reset Details sections to the project-entry default (all collapsed).
     pub fn reset_expand_for_project(&mut self) {
         self.details = DetailsExpandState::default();
+        self.source_metadata = ImportedSourceCache::default();
     }
 }
 
@@ -353,6 +359,9 @@ pub fn draw_inspector_gui(
     }
     if ui_state.editor_tool.is_sculpt() && (selected_is_base || doc.selected.is_none()) {
         draw_tool_inspector(ui, doc, ui_state);
+        if let Some(layer) = doc.selected.and_then(|id| doc.stack.find(id)) {
+            draw_layer_resolution(ui, doc, ui_state, state, layer);
+        }
         ui.end_panel_scrolled(&mut state.scroll_y);
         return actions;
     }
@@ -753,8 +762,9 @@ pub fn draw_inspector_gui(
         }
     }
 
-    // Clear split between identity chip and top section tabs.
+    // Resolution is selection context, so keep it visible regardless of the active tab.
     ui.gap(4.0);
+    draw_layer_resolution(ui, doc, ui_state, state, &layer);
     ui.separator();
 
     let tab_icons: Vec<Icon> = tabs.iter().map(|t| t.icon()).collect();
@@ -1309,6 +1319,8 @@ fn draw_mask_tool_inspector(
             }
         }
     }
+
+    draw_painted_mask_resolution(ui, doc, ui_state);
 
     let mut overlay = ui_state.viewport_overlays.mask_overlay;
     if checkbox(ui, "Show mask overlay", &mut overlay) {
