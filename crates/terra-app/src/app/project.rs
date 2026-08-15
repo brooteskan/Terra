@@ -830,6 +830,38 @@ mod tests {
             .expect("resaved new-world document must reload");
     }
 
+    #[test]
+    fn blank_new_world_has_no_shape_constraints_or_reconstruction() {
+        let doc = document_from_world_settings("blank", 4_096.0, 0.0);
+        assert!(doc.shapes.shapes.is_empty());
+        assert!(doc.shapes.managed_constraints_layer.is_none());
+        assert!(doc.stack.flatten_layers().iter().all(|layer| !matches!(
+            layer.kind,
+            terra_core::LayerKind::TerrainConstraints(_)
+                | terra_core::LayerKind::GradientReconstruct(_)
+        )));
+        let base = doc
+            .stack
+            .flatten_layers()
+            .into_iter()
+            .find_map(|layer| match &layer.kind {
+                terra_core::LayerKind::SculptBase(params) => Some(params),
+                _ => None,
+            })
+            .expect("blank new world has a sculptable base");
+        assert!(!base.samples.is_empty());
+        assert!(base.samples.iter().all(|sample| *sample == 8.0));
+
+        let alpine = document_from_world_settings("alpine", 4_096.0, 0.0);
+        assert!(!alpine.shapes.shapes.is_empty());
+        assert!(alpine.shapes.managed_constraints_layer.is_some());
+        assert!(alpine
+            .stack
+            .flatten_layers()
+            .iter()
+            .any(|layer| matches!(&layer.kind, terra_core::LayerKind::TerrainConstraints(_))));
+    }
+
     /// Revert check for #34: document reset must retain an empty atlas and the
     /// existing upload/sync path must make it streamable again.
     #[test]

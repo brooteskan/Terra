@@ -495,7 +495,9 @@ pub(crate) fn apply_blueprint_to_stack(doc: &mut terra_core::document::TerrainDo
             shape.width_m = ridge_w;
         }
     }
-    doc.compile_shapes_into_stack();
+    if !doc.shapes.shapes.is_empty() || doc.shapes.managed_constraints_layer.is_some() {
+        doc.compile_shapes_into_stack();
+    }
     for layer in doc.stack.flatten_layers_mut() {
         match &mut layer.kind {
             terra_core::LayerKind::LandscapeEvolution(p) => {
