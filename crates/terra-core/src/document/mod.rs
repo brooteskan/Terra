@@ -439,7 +439,7 @@ impl TerrainDocument {
     pub fn evaluate_final_height(
         &mut self,
         ctx: &mut crate::eval::EvalContext,
-    ) -> Result<crate::Heightfield, crate::eval::EvalError> {
+    ) -> Result<crate::heightfield::Heightfield, crate::eval::EvalError> {
         let mut evaluator = crate::eval::StackEvaluator::new();
         evaluator.rebuild_all(&self.stack, ctx)
     }
