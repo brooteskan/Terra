@@ -51,12 +51,10 @@ use std::sync::OnceLock;
 
 /// Production cross-module edges `(from, to)` that participate in a cycle at this
 /// commit — i.e. `from` and `to` are in the same strongly-connected component.
-/// Exact set (Rule 2). Seeded to today's graph; each A3 fix deletes the edges it
-/// removes in the same commit. Sorted for readable diffs.
-const CYCLIC_EDGES: &[(&str, &str)] = &[
-    ("document", "rebuild_feedback"),
-    ("rebuild_feedback", "document"),
-];
+/// Exact set (Rule 2). **Empty since A3-B6** (#84): terra-core's top-level module
+/// graph is now a DAG. Any future entry means a new cycle was introduced — break
+/// it rather than allowlisting, unless the cycle is genuinely intended.
+const CYCLIC_EDGES: &[(&str, &str)] = &[];
 
 /// Top-level modules that are outside every cycle at this commit and must stay
 /// that way (Rule 3). The newest module families live here; the guard keeps the
@@ -70,6 +68,7 @@ const CLEAN_MODULES: &[&str] = &[
     "command",
     "contextual_create",
     "deps",
+    "document",
     "domain",
     "eval",
     "field_data",
@@ -96,6 +95,8 @@ const CLEAN_MODULES: &[&str] = &[
     "noise",
     "quality",
     "realism_benchmark",
+    "rebuild_feedback",
+    "rebuild_state",
     "scatter",
     "shape_history",
     "shape_object",
@@ -134,6 +135,16 @@ const TIER_DEPENDENCIES: &[(&str, &[&str])] = &[
     (
         "mask_ir",
         &["ids", "mask_field", "mask_types", "raster", "simd_ops"],
+    ),
+    (
+        "rebuild_state",
+        &[
+            "deps",
+            "domain",
+            "layer",
+            "simulation_scenario",
+            "world_rules",
+        ],
     ),
     ("spatial_kernels", &["heightfield", "mask_field"]),
 ];
