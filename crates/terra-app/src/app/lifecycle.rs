@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use crate::ui::{resolve_shortcut_for_input, PanelAction, ShortcutChord, ShortcutModifiers};
 use terra_core::command::EditorCommand;
-use terra_core::eval::PreviewQuality;
+use terra_core::eval::{EvalWorkerEvent, PreviewQuality};
 use terra_gpu::{GpuTerrainEngine, GpuTileAtlas};
 use terra_gui::GuiRenderer;
 use terra_render::TerrainRenderer;
@@ -467,72 +467,102 @@ impl ApplicationHandler for TerraApp {
                         .simulation_iteration_cap(),
                 );
             }
-            // The worker is never awaited: consume its newest matching result, if available.
-            if let Some(result) = self.eval_worker.try_recv_matching(self.eval_token) {
-                let quality = result.quality;
-                let height = result.height;
-                self.scheduler.last_aux = result.aux;
-                self.scheduler.last_strata = result.strata;
-                self.scheduler.last_layer_timings = result.layer_timings;
-                self.ui_state
-                    .profile
-                    .update_layer_timings(&self.scheduler.last_layer_timings);
-                let height = std::sync::Arc::new(height);
-                self.scheduler.last_good = Some(std::sync::Arc::clone(&height));
-                self.last_height = Some((*height).clone());
-                // Ingest every CPU layer checkpoint so GPU can bake unsupported shapes
-                // and keep EffectFilters live on the next edit.
-                if let (Some(engine), Some(gpu)) = (self.gpu_engine.as_mut(), self.gpu.as_ref()) {
-                    let preview = self.session.document.preview_eval_stack();
-                    for layer in preview.flatten_layers() {
-                        if let Some(cached) = self.scheduler.evaluator.cache.get(layer.id()) {
-                            if cached.dirty {
-                                continue;
+            // The worker is never awaited: drain available completion/failure events.
+            while let Some(event) = self.eval_worker.try_recv_event() {
+                match event {
+                    EvalWorkerEvent::Completed(result) if result.token == self.eval_token => {
+                        let quality = result.quality;
+                        let height = result.height;
+                        self.scheduler.last_aux = result.aux;
+                        self.scheduler.last_strata = result.strata;
+                        self.scheduler.last_layer_timings = result.layer_timings;
+                        self.ui_state
+                            .profile
+                            .update_layer_timings(&self.scheduler.last_layer_timings);
+                        let height = std::sync::Arc::new(height);
+                        self.scheduler.last_good = Some(std::sync::Arc::clone(&height));
+                        self.last_height = Some((*height).clone());
+                        // Ingest every CPU layer checkpoint so GPU can bake unsupported shapes
+                        // and keep EffectFilters live on the next edit.
+                        if let (Some(engine), Some(gpu)) =
+                            (self.gpu_engine.as_mut(), self.gpu.as_ref())
+                        {
+                            let preview = self.session.document.preview_eval_stack();
+                            for layer in preview.flatten_layers() {
+                                if let Some(cached) = self.scheduler.evaluator.cache.get(layer.id())
+                                {
+                                    if cached.dirty {
+                                        continue;
+                                    }
+                                    if cached.height.metrics.width == 0 {
+                                        continue;
+                                    }
+                                    let (lo, hi) = cached.height.min_max();
+                                    engine.ingest_height(
+                                        &gpu.device,
+                                        &gpu.queue,
+                                        layer.id(),
+                                        &cached.height,
+                                        (lo, hi),
+                                    );
+                                }
                             }
-                            if cached.height.metrics.width == 0 {
-                                continue;
-                            }
-                            let (lo, hi) = cached.height.min_max();
-                            engine.ingest_height(
-                                &gpu.device,
-                                &gpu.queue,
-                                layer.id(),
-                                &cached.height,
-                                (lo, hi),
-                            );
                         }
+                        self.queue_final_tile_uploads();
+                        self.preview_dirty = true;
+                        self.needs_height_upload = true;
+                        self.worker_refine_pending = false;
+                        self.ui_state.profile.eval_us = result.eval_us;
+                        self.ui_state.profile.tex_w =
+                            self.last_height.as_ref().unwrap().metrics.width;
+                        self.ui_state.profile.tex_h =
+                            self.last_height.as_ref().unwrap().metrics.height;
+                        self.ui_state.profile.tiles_x =
+                            self.last_height.as_ref().unwrap().metrics.tiles_x();
+                        self.ui_state.profile.tiles_z =
+                            self.last_height.as_ref().unwrap().metrics.tiles_z();
+                        self.ui_state.profile.path = "CPU (async)";
+                        self.ui_state.profile.quality = match quality {
+                            PreviewQuality::Draft => "Draft (fast)",
+                            PreviewQuality::Medium => "Medium",
+                            PreviewQuality::Full => "Final (viewport)",
+                            PreviewQuality::Export => "Export quality",
+                        };
+                        self.ui_state.quality = quality;
+                        self.ui_state.build_progress = Some(quality_stage_progress(quality));
+                        self.ui_state.draft_displayed =
+                            matches!(quality, PreviewQuality::Draft | PreviewQuality::Medium);
+                        self.ui_state.refining = quality.next_refine().is_some();
+                        if !self.ui_state.refining {
+                            self.ui_state.build_progress = None;
+                            self.ui_state.refining_layer_name = None;
+                            self.ui_state.draft_displayed = false;
+                        }
+                        self.last_refine = Instant::now();
+                        did_eval = true;
+                    }
+                    EvalWorkerEvent::Completed(result) => {
+                        log::debug!(
+                            target: "terra_app::evaluation",
+                            "discarding stale evaluation result; {}",
+                            self.evaluation_log_context(result.token, result.quality)
+                        );
+                    }
+                    EvalWorkerEvent::Failed(failure) => {
+                        self.handle_evaluation_failure(
+                            failure.token,
+                            failure.quality,
+                            format!("evaluation worker failed: {}", failure.error),
+                        );
+                    }
+                    EvalWorkerEvent::Disconnected => {
+                        self.handle_evaluation_failure(
+                            self.eval_token,
+                            self.scheduler.quality,
+                            "evaluation worker disconnected or panicked",
+                        );
                     }
                 }
-                self.queue_final_tile_uploads();
-                self.preview_dirty = true;
-                self.needs_height_upload = true;
-                self.worker_refine_pending = false;
-                self.ui_state.profile.eval_us = result.eval_us;
-                self.ui_state.profile.tex_w = self.last_height.as_ref().unwrap().metrics.width;
-                self.ui_state.profile.tex_h = self.last_height.as_ref().unwrap().metrics.height;
-                self.ui_state.profile.tiles_x =
-                    self.last_height.as_ref().unwrap().metrics.tiles_x();
-                self.ui_state.profile.tiles_z =
-                    self.last_height.as_ref().unwrap().metrics.tiles_z();
-                self.ui_state.profile.path = "CPU (async)";
-                self.ui_state.profile.quality = match quality {
-                    PreviewQuality::Draft => "Draft (fast)",
-                    PreviewQuality::Medium => "Medium",
-                    PreviewQuality::Full => "Final (viewport)",
-                    PreviewQuality::Export => "Export quality",
-                };
-                self.ui_state.quality = quality;
-                self.ui_state.build_progress = Some(quality_stage_progress(quality));
-                self.ui_state.draft_displayed =
-                    matches!(quality, PreviewQuality::Draft | PreviewQuality::Medium);
-                self.ui_state.refining = quality.next_refine().is_some();
-                if !self.ui_state.refining {
-                    self.ui_state.build_progress = None;
-                    self.ui_state.refining_layer_name = None;
-                    self.ui_state.draft_displayed = false;
-                }
-                self.last_refine = Instant::now();
-                did_eval = true;
             }
 
             // Debounced draft eval. During paint/sculpt, key off last eval time â€” stamps

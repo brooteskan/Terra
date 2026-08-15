@@ -11,7 +11,10 @@ pub use cache::{CachedOutput, LayerCache};
 pub use processors::ProcessorRegistry;
 pub use scheduler::{EvalJob, EvalScheduler};
 pub use smart_cache::DiskSmartCache;
-pub use worker::{EvalWorkRequest, EvalWorkResult, EvalWorker};
+pub use worker::{
+    EvalWorkFailure, EvalWorkRequest, EvalWorkResult, EvalWorker, EvalWorkerEvent,
+    EvalWorkerSubmitError,
+};
 
 use crate::fields::AuxMaps;
 use crate::heightfield::{Heightfield, HeightfieldMetrics};

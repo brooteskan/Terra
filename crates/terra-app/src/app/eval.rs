@@ -1,10 +1,12 @@
 use std::time::{Duration, Instant};
 
+use crate::logging::OperationContext;
 use crate::ui::Preview2dMode;
-use terra_core::eval::{EvalWorkRequest, PreviewQuality};
+use terra_core::eval::{EvalError, EvalWorkRequest, PreviewQuality};
 use terra_core::heightfield::{Heightfield, HeightfieldMetrics};
 use terra_core::layer::{LayerId, LayerKind};
 use terra_core::mask::bake_mask_assets;
+use terra_gpu::GpuError;
 
 use super::{quality_stage_progress, TerraApp};
 
@@ -114,7 +116,7 @@ impl TerraApp {
         let mark_all_dirty = std::mem::take(&mut self.worker_mark_all_dirty);
         let dirty_from = self.worker_dirty_from.take();
 
-        self.eval_worker.submit(EvalWorkRequest {
+        let request = EvalWorkRequest {
             token: self.eval_token,
             quality,
             stack: preview_stack,
@@ -132,9 +134,54 @@ impl TerraApp {
             mask_reference: self.scheduler.last_good.clone(),
             mark_all_dirty,
             dirty_from,
-        });
-        self.worker_refine_pending = true;
-        self.ui_state.refining = true;
+        };
+        match self.eval_worker.submit(request) {
+            Ok(()) => {
+                self.worker_refine_pending = true;
+                self.ui_state.refining = true;
+            }
+            Err(error) => {
+                self.worker_mark_all_dirty |= mark_all_dirty;
+                if self.worker_dirty_from.is_none() {
+                    self.worker_dirty_from = dirty_from;
+                }
+                self.handle_evaluation_failure(
+                    self.eval_token,
+                    quality,
+                    format!("evaluation worker submission failed: {error}"),
+                );
+            }
+        }
+    }
+
+    pub(crate) fn evaluation_log_context(&self, token: u64, quality: PreviewQuality) -> String {
+        let current = token == self.eval_token;
+        OperationContext::evaluation(token, quality)
+            .with_layer(
+                current
+                    .then_some(self.ui_state.refining_layer_name.as_deref())
+                    .flatten(),
+            )
+            .with_project_path(current.then_some(self.project_path.as_deref()).flatten())
+            .to_string()
+    }
+
+    pub(crate) fn handle_evaluation_failure(
+        &mut self,
+        token: u64,
+        quality: PreviewQuality,
+        message: impl std::fmt::Display,
+    ) {
+        let context = self.evaluation_log_context(token, quality);
+        log::error!(target: "terra_app::evaluation", "{message}; {context}");
+        if token != self.eval_token {
+            return;
+        }
+        self.worker_refine_pending = false;
+        self.ui_state.refining = false;
+        self.ui_state.build_progress = None;
+        self.ui_state.refining_layer_name = None;
+        self.ui_state.status = "Terrain evaluation failed; see log for details".into();
     }
 
     pub(crate) fn queue_final_tile_uploads(&mut self) {
@@ -461,6 +508,7 @@ impl TerraApp {
             halo: base.halo,
         };
         let token = self.eval_token;
+        let operation_context = self.evaluation_log_context(token, quality);
         // Interactive evaluation must never force a GPU readback/Wait on the UI thread.
         let want_cpu = false;
 
@@ -659,7 +707,17 @@ impl TerraApp {
                                         used_gpu = true;
                                         eval_completed = true;
                                     }
-                                    Err(_) => {
+                                    Err(error) => {
+                                        match error {
+                                            EvalError::Cancelled => log::debug!(
+                                                target: "terra_app::evaluation",
+                                                "hybrid CPU suffix cancelled; {operation_context}"
+                                            ),
+                                            error => log::error!(
+                                                target: "terra_app::evaluation",
+                                                "hybrid CPU suffix failed: {error}; {operation_context}"
+                                            ),
+                                        }
                                         used_gpu = true;
                                         eval_completed = true;
                                         if !self.worker_refine_pending {
@@ -701,7 +759,17 @@ impl TerraApp {
                             }
                         }
                     }
-                    Err(_) => {
+                    Err(error) => {
+                        match &error {
+                            GpuError::RequiresCpu => log::debug!(
+                                target: "terra_app::evaluation",
+                                "GPU path requires CPU fallback; {operation_context}"
+                            ),
+                            GpuError::Wgpu(_) => log::error!(
+                                target: "terra_app::evaluation",
+                                "GPU evaluation failed: {error}; {operation_context}"
+                            ),
+                        }
                         // GPU path failed — async CPU, keep last-good on screen.
                         self.last_eval_fully_gpu = false;
                         self.ui_state.profile.path = "async CPU";
@@ -1003,6 +1071,7 @@ impl TerraApp {
 mod tests {
     use std::sync::Arc;
 
+    use terra_core::eval::PreviewQuality;
     use terra_core::heightfield::{Heightfield, HeightfieldMetrics};
     use terra_core::layer::{Layer, LayerKind, LayerStack, StreamPowerParams};
 
@@ -1077,5 +1146,47 @@ mod tests {
             ),
             "the viewport must retain last-good until the worker result is consumed"
         );
+    }
+
+    #[test]
+    fn current_worker_failure_clears_pending_state_and_preserves_last_good() {
+        let mut app = TerraApp::default();
+        app.eval_token = 23;
+        app.worker_refine_pending = true;
+        app.ui_state.refining = true;
+        app.ui_state.build_progress = Some(0.5);
+        app.ui_state.refining_layer_name = Some("Hydraulic Erosion".into());
+        let last_good = Arc::new(Heightfield::filled(
+            HeightfieldMetrics::new(8, 8, 80.0, 80.0),
+            12.0,
+        ));
+        app.scheduler.last_good = Some(Arc::clone(&last_good));
+
+        app.handle_evaluation_failure(23, PreviewQuality::Full, "synthetic worker failure");
+
+        assert!(!app.worker_refine_pending);
+        assert!(!app.ui_state.refining);
+        assert_eq!(app.ui_state.build_progress, None);
+        assert_eq!(app.ui_state.refining_layer_name, None);
+        assert!(app.ui_state.status.contains("see log"));
+        assert!(Arc::ptr_eq(
+            app.scheduler.last_good.as_ref().expect("last good"),
+            &last_good
+        ));
+    }
+
+    #[test]
+    fn stale_worker_failure_does_not_cancel_current_generation() {
+        let mut app = TerraApp::default();
+        app.eval_token = 31;
+        app.worker_refine_pending = true;
+        app.ui_state.refining = true;
+        app.ui_state.build_progress = Some(0.25);
+
+        app.handle_evaluation_failure(30, PreviewQuality::Draft, "stale failure");
+
+        assert!(app.worker_refine_pending);
+        assert!(app.ui_state.refining);
+        assert_eq!(app.ui_state.build_progress, Some(0.25));
     }
 }

@@ -8,8 +8,8 @@ fn main() {
         std::process::exit(exit_code);
     }
 
+    let _logging = terra_app::logging::init();
     harden_gpu_env();
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let event_loop = EventLoop::new().expect("event loop");
     // Wait on OS events; about_to_wait arms WaitUntil only while refining.

@@ -35,6 +35,31 @@ Keep domain content (layer kinds, presets, archetypes) in `terra-core` when prac
 - User-facing guides live under `docs/` (workflow, creating terrain, editor overview); the root [README](README.md) lists them.
 - Prefer updating those guides when authoring UX changes; keep algorithm internals in code comments or module docs rather than new algorithm guides.
 
+## Logs and diagnostics
+
+Terra writes the same filtered records to an attached console and to a persistent
+per-user log. On Windows, logs are under `%LOCALAPPDATA%\Terra\logs`; other
+platforms use the local data directory reported by the operating system. The
+current file is `terra_rCURRENT.log`.
+
+Log files rotate at 5 MiB. Terra retains the current file and five rotated files,
+bounding normal log storage to approximately 30 MiB. If the directory or file
+cannot be created, Terra reports the problem to the console and continues with
+console-only logging.
+
+The default filter is `info`. Set `RUST_LOG` before launch to change it without
+recompiling, for example in PowerShell:
+
+```powershell
+$env:RUST_LOG = "terra_core=debug,terra_render=warn,terra_app=debug"
+cargo run -p terra-app
+```
+
+For a useful bug report, include the Terra version, OS and GPU, reproduction
+steps, the current log and any adjacent rotated log that covers the failure.
+Include the evaluation token, quality, layer, and project involved when known.
+Logs can contain local project paths, so review them before sharing publicly.
+
 ## License
 
 By contributing, you agree that your contributions are licensed under the MIT License, as described in [LICENSE](LICENSE).

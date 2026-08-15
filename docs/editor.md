@@ -45,6 +45,12 @@ Projects are JSON documents. See [Creating terrain](creating-terrain.md) for a f
 
 Terra evaluates progressively. The viewport may lag or show approximate results while a build is running. Use the bottom dock status and **View → Profiler** when diagnosing sluggish frames.
 
+If a build fails or remains incomplete, check Terra's persistent log. On Windows
+it is stored under `%LOCALAPPDATA%\Terra\logs` as `terra_rCURRENT.log`; the exact
+path is also printed during startup. Terra keeps five rotated 5 MiB files in
+addition to the current file. Set `RUST_LOG=debug` before launch for more detail.
+If file logging is unavailable, Terra continues with console-only diagnostics.
+
 ## Export
 
 Export packaging (height PNG/meta, raw, masks, splats, normals, and related outputs) is wired through `terra-io` but is **not ready for production**. Treat the Export panel as experimental scaffolding.

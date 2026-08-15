@@ -19,7 +19,7 @@ wgpu = { workspace = true }
 winit = { workspace = true }
 glam = { workspace = true }
 pollster = { workspace = true }
-env_logger = { workspace = true }
+flexi_logger = { workspace = true }
 log = { workspace = true }
 profiling = { workspace = true }
 serde = { workspace = true }

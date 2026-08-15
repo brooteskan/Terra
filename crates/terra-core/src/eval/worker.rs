@@ -46,6 +46,35 @@ pub struct EvalWorkResult {
     pub layer_timings: Vec<super::LayerEvalTiming>,
 }
 
+#[derive(Debug)]
+pub struct EvalWorkFailure {
+    pub token: u64,
+    pub quality: PreviewQuality,
+    pub error: EvalError,
+}
+
+#[derive(Debug)]
+pub enum EvalWorkerEvent {
+    Completed(EvalWorkResult),
+    Failed(EvalWorkFailure),
+    /// The worker result channel closed, normally because its thread terminated.
+    Disconnected,
+}
+
+impl EvalWorkerEvent {
+    fn token(&self) -> Option<u64> {
+        match self {
+            Self::Completed(result) => Some(result.token),
+            Self::Failed(failure) => Some(failure.token),
+            Self::Disconnected => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("evaluation worker is disconnected")]
+pub struct EvalWorkerSubmitError;
+
 enum WorkerMsg {
     Job(EvalWorkRequest),
     Shutdown,
@@ -54,18 +83,19 @@ enum WorkerMsg {
 /// Owns a dedicated thread with its own [`StackEvaluator`] and layer cache.
 pub struct EvalWorker {
     tx: Sender<WorkerMsg>,
-    rx: Receiver<EvalWorkResult>,
+    rx: Receiver<EvalWorkerEvent>,
     /// Shared cancel / generation id — worker skips jobs with older tokens.
     pub current_token: Arc<AtomicU64>,
     _handle: JoinHandle<()>,
     /// True while a job may still be running (best-effort).
     pub busy: bool,
+    disconnected_reported: bool,
 }
 
 impl EvalWorker {
     pub fn spawn() -> Self {
         let (job_tx, job_rx) = mpsc::channel::<WorkerMsg>();
-        let (result_tx, result_rx) = mpsc::channel::<EvalWorkResult>();
+        let (result_tx, result_rx) = mpsc::channel::<EvalWorkerEvent>();
         let current_token = Arc::new(AtomicU64::new(0));
         let token_flag = Arc::clone(&current_token);
 
@@ -81,13 +111,12 @@ impl EvalWorker {
                             if job.token != live {
                                 continue;
                             }
-                            match run_cpu_job(&mut evaluator, &job, &token_flag) {
-                                Ok(result) => {
-                                    let _ = result_tx.send(result);
-                                }
-                                Err(EvalError::Cancelled) => {}
-                                Err(_) => {}
-                            }
+                            publish_job_result(
+                                &result_tx,
+                                job.token,
+                                job.quality,
+                                run_cpu_job(&mut evaluator, &job, &token_flag),
+                            );
                         }
                     }
                 }
@@ -100,6 +129,7 @@ impl EvalWorker {
             current_token,
             _handle: handle,
             busy: false,
+            disconnected_reported: false,
         }
     }
 
@@ -107,38 +137,60 @@ impl EvalWorker {
         self.current_token.store(token, Ordering::Release);
     }
 
-    pub fn submit(&mut self, request: EvalWorkRequest) {
+    pub fn submit(&mut self, request: EvalWorkRequest) -> Result<(), EvalWorkerSubmitError> {
         self.set_token(request.token);
+        self.tx
+            .send(WorkerMsg::Job(request))
+            .map_err(|_| EvalWorkerSubmitError)?;
         self.busy = true;
-        let _ = self.tx.send(WorkerMsg::Job(request));
+        Ok(())
     }
 
-    /// Non-blocking poll for the newest completed result matching `token`.
-    pub fn try_recv_matching(&mut self, token: u64) -> Option<EvalWorkResult> {
-        let mut latest = None;
-        loop {
-            match self.rx.try_recv() {
-                Ok(result) => {
-                    if result.token == token {
-                        latest = Some(result);
-                    }
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
+    /// Non-blocking poll for one worker event.
+    ///
+    /// Disconnection is emitted once so a UI polling loop cannot flood logs.
+    pub fn try_recv_event(&mut self) -> Option<EvalWorkerEvent> {
+        match self.rx.try_recv() {
+            Ok(event) => {
+                if event
+                    .token()
+                    .is_some_and(|token| token == self.current_token.load(Ordering::Acquire))
+                {
                     self.busy = false;
-                    break;
                 }
+                Some(event)
             }
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) if !self.disconnected_reported => {
+                self.busy = false;
+                self.disconnected_reported = true;
+                Some(EvalWorkerEvent::Disconnected)
+            }
+            Err(TryRecvError::Disconnected) => None,
         }
-        if latest.is_some() {
-            self.busy = false;
-        }
-        latest
     }
 
     pub fn shutdown(&self) {
         let _ = self.tx.send(WorkerMsg::Shutdown);
     }
+}
+
+fn publish_job_result(
+    result_tx: &Sender<EvalWorkerEvent>,
+    token: u64,
+    quality: PreviewQuality,
+    result: Result<EvalWorkResult, EvalError>,
+) {
+    let event = match result {
+        Ok(result) => EvalWorkerEvent::Completed(result),
+        Err(EvalError::Cancelled) => return,
+        Err(error) => EvalWorkerEvent::Failed(EvalWorkFailure {
+            token,
+            quality,
+            error,
+        }),
+    };
+    let _ = result_tx.send(event);
 }
 
 impl Drop for EvalWorker {
@@ -258,26 +310,36 @@ mod tests {
             LayerKind::Flat(FlatParams { height: 12.0 }),
         ));
         let token = 1;
-        worker.submit(EvalWorkRequest {
-            token,
-            quality: PreviewQuality::Draft,
-            stack,
-            masks: Vec::new(),
-            base_metrics: HeightfieldMetrics::preview_default(),
-            level_steps: crate::analyze::LevelStepSettings::default(),
-            preview_res: 256,
-            export_res: 1024,
-            aux: HashMap::new(),
-            strata: None,
-            mask_reference: None,
-            dirty_from: None,
-            mark_all_dirty: true,
-        });
+        worker
+            .submit(EvalWorkRequest {
+                token,
+                quality: PreviewQuality::Draft,
+                stack,
+                masks: Vec::new(),
+                base_metrics: HeightfieldMetrics::preview_default(),
+                level_steps: crate::analyze::LevelStepSettings::default(),
+                preview_res: 256,
+                export_res: 1024,
+                aux: HashMap::new(),
+                strata: None,
+                mask_reference: None,
+                dirty_from: None,
+                mark_all_dirty: true,
+            })
+            .expect("submit worker job");
         let mut result = None;
         for _ in 0..200 {
-            if let Some(r) = worker.try_recv_matching(token) {
-                result = Some(r);
-                break;
+            if let Some(event) = worker.try_recv_event() {
+                match event {
+                    EvalWorkerEvent::Completed(r) if r.token == token => {
+                        result = Some(r);
+                        break;
+                    }
+                    EvalWorkerEvent::Failed(failure) => {
+                        panic!("worker failed unexpectedly: {}", failure.error)
+                    }
+                    EvalWorkerEvent::Completed(_) | EvalWorkerEvent::Disconnected => {}
+                }
             }
             thread::sleep(std::time::Duration::from_millis(5));
         }
@@ -324,26 +386,36 @@ mod tests {
 
         let mut worker = EvalWorker::spawn();
         let token = 2;
-        worker.submit(EvalWorkRequest {
-            token,
-            quality: PreviewQuality::Full,
-            stack,
-            masks: vec![asset],
-            base_metrics: metrics,
-            level_steps: crate::analyze::LevelStepSettings::default(),
-            preview_res: 32,
-            export_res: 32,
-            aux: HashMap::new(),
-            strata: None,
-            mask_reference: Some(std::sync::Arc::new(reference)),
-            dirty_from: None,
-            mark_all_dirty: true,
-        });
+        worker
+            .submit(EvalWorkRequest {
+                token,
+                quality: PreviewQuality::Full,
+                stack,
+                masks: vec![asset],
+                base_metrics: metrics,
+                level_steps: crate::analyze::LevelStepSettings::default(),
+                preview_res: 32,
+                export_res: 32,
+                aux: HashMap::new(),
+                strata: None,
+                mask_reference: Some(std::sync::Arc::new(reference)),
+                dirty_from: None,
+                mark_all_dirty: true,
+            })
+            .expect("submit worker job");
         let mut result = None;
         for _ in 0..400 {
-            if let Some(r) = worker.try_recv_matching(token) {
-                result = Some(r);
-                break;
+            if let Some(event) = worker.try_recv_event() {
+                match event {
+                    EvalWorkerEvent::Completed(r) if r.token == token => {
+                        result = Some(r);
+                        break;
+                    }
+                    EvalWorkerEvent::Failed(failure) => {
+                        panic!("worker failed unexpectedly: {}", failure.error)
+                    }
+                    EvalWorkerEvent::Completed(_) | EvalWorkerEvent::Disconnected => {}
+                }
             }
             thread::sleep(std::time::Duration::from_millis(5));
         }
@@ -409,5 +481,64 @@ mod tests {
         assert!(ctx.check_cancelled().is_ok());
         generation.store(12, Ordering::Release);
         assert!(matches!(ctx.check_cancelled(), Err(EvalError::Cancelled)));
+    }
+
+    #[test]
+    fn non_cancellation_error_becomes_a_contextual_failure_event() {
+        let (tx, rx) = mpsc::channel();
+        publish_job_result(
+            &tx,
+            17,
+            PreviewQuality::Medium,
+            Err(EvalError::Io("broken input".into())),
+        );
+        let event = rx.try_recv().expect("failure event");
+        let EvalWorkerEvent::Failed(failure) = event else {
+            panic!("expected failure event");
+        };
+        assert_eq!(failure.token, 17);
+        assert_eq!(failure.quality, PreviewQuality::Medium);
+        assert!(failure.error.to_string().contains("broken input"));
+    }
+
+    #[test]
+    fn cancellation_does_not_become_a_failure_event() {
+        let (tx, rx) = mpsc::channel();
+        publish_job_result(&tx, 18, PreviewQuality::Draft, Err(EvalError::Cancelled));
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn disconnection_is_reported_only_once_and_rejects_new_work() {
+        let mut worker = EvalWorker::spawn();
+        worker.shutdown();
+        let mut disconnected = false;
+        for _ in 0..200 {
+            if matches!(worker.try_recv_event(), Some(EvalWorkerEvent::Disconnected)) {
+                disconnected = true;
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(disconnected, "worker should report result-channel closure");
+        assert!(worker.try_recv_event().is_none());
+
+        let request = EvalWorkRequest {
+            token: 19,
+            quality: PreviewQuality::Draft,
+            stack: LayerStack::new(),
+            masks: Vec::new(),
+            base_metrics: HeightfieldMetrics::preview_default(),
+            level_steps: crate::analyze::LevelStepSettings::default(),
+            preview_res: 256,
+            export_res: 1024,
+            aux: HashMap::new(),
+            strata: None,
+            mask_reference: None,
+            dirty_from: None,
+            mark_all_dirty: true,
+        };
+        assert_eq!(worker.submit(request), Err(EvalWorkerSubmitError));
+        assert!(!worker.busy);
     }
 }
