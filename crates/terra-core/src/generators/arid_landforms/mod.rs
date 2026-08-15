@@ -17,13 +17,13 @@
 //! Cordonnier / Génevaux drainage-driven landforms.
 
 use super::EffectFilterParams;
-use crate::analyze::StreamPowerParams;
 use crate::geomorph::{
     accumulate_drainage_area, build_flow_graph, extract_streams, handle_depressions,
     profile_curvature, ridge_valley_likelihood, slope_magnitude, DepressionMode, FlowModel,
     Precipitation, StreamExtractParams,
 };
 use crate::heightfield::Heightfield;
+use crate::hydro::StreamPowerParams;
 use crate::mask::MaskField;
 use crate::noise;
 use crate::noise::{FractalNoiseType, WorleyMetric};

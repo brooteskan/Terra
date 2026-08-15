@@ -1,25 +1,268 @@
 //! Legacy layer parameter paths remain aliases of their canonical owners.
 
+macro_rules! assert_same_type {
+    ($canonical:path, $legacy:path) => {{
+        fn coerce(value: $canonical) -> $legacy {
+            value
+        }
+        let _ = coerce as fn($canonical) -> $legacy;
+    }};
+}
+
 #[test]
 fn legacy_layer_parameter_paths_name_the_canonical_types() {
-    let erosion = terra_core::analyze::HydraulicErosionParams::default();
-    let _: terra_core::layer::HydraulicErosionParams = erosion;
+    assert_same_type!(terra_core::mask_types::MaskId, terra_core::mask::MaskId);
+    assert_same_type!(terra_core::mask_types::MaskRef, terra_core::mask::MaskRef);
+    assert_same_type!(
+        terra_core::mask_types::MaskSource,
+        terra_core::mask::MaskSource
+    );
+    assert_same_type!(
+        terra_core::mask_field::MaskField,
+        terra_core::mask::MaskField
+    );
+    assert_same_type!(
+        terra_core::invalidation::DirtyClass,
+        terra_core::tiling::DirtyClass
+    );
+    assert_same_type!(
+        terra_core::layer::ApplyWhere,
+        terra_core::operation_placement::ApplyWhere
+    );
+    assert_same_type!(
+        terra_core::layer::OperationPlacement,
+        terra_core::operation_placement::OperationPlacement
+    );
+    assert_same_type!(
+        terra_core::layer::DevelopCategory,
+        terra_core::operation_placement::DevelopCategory
+    );
 
-    let stream_power = terra_core::analyze::StreamPowerParams::default();
-    let _: terra_core::layer::StreamPowerParams = stream_power;
+    assert_same_type!(
+        terra_core::noise::NoiseParams,
+        terra_core::layer::NoiseParams
+    );
+    assert_same_type!(
+        terra_core::noise::WorleyParams,
+        terra_core::layer::WorleyParams
+    );
+    assert_same_type!(
+        terra_core::noise::WorleyMetric,
+        terra_core::layer::WorleyMetric
+    );
+    assert_same_type!(
+        terra_core::noise::WorleyFeature,
+        terra_core::layer::WorleyFeature
+    );
+    assert_same_type!(
+        terra_core::noise::FractalNoiseType,
+        terra_core::layer::FractalNoiseType
+    );
 
-    let river = terra_core::hydro::RiverCarveParams::default();
-    let _: terra_core::layer::RiverCarveParams = river;
+    assert_same_type!(
+        terra_core::analyze::TransportModel,
+        terra_core::layer::TransportModel
+    );
+    assert_same_type!(
+        terra_core::analyze::ThermalErosionParams,
+        terra_core::layer::ThermalErosionParams
+    );
+    assert_same_type!(
+        terra_core::analyze::DebrisFlowParams,
+        terra_core::layer::DebrisFlowParams
+    );
+    assert_same_type!(
+        terra_core::analyze::HydraulicErosionParams,
+        terra_core::layer::HydraulicErosionParams
+    );
+    assert_same_type!(
+        terra_core::analyze::MultiScaleAmplifyParams,
+        terra_core::layer::MultiScaleAmplifyParams
+    );
+    assert_same_type!(
+        terra_core::hydro::StreamPowerParams,
+        terra_core::layer::StreamPowerParams
+    );
+    assert_same_type!(
+        terra_core::hydro::RiverCarveParams,
+        terra_core::layer::RiverCarveParams
+    );
 
-    let filter = terra_core::generators::EffectFilterParams::default();
-    let _: terra_core::layer::EffectFilterParams = filter;
+    assert_same_type!(
+        terra_core::generators::BlurParams,
+        terra_core::layer::BlurParams
+    );
+    assert_same_type!(
+        terra_core::generators::EffectFilterKind,
+        terra_core::layer::EffectFilterKind
+    );
+    assert_same_type!(
+        terra_core::generators::EffectFilterParams,
+        terra_core::layer::EffectFilterParams
+    );
+    assert_same_type!(
+        terra_core::generators::SculptParams,
+        terra_core::layer::SculptParams
+    );
+    assert_same_type!(
+        terra_core::generators::FlatParams,
+        terra_core::layer::FlatParams
+    );
+    assert_same_type!(
+        terra_core::generators::RampParams,
+        terra_core::layer::RampParams
+    );
+    assert_same_type!(
+        terra_core::generators::FbmParams,
+        terra_core::layer::FbmParams
+    );
+    assert_same_type!(
+        terra_core::generators::DomainWarpParams,
+        terra_core::layer::DomainWarpParams
+    );
+    assert_same_type!(
+        terra_core::generators::TerraceParams,
+        terra_core::layer::TerraceParams
+    );
+    assert_same_type!(
+        terra_core::generators::PlateauParams,
+        terra_core::layer::PlateauParams
+    );
+    assert_same_type!(
+        terra_core::generators::MesaParams,
+        terra_core::layer::MesaParams
+    );
+    assert_same_type!(
+        terra_core::generators::IslandArchetype,
+        terra_core::layer::IslandArchetype
+    );
+    assert_same_type!(
+        terra_core::generators::IslandParams,
+        terra_core::layer::IslandParams
+    );
+    assert_same_type!(
+        terra_core::generators::MountainParams,
+        terra_core::layer::MountainParams
+    );
+    assert_same_type!(
+        terra_core::generators::VolcanoParams,
+        terra_core::layer::VolcanoParams
+    );
+    assert_same_type!(
+        terra_core::generators::UpliftParams,
+        terra_core::layer::UpliftParams
+    );
+    assert_same_type!(
+        terra_core::generators::DuneParams,
+        terra_core::layer::DuneParams
+    );
+    assert_same_type!(
+        terra_core::generators::CanyonParams,
+        terra_core::layer::CanyonParams
+    );
+    assert_same_type!(
+        terra_core::generators::VoronoiParams,
+        terra_core::layer::VoronoiParams
+    );
+    assert_same_type!(
+        terra_core::generators::ImportHeightmapParams,
+        terra_core::layer::ImportHeightmapParams
+    );
+    assert_same_type!(
+        terra_core::generators::CoastalParams,
+        terra_core::layer::CoastalParams
+    );
+    assert_same_type!(
+        terra_core::generators::RiverNode,
+        terra_core::layer::RiverNode
+    );
+    assert_same_type!(
+        terra_core::generators::RiverNetworkParams,
+        terra_core::layer::RiverNetworkParams
+    );
+    assert_same_type!(
+        terra_core::generators::SandSimParams,
+        terra_core::layer::SandSimParams
+    );
+    assert_same_type!(
+        terra_core::generators::FluidSimParams,
+        terra_core::layer::FluidSimParams
+    );
+    assert_same_type!(
+        terra_core::generators::PathNode,
+        terra_core::layer::PathNode
+    );
+    assert_same_type!(
+        terra_core::generators::PathParams,
+        terra_core::layer::PathParams
+    );
+    assert_same_type!(
+        terra_core::generators::ProceduralGenerator,
+        terra_core::layer::ProceduralGenerator
+    );
+    assert_same_type!(
+        terra_core::generators::ProceduralShapeParams,
+        terra_core::layer::ProceduralShapeParams
+    );
+    assert_same_type!(
+        terra_core::generators::Stamp2dParams,
+        terra_core::layer::Stamp2dParams
+    );
+    assert_same_type!(
+        terra_core::generators::Stamp3dParams,
+        terra_core::layer::Stamp3dParams
+    );
+    assert_same_type!(
+        terra_core::generators::PolygonHeightMode,
+        terra_core::layer::PolygonHeightMode
+    );
+    assert_same_type!(
+        terra_core::generators::PolygonHeightParams,
+        terra_core::layer::PolygonHeightParams
+    );
 
-    let materials = terra_core::material_schema::MaterialsParams::default();
-    let _: terra_core::layer::MaterialsParams = materials;
-
-    let vegetation = terra_core::scatter::VegetationParams::default();
-    let _: terra_core::layer::VegetationParams = vegetation;
-
-    let overhang = terra_core::generators::OverhangStampParams::default();
-    let _: terra_core::layer::OverhangStampParams = overhang;
+    assert_same_type!(
+        terra_core::material_schema::StratumMaterial,
+        terra_core::layer::StratumMaterial
+    );
+    assert_same_type!(
+        terra_core::material_schema::BedGeometry,
+        terra_core::layer::BedGeometry
+    );
+    assert_same_type!(
+        terra_core::material_schema::Stratum,
+        terra_core::layer::Stratum
+    );
+    assert_same_type!(
+        terra_core::material_schema::MaterialsParams,
+        terra_core::layer::MaterialsParams
+    );
+    assert_same_type!(
+        terra_core::material_schema::MaterialRule,
+        terra_core::layer::MaterialRule
+    );
+    assert_same_type!(
+        terra_core::material_schema::ClimateParams,
+        terra_core::layer::ClimateParams
+    );
+    assert_same_type!(
+        terra_core::material_schema::BiomesParams,
+        terra_core::layer::BiomesParams
+    );
+    assert_same_type!(
+        terra_core::material_schema::BiomeBand,
+        terra_core::layer::BiomeBand
+    );
+    assert_same_type!(
+        terra_core::scatter::VegetationParams,
+        terra_core::layer::VegetationParams
+    );
+    assert_same_type!(
+        terra_core::volumetric::OverhangStampParams,
+        terra_core::layer::OverhangStampParams
+    );
+    assert_same_type!(
+        terra_core::volumetric::LocalSdfParams,
+        terra_core::layer::LocalSdfParams
+    );
 }

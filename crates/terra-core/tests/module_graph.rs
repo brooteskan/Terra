@@ -80,7 +80,6 @@ const CYCLIC_EDGES: &[(&str, &str)] = &[
     ("eval", "layer"),
     ("eval", "mask"),
     ("eval", "surface"),
-    ("eval", "volumetric"),
     ("fields", "analyze"),
     ("fields", "generators"),
     ("fields", "mask"),
@@ -93,7 +92,6 @@ const CYCLIC_EDGES: &[(&str, &str)] = &[
     ("generators", "material_schema"),
     ("geomorph", "analyze"),
     ("geomorph", "mask"),
-    ("hydro", "analyze"),
     ("hydro", "fields"),
     ("hydro", "geomorph"),
     ("hydro", "mask"),
@@ -125,8 +123,6 @@ const CYCLIC_EDGES: &[(&str, &str)] = &[
     ("surface", "mask"),
     ("surface", "material_schema"),
     ("surface", "scatter"),
-    ("volumetric", "generators"),
-    ("volumetric", "mask"),
 ];
 
 /// Top-level modules that are outside every cycle at this commit and must stay
@@ -144,6 +140,7 @@ const CLEAN_MODULES: &[&str] = &[
     "landscape_style",
     "matter_sim",
     "mask_types",
+    "mask_field",
     "noise",
     "quality",
     "realism_benchmark",
@@ -154,6 +151,7 @@ const CLEAN_MODULES: &[&str] = &[
     "sparse_paint",
     "terrain",
     "terrain_recipe",
+    "volumetric",
     "world_archetype",
     "world_rules",
 ];

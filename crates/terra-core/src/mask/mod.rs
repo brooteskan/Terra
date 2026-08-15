@@ -3,12 +3,12 @@
 mod bake;
 mod dist_nodes;
 mod distribution;
-mod field;
 mod geom;
 mod ops;
 mod paint;
 mod placement;
 
+pub use crate::mask_field::MaskField;
 pub use crate::mask_types::{MaskId, MaskRef, MaskSource};
 pub use bake::{bake_mask_assets, bake_mask_assets_resolved};
 pub use dist_nodes::{
@@ -18,7 +18,6 @@ pub use dist_nodes::{
 pub use distribution::{
     bake_distribution, bake_distribution_with_context, Distribution, DistributionEntry, MaskCombine,
 };
-pub use field::MaskField;
 pub use geom::{dist_point_segment, point_in_polygon};
 pub use ops::{apply_mask_ops, MaskOp};
 pub use paint::{MaskPaintTool, PaintBuffer, PaintStroke};

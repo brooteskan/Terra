@@ -5,13 +5,11 @@
 //! Phase I adds Schott-adapted multi-scale amplify on the same `SimLevel` schedule.
 
 use crate::heightfield::{FloatArena, Heightfield, HeightfieldMetrics};
-use crate::hydro;
+use crate::hydro::{self, StreamPowerParams};
 use crate::mask::MaskField;
 use std::cell::RefCell;
 
-use super::{
-    HydraulicErosionParams, MultiScaleAmplifyParams, StreamPowerParams, ThermalErosionParams,
-};
+use super::{HydraulicErosionParams, MultiScaleAmplifyParams, ThermalErosionParams};
 
 thread_local! {
     static DOWNSAMPLE_ARENA: RefCell<FloatArena> = RefCell::new(FloatArena::new());

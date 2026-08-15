@@ -16,8 +16,8 @@ pub use hydro_params::{
     CoastalParams, FluidSimParams, RiverNetworkParams, RiverNode, SandSimParams,
 };
 pub use shape_params::{
-    LocalSdfParams, OverhangStampParams, PathNode, PathParams, PolygonHeightMode,
-    PolygonHeightParams, ProceduralGenerator, ProceduralShapeParams, Stamp2dParams, Stamp3dParams,
+    PathNode, PathParams, PolygonHeightMode, PolygonHeightParams, ProceduralGenerator,
+    ProceduralShapeParams, Stamp2dParams, Stamp3dParams,
 };
 pub use terrain_params::{
     CanyonParams, DomainWarpParams, DuneParams, FbmParams, ImportHeightmapParams, IslandArchetype,

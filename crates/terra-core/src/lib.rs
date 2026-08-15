@@ -29,6 +29,7 @@ pub mod landscape_evolution;
 pub mod landscape_style;
 pub mod layer;
 pub mod mask;
+pub mod mask_field;
 pub mod mask_types;
 pub mod material_schema;
 pub mod matter_sim;

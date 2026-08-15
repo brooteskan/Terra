@@ -4,12 +4,14 @@
 //! evolution, thermal / debris, materials strata). They never bake unique
 //! hardcoded generators per look.
 
-use crate::authoring::{GeomorphicDetailParams, LandscapeEvolutionParams};
-use crate::landscape_evolution::EvolutionSolverMode;
-use crate::layer::{
-    DebrisFlowParams, HydraulicErosionParams, MaterialsParams, MultiScaleAmplifyParams,
-    StreamPowerParams, ThermalErosionParams, UpliftParams,
+use crate::analyze::{
+    DebrisFlowParams, HydraulicErosionParams, MultiScaleAmplifyParams, ThermalErosionParams,
 };
+use crate::authoring::{GeomorphicDetailParams, LandscapeEvolutionParams};
+use crate::generators::UpliftParams;
+use crate::hydro::StreamPowerParams;
+use crate::landscape_evolution::EvolutionSolverMode;
+use crate::material_schema::MaterialsParams;
 
 /// Named landscape look built from shared process parameters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

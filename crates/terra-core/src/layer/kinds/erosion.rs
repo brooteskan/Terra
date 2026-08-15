@@ -1,6 +1,6 @@
 //! Compatibility re-exports for erosion parameter vocabulary.
 
 pub use crate::analyze::{
-    DebrisFlowParams, HydraulicErosionParams, MultiScaleAmplifyParams, StreamPowerParams,
-    ThermalErosionParams, TransportModel,
+    DebrisFlowParams, HydraulicErosionParams, MultiScaleAmplifyParams, ThermalErosionParams,
+    TransportModel,
 };

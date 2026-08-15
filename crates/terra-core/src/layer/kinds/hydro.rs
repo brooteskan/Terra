@@ -3,4 +3,4 @@
 pub use crate::generators::{
     CoastalParams, FluidSimParams, RiverNetworkParams, RiverNode, SandSimParams,
 };
-pub use crate::hydro::RiverCarveParams;
+pub use crate::hydro::{RiverCarveParams, StreamPowerParams};

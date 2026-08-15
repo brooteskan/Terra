@@ -4,9 +4,12 @@
 //! **dual-height** representation: a carved floor DEM plus a ceiling aux map, limited to a
 //! UV region / falloff. A lightweight triangle proxy visualizes the overhang / cave roof.
 
-use crate::generators::{LocalSdfParams, OverhangStampParams};
+mod params;
+
+pub use params::{LocalSdfParams, OverhangStampParams};
+
 use crate::heightfield::Heightfield;
-use crate::mask::MaskField;
+use crate::mask_field::MaskField;
 use crate::noise::{canonical_seed32, value_noise2};
 
 /// Result of an opt-in volumetric stamp: carved floor + ceiling dual-height + region mask.
@@ -406,8 +409,8 @@ fn push_quad(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::{LocalSdfParams, OverhangStampParams};
     use crate::heightfield::HeightfieldMetrics;
-    use crate::layer::{LocalSdfParams, OverhangStampParams};
 
     fn cliff_plateau(res: u32) -> Heightfield {
         let m = HeightfieldMetrics::new(res, res, res as f32 * 2.0, res as f32 * 2.0);

@@ -7,11 +7,10 @@
 
 mod params;
 
-pub use params::RiverCarveParams;
+pub use params::{RiverCarveParams, StreamPowerParams};
 
 use std::collections::VecDeque;
 
-use crate::analyze::StreamPowerParams;
 use crate::fields::erodibility_at_strata_depth;
 use crate::geomorph::{
     accumulate_drainage_area, accumulate_drainage_area_d8, build_flow_graph, priority_flood_fill,
@@ -325,7 +324,7 @@ fn max_local_slope(hf: &Heightfield, i: u32, j: u32) -> f32 {
 ///   `slope * ((dx + dz) / 2) * 4.0`, then `80.0`.
 ///
 /// The two K's are therefore not interchangeable — see the notes on
-/// [`crate::analyze::StreamPowerParams`] and
+/// [`StreamPowerParams`] and
 /// [`crate::landscape_evolution::LandscapeEvolutionParams`]. The Tzathas analytical
 /// solver and the mass-wasting fluvial term are separate cited models that do not
 /// route through here; the GPU shader is a declared approximation (station C1).

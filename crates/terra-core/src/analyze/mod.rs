@@ -39,8 +39,8 @@ pub use mass_wasting::{
 };
 pub use metrics::*;
 pub use params::{
-    DebrisFlowParams, HydraulicErosionParams, MultiScaleAmplifyParams, StreamPowerParams,
-    ThermalErosionParams, TransportModel,
+    DebrisFlowParams, HydraulicErosionParams, MultiScaleAmplifyParams, ThermalErosionParams,
+    TransportModel,
 };
 pub use terrain_amplification::{
     amplify_terrain, AmplificationBands, TerrainAmplificationParams, TerrainAmplificationResult,

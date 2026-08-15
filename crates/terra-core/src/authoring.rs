@@ -4,10 +4,9 @@
 //! with semantic strokes, constraints and reconstruction. Authoring data stays
 //! resolution independent; only evaluation rasterizes it.
 
-use crate::analyze::StreamPowerParams;
 use crate::fields::keys;
 use crate::heightfield::Heightfield;
-use crate::hydro;
+use crate::hydro::{self, StreamPowerParams};
 use crate::mask::{MaskField, MaskSource};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
