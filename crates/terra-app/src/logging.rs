@@ -36,7 +36,7 @@ impl LoggingGuard {
 /// Initialize console + rotating file logging, degrading to console-only on failure.
 pub fn init() -> LoggingGuard {
     let mut startup_warning = None;
-    let file_logger = match prepare_log_destination(resolve_log_directory()) {
+    let file_logger = match prepare_log_destination(log_directory()) {
         LogDestination::File(directory) => start_file_logger(&directory)
             .map(|(handle, filter_warning)| {
                 startup_warning = filter_warning;
@@ -100,7 +100,8 @@ pub fn init() -> LoggingGuard {
     }
 }
 
-fn resolve_log_directory() -> Result<PathBuf, String> {
+/// Return the directory where Terra writes its rotating application logs.
+pub fn log_directory() -> Result<PathBuf, String> {
     directories::BaseDirs::new()
         .map(|dirs| log_directory_from_local_data(dirs.data_local_dir()))
         .ok_or_else(|| "per-user local application-data directory is unavailable".to_string())

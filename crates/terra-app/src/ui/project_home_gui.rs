@@ -37,6 +37,8 @@ pub struct ProjectHomeGuiState {
 pub enum ProjectHomeAction {
     New,
     Open,
+    /// Open Terra's persistent application-log directory.
+    OpenLogs,
     /// Folder picker â†’ open a project found inside.
     Browse,
     OpenPath(PathBuf),
@@ -492,7 +494,26 @@ pub fn draw_project_home(
     let foot_w = content_w.min(780.0);
     let foot_x = (ui.screen_w - foot_w) * 0.5;
     // Only honest, wired actions â€” Settings / Recover stubs removed from the footer.
-    let browse = Rect::from_pos_size(foot_x, footer_y + 14.0, foot_w, 60.0);
+    let footer_gap = 16.0;
+    let footer_item_w = (foot_w - footer_gap) * 0.5;
+    let logs = Rect::from_pos_size(foot_x, footer_y + 14.0, footer_item_w, 60.0);
+    if draw_footer_item(
+        ui,
+        Id::new("home_foot_logs"),
+        logs,
+        Icon::ScrollText,
+        "Open Logs",
+        "View diagnostic log files",
+    ) {
+        actions.push(ProjectHomeAction::OpenLogs);
+    }
+
+    let browse = Rect::from_pos_size(
+        foot_x + footer_item_w + footer_gap,
+        footer_y + 14.0,
+        footer_item_w,
+        60.0,
+    );
     if draw_footer_item(
         ui,
         Id::new("home_foot_browse"),

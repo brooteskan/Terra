@@ -1,4 +1,6 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+#[cfg(any(target_os = "windows", target_os = "macos", unix))]
+use std::process::Command;
 
 use crate::ui::{
     project_template_by_id, resolve_workspace_command, CommandId, NewWorldSettings,
@@ -12,6 +14,27 @@ use super::{
     project_name_from_path, save_project_prefs, AppScreen, PendingProjectAction, TerraApp,
 };
 use terra_core::eval::PreviewQuality;
+
+#[cfg(any(target_os = "windows", target_os = "macos", unix))]
+fn open_directory(path: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "windows")]
+    let program = "explorer.exe";
+    #[cfg(target_os = "macos")]
+    let program = "open";
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let program = "xdg-open";
+
+    Command::new(program).arg(path).spawn().map(|_| ())
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos", unix)))]
+fn open_directory(_path: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "opening directories is unsupported on this platform",
+    ))
+}
+
 impl TerraApp {
     pub(crate) fn poll_project_io(&mut self) {
         self.project_io.poll();
@@ -434,6 +457,9 @@ impl TerraApp {
                     self.project_home.notice = None;
                     self.request_project_action(PendingProjectAction::Open);
                 }
+                ProjectHomeAction::OpenLogs => {
+                    self.open_logs_folder();
+                }
                 ProjectHomeAction::Browse => {
                     self.project_home.notice = None;
                     self.browse_projects_folder();
@@ -447,6 +473,41 @@ impl TerraApp {
                     save_project_prefs(&self.project_prefs);
                 }
             }
+        }
+    }
+
+    pub(crate) fn open_logs_folder(&mut self) {
+        self.project_home.notice = None;
+        let result = crate::logging::log_directory().and_then(|directory| {
+            std::fs::create_dir_all(&directory).map_err(|error| {
+                format!(
+                    "could not create log directory {}: {error}",
+                    directory.display()
+                )
+            })?;
+            open_directory(&directory).map_err(|error| {
+                format!(
+                    "could not open log directory {}: {error}",
+                    directory.display()
+                )
+            })?;
+            log::info!("opened log directory: {}", directory.display());
+            Ok(directory)
+        });
+
+        match result {
+            Ok(directory) => {
+                self.project_home.notice =
+                    Some(format!("Opened log folder: {}", directory.display()));
+            }
+            Err(error) => {
+                log::error!("{error}");
+                self.project_home.notice = Some(format!("Could not open logs: {error}"));
+                self.ui_state.status = error;
+            }
+        }
+        if let Some(window) = &self.window {
+            window.request_redraw();
         }
     }
 
