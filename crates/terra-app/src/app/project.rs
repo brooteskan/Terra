@@ -810,7 +810,7 @@ impl TerraApp {
 mod tests {
     use super::*;
     use terra_core::{FieldId, Heightfield, HeightfieldMetrics, TerrainTileKey};
-    use terra_gpu::GpuTileAtlas;
+    use terra_gpu::{GpuPageTableEntry, GpuTileAtlas};
     use terra_render::{GpuContext, TerrainRenderer};
 
     #[test]
@@ -939,6 +939,13 @@ mod tests {
             .as_ref()
             .expect("renderer")
             .tile_stream_enabled());
+        assert!(
+            atlas
+                .read_page_table_blocking(&gpu.device, &gpu.queue)
+                .iter()
+                .all(|entry| entry.valid == 0),
+            "reset must leave the GPU page table fully invalid"
+        );
 
         app.last_height = Some(Heightfield::filled(metrics, 2.0));
         app.queue_final_tile_uploads();
@@ -966,11 +973,7 @@ mod tests {
         assert_eq!(new_handle.slot, old_handle.slot);
         assert_ne!(new_handle.generation, old_handle.generation);
         assert_eq!(atlas.residency().resolve_handle(old_handle), None);
-        assert!(app
-            .renderer
-            .as_ref()
-            .expect("renderer")
-            .tile_stream_enabled());
+        assert_single_live_page_at_current_revision(&app, &new_key);
     }
 
     /// Prime an app with a single streamed page resident at the current output
@@ -1023,11 +1026,11 @@ mod tests {
             .expect("atlas")
             .lookup(&key)
             .expect("page resident");
-        assert!(app
-            .renderer
-            .as_ref()
-            .expect("renderer")
-            .tile_stream_enabled());
+        let entry = assert_single_live_page_at_current_revision(&app, &key);
+        assert_eq!(
+            entry.generation, handle.generation,
+            "page table records the seeded handle's generation"
+        );
         (app, metrics, key, handle)
     }
 
@@ -1050,6 +1053,162 @@ mod tests {
             .as_ref()
             .expect("renderer")
             .tile_stream_enabled());
+
+        // The CPU mirrors above can agree while the GPU page table the shader
+        // actually reads still holds the retired revision's pages -- that is the
+        // exact E1-C2 divergence. Read the buffer back and require no row survives.
+        let gpu = app.gpu.as_ref().expect("gpu context");
+        assert!(
+            atlas
+                .read_page_table_blocking(&gpu.device, &gpu.queue)
+                .iter()
+                .all(|entry| entry.valid == 0),
+            "no page-table row may stay valid once residency is retired"
+        );
+    }
+
+    /// Assert the atlas holds exactly one resident page, that it carries `key`'s
+    /// identity stamped with the runtime's *current* output revision, and that the
+    /// renderer streams at that same revision. This is the post-sync invariant the
+    /// shader's stale-page gate relies on (uniform revision == page-stamp revision);
+    /// returns the live entry so callers can assert more (e.g. handle generation).
+    fn assert_single_live_page_at_current_revision(
+        app: &TerraApp,
+        key: &TerrainTileKey,
+    ) -> GpuPageTableEntry {
+        let revision = app.terrain_runtime.output_revision();
+        let renderer = app.renderer.as_ref().expect("renderer");
+        assert!(
+            renderer.tile_stream_enabled(),
+            "streaming stays enabled after a completed sync"
+        );
+        assert_eq!(
+            renderer.tile_stream_revision(),
+            revision,
+            "renderer streams the current output revision"
+        );
+        let gpu = app.gpu.as_ref().expect("gpu context");
+        let atlas = app.tile_atlas.as_ref().expect("atlas");
+        let live: Vec<GpuPageTableEntry> = atlas
+            .read_page_table_blocking(&gpu.device, &gpu.queue)
+            .into_iter()
+            .filter(|entry| entry.valid != 0)
+            .collect();
+        assert_eq!(live.len(), 1, "exactly one page resident after sync");
+        let entry = live[0];
+        assert_eq!(entry.level as u8, key.level, "page level matches key");
+        assert_eq!(
+            (entry.tile_x, entry.tile_z),
+            (key.tile.tx, key.tile.tz),
+            "page tile coords match key"
+        );
+        assert_eq!(
+            (entry.revision_hi, entry.revision_lo),
+            ((revision >> 32) as u32, revision as u32),
+            "page stamped with the current output revision"
+        );
+        entry
+    }
+
+    /// Ratchet 3 (count honesty): every residency source must agree, so the HUD
+    /// can never report "no residency" while stale pages still render (the E1-C2
+    /// symptom).
+    ///
+    /// The sources cross-checked are the GPU page table (what the shader actually
+    /// samples, authoritative), `atlas.residency().stats()` (the CPU mirror the HUD
+    /// is fed from), `profile.tile_cache_resident` (the count the artist reads), and
+    /// the visible-tile plan derived from the CPU pyramid via `update_visible_tile_plan`.
+    /// It also forbids stale rows and pins stream-enable honesty (streaming on only
+    /// with live pages at the current revision). Takes `&mut` because refreshing the
+    /// visible-tile plan mutates the renderer, exactly as the redraw path does.
+    fn assert_residency_sources_agree(app: &mut TerraApp) {
+        let revision = app.terrain_runtime.output_revision();
+        let rev_lo = revision as u32;
+        let rev_hi = (revision >> 32) as u32;
+
+        let entries = {
+            let gpu = app.gpu.as_ref().expect("gpu context");
+            app.tile_atlas
+                .as_ref()
+                .expect("atlas")
+                .read_page_table_blocking(&gpu.device, &gpu.queue)
+        };
+        let live = entries.iter().filter(|e| e.valid != 0).count();
+        let stale = entries
+            .iter()
+            .filter(|e| e.valid != 0 && (e.revision_lo, e.revision_hi) != (rev_lo, rev_hi))
+            .count();
+        assert_eq!(
+            stale, 0,
+            "no page-table row may carry a prior output revision"
+        );
+
+        // GPU truth vs the CPU mirror that feeds the HUD, and the HUD field itself.
+        let resident = app
+            .tile_atlas
+            .as_ref()
+            .expect("atlas")
+            .residency()
+            .stats()
+            .resident_tiles;
+        assert_eq!(
+            resident, live,
+            "atlas residency stats must match the page-table valid count"
+        );
+        assert_eq!(
+            app.ui_state.profile.tile_cache_resident, live,
+            "HUD tile_cache_resident must match the page-table valid count"
+        );
+
+        // Stream-enable honesty: streaming is on only with live pages at this revision.
+        let (enabled, stream_rev) = {
+            let renderer = app.renderer.as_ref().expect("renderer");
+            (
+                renderer.tile_stream_enabled(),
+                renderer.tile_stream_revision(),
+            )
+        };
+        if enabled {
+            assert!(live >= 1, "streaming enabled while the page table is empty");
+            assert_eq!(
+                stream_rev, revision,
+                "streaming enabled at a revision the pages are not stamped with"
+            );
+        }
+
+        // The visible-tile plan is the CPU-pyramid view the HUD's visible-tile
+        // counts come from; drive it exactly as the redraw path does and require it
+        // to agree with page-table residency in direction.
+        if let Some(renderer) = app.renderer.as_mut() {
+            renderer.update_visible_tile_plan(&app.terrain_runtime.pyramid);
+        }
+        let (exact, fallback, missing) = {
+            let renderer = app.renderer.as_ref().expect("renderer");
+            (
+                renderer.last_tile_plan_exact,
+                renderer.last_tile_plan_fallback,
+                renderer.last_tile_plan_missing,
+            )
+        };
+        let total = exact + fallback + missing;
+        assert!(
+            total >= 1,
+            "unit world must contain at least one visible tile"
+        );
+        if live == 0 {
+            assert_eq!(
+                (exact, fallback, missing),
+                (0, 0, total),
+                "with no residency every visible tile must read as missing -- \
+                 the HUD cannot claim coverage the shader does not have"
+            );
+        } else {
+            assert_eq!(
+                missing, 0,
+                "a world-covering resident page must leave no visible tile missing"
+            );
+            assert_eq!(exact + fallback, total);
+        }
     }
 
     /// Revert check for #86: advancing the output revision via `mark_dirty_from`
@@ -1083,17 +1242,10 @@ mod tests {
             level: new_level,
             tile: new_tile,
         };
-        assert!(app
-            .tile_atlas
-            .as_mut()
-            .expect("atlas")
-            .lookup(&new_key)
-            .is_some());
-        assert!(app
-            .renderer
-            .as_ref()
-            .expect("renderer")
-            .tile_stream_enabled());
+        // Re-enable ratchet: the page repopulates and the renderer streams again,
+        // now stamped with the post-edit revision (not the retired one).
+        assert_ne!(app.terrain_runtime.output_revision(), revision_before);
+        assert_single_live_page_at_current_revision(&app, &new_key);
     }
 
     /// The stage-aware edit path advances the revision too, so it must retire
@@ -1124,5 +1276,32 @@ mod tests {
         app.mark_all_layers_dirty();
 
         assert_streamed_residency_retired(&app, &old_key, old_handle);
+    }
+
+    /// Consistency ratchet (#87): the residency counts the HUD reads and the page
+    /// table the shader samples must agree at every point in the edit lifecycle,
+    /// so the E1-C2 divergence -- HUD reporting no residency while stale pages
+    /// still render -- cannot silently reappear.
+    #[test]
+    fn residency_counts_agree_across_hud_sources_and_page_table() {
+        let Some(gpu) = terra_test_gpu::headless() else {
+            return;
+        };
+        let (mut app, metrics, _old_key, _old_handle) = app_with_one_streamed_page(gpu);
+
+        // Stage 1: freshly streamed -- every source reports the one resident page.
+        assert_residency_sources_agree(&mut app);
+
+        // Stage 2: the E1-C2 moment. The edit retires residency; no source may
+        // still count (or let the shader sample) the prior revision's page.
+        app.mark_dirty_from(terra_core::LayerId::new());
+        assert_residency_sources_agree(&mut app);
+
+        // Stage 3: worker completion re-streams; every source agrees once more,
+        // now at the post-edit revision.
+        app.last_height = Some(Heightfield::filled(metrics, 2.0));
+        app.queue_final_tile_uploads();
+        assert_eq!(app.upload_pending_terrain_tiles(), 1);
+        assert_residency_sources_agree(&mut app);
     }
 }

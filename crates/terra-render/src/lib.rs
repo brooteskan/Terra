@@ -1611,6 +1611,14 @@ impl TerrainRenderer {
         self.use_tile_stream
     }
 
+    /// The output revision the currently-streamed pages were stamped with, mirrored
+    /// into `FrameUniforms.stream2` and matched by the shader's stale-page gate
+    /// (`find_tile_page`). Tests pin this against `TerrainRuntime::output_revision`
+    /// to prove the sync path stamps one authoritative revision into both places.
+    pub fn tile_stream_revision(&self) -> u64 {
+        self.tile_stream_revision
+    }
+
     pub fn set_shadows_enabled(&mut self, enable: bool) {
         self.shadow_map.set_enabled(enable);
         self.notify_invalidation(InvalidationReason::LightingChanged);

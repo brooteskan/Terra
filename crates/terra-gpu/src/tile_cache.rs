@@ -280,6 +280,48 @@ impl GpuTileAtlas {
         self.page_table.clone()
     }
 
+    /// Read the shader-visible page table back to the CPU. Test observability only.
+    ///
+    /// Blocks on a GPU readback (`map_async` + `poll(Wait)`), so it must never run
+    /// on a frame path — it exists so tests can assert what the shader would see
+    /// (the authoritative residency source), not the CPU mirrors that can silently
+    /// diverge from it. `#[doc(hidden)]` keeps it off the public API surface while
+    /// still letting downstream crates' tests reach it across the crate boundary.
+    #[doc(hidden)]
+    pub fn read_page_table_blocking(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> Vec<GpuPageTableEntry> {
+        let size = std::mem::size_of::<GpuPageTableEntry>() as u64 * u64::from(self.max_pages);
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("tile-page-table-readback"),
+            size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("tile-page-table-readback-encoder"),
+        });
+        encoder.copy_buffer_to_buffer(&self.page_table, 0, &staging, 0, size);
+        queue.submit(Some(encoder.finish()));
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+        device.poll(wgpu::Maintain::Wait);
+        rx.recv()
+            .expect("map callback")
+            .expect("page-table readback mapping");
+        let mapped = slice.get_mapped_range();
+        let entries = bytemuck::cast_slice(&mapped).to_vec();
+        drop(mapped);
+        staging.unmap();
+        entries
+    }
+
     pub fn page_extent(&self) -> u32 {
         self.page_extent
     }
@@ -314,40 +356,6 @@ impl GpuTileAtlas {
 mod tests {
     use super::*;
     use terra_core::{FieldId, LayerId, TileId};
-
-    fn read_page_table(
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        atlas: &GpuTileAtlas,
-    ) -> Vec<GpuPageTableEntry> {
-        let size = std::mem::size_of::<GpuPageTableEntry>() as u64 * u64::from(atlas.max_pages());
-        let staging = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("tile-page-table-test-readback"),
-            size,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("tile-page-table-test-readback-encoder"),
-        });
-        encoder.copy_buffer_to_buffer(atlas.page_table_buffer(), 0, &staging, 0, size);
-        queue.submit(Some(encoder.finish()));
-
-        let slice = staging.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |result| {
-            let _ = tx.send(result);
-        });
-        device.poll(wgpu::Maintain::Wait);
-        rx.recv()
-            .expect("map callback")
-            .expect("page-table readback mapping");
-        let mapped = slice.get_mapped_range();
-        let entries = bytemuck::cast_slice(&mapped).to_vec();
-        drop(mapped);
-        staging.unmap();
-        entries
-    }
 
     #[test]
     fn page_entry_carries_generation_and_virtual_identity() {
@@ -407,7 +415,7 @@ mod tests {
             .unwrap()
             .handle;
         assert_eq!(
-            read_page_table(&gpu.device, &gpu.queue, &atlas)[old.slot as usize].valid,
+            atlas.read_page_table_blocking(&gpu.device, &gpu.queue)[old.slot as usize].valid,
             1
         );
 
@@ -415,7 +423,8 @@ mod tests {
 
         assert_eq!(atlas.residency().stats().resident_tiles, 0);
         assert_eq!(atlas.residency().resolve_handle(old), None);
-        assert!(read_page_table(&gpu.device, &gpu.queue, &atlas)
+        assert!(atlas
+            .read_page_table_blocking(&gpu.device, &gpu.queue)
             .iter()
             .all(|entry| entry.valid == 0));
 
@@ -433,7 +442,7 @@ mod tests {
         assert_ne!(new.generation, old.generation);
         assert_eq!(atlas.residency().resolve_handle(old), None);
         assert_eq!(atlas.residency().resolve_handle(new), Some(&new_key));
-        let entries = read_page_table(&gpu.device, &gpu.queue, &atlas);
+        let entries = atlas.read_page_table_blocking(&gpu.device, &gpu.queue);
         assert_eq!(entries[new.slot as usize].valid, 1);
         assert_eq!(entries[new.slot as usize].generation, new.generation);
     }
