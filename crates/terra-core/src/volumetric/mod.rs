@@ -4,8 +4,8 @@
 //! **dual-height** representation: a carved floor DEM plus a ceiling aux map, limited to a
 //! UV region / falloff. A lightweight triangle proxy visualizes the overhang / cave roof.
 
+use crate::generators::{LocalSdfParams, OverhangStampParams};
 use crate::heightfield::Heightfield;
-use crate::layer::{LocalSdfParams, OverhangStampParams};
 use crate::mask::MaskField;
 use crate::noise::{canonical_seed32, value_noise2};
 

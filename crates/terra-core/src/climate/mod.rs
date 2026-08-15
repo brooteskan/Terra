@@ -6,8 +6,8 @@
 
 use crate::analyze::jump_flood_distance;
 use crate::heightfield::Heightfield;
-use crate::layer::{BiomeBand, BiomesParams, OPEN_HEIGHT_MAX, OPEN_HEIGHT_MIN};
 use crate::mask::MaskField;
+use crate::material_schema::{BiomeBand, BiomesParams, OPEN_HEIGHT_MAX, OPEN_HEIGHT_MIN};
 
 /// Packed climate / biome output maps (all values typically in \[0,1\]).
 #[derive(Debug, Clone)]

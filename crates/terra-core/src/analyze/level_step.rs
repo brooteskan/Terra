@@ -6,11 +6,12 @@
 
 use crate::heightfield::{FloatArena, Heightfield, HeightfieldMetrics};
 use crate::hydro;
-use crate::layer::{
-    HydraulicErosionParams, MultiScaleAmplifyParams, StreamPowerParams, ThermalErosionParams,
-};
 use crate::mask::MaskField;
 use std::cell::RefCell;
+
+use super::{
+    HydraulicErosionParams, MultiScaleAmplifyParams, StreamPowerParams, ThermalErosionParams,
+};
 
 thread_local! {
     static DOWNSAMPLE_ARENA: RefCell<FloatArena> = RefCell::new(FloatArena::new());

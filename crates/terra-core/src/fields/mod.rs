@@ -163,9 +163,9 @@ pub struct AuxMaps {
     /// Heightfield snapshot (as MaskField meters) when Materials baked strata.
     pub strata_reference: Option<MaskField>,
     /// Vertical material stack from the last Materials layer (surface → bedrock).
-    pub strata: Option<Vec<crate::layer::Stratum>>,
+    pub strata: Option<Vec<crate::material_schema::Stratum>>,
     /// Bed attitude from the last Materials layer (tilted / folded / warped).
-    pub bed_geometry: crate::layer::BedGeometry,
+    pub bed_geometry: crate::material_schema::BedGeometry,
     // Phase H climate fields (normalized \[0,1\] unless noted).
     pub temperature: Option<MaskField>,
     pub rainfall: Option<MaskField>,
@@ -294,7 +294,7 @@ impl AuxMaps {
     /// (strata cannot round-trip through MaskField storage).
     pub fn from_hashmap_preserving_strata(
         map: &HashMap<String, MaskField>,
-        strata: Option<Vec<crate::layer::Stratum>>,
+        strata: Option<Vec<crate::material_schema::Stratum>>,
     ) -> Self {
         let mut aux = Self::from_hashmap(map);
         if strata.is_some() {
@@ -400,10 +400,10 @@ pub fn resolve_hardness(
 
 /// Hardness at eroded depth \(d\) (meters below the Materials reference surface).
 ///
-/// Walks [`crate::layer::Stratum`] from the surface downward. Beyond the stack,
+/// Walks [`crate::material_schema::Stratum`] from the surface downward. Beyond the stack,
 /// returns `default_hardness`.
 pub fn hardness_at_strata_depth(
-    strata: &[crate::layer::Stratum],
+    strata: &[crate::material_schema::Stratum],
     depth: f32,
     default_hardness: f32,
 ) -> f32 {
@@ -426,7 +426,7 @@ pub fn hardness_at_strata_depth(
 
 /// Hydraulic erodibility at depth (defaults to `1 - K` for legacy strata).
 pub fn erodibility_at_strata_depth(
-    strata: &[crate::layer::Stratum],
+    strata: &[crate::material_schema::Stratum],
     depth: f32,
     default_hardness: f32,
 ) -> f32 {
@@ -449,7 +449,7 @@ pub fn erodibility_at_strata_depth(
 
 /// Thermal material stability at depth ∈ \[0,1\] (1 = holds steep faces).
 pub fn stability_at_strata_depth(
-    strata: &[crate::layer::Stratum],
+    strata: &[crate::material_schema::Stratum],
     depth: f32,
     default_hardness: f32,
 ) -> f32 {
@@ -471,7 +471,7 @@ pub fn stability_at_strata_depth(
 }
 
 /// Surface material ID (encoded /16) at depth \(d\).
-pub fn material_id_at_strata_depth(strata: &[crate::layer::Stratum], depth: f32) -> f32 {
+pub fn material_id_at_strata_depth(strata: &[crate::material_schema::Stratum], depth: f32) -> f32 {
     if strata.is_empty() {
         return 0.0;
     }
@@ -493,7 +493,7 @@ pub fn material_id_at_strata_depth(strata: &[crate::layer::Stratum], depth: f32)
 pub fn bake_hardness_from_strata(
     reference: &MaskField,
     current: &Heightfield,
-    strata: &[crate::layer::Stratum],
+    strata: &[crate::material_schema::Stratum],
     default_hardness: f32,
 ) -> MaskField {
     bake_hardness_from_strata_ex(
@@ -501,7 +501,7 @@ pub fn bake_hardness_from_strata(
         current,
         strata,
         default_hardness,
-        &crate::layer::BedGeometry::Horizontal,
+        &crate::material_schema::BedGeometry::Horizontal,
     )
 }
 
@@ -509,9 +509,9 @@ pub fn bake_hardness_from_strata(
 pub fn bake_hardness_from_strata_ex(
     reference: &MaskField,
     current: &Heightfield,
-    strata: &[crate::layer::Stratum],
+    strata: &[crate::material_schema::Stratum],
     default_hardness: f32,
-    geom: &crate::layer::BedGeometry,
+    geom: &crate::material_schema::BedGeometry,
 ) -> MaskField {
     let mut out = MaskField::filled(current.metrics, default_hardness.clamp(0.0, 1.0));
     for j in 0..current.metrics.height {
@@ -541,7 +541,7 @@ pub fn bake_hardness_from_strata_ex(
 /// else the top stratum hardness (if any), else `default_hardness`.
 pub fn bake_hardness_from_materials(
     materials: &MaskField,
-    rules: &[crate::layer::MaterialRule],
+    rules: &[crate::material_schema::MaterialRule],
     default_hardness: f32,
 ) -> MaskField {
     bake_hardness_from_materials_ex(materials, rules, &[], default_hardness)
@@ -550,8 +550,8 @@ pub fn bake_hardness_from_materials(
 /// Materials → \(K\) bake with optional strata fallback for unmatched IDs.
 pub fn bake_hardness_from_materials_ex(
     materials: &MaskField,
-    rules: &[crate::layer::MaterialRule],
-    strata: &[crate::layer::Stratum],
+    rules: &[crate::material_schema::MaterialRule],
+    strata: &[crate::material_schema::Stratum],
     default_hardness: f32,
 ) -> MaskField {
     let surface_k = if !strata.is_empty() {

@@ -7,8 +7,9 @@ use crate::geomorph::{
     accumulate_drainage_area, build_flow_graph, priority_flood_fill, FlowModel, Precipitation,
 };
 use crate::heightfield::{Heightfield, HeightfieldMetrics};
-use crate::layer::{DebrisFlowParams, ThermalErosionParams};
 use crate::mask::MaskField;
+
+use super::{DebrisFlowParams, ThermalErosionParams};
 
 /// Layered terrain state shared by thermal and debris-flow solvers.
 #[derive(Debug, Clone)]

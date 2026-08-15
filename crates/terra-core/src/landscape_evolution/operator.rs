@@ -1,10 +1,10 @@
 //! Reusable [`LandscapeEvolutionOperator`] — Phase 3 physically-based evolution.
 
 use crate::analyze;
+use crate::analyze::ThermalErosionParams;
 use crate::fields::keys;
 use crate::heightfield::Heightfield;
 use crate::hydro;
-use crate::layer::ThermalErosionParams;
 use crate::mask::{MaskField, MaskSource};
 use std::collections::HashMap;
 

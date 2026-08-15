@@ -116,7 +116,7 @@ pub struct LandscapeEvolutionParams {
     /// Acts on **world-metric** slope (drop per dx/dz metres) and rain-scaled
     /// discharge Q — see [`effective_k`](Self::effective_k) and the shared
     /// [`crate::hydro::spe_increment`]. **Not** numerically comparable with
-    /// [`crate::layer::StreamPowerParams`]'s `k` (grid-relative slope, world-m²
+    /// [`crate::analyze::StreamPowerParams`]'s `k` (grid-relative slope, world-m²
     /// area); unifying them would retune saved projects and needs a versioned
     /// document migration (station D1).
     #[serde(default = "default_k")]

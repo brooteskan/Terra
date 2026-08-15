@@ -7,6 +7,7 @@ mod group_mode;
 mod kinds;
 mod metadata;
 mod operation;
+mod operation_placement_model;
 mod output;
 mod registry;
 mod resolution;
@@ -32,6 +33,7 @@ pub use metadata::{
     LayerTypeMeta, MaskCompatibility,
 };
 pub use operation::{FieldContract, OperationCategory};
+pub use operation_placement_model::{ApplyWhere, DevelopCategory, OperationPlacement};
 pub use output::{NamedOutputDecl, OutputRef, PublishedOutput};
 pub use registry::LayerTypeRegistry;
 pub use resolution::{
@@ -43,7 +45,6 @@ pub use stack::{biome_destination_section, is_shape_kind, LayerGroup, LayerStack
 pub use workflow::WorkflowStage;
 
 use crate::mask::Distribution;
-use crate::operation_placement::OperationPlacement;
 use serde::{Deserialize, Serialize};
 
 /// Parameters shared by every layer.
@@ -86,7 +87,7 @@ pub struct LayerCommon {
     pub operation_placement: OperationPlacement,
     /// Artist Develop category when under a Biome (Vegetation vs Objects, etc.).
     #[serde(default)]
-    pub develop_category: Option<crate::operation_placement::DevelopCategory>,
+    pub develop_category: Option<DevelopCategory>,
 }
 
 impl LayerCommon {

@@ -5,8 +5,8 @@
 //! erosion and rock filters share one lithology query.
 
 use crate::heightfield::Heightfield;
-use crate::layer::{BedGeometry, Stratum, StratumMaterial};
 use crate::mask::MaskField;
+use crate::material_schema::{BedGeometry, Stratum, StratumMaterial};
 
 /// Parameters for synthesising a stratum field from height (filter path).
 #[derive(Debug, Clone, Copy)]

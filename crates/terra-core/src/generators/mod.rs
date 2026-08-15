@@ -2,15 +2,35 @@
 
 mod arid_landforms;
 mod filter_kernels;
+mod filter_params;
+mod foundation_params;
 pub mod geology;
+mod hydro_params;
 mod morphology;
+mod shape_params;
+mod terrain_params;
+
+pub use filter_params::{BlurParams, EffectFilterKind, EffectFilterParams};
+pub use foundation_params::{FlatParams, RampParams, SculptParams};
+pub use hydro_params::{
+    CoastalParams, FluidSimParams, RiverNetworkParams, RiverNode, SandSimParams,
+};
+pub use shape_params::{
+    LocalSdfParams, OverhangStampParams, PathNode, PathParams, PolygonHeightMode,
+    PolygonHeightParams, ProceduralGenerator, ProceduralShapeParams, Stamp2dParams, Stamp3dParams,
+};
+pub use terrain_params::{
+    CanyonParams, DomainWarpParams, DuneParams, FbmParams, ImportHeightmapParams, IslandArchetype,
+    IslandParams, MesaParams, MountainParams, PlateauParams, TerraceParams, UpliftParams,
+    VolcanoParams, VoronoiParams,
+};
 
 use crate::analyze;
 use crate::eval::EvalError;
 use crate::heightfield::{HeightTile, Heightfield, HeightfieldMetrics, TileId};
-use crate::layer::*;
 use crate::mask::{dist_point_segment, point_in_polygon, MaskField};
 use crate::noise::{self, domain_warp_fbm, fbm, ridged_mf, sample_worley};
+use crate::noise::{FractalNoiseType, NoiseParams, WorleyFeature, WorleyMetric, WorleyParams};
 use rayon::prelude::*;
 
 pub fn flat(metrics: HeightfieldMetrics, height: f32) -> Heightfield {
@@ -973,11 +993,7 @@ fn stamp_3d_from_obj(
 }
 
 /// Evaluate a WC-style procedural shape layer (generator picker).
-pub fn procedural_shape(
-    metrics: HeightfieldMetrics,
-    p: &crate::layer::ProceduralShapeParams,
-) -> Heightfield {
-    use crate::layer::{FractalNoiseType, ProceduralGenerator};
+pub fn procedural_shape(metrics: HeightfieldMetrics, p: &ProceduralShapeParams) -> Heightfield {
     match p.generator {
         ProceduralGenerator::Mountain => mountains(metrics, &p.mountain),
         ProceduralGenerator::Hills => fbm_field(metrics, &p.hills),
@@ -998,7 +1014,7 @@ pub fn procedural_shape(
 }
 
 /// Closed polygon raise / carve (normalized UV vertices).
-pub fn polygon_height(input: &Heightfield, p: &crate::layer::PolygonHeightParams) -> Heightfield {
+pub fn polygon_height(input: &Heightfield, p: &PolygonHeightParams) -> Heightfield {
     let mut out = input.clone();
     if p.points.len() < 3 {
         return out;
@@ -1059,7 +1075,7 @@ pub fn polygon_height(input: &Heightfield, p: &crate::layer::PolygonHeightParams
 /// Halo exchange is intentionally a separate scheduler step.
 pub fn polygon_height_tile(
     input: &Heightfield,
-    p: &crate::layer::PolygonHeightParams,
+    p: &PolygonHeightParams,
     id: TileId,
 ) -> Option<HeightTile> {
     let mut out = input.tile(id)?.clone();
@@ -1099,10 +1115,8 @@ pub fn polygon_height_tile(
             }
             let h0 = input.get(i, j);
             let target = match p.mode {
-                crate::layer::PolygonHeightMode::RaiseBy => {
-                    h0 + if p.carve { -p.height.abs() } else { p.height }
-                }
-                crate::layer::PolygonHeightMode::SetElevation => {
+                PolygonHeightMode::RaiseBy => h0 + if p.carve { -p.height.abs() } else { p.height },
+                PolygonHeightMode::SetElevation => {
                     if p.carve {
                         h0 - p.height.abs()
                     } else {

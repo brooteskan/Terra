@@ -1,7 +1,7 @@
 //! All layer parameter kinds. Extended across phases; serde-stable via enum.
 //!
-//! Param structs are split by family under this module; [`LayerKind`] stays here
-//! so serde variant names/tags remain stable.
+//! Param structs live with their algorithm or schema owners and are re-exported
+//! here; [`LayerKind`] stays here so serde variant names/tags remain stable.
 
 mod erosion;
 mod filters;

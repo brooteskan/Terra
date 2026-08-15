@@ -2,7 +2,7 @@
 
 use super::LayerKind;
 use crate::fields::FieldId;
-use crate::tiling::DirtyClass;
+use crate::invalidation::DirtyClass;
 use serde::{Deserialize, Serialize};
 
 use super::ScaleBand;
@@ -373,7 +373,25 @@ impl LayerKind {
     }
 
     pub fn spatial_dependency(&self) -> DirtyClass {
-        crate::tiling::dirty_class_for(self)
+        match self {
+            LayerKind::Blur(_)
+            | LayerKind::Coastal(_)
+            | LayerKind::EffectFilter(_)
+            | LayerKind::Path(_)
+            | LayerKind::PolygonHeight(_)
+            | LayerKind::Terrace(_)
+            | LayerKind::Plateau(_) => DirtyClass::Local,
+            LayerKind::ThermalErosion(_)
+            | LayerKind::HydraulicErosion(_)
+            | LayerKind::DebrisFlow(_)
+            | LayerKind::SandSimulation(_)
+            | LayerKind::FluidSimulation(_) => DirtyClass::Expanding,
+            LayerKind::StreamPowerErosion(_)
+            | LayerKind::MultiScaleAmplify(_)
+            | LayerKind::RiverCarve(_)
+            | LayerKind::RiverNetwork(_) => DirtyClass::BasinDependent,
+            _ => DirtyClass::Local,
+        }
     }
 
     /// Phase 11 Rule 3 — scale ownership for this operator family.

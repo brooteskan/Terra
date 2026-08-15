@@ -7,6 +7,7 @@ mod level_schedule;
 mod level_step;
 pub mod mass_wasting;
 mod metrics;
+mod params;
 pub mod terrain_amplification;
 pub mod terrain_stats;
 
@@ -37,6 +38,10 @@ pub use mass_wasting::{
     MassWastingState, ThermalResult,
 };
 pub use metrics::*;
+pub use params::{
+    DebrisFlowParams, HydraulicErosionParams, MultiScaleAmplifyParams, StreamPowerParams,
+    ThermalErosionParams, TransportModel,
+};
 pub use terrain_amplification::{
     amplify_terrain, AmplificationBands, TerrainAmplificationParams, TerrainAmplificationResult,
 };

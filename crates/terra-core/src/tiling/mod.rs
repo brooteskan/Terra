@@ -2,44 +2,16 @@
 
 mod region;
 
+pub use crate::invalidation::{expand_radius_for, DirtyClass};
 pub use region::{bounds_from_tiles, rects_from_tiles, SampleRect};
 
 use crate::heightfield::{HeightTile, Heightfield, HeightfieldMetrics, TileId};
 use crate::layer::LayerKind;
 use std::collections::HashSet;
 
-/// How a process dirty region should expand for incremental recomputation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DirtyClass {
-    /// Local stencil (blur / single-pass thermal) — pad by stencil radius only.
-    Local,
-    /// Multi-iteration neighbourhood ops — expand by tile radius from iters.
-    Expanding,
-    /// Drainage / SPE / amplify — basin-coupled; prefer full field or large expand.
-    BasinDependent,
-}
-
 /// Classify a layer kind for dirty-region / cache expansion policy.
 pub fn dirty_class_for(kind: &LayerKind) -> DirtyClass {
-    match kind {
-        LayerKind::Blur(_)
-        | LayerKind::Coastal(_)
-        | LayerKind::EffectFilter(_)
-        | LayerKind::Path(_)
-        | LayerKind::PolygonHeight(_)
-        | LayerKind::Terrace(_)
-        | LayerKind::Plateau(_) => DirtyClass::Local,
-        LayerKind::ThermalErosion(_)
-        | LayerKind::HydraulicErosion(_)
-        | LayerKind::DebrisFlow(_)
-        | LayerKind::SandSimulation(_)
-        | LayerKind::FluidSimulation(_) => DirtyClass::Expanding,
-        LayerKind::StreamPowerErosion(_)
-        | LayerKind::MultiScaleAmplify(_)
-        | LayerKind::RiverCarve(_)
-        | LayerKind::RiverNetwork(_) => DirtyClass::BasinDependent,
-        _ => DirtyClass::Local,
-    }
+    kind.spatial_dependency()
 }
 
 /// Recommended halo (ghost) width for a neighbourhood process.
@@ -52,43 +24,6 @@ pub fn dirty_class_for(kind: &LayerKind) -> DirtyClass {
 pub fn recommended_halo(stencil_radius: u32, iters_per_batch: u32) -> u32 {
     let need = stencil_radius.saturating_mul(iters_per_batch.max(1));
     need.max(crate::heightfield::DEFAULT_HALO).min(16)
-}
-
-/// Tile Chebyshev expand radius for a dirty class (not sample halo).
-pub fn expand_radius_for(class: DirtyClass, stencil: u32, iterations: u32) -> u32 {
-    match class {
-        DirtyClass::Local => stencil.max(1).saturating_sub(1).max(1),
-        DirtyClass::Expanding => {
-            // Grow ~1 tile per ~8 iters (halo refresh between batches assumed).
-            let batches = (iterations.max(1) + 7) / 8;
-            batches.max(1).min(4)
-        }
-        DirtyClass::BasinDependent => {
-            // Conservative: expand several rings; callers may still mark_all.
-            ((iterations.max(1) + 3) / 4).max(2).min(8)
-        }
-    }
-}
-
-impl DirtyClass {
-    /// Sample-space support radius for cache keys and invalidation expansion.
-    ///
-    /// Basin-coupled processes are treated as global — callers should prefer
-    /// `mark_all` when this returns `None`.
-    pub fn support_radius_samples(
-        self,
-        tile_size_samples: u32,
-        stencil: u32,
-        iterations: u32,
-    ) -> Option<u32> {
-        match self {
-            Self::BasinDependent => None,
-            Self::Local | Self::Expanding => Some(
-                expand_radius_for(self, stencil, iterations)
-                    .saturating_mul(tile_size_samples.max(1)),
-            ),
-        }
-    }
 }
 
 /// Process tiles with neighbor halo refresh between passes.

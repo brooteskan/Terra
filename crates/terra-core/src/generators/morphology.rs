@@ -3,9 +3,9 @@
 //! Algorithms follow public literature (flow accumulation, noise, imaging, thermal,
 //! aeolian). Shared kernels live in `super::filter_kernels`.
 
+use super::EffectFilterParams;
 use crate::analyze::{AeolianState, AeolianTransportParams};
 use crate::heightfield::Heightfield;
-use crate::layer::EffectFilterParams;
 use crate::noise;
 use crate::noise::{FractalNoiseType, WorleyFeature, WorleyParams};
 
@@ -1067,7 +1067,7 @@ pub(super) fn strata_filter(input: &Heightfield, p: &EffectFilterParams) -> Heig
     use super::geology::{
         expose_strata_height, strata_band_displace, strata_fields_with, StrataFieldParams,
     };
-    use crate::layer::BedGeometry;
+    use crate::material_schema::BedGeometry;
 
     let freq = p.effective_frequency();
     let banded = strata_band_displace(input, freq, p.amount, p.seed);

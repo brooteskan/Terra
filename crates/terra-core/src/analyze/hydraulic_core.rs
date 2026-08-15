@@ -4,16 +4,14 @@
 //! and Hydraulic Sediment. Presets bias transport / erodibility / particle kernels —
 //! they do not fork independent erosion implementations or post-apply ridge noise.
 
+use crate::generators::{EffectFilterKind, EffectFilterParams};
 use crate::geomorph::ridge_valley_likelihood;
 use crate::heightfield::{Heightfield, HeightfieldMetrics};
-use crate::layer::{
-    EffectFilterKind, EffectFilterParams, FractalNoiseType, HydraulicErosionParams, NoiseParams,
-    TransportModel,
-};
 use crate::mask::{MaskField, MaskSource};
-use crate::noise::fbm;
+use crate::noise::{fbm, FractalNoiseType, NoiseParams};
 
 use super::erosion::{apply_particle_erosion, hydraulic_erode_with_fields, HydraulicResult};
+use super::{HydraulicErosionParams, TransportModel};
 
 /// How rainfall is authored for every hydraulic-family operator.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

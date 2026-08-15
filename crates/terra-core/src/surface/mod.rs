@@ -5,9 +5,9 @@ use crate::fields::{
     bake_hardness_from_materials_ex, hardness_at_strata_depth, material_id_at_strata_depth,
 };
 use crate::heightfield::Heightfield;
-use crate::layer::{BiomesParams, MaterialsParams, VegetationParams};
 use crate::mask::{MaskField, MaskSource};
-use crate::scatter;
+use crate::material_schema::{BiomesParams, MaterialsParams, Stratum};
+use crate::scatter::{self, VegetationParams};
 use std::collections::HashMap;
 
 /// Classify surface material IDs and bake hardness.
@@ -129,7 +129,7 @@ fn bake_rule_mask(
 pub fn material_weights_at_depth(
     reference: &MaskField,
     current: &Heightfield,
-    strata: &[crate::layer::Stratum],
+    strata: &[Stratum],
 ) -> MaskField {
     let mut out = MaskField::zeros(current.metrics);
     for j in 0..current.metrics.height {
