@@ -419,13 +419,9 @@ impl TerraApp {
         if let Some(renderer) = self.renderer.as_mut() {
             renderer.reset_project_state(world_size, ocean_level);
         }
-        // Preserve the GPU allocation, but make all previous-document pages unreachable.
-        if let (Some(atlas), Some(gpu)) = (self.tile_atlas.as_mut(), self.gpu.as_ref()) {
-            atlas.clear(&gpu.queue);
-            self.ui_state
-                .profile
-                .update_tile_cache(atlas.residency().stats(), 0);
-        }
+        // Preserve the GPU allocation, but make all previous-document pages
+        // unreachable and stop streaming until the new document re-syncs.
+        self.retire_streamed_residency();
     }
 
     pub(crate) fn close_project(&mut self) {
@@ -975,5 +971,158 @@ mod tests {
             .as_ref()
             .expect("renderer")
             .tile_stream_enabled());
+    }
+
+    /// Prime an app with a single streamed page resident at the current output
+    /// revision. Returns the seeded metrics, the resident page's key, and its
+    /// handle so a caller can assert the page is retired after an edit.
+    fn app_with_one_streamed_page(
+        gpu: &terra_test_gpu::TestGpu,
+    ) -> (
+        TerraApp,
+        HeightfieldMetrics,
+        TerrainTileKey,
+        terra_core::TilePageHandle,
+    ) {
+        let context = GpuContext {
+            device: gpu.device.clone(),
+            queue: gpu.queue.clone(),
+            surface_format: wgpu::TextureFormat::Rgba8Unorm,
+        };
+        let mut app = TerraApp::default();
+        app.renderer = Some(TerrainRenderer::new_headless(&context, 64, 64));
+        app.gpu = Some(context);
+        let config = app.terrain_runtime.pyramid.config;
+        app.tile_atlas = Some(
+            GpuTileAtlas::new(&gpu.device, config.tile_size, config.halo, 4).expect("test atlas"),
+        );
+        let metrics = HeightfieldMetrics {
+            width: config.tile_size,
+            height: config.tile_size,
+            world_size_x: 1000.0,
+            world_size_z: 1000.0,
+            tile_size: config.tile_size,
+            halo: config.halo,
+        };
+        app.last_height = Some(Heightfield::filled(metrics, 1.0));
+        app.queue_final_tile_uploads();
+        let (_, level, tile) = *app
+            .pending_tile_uploads
+            .front()
+            .expect("page upload queued");
+        assert_eq!(app.upload_pending_terrain_tiles(), 1);
+        let key = TerrainTileKey {
+            layer: None,
+            field: FieldId::Height,
+            level,
+            tile,
+        };
+        let handle = app
+            .tile_atlas
+            .as_mut()
+            .expect("atlas")
+            .lookup(&key)
+            .expect("page resident");
+        assert!(app
+            .renderer
+            .as_ref()
+            .expect("renderer")
+            .tile_stream_enabled());
+        (app, metrics, key, handle)
+    }
+
+    /// Assert both sides of the revision boundary are retired: the CPU pyramid
+    /// no longer records the page, the atlas has no resident tiles and cannot
+    /// resolve the old handle, no uploads remain queued, and the renderer has
+    /// stopped streaming (so the shader falls back to the monolithic texture).
+    fn assert_streamed_residency_retired(
+        app: &TerraApp,
+        old_key: &TerrainTileKey,
+        old_handle: terra_core::TilePageHandle,
+    ) {
+        let atlas = app.tile_atlas.as_ref().expect("atlas retained");
+        assert_eq!(atlas.residency().stats().resident_tiles, 0);
+        assert_eq!(atlas.residency().resolve_handle(old_handle), None);
+        assert!(app.terrain_runtime.pyramid.record(old_key).is_none());
+        assert!(app.pending_tile_uploads.is_empty());
+        assert!(!app
+            .renderer
+            .as_ref()
+            .expect("renderer")
+            .tile_stream_enabled());
+    }
+
+    /// Revert check for #86: advancing the output revision via `mark_dirty_from`
+    /// must retire the prior revision's streamed pages, and the #34 upload/sync
+    /// lifecycle must then re-populate the atlas and re-enable streaming.
+    #[test]
+    fn edit_via_mark_dirty_from_retires_streamed_pages_until_resync() {
+        let Some(gpu) = terra_test_gpu::headless() else {
+            return;
+        };
+        let (mut app, metrics, old_key, old_handle) = app_with_one_streamed_page(gpu);
+        let revision_before = app.terrain_runtime.output_revision();
+
+        // An unknown layer id dirties the whole stack — the strongest edit shape.
+        app.mark_dirty_from(terra_core::LayerId::new());
+
+        assert_ne!(app.terrain_runtime.output_revision(), revision_before);
+        assert_streamed_residency_retired(&app, &old_key, old_handle);
+
+        // #34 lifecycle: worker completion re-queues tiles and re-enables streaming.
+        app.last_height = Some(Heightfield::filled(metrics, 2.0));
+        app.queue_final_tile_uploads();
+        let (_, new_level, new_tile) = *app
+            .pending_tile_uploads
+            .front()
+            .expect("resync upload queued");
+        assert_eq!(app.upload_pending_terrain_tiles(), 1);
+        let new_key = TerrainTileKey {
+            layer: None,
+            field: FieldId::Height,
+            level: new_level,
+            tile: new_tile,
+        };
+        assert!(app
+            .tile_atlas
+            .as_mut()
+            .expect("atlas")
+            .lookup(&new_key)
+            .is_some());
+        assert!(app
+            .renderer
+            .as_ref()
+            .expect("renderer")
+            .tile_stream_enabled());
+    }
+
+    /// The stage-aware edit path advances the revision too, so it must retire
+    /// streamed pages identically.
+    #[test]
+    fn edit_via_mark_dirty_from_stage_retires_streamed_pages() {
+        let Some(gpu) = terra_test_gpu::headless() else {
+            return;
+        };
+        let (mut app, _metrics, old_key, old_handle) = app_with_one_streamed_page(gpu);
+        let revision_before = app.terrain_runtime.output_revision();
+
+        app.mark_dirty_from_stage(terra_core::LayerId::new());
+
+        assert_ne!(app.terrain_runtime.output_revision(), revision_before);
+        assert_streamed_residency_retired(&app, &old_key, old_handle);
+    }
+
+    /// Whole-stack edits advance the revision via `reconfigure`; that boundary
+    /// must retire streamed pages as well.
+    #[test]
+    fn mark_all_layers_dirty_retires_streamed_pages() {
+        let Some(gpu) = terra_test_gpu::headless() else {
+            return;
+        };
+        let (mut app, _metrics, old_key, old_handle) = app_with_one_streamed_page(gpu);
+
+        app.mark_all_layers_dirty();
+
+        assert_streamed_residency_retired(&app, &old_key, old_handle);
     }
 }

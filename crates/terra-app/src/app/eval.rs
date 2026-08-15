@@ -336,10 +336,38 @@ impl TerraApp {
         );
     }
 
+    /// GPU half of the output-revision boundary. CPU pyramid residency is retired
+    /// by `TerrainRuntime::advance_output_revision`; this retires the streamed side
+    /// with it: pending uploads, atlas page table + residency, and the renderer's
+    /// streaming flag. Presentation stays continuous via the shader's monolithic
+    /// page-miss fallback until `upload_pending_terrain_tiles` →
+    /// `sync_tile_stream_to_renderer` re-enable streaming for the new revision.
+    pub(crate) fn retire_streamed_residency(&mut self) {
+        self.pending_tile_uploads.clear();
+        if let (Some(atlas), Some(gpu)) = (self.tile_atlas.as_mut(), self.gpu.as_ref()) {
+            atlas.clear(&gpu.queue);
+            self.ui_state
+                .profile
+                .update_tile_cache(atlas.residency().stats(), 0);
+        }
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.set_use_tile_stream(false);
+        }
+    }
+
+    /// Single door for edit-driven revision advancement: bump the output revision
+    /// and retire both sides of tile residency in the same step. Callers that
+    /// advance the revision via `reconfigure` instead call
+    /// [`Self::retire_streamed_residency`] directly.
+    pub(crate) fn advance_output_revision(&mut self) {
+        self.terrain_runtime.advance_output_revision();
+        self.retire_streamed_residency();
+    }
+
     pub(crate) fn mark_dirty_from(&mut self, id: LayerId) {
         let preview = self.session.document.preview_eval_stack();
         self.scheduler.evaluator.mark_dirty_from(&preview, id);
-        self.terrain_runtime.advance_output_revision();
+        self.advance_output_revision();
         self.track_worker_dirty_from(&preview, id);
         if let Some(gpu) = self.gpu_engine.as_mut() {
             gpu.mark_dirty_from(&preview, id);
@@ -349,7 +377,7 @@ impl TerraApp {
     pub(crate) fn mark_dirty_from_stage(&mut self, id: LayerId) {
         let preview = self.session.document.preview_eval_stack();
         self.scheduler.evaluator.mark_dirty_from_stage(&preview, id);
-        self.terrain_runtime.advance_output_revision();
+        self.advance_output_revision();
         self.track_worker_dirty_from(&preview, id);
         if let Some(gpu) = self.gpu_engine.as_mut() {
             // GPU path still uses suffix dirty; stage-aware CPU cache is the main win.
@@ -390,6 +418,8 @@ impl TerraApp {
                 metrics.world_size_x,
                 metrics.world_size_z,
             ));
+        // reconfigure() advances the output revision; retire the streamed side too.
+        self.retire_streamed_residency();
         self.worker_mark_all_dirty = true;
         self.worker_dirty_from = None;
         if let Some(gpu) = self.gpu_engine.as_mut() {

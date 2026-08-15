@@ -124,7 +124,7 @@ impl TerraApp {
                     );
                 self.scheduler.evaluator.mark_dirty_from(&preview, id);
                 self.track_worker_dirty_from(&preview, id);
-                self.terrain_runtime.advance_output_revision();
+                self.advance_output_revision();
                 if let Some(gpu) = self.gpu_engine.as_mut() {
                     if sculpt_only {
                         gpu.mark_dirty(id);
