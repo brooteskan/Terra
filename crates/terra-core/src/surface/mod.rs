@@ -1,13 +1,12 @@
 //! Materials, biomes, and vegetation density maps.
 
-use crate::analyze::slope_degrees;
-use crate::fields::{
-    bake_hardness_from_materials_ex, hardness_at_strata_depth, material_id_at_strata_depth,
-};
+use crate::fields::bake_hardness_from_materials_ex;
+use crate::geology::{hardness_at_strata_depth, material_id_at_strata_depth};
 use crate::heightfield::Heightfield;
 use crate::mask::{MaskField, MaskSource};
 use crate::material_schema::{BiomesParams, MaterialsParams, Stratum};
 use crate::scatter::{self, VegetationParams};
+use crate::spatial_kernels::slope_degrees;
 use std::collections::HashMap;
 
 /// Classify surface material IDs and bake hardness.

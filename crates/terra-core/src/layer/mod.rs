@@ -137,7 +137,7 @@ impl Layer {
         common.blend = blend;
         // Default published outputs from the operation contract.
         for field in kind.produced_fields() {
-            if field != crate::fields::FieldId::Height {
+            if field != crate::field_data::FieldId::Height {
                 common
                     .outputs
                     .push(NamedOutputDecl::new(field.display_name(), field));

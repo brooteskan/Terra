@@ -2,7 +2,7 @@
 
 use crate::analyze;
 use crate::analyze::ThermalErosionParams;
-use crate::fields::keys;
+use crate::field_data::keys;
 use crate::heightfield::Heightfield;
 use crate::hydro;
 use crate::mask::{MaskField, MaskSource};

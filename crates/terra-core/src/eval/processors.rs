@@ -1,8 +1,9 @@
 use super::{EvalContext, EvalError};
 use crate::analyze;
 use crate::authoring;
+use crate::field_data::keys;
 use crate::fields::{
-    bake_hardness_from_materials_ex, bake_hardness_from_strata_ex, has_depth_aware_strata, keys,
+    bake_hardness_from_materials_ex, bake_hardness_from_strata_ex, has_depth_aware_strata,
     resolve_hardness,
 };
 use crate::generators;

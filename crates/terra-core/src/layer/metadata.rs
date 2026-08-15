@@ -4,7 +4,7 @@ use super::cache_policy::{CachePolicy, CacheState};
 use super::operation::{FieldContract, OperationCategory};
 use super::workflow::WorkflowStage;
 use super::{Layer, LayerGroup, LayerId, LayerKind};
-use crate::fields::FieldId;
+use crate::field_data::FieldId;
 use serde::{Deserialize, Serialize};
 
 /// Visual accent bucket for lists / badges (not a hardcoded UI colour).

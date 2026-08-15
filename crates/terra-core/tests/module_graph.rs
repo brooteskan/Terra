@@ -18,6 +18,8 @@
 //! - **Rule 3** (`clean_modules_stay_acyclic`): the modules currently outside
 //!   every cycle ([`CLEAN_MODULES`]) must stay outside — the knot cannot recruit
 //!   them.
+//! - **Rule 4** (`dependency_tiers_point_downward`): newly extracted schema and
+//!   kernel modules may depend only on their explicitly lower-level allowlist.
 //!
 //! Kept deliberately dumb — line scanning, no `syn`/`regex` — so it grows no
 //! dependencies and cannot rot, exactly like `purity.rs` and `dead_seams.rs`.
@@ -52,108 +54,89 @@ use std::sync::OnceLock;
 /// Exact set (Rule 2). Seeded to today's graph; each A3 fix deletes the edges it
 /// removes in the same commit. Sorted for readable diffs.
 const CYCLIC_EDGES: &[(&str, &str)] = &[
-    ("analyze", "fields"),
-    ("analyze", "generators"),
-    ("analyze", "geomorph"),
-    ("analyze", "hydro"),
-    ("analyze", "mask"),
-    ("analyze", "material_schema"),
-    ("authoring", "analyze"),
-    ("authoring", "fields"),
-    ("authoring", "hydro"),
-    ("authoring", "landscape_evolution"),
-    ("authoring", "mask"),
-    ("biome_definition", "layer"),
-    ("biome_definition", "mask"),
-    ("biome_paint", "mask"),
-    ("climate", "analyze"),
-    ("climate", "mask"),
-    ("climate", "material_schema"),
     ("document", "rebuild_feedback"),
-    ("eval", "analyze"),
-    ("eval", "authoring"),
-    ("eval", "climate"),
-    ("eval", "fields"),
     ("eval", "generators"),
-    ("eval", "hydro"),
-    ("eval", "landscape_evolution"),
     ("eval", "layer"),
-    ("eval", "mask"),
-    ("eval", "surface"),
-    ("fields", "analyze"),
-    ("fields", "generators"),
-    ("fields", "mask"),
-    ("fields", "material_schema"),
-    ("generators", "analyze"),
     ("generators", "eval"),
-    ("generators", "geomorph"),
-    ("generators", "hydro"),
-    ("generators", "mask"),
-    ("generators", "material_schema"),
-    ("geomorph", "analyze"),
-    ("geomorph", "mask"),
-    ("hydro", "fields"),
-    ("hydro", "geomorph"),
-    ("hydro", "mask"),
-    ("hydro", "material_schema"),
-    ("landscape_evolution", "analyze"),
-    ("landscape_evolution", "fields"),
-    ("landscape_evolution", "geomorph"),
-    ("landscape_evolution", "hydro"),
-    ("landscape_evolution", "mask"),
-    ("layer", "analyze"),
-    ("layer", "authoring"),
-    ("layer", "biome_paint"),
-    ("layer", "fields"),
     ("layer", "generators"),
-    ("layer", "hydro"),
-    ("layer", "landscape_evolution"),
-    ("layer", "mask"),
-    ("layer", "material_schema"),
-    ("layer", "scatter"),
-    ("mask", "analyze"),
-    ("mask", "biome_definition"),
-    ("material_schema", "mask"),
     ("rebuild_feedback", "document"),
-    ("scatter", "analyze"),
-    ("scatter", "mask"),
-    ("surface", "analyze"),
-    ("surface", "climate"),
-    ("surface", "fields"),
-    ("surface", "mask"),
-    ("surface", "material_schema"),
-    ("surface", "scatter"),
 ];
 
 /// Top-level modules that are outside every cycle at this commit and must stay
 /// that way (Rule 3). The newest module families live here; the guard keeps the
 /// knot from recruiting them.
 const CLEAN_MODULES: &[&str] = &[
+    "analyze",
+    "authoring",
+    "biome_definition",
+    "biome_paint",
+    "climate",
     "command",
     "contextual_create",
     "deps",
     "domain",
+    "field_data",
+    "filter_params",
+    "fields",
+    "geology",
+    "geomorph",
     "heightfield",
+    "hydro",
     "ids",
     "invalidation",
     "landscape_blueprint",
     "landscape_style",
+    "landscape_evolution",
     "matter_sim",
+    "mask",
+    "mask_execution",
+    "mask_ir",
     "mask_types",
     "mask_field",
+    "material_schema",
     "noise",
     "quality",
     "realism_benchmark",
+    "scatter",
     "shape_history",
     "shape_object",
     "simd_ops",
     "simulation_scenario",
     "sparse_paint",
+    "spatial_kernels",
+    "surface",
     "terrain",
     "terrain_recipe",
     "volumetric",
     "world_archetype",
     "world_rules",
+];
+
+/// Allowed production dependencies for the extracted data → kernel → execution tiers.
+const TIER_DEPENDENCIES: &[(&str, &[&str])] = &[
+    (
+        "field_data",
+        &["geology", "heightfield", "mask_field", "spatial_kernels"],
+    ),
+    ("filter_params", &["noise"]),
+    ("geology", &["noise"]),
+    (
+        "mask_execution",
+        &[
+            "heightfield",
+            "ids",
+            "mask_field",
+            "mask_ir",
+            "mask_types",
+            "noise",
+            "spatial_kernels",
+        ],
+    ),
+    (
+        "mask_ir",
+        &["ids", "mask_field", "mask_types", "raster", "simd_ops"],
+    ),
+    ("spatial_kernels", &["heightfield", "mask_field"]),
 ];
 
 /// Crate names (exact) that terra-core must never take as a normal or build
@@ -274,6 +257,37 @@ fn clean_modules_stay_acyclic() {
     assert!(
         violations.is_empty(),
         "clean-set guard failed:\n  {}",
+        violations.join("\n  "),
+    );
+}
+
+// ===========================================================================
+// Rule 4 — extracted tiers point downward
+// ===========================================================================
+
+#[test]
+fn dependency_tiers_point_downward() {
+    let g = graph();
+    let mut violations = Vec::new();
+
+    for &(module, allowed) in TIER_DEPENDENCIES {
+        if !g.modules.contains(module) {
+            violations.push(format!("TIER_DEPENDENCIES names unknown module `{module}`"));
+            continue;
+        }
+        for (_, target) in g.edges.iter().filter(|(source, _)| source == module) {
+            if !allowed.contains(&target.as_str()) {
+                violations.push(format!(
+                    "module `{module}` depends upward or sideways on `{target}`; allowed: {}",
+                    allowed.join(", ")
+                ));
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "dependency-tier guard failed:\n  {}",
         violations.join("\n  "),
     );
 }

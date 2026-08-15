@@ -11,7 +11,7 @@
 //! not rewritten.
 
 use crate::domain::SoftDiagnostic;
-use crate::fields::FieldId;
+use crate::field_data::FieldId;
 use crate::simulation_scenario::SimulationScenario;
 
 pub use crate::simulation_scenario::{

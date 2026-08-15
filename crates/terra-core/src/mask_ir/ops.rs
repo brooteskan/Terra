@@ -1,4 +1,4 @@
-use super::MaskField;
+use crate::mask_field::MaskField;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

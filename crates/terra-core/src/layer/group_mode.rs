@@ -1,7 +1,7 @@
 //! Explicit group evaluation and input modes.
 
 use super::operation::OperationCategory;
-use crate::fields::FieldId;
+use crate::field_data::FieldId;
 use crate::ids::OutputId;
 use serde::{Deserialize, Serialize};
 

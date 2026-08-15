@@ -4,7 +4,7 @@
 //! and Hydraulic Sediment. Presets bias transport / erodibility / particle kernels —
 //! they do not fork independent erosion implementations or post-apply ridge noise.
 
-use crate::generators::{EffectFilterKind, EffectFilterParams};
+use crate::filter_params::{EffectFilterKind, EffectFilterParams};
 use crate::geomorph::ridge_valley_likelihood;
 use crate::heightfield::{Heightfield, HeightfieldMetrics};
 use crate::mask::{MaskField, MaskSource};

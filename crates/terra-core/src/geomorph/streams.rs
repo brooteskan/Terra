@@ -1,8 +1,8 @@
 //! Channel network extraction and Horton–Strahler ordering.
 
-use crate::analyze::jump_flood_distance;
 use crate::heightfield::HeightfieldMetrics;
 use crate::mask::MaskField;
+use crate::spatial_kernels::jump_flood_distance;
 
 use super::routing::FlowGraph;
 

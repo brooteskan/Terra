@@ -4,7 +4,7 @@
 //! with semantic strokes, constraints and reconstruction. Authoring data stays
 //! resolution independent; only evaluation rasterizes it.
 
-use crate::fields::keys;
+use crate::field_data::keys;
 use crate::heightfield::Heightfield;
 use crate::hydro::{self, StreamPowerParams};
 use crate::mask::{MaskField, MaskSource};

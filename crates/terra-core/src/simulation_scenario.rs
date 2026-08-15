@@ -12,7 +12,7 @@
 
 use crate::biome_definition::BiomeDefinitionId;
 use crate::domain::SoftDiagnostic;
-use crate::fields::FieldId;
+use crate::field_data::FieldId;
 use crate::layer::{CachePolicy, LayerId, LayerKind};
 use crate::mask::{MaskId, PlacementDefinition};
 use serde::{Deserialize, Serialize};

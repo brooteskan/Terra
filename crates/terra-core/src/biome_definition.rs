@@ -3,7 +3,9 @@
 use crate::layer::{
     EffectFilterKind, EffectFilterParams, Layer, LayerId, LayerKind, MaterialRule, MaterialsParams,
 };
-use crate::mask::{DistNode, DistNodeKind, MaskCombine, MaskSource};
+pub use crate::mask_ir::PlacementCombineMode;
+use crate::mask_ir::{DistNode, DistNodeKind, Distribution, MaskCombine, PlacementDefinition};
+use crate::mask_types::MaskSource;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -20,88 +22,6 @@ impl BiomeDefinitionId {
 impl Default for BiomeDefinitionId {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-/// How manual paint combines with procedural placement rules.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum PlacementCombineMode {
-    #[default]
-    PaintOnly,
-    RulesOnly,
-    PaintMulRules,
-    PaintAddRules,
-    PaintOverridesRules,
-    RulesOutsidePaint,
-}
-
-impl PlacementCombineMode {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::PaintOnly => "Paint Only",
-            Self::RulesOnly => "Rules Only",
-            Self::PaintMulRules => "Paint x Rules",
-            Self::PaintAddRules => "Paint + Rules",
-            Self::PaintOverridesRules => "Paint Overrides Rules",
-            Self::RulesOutsidePaint => "Rules Outside Painted Area",
-        }
-    }
-
-    /// Plain-language ownership control for artists.
-    pub fn artist_label(self) -> &'static str {
-        match self {
-            Self::PaintOverridesRules | Self::RulesOutsidePaint => "Paint owns · rules fill gaps",
-            Self::PaintMulRules => "Guided by rules",
-            Self::PaintAddRules => "Paint + rules",
-            Self::PaintOnly => "Paint only",
-            Self::RulesOnly => "Rules only",
-        }
-    }
-
-    /// Toggle between ownership paint (default) and guided multiply.
-    pub fn cycle_artist(self) -> Self {
-        match self {
-            Self::PaintOverridesRules | Self::RulesOutsidePaint | Self::PaintOnly => {
-                Self::PaintMulRules
-            }
-            _ => Self::PaintOverridesRules,
-        }
-    }
-
-    pub fn combine(self, manual: f32, procedural: f32) -> f32 {
-        let m = manual.clamp(0.0, 1.0);
-        let p = procedural.clamp(0.0, 1.0);
-        match self {
-            Self::PaintOnly => m,
-            Self::RulesOnly => p,
-            Self::PaintMulRules => m * p,
-            Self::PaintAddRules => (m + p).clamp(0.0, 1.0),
-            Self::PaintOverridesRules | Self::RulesOutsidePaint => {
-                if m > 1e-4 {
-                    m
-                } else {
-                    p
-                }
-            }
-        }
-    }
-
-    /// Map to DistNode / mask stack combine when rules are DistNodes and paint is a mask ref.
-    /// Paint is applied *after* DistNodes in [`bake_distribution_with_context`].
-    pub fn mask_combine(self) -> MaskCombine {
-        match self {
-            Self::PaintMulRules => MaskCombine::Multiply,
-            Self::PaintAddRules => MaskCombine::Add,
-            Self::PaintOnly => MaskCombine::Replace,
-            Self::PaintOverridesRules | Self::RulesOutsidePaint => MaskCombine::PaintOverride,
-            // Paint entry should be omitted for RulesOnly; Multiply is a harmless fallback.
-            Self::RulesOnly => MaskCombine::Multiply,
-        }
-    }
-
-    /// Whether manual paint should be attached to the biome distribution.
-    pub fn uses_manual_paint(self) -> bool {
-        !matches!(self, Self::RulesOnly)
     }
 }
 
@@ -124,7 +44,7 @@ pub struct BiomePlacementRules {
     pub rules: Option<DistNode>,
     /// Artist PlacementDefinition (compiles into Mask Layer DistNode stack).
     #[serde(default)]
-    pub definition: Option<crate::mask::PlacementDefinition>,
+    pub definition: Option<PlacementDefinition>,
     #[serde(default)]
     pub blur_m: f32,
     #[serde(default)]
@@ -135,34 +55,34 @@ pub struct BiomePlacementRules {
 
 impl BiomePlacementRules {
     /// Resolve the distribution written onto a biome group.
-    pub fn compiled_distribution(&self) -> crate::mask::Distribution {
+    pub fn compiled_distribution(&self) -> Distribution {
         if let Some(def) = &self.definition {
             return def.active_distribution();
         }
         if let Some(rules) = &self.rules {
-            return crate::mask::Distribution::from_nodes(vec![rules.clone()]);
+            return Distribution::from_nodes(vec![rules.clone()]);
         }
-        crate::mask::Distribution::new()
+        Distribution::new()
     }
 
     /// Ensure `definition` exists, wrapping legacy `rules` when needed.
-    pub fn ensure_definition(&mut self) -> &mut crate::mask::PlacementDefinition {
+    pub fn ensure_definition(&mut self) -> &mut PlacementDefinition {
         if self.definition.is_none() {
             self.definition = Some(match &self.rules {
-                Some(node) => crate::mask::PlacementDefinition::from_legacy_dist_node(node.clone()),
-                None => crate::mask::PlacementDefinition::default(),
+                Some(node) => PlacementDefinition::from_legacy_dist_node(node.clone()),
+                None => PlacementDefinition::default(),
             });
         }
         self.definition.as_mut().expect("just inserted")
     }
 
     /// Mark Mask Stack as Custom after a manual DistNode edit.
-    pub fn mark_mask_stack_custom(&mut self, stack: crate::mask::Distribution) {
+    pub fn mark_mask_stack_custom(&mut self, stack: Distribution) {
         self.ensure_definition().mark_custom(stack);
     }
 
     /// Reset Custom stack by recompiling from PlacementDefinition rules.
-    pub fn reset_placement_to_rules(&mut self) -> crate::mask::Distribution {
+    pub fn reset_placement_to_rules(&mut self) -> Distribution {
         self.ensure_definition().reset_to_rules()
     }
 }

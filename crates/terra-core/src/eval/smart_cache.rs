@@ -235,7 +235,7 @@ fn read_f32_blob(path: &Path) -> Result<Vec<f32>, EvalError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fields::{keys, AuxMaps};
+    use crate::field_data::{keys, AuxMaps};
     use crate::heightfield::HeightfieldMetrics;
     use std::collections::HashMap;
 

@@ -21,6 +21,39 @@ fn legacy_layer_parameter_paths_name_the_canonical_types() {
         terra_core::mask_field::MaskField,
         terra_core::mask::MaskField
     );
+    assert_same_type!(terra_core::mask_ir::MaskAsset, terra_core::mask::MaskAsset);
+    assert_same_type!(terra_core::mask_ir::MaskOp, terra_core::mask::MaskOp);
+    assert_same_type!(
+        terra_core::mask_ir::PaintBuffer,
+        terra_core::mask::PaintBuffer
+    );
+    assert_same_type!(terra_core::mask_ir::DistNode, terra_core::mask::DistNode);
+    assert_same_type!(
+        terra_core::mask_ir::Distribution,
+        terra_core::mask::Distribution
+    );
+    assert_same_type!(
+        terra_core::mask_ir::PlacementDefinition,
+        terra_core::mask::PlacementDefinition
+    );
+    assert_same_type!(
+        terra_core::mask_ir::PlacementCombineMode,
+        terra_core::biome_definition::PlacementCombineMode
+    );
+    assert_same_type!(terra_core::field_data::FieldId, terra_core::fields::FieldId);
+    assert_same_type!(terra_core::field_data::AuxMaps, terra_core::fields::AuxMaps);
+    assert_same_type!(
+        terra_core::geology::BedGeometry,
+        terra_core::material_schema::BedGeometry
+    );
+    assert_same_type!(
+        terra_core::geology::Stratum,
+        terra_core::material_schema::Stratum
+    );
+    assert_same_type!(
+        terra_core::geology::StratumMaterial,
+        terra_core::material_schema::StratumMaterial
+    );
     assert_same_type!(
         terra_core::invalidation::DirtyClass,
         terra_core::tiling::DirtyClass

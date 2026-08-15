@@ -4,8 +4,8 @@ mod params;
 
 pub use params::VegetationParams;
 
-use crate::analyze::slope_degrees;
 use crate::heightfield::Heightfield;
+use crate::spatial_kernels::slope_degrees;
 
 /// Bridson-style Poisson disk in world XZ, filtered by slope/biome proxies.
 pub fn poisson_disk(hf: &Heightfield, p: &VegetationParams) -> Vec<(f32, f32)> {

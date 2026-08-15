@@ -16,7 +16,7 @@ pub use worker::{
     EvalWorkerSubmitError,
 };
 
-use crate::fields::AuxMaps;
+use crate::field_data::AuxMaps;
 use crate::heightfield::{Heightfield, HeightfieldMetrics};
 use crate::layer::{blend_heights, Layer, LayerId, LayerStack, StackNode};
 use crate::mask::{MaskAsset, MaskField, MaskId};
@@ -137,11 +137,11 @@ impl EvalContext {
     /// Insert an aux map into both typed and string stores.
     pub fn aux_insert(&mut self, key: impl Into<String>, field: MaskField) {
         let key = key.into();
-        let canonical = crate::fields::keys::canonical(&key).to_string();
+        let canonical = crate::field_data::keys::canonical(&key).to_string();
         self.aux_maps.insert(canonical.clone(), field.clone());
-        if canonical == crate::fields::keys::SEDIMENT_THICKNESS {
-            self.aux.remove(crate::fields::keys::SEDIMENT_DEPTH);
-            self.aux.remove(crate::fields::keys::LOOSE_SEDIMENT);
+        if canonical == crate::field_data::keys::SEDIMENT_THICKNESS {
+            self.aux.remove(crate::field_data::keys::SEDIMENT_DEPTH);
+            self.aux.remove(crate::field_data::keys::LOOSE_SEDIMENT);
         }
         self.aux.insert(canonical, field);
     }
@@ -474,7 +474,7 @@ impl StackEvaluator {
         &mut self,
         id: LayerId,
         height: &Heightfield,
-        child_aux: &crate::fields::AuxMaps,
+        child_aux: &crate::field_data::AuxMaps,
         input: &Heightfield,
         _ctx: &EvalContext,
         baked: bool,
@@ -579,7 +579,7 @@ impl StackEvaluator {
         ctx: &EvalContext,
         descendant_ids: &[LayerId],
         input: &Heightfield,
-    ) -> Option<(Heightfield, crate::fields::AuxMaps)> {
+    ) -> Option<(Heightfield, crate::field_data::AuxMaps)> {
         if self.cache.is_dirty(group_id) {
             return None;
         }
@@ -590,7 +590,7 @@ impl StackEvaluator {
         if cached.generation != height_fingerprint(input) {
             return None;
         }
-        let child_aux = crate::fields::AuxMaps::from_hashmap_preserving_strata(
+        let child_aux = crate::field_data::AuxMaps::from_hashmap_preserving_strata(
             &cached.aux,
             cached.strata.clone(),
         );
@@ -821,7 +821,7 @@ fn publish_layer_outputs(ctx: &mut EvalContext, layer: &Layer, height: &Heightfi
         if !output.enabled {
             continue;
         }
-        let field = if output.field == crate::fields::FieldId::Height {
+        let field = if output.field == crate::field_data::FieldId::Height {
             MaskField::from_raw(height.metrics, &height.to_dense())
         } else {
             let key = output.field.cache_key();
@@ -884,7 +884,7 @@ fn mix_height_delta(
 /// Merge child aux maps into the parent context, weighted by the group mask.
 fn merge_aux_masked(
     ctx: &mut EvalContext,
-    child: &crate::fields::AuxMaps,
+    child: &crate::field_data::AuxMaps,
     mask: &MaskField,
     opacity: f32,
 ) {
@@ -980,7 +980,7 @@ fn height_fingerprint(h: &Heightfield) -> u64 {
 
 /// Multiply recent materials / vegetation aux fields by a placement mask.
 fn gate_aux_by_mask(ctx: &mut EvalContext, mask: &MaskField) {
-    use crate::fields::keys;
+    use crate::field_data::keys;
     let mul = |field: &mut MaskField| {
         let w = field.metrics.width;
         let h = field.metrics.height;

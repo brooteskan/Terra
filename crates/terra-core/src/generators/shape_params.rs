@@ -1,10 +1,10 @@
 //! Layer parameter kinds (split by family).
 
-use super::filter_params::EffectFilterParams;
 use super::terrain_params::{
     CanyonParams, DuneParams, FbmParams, ImportHeightmapParams, MesaParams, MountainParams,
     PlateauParams, VolcanoParams,
 };
+use crate::filter_params::EffectFilterParams;
 use crate::noise::NoiseParams;
 use serde::{Deserialize, Serialize};
 

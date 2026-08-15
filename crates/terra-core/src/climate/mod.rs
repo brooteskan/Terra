@@ -4,11 +4,11 @@
 //! GPU preview may skip height-affecting work, while climate AuxMaps are baked
 //! on CPU and uploaded as R32Float for overlays.
 
-use crate::analyze::jump_flood_distance;
 use crate::heightfield::Heightfield;
 use crate::mask::MaskField;
 pub use crate::material_schema::default_climate_bands;
 use crate::material_schema::{BiomeBand, BiomesParams};
+use crate::spatial_kernels::jump_flood_distance;
 
 /// Packed climate / biome output maps (all values typically in \[0,1\]).
 #[derive(Debug, Clone)]

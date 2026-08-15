@@ -2,7 +2,6 @@
 
 mod arid_landforms;
 mod filter_kernels;
-mod filter_params;
 mod foundation_params;
 pub mod geology;
 mod hydro_params;
@@ -10,7 +9,7 @@ mod morphology;
 mod shape_params;
 mod terrain_params;
 
-pub use filter_params::{BlurParams, EffectFilterKind, EffectFilterParams};
+pub use crate::filter_params::{BlurParams, EffectFilterKind, EffectFilterParams};
 pub use foundation_params::{FlatParams, RampParams, SculptParams};
 pub use hydro_params::{
     CoastalParams, FluidSimParams, RiverNetworkParams, RiverNode, SandSimParams,

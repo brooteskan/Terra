@@ -1,7 +1,7 @@
 //! Operation categories and field contracts for terrain layers.
 
 use super::LayerKind;
-use crate::fields::FieldId;
+use crate::field_data::FieldId;
 use crate::invalidation::DirtyClass;
 use serde::{Deserialize, Serialize};
 
@@ -204,22 +204,22 @@ impl LayerKind {
             LayerKind::SculptStrokes(_) => vec![
                 FieldId::Height,
                 FieldId::Hardness,
-                FieldId::Named(crate::fields::keys::SCULPT_PROTECTION.into()),
-                FieldId::Named(crate::fields::keys::UPLIFT_RATE.into()),
+                FieldId::Named(crate::field_data::keys::SCULPT_PROTECTION.into()),
+                FieldId::Named(crate::field_data::keys::UPLIFT_RATE.into()),
                 FieldId::SedimentThickness,
-                FieldId::Named(crate::fields::keys::EDIT_REGION.into()),
+                FieldId::Named(crate::field_data::keys::EDIT_REGION.into()),
             ],
             LayerKind::TerrainConstraints(_) => vec![
                 FieldId::Height,
-                FieldId::Named(crate::fields::keys::CONSTRAINT_TARGET.into()),
-                FieldId::Named(crate::fields::keys::CONSTRAINT_WEIGHT.into()),
-                FieldId::Named(crate::fields::keys::SCULPT_PROTECTION.into()),
-                FieldId::Named(crate::fields::keys::UPLIFT_RATE.into()),
-                FieldId::Named(crate::fields::keys::EDIT_REGION.into()),
+                FieldId::Named(crate::field_data::keys::CONSTRAINT_TARGET.into()),
+                FieldId::Named(crate::field_data::keys::CONSTRAINT_WEIGHT.into()),
+                FieldId::Named(crate::field_data::keys::SCULPT_PROTECTION.into()),
+                FieldId::Named(crate::field_data::keys::UPLIFT_RATE.into()),
+                FieldId::Named(crate::field_data::keys::EDIT_REGION.into()),
             ],
             LayerKind::GradientReconstruct(_) => vec![
                 FieldId::Height,
-                FieldId::Named(crate::fields::keys::CONSTRAINT_ERROR.into()),
+                FieldId::Named(crate::field_data::keys::CONSTRAINT_ERROR.into()),
             ],
             LayerKind::LandscapeEvolution(_) => vec![
                 FieldId::Height,
@@ -231,8 +231,8 @@ impl LayerKind {
                 FieldId::Deposition,
                 FieldId::WaterDischarge,
                 FieldId::SedimentThickness,
-                FieldId::Named(crate::fields::keys::UPLIFT_RATE.into()),
-                FieldId::Named(crate::fields::keys::TECTONIC_BASE.into()),
+                FieldId::Named(crate::field_data::keys::UPLIFT_RATE.into()),
+                FieldId::Named(crate::field_data::keys::TECTONIC_BASE.into()),
             ],
             LayerKind::HydrologyRepair(_) => vec![
                 FieldId::Height,
@@ -240,11 +240,11 @@ impl LayerKind {
                 FieldId::FlowAccumulation,
                 FieldId::StreamOrder,
                 FieldId::SpeIncision,
-                FieldId::Named(crate::fields::keys::REPAIR_REGION.into()),
+                FieldId::Named(crate::field_data::keys::REPAIR_REGION.into()),
             ],
             LayerKind::GeomorphicDetail(_) => vec![
                 FieldId::Height,
-                FieldId::Named(crate::fields::keys::DETAIL_MASK.into()),
+                FieldId::Named(crate::field_data::keys::DETAIL_MASK.into()),
                 FieldId::FineFlow,
                 FieldId::MicroChannel,
                 FieldId::RidgeBreakup,
@@ -254,17 +254,17 @@ impl LayerKind {
                 FieldId::Height,
                 FieldId::Hardness,
                 FieldId::Deposition,
-                FieldId::Named(crate::fields::keys::ROOT_COHESION.into()),
+                FieldId::Named(crate::field_data::keys::ROOT_COHESION.into()),
             ],
             LayerKind::Island(_) => vec![
                 FieldId::Height,
-                FieldId::Named(crate::fields::keys::LAND_MASK.into()),
-                FieldId::Named(crate::fields::keys::SHORE_DISTANCE.into()),
-                FieldId::Named(crate::fields::keys::BATHYMETRY.into()),
-                FieldId::Named(crate::fields::keys::SHELF.into()),
-                FieldId::Named(crate::fields::keys::BEACH.into()),
-                FieldId::Named(crate::fields::keys::REEF.into()),
-                FieldId::Named(crate::fields::keys::MOUNTAIN_MASK.into()),
+                FieldId::Named(crate::field_data::keys::LAND_MASK.into()),
+                FieldId::Named(crate::field_data::keys::SHORE_DISTANCE.into()),
+                FieldId::Named(crate::field_data::keys::BATHYMETRY.into()),
+                FieldId::Named(crate::field_data::keys::SHELF.into()),
+                FieldId::Named(crate::field_data::keys::BEACH.into()),
+                FieldId::Named(crate::field_data::keys::REEF.into()),
+                FieldId::Named(crate::field_data::keys::MOUNTAIN_MASK.into()),
             ],
             LayerKind::HydraulicErosion(_) => vec![
                 FieldId::Height,

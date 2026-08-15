@@ -3,7 +3,7 @@
 //! Presets are parameter sets over real algorithms (see [`crate::landscape_style`]).
 //! Do not bake unique hardcoded generators per look.
 
-use crate::authoring::{GradientReconstructParams, HydrologyRepairParams, SculptPoint};
+use crate::authoring::{GradientReconstructParams, HydrologyRepairParams};
 use crate::biome_definition::BiomeLibrary;
 use crate::biome_paint::BiomeLayer;
 use crate::document::TerrainDocument;
@@ -16,7 +16,7 @@ use crate::layer::{
     SandSimParams, SculptParams,
 };
 use crate::mask::MaskSource;
-use crate::shape_object::{ShapeKind, ShapeObject, ShapeObjectStore};
+use crate::shape_object::{ShapeKind, ShapeObjectStore};
 
 /// Stable New World template identity (matches project template ids).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -81,7 +81,7 @@ impl WorldTemplate {
 
     pub fn description(self) -> &'static str {
         match self {
-            Self::Blank => "Scaffold only: blueprint, shapes, biome library — no baked evolution.",
+            Self::Blank => "Empty flat surface with a blueprint and biome library.",
             Self::TropicalIsland => {
                 "Island landmass → evolution → shore profile → geomorphic detail."
             }
@@ -159,7 +159,7 @@ pub fn build_world(
 
     match template {
         WorldTemplate::Blank => {
-            push_blank_shapes(&mut doc);
+            prepare_blank_surface(&mut doc);
             finish_biomes(&mut doc, BiomeLibrary::default_world_palette(), mps, false);
             for def in &mut doc.biome_library.definitions {
                 def.placement.combine =
@@ -480,54 +480,15 @@ fn finish_biomes(doc: &mut TerrainDocument, biomes: BiomeLibrary, mps: f32, hd_o
 
 // —— Macro stages ————————————————————————————————————————————————————
 
-fn push_blank_shapes(doc: &mut TerrainDocument) {
-    let mut landmass = ShapeObject::new("Initial Landmass", ShapeKind::LandmassPolygon);
-    landmass.points = vec![
-        SculptPoint {
-            u: 0.2,
-            v: 0.2,
-            pressure: 1.0,
-        },
-        SculptPoint {
-            u: 0.8,
-            v: 0.2,
-            pressure: 1.0,
-        },
-        SculptPoint {
-            u: 0.8,
-            v: 0.8,
-            pressure: 1.0,
-        },
-        SculptPoint {
-            u: 0.2,
-            v: 0.8,
-            pressure: 1.0,
-        },
-    ];
-    landmass.width_m = 80.0;
-    let mut uplift = ShapeObject::new("Initial Uplift", ShapeKind::UpliftCentre);
-    uplift.points = vec![SculptPoint {
-        u: 0.5,
-        v: 0.5,
-        pressure: 1.0,
-    }];
-    uplift.width_m = 400.0;
-    uplift.value = 40.0;
-    doc.shapes.push(landmass);
-    doc.shapes.push(uplift);
-    doc.compile_shapes_into_stack();
-    push_gradient_reconstruct(doc, 48, 6.0);
-
+fn prepare_blank_surface(doc: &mut TerrainDocument) {
     if let Some(base) = doc
         .stack
         .flatten_layers_mut()
         .into_iter()
         .find(|l| l.kind.is_sculpt_base())
     {
-        *base = Layer::new(
-            "Base",
-            LayerKind::SculptBase(SculptParams::filled(doc.preview_resolution.min(512), 8.0)),
-        );
+        base.kind =
+            LayerKind::SculptBase(SculptParams::filled(doc.preview_resolution.min(512), 8.0));
     }
 }
 
@@ -786,14 +747,15 @@ mod tests {
     }
 
     #[test]
-    fn blank_is_scaffold_without_evolution() {
+    fn blank_is_flat_and_contains_no_authored_landforms() {
         let doc = blank_world_design(8192.0, 256);
         assert!(!doc.biome_library.definitions.is_empty());
         assert!(doc.selected_biome_layer.is_some());
-        assert_eq!(doc.shapes.shapes.len(), 2);
-        assert!(has_kind(&doc, |k| matches!(
+        assert!(doc.shapes.shapes.is_empty());
+        assert!(doc.shapes.managed_constraints_layer.is_none());
+        assert!(!has_kind(&doc, |k| matches!(
             k,
-            LayerKind::GradientReconstruct(_)
+            LayerKind::TerrainConstraints(_) | LayerKind::GradientReconstruct(_)
         )));
         assert!(!has_kind(&doc, |k| matches!(
             k,
@@ -803,6 +765,17 @@ mod tests {
             k,
             LayerKind::EffectFilter(_)
         )));
+        let base = doc
+            .stack
+            .flatten_layers()
+            .into_iter()
+            .find_map(|layer| match &layer.kind {
+                LayerKind::SculptBase(params) => Some(params),
+                _ => None,
+            })
+            .expect("blank template has a sculptable base");
+        assert!(!base.samples.is_empty());
+        assert!(base.samples.iter().all(|sample| *sample == 8.0));
     }
 
     #[test]

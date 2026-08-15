@@ -11,7 +11,7 @@ pub use params::{RiverCarveParams, StreamPowerParams};
 
 use std::collections::VecDeque;
 
-use crate::fields::erodibility_at_strata_depth;
+use crate::geology::erodibility_at_strata_depth;
 use crate::geomorph::{
     accumulate_drainage_area, accumulate_drainage_area_d8, build_flow_graph, priority_flood_fill,
     D8Drainage, FlowModel, Precipitation,

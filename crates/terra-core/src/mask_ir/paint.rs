@@ -1,4 +1,4 @@
-use super::MaskField;
+use crate::mask_field::MaskField;
 use crate::raster::{
     resample_f32_grid, GridDimensions, RasterResizeError, RasterResizeLimits, RasterSemantic,
 };

@@ -1,8 +1,10 @@
 //! Bake project mask assets into `MaskField`s for evaluation.
 
-use super::{apply_mask_ops, MaskAsset, MaskField, MaskId, MaskSource};
-use crate::analyze;
 use crate::heightfield::{Heightfield, HeightfieldMetrics};
+use crate::mask_field::MaskField;
+use crate::mask_ir::{apply_mask_ops, MaskAsset};
+use crate::mask_types::{MaskId, MaskSource};
+use crate::spatial_kernels;
 use std::collections::HashMap;
 
 /// Bake all mask assets against a reference heightfield.
@@ -79,7 +81,7 @@ fn bake_source(
         MaskSource::Constant(v) => MaskField::filled(hf.metrics, *v),
         MaskSource::Height { min, max } => MaskField::from_height_range(hf, *min, *max),
         MaskSource::Slope { min_deg, max_deg } => {
-            let s = analyze::slope_degrees(hf);
+            let s = spatial_kernels::slope_degrees(hf);
             let mut m = MaskField::zeros(hf.metrics);
             for j in 0..hf.metrics.height {
                 for i in 0..hf.metrics.width {
@@ -93,19 +95,19 @@ fn bake_source(
         MaskSource::Aspect {
             center_deg,
             width_deg,
-        } => analyze::aspect_mask(hf, *center_deg, *width_deg),
+        } => spatial_kernels::aspect_mask(hf, *center_deg, *width_deg),
         MaskSource::Curvature { min, max } => {
-            let c = analyze::curvature(hf);
+            let c = spatial_kernels::curvature(hf);
             let mut m = c;
             for v in m.data_mut() {
                 *v = ((*v - *min) / (*max - *min).max(1e-3)).clamp(0.0, 1.0);
             }
             m
         }
-        MaskSource::Convexity => analyze::convexity(hf),
-        MaskSource::Concavity => analyze::concavity(hf),
+        MaskSource::Convexity => spatial_kernels::convexity(hf),
+        MaskSource::Concavity => spatial_kernels::concavity(hf),
         MaskSource::AmbientOcclusion { radius, strength } => {
-            analyze::ambient_occlusion(hf, *radius, *strength)
+            spatial_kernels::ambient_occlusion(hf, *radius, *strength)
         }
         MaskSource::DistanceField { threshold } => {
             let mut seeds = MaskField::zeros(hf.metrics);
@@ -116,7 +118,7 @@ fn bake_source(
                     }
                 }
             }
-            analyze::jump_flood_distance(&seeds)
+            spatial_kernels::jump_flood_distance(&seeds)
         }
         MaskSource::Noise { seed, frequency } => {
             let mut m = MaskField::zeros(hf.metrics);
@@ -221,7 +223,8 @@ fn bake_source(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mask::{default_mask_display_color, MaskAsset, MaskId, MaskSource, PaintBuffer};
+    use crate::mask_ir::{default_mask_display_color, MaskAsset, PaintBuffer};
+    use crate::mask_types::{MaskId, MaskSource};
 
     #[test]
     fn painted_mask_bakes_painted_values() {

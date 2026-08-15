@@ -6,7 +6,7 @@
 
 use crate::heightfield::Heightfield;
 use crate::mask::MaskField;
-use crate::material_schema::{BedGeometry, Stratum, StratumMaterial};
+use crate::material_schema::{BedGeometry, StratumMaterial};
 
 /// Parameters for synthesising a stratum field from height (filter path).
 #[derive(Debug, Clone, Copy)]
@@ -167,28 +167,6 @@ pub fn expose_strata_height(
         }
     }
     out
-}
-
-/// Look up an authored [`Stratum`] stack at stratigraphic depth (meters into subsurface).
-pub fn stratum_at_depth<'a>(strata: &'a [Stratum], depth: f32) -> Option<&'a Stratum> {
-    if strata.is_empty() {
-        return None;
-    }
-    let mut remaining = depth.max(0.0);
-    for s in strata {
-        let t = s.thickness.max(0.0);
-        if remaining <= t || t >= 1.0e5 {
-            return Some(s);
-        }
-        remaining -= t;
-    }
-    strata.last()
-}
-
-/// Depth below Materials reference, warped by bed geometry.
-pub fn strata_depth_m(h_ref: f32, h: f32, x: f32, z: f32, geom: &BedGeometry) -> f32 {
-    let warp = geom.depth_warp(x, z);
-    (h_ref - h + warp).max(0.0)
 }
 
 /// Folded-bed helper used by the cosmetic Strata EffectFilter.

@@ -1,6 +1,6 @@
 //! Parameter modulation bindings (mask / field → numeric params).
 
-use crate::fields::FieldId;
+use crate::field_data::FieldId;
 use crate::layer::OutputId;
 use crate::mask::MaskId;
 use serde::{Deserialize, Serialize};

@@ -1,5 +1,5 @@
 use super::{TerrainTileKey, TilePageHandle};
-use crate::fields::FieldId;
+use crate::field_data::FieldId;
 use crate::heightfield::{HeightfieldMetrics, TileId, DEFAULT_HALO, DEFAULT_TILE_SIZE};
 use crate::layer::LayerId;
 use serde::{Deserialize, Serialize};

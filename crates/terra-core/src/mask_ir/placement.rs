@@ -3,13 +3,11 @@
 //! Authoring IR only. Coverage bake remains [`super::bake_dist_nodes`] /
 //! [`super::bake_distribution_with_context`].
 
-use super::dist_nodes::{ClimateMaskChannel, DistBakeContext, DistNode, DistNodeId, DistNodeKind};
-use super::distribution::{
-    bake_distribution_with_context, Distribution, DistributionEntry, MaskCombine,
-};
-use super::{MaskId, MaskRef};
-use crate::heightfield::HeightfieldMetrics;
+use super::dist_nodes::{ClimateMaskChannel, DistNode, DistNodeId, DistNodeKind};
+use super::distribution::{Distribution, DistributionEntry, MaskCombine};
+use super::PlacementCombineMode;
 use crate::ids::LayerId;
+use crate::mask_types::{MaskId, MaskRef};
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -216,7 +214,7 @@ pub struct PlacementDefinition {
     #[serde(default)]
     pub refinements: Vec<PlacementRefinement>,
     #[serde(default)]
-    pub paint_combine: crate::biome_definition::PlacementCombineMode,
+    pub paint_combine: PlacementCombineMode,
     #[serde(default)]
     pub paint_mask: Option<MaskId>,
     #[serde(default)]
@@ -233,7 +231,7 @@ impl Default for PlacementDefinition {
             coverage: Vec::new(),
             root: RuleGroup::default(),
             refinements: Vec::new(),
-            paint_combine: crate::biome_definition::PlacementCombineMode::default(),
+            paint_combine: PlacementCombineMode::default(),
             paint_mask: None,
             content_hash: 0,
             custom_stack: None,
@@ -313,20 +311,16 @@ impl PlacementDefinition {
         let mut refinements = Vec::new();
         let mut root = RuleGroup::default();
         let mut paint_mask = None;
-        let mut paint_combine = crate::biome_definition::PlacementCombineMode::default();
+        let mut paint_combine = PlacementCombineMode::default();
 
         if let Some(entry) = dist.entries.first() {
             paint_mask = Some(entry.mask.id);
             paint_combine = match entry.combine {
-                MaskCombine::Multiply => {
-                    crate::biome_definition::PlacementCombineMode::PaintMulRules
-                }
-                MaskCombine::Add => crate::biome_definition::PlacementCombineMode::PaintAddRules,
-                MaskCombine::Replace => crate::biome_definition::PlacementCombineMode::PaintOnly,
-                MaskCombine::PaintOverride => {
-                    crate::biome_definition::PlacementCombineMode::PaintOverridesRules
-                }
-                _ => crate::biome_definition::PlacementCombineMode::PaintMulRules,
+                MaskCombine::Multiply => PlacementCombineMode::PaintMulRules,
+                MaskCombine::Add => PlacementCombineMode::PaintAddRules,
+                MaskCombine::Replace => PlacementCombineMode::PaintOnly,
+                MaskCombine::PaintOverride => PlacementCombineMode::PaintOverridesRules,
+                _ => PlacementCombineMode::PaintMulRules,
             };
         }
 
@@ -764,7 +758,7 @@ fn hash_placement_rules(p: &PlacementDefinition) -> u64 {
         coverage: &'a [CoverageTerm],
         root: &'a RuleGroup,
         refinements: &'a [PlacementRefinement],
-        paint_combine: crate::biome_definition::PlacementCombineMode,
+        paint_combine: PlacementCombineMode,
         paint_mask: Option<MaskId>,
     }
     if let Ok(bytes) = serde_json::to_vec(&Key {
@@ -778,26 +772,6 @@ fn hash_placement_rules(p: &PlacementDefinition) -> u64 {
         bytes.hash(&mut h);
     }
     h.finish()
-}
-
-/// Fraction of samples with coverage > 0.05.
-pub fn coverage_estimate(
-    placement: &PlacementDefinition,
-    metrics: HeightfieldMetrics,
-    ctx: &DistBakeContext<'_>,
-) -> f32 {
-    let dist = placement.active_distribution();
-    let field = bake_distribution_with_context(&dist, metrics, ctx);
-    let total = (metrics.width * metrics.height).max(1) as f32;
-    let mut hit = 0u32;
-    for j in 0..metrics.height {
-        for i in 0..metrics.width {
-            if field.get(i, j) > 0.05 {
-                hit += 1;
-            }
-        }
-    }
-    hit as f32 / total
 }
 
 fn decompile_group(node: &DistNode, coverage: &mut Vec<CoverageTerm>) -> Option<RuleGroup> {
@@ -940,6 +914,7 @@ fn band_op(min: f32, max: f32, lo_bound: f32, hi_bound: f32) -> CompareOp {
 mod tests {
     use super::*;
     use crate::heightfield::HeightfieldMetrics;
+    use crate::mask_execution::{bake_distribution_with_context, DistBakeContext};
     use std::collections::HashMap;
 
     fn sample_rules() -> PlacementDefinition {

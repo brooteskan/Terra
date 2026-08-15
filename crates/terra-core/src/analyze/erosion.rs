@@ -1,5 +1,4 @@
-use crate::fields::{erodibility_at_strata_depth, stability_at_strata_depth};
-use crate::generators::geology::strata_depth_m;
+use crate::geology::{erodibility_at_strata_depth, stability_at_strata_depth, strata_depth_m};
 use crate::heightfield::Heightfield;
 use crate::mask::MaskField;
 use crate::material_schema::{BedGeometry, Stratum};

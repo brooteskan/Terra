@@ -1,8 +1,8 @@
 //! Drainage-aware ridge / valley analysis.
 
-use crate::analyze::jump_flood_distance;
 use crate::heightfield::Heightfield;
 use crate::mask::MaskField;
+use crate::spatial_kernels::jump_flood_distance;
 
 use super::derivatives::ridge_valley_likelihood;
 use super::routing::{FlowGraph, D8_OFFSETS};
