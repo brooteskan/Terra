@@ -1,4 +1,5 @@
-//! B1 evaluator-authority ratchet (audit B1-G1; protects B1-D1 through B1-D4).
+//! B1 evaluator-authority ratchet (audit B1-G1, extended by B1-G2; protects
+//! B1-D1 through B1-D5).
 //!
 //! `StackEvaluator` is terra-core's sole CPU layer-stack execution authority.
 //! `EvalWorker` is the approved orchestration wrapper: it may retain state,
@@ -9,16 +10,21 @@
 //! longer appears on this surface.)
 //!
 //! This source-level guard deliberately uses a small lexical scanner rather
-//! than a Rust parser. It enforces four review tripwires:
+//! than a Rust parser. It scans every crate's `src/` (B1-G2) and enforces:
 //!
-//! - the discovered authority-sensitive surface exactly matches
-//!   `APPROVED_EXECUTION_SEAMS`;
-//! - every approved seam has a justification, a production caller outside its
-//!   defining module, and a result-level test;
+//! - the discovered authority-sensitive surface across the whole workspace
+//!   exactly matches `APPROVED_EXECUTION_SEAMS` plus `DEFERRED_CANDIDATES`;
+//! - every approved seam names each of its production entry methods with a live
+//!   external call site (outside its defining file and outside `cfg(test)`),
+//!   accounts for every `pub fn` it exposes (as an entry point or a justified
+//!   internal method), and has a result-level test;
 //! - a new evaluator/executor, graph compiler, operator executor, tile
-//!   executor, or owner of `ProcessorRegistry` cannot land silently when it
-//!   accepts or owns `LayerStack` / `ProcessorRegistry`;
-//! - the evaluator generations retired by #53-#56 stay absent.
+//!   executor, or owner of `ProcessorRegistry` cannot land silently in *any*
+//!   crate when it accepts or owns `LayerStack` / `ProcessorRegistry`;
+//! - each `DEFERRED_CANDIDATES` entry stays honest (really discovered, reasoned,
+//!   and never also approved), so a follow-up cannot quietly forget to claim it;
+//! - the evaluator generations retired by #53-#56, and the eval entry points
+//!   retired by B1-D5 (#89), stay absent from production.
 //!
 //! An intentional new orchestration seam must be added to the inventory with
 //! honest evidence. A replacement CPU authority additionally requires changing
@@ -40,6 +46,25 @@ struct SourceEvidence {
     needle: &'static str,
 }
 
+/// A production entry method on a seam paired with a live call site: `caller`'s
+/// needle must appear in `caller.path`'s production source (comments, strings,
+/// and `cfg(test)` stripped), outside the seam's own defining file. This is the
+/// B1-G2 upgrade over the old single `production_caller` — evidence now proves a
+/// live call *chain* per entry, not one needle that a dead method could satisfy.
+struct EntryPoint {
+    method: &'static str,
+    caller: SourceEvidence,
+}
+
+/// A `pub fn` on a seam that is deliberately not a production entry point — an
+/// internal primitive, or a method reached only through `Drop`/another method.
+/// It carries no external-caller requirement, only a justification: the same
+/// visible-in-review exception the dead-seam guard's `ALLOWED_INERT` uses.
+struct InternalMethod {
+    method: &'static str,
+    justification: &'static str,
+}
+
 struct ResultTestEvidence {
     path: &'static str,
     test_name: &'static str,
@@ -52,25 +77,108 @@ struct ApprovedSeam {
     definition: &'static str,
     role: SeamRole,
     justification: &'static str,
-    production_caller: SourceEvidence,
+    /// Every production entry method, each with a live external call site.
+    /// Together with `internal_methods` this must account for *every* `pub fn`
+    /// the seam exposes — a new public method cannot land without a declaration.
+    entry_points: &'static [EntryPoint],
+    /// Public methods that are intentionally not entry points.
+    internal_methods: &'static [InternalMethod],
     result_test: ResultTestEvidence,
 }
 
-/// The complete approved terra-core layer-stack execution surface.
+/// A workspace-discovered authority-shaped candidate whose full inventory entry
+/// is intentionally deferred to a named follow-up. It counts as represented (the
+/// honesty scan does not fail on it), but `deferred_candidates_are_honest` keeps
+/// it from rotting: a stale entry (candidate vanished/renamed), a blank reason,
+/// or one that also became an approved seam all fail — forcing the list to
+/// shrink as the follow-ups land.
+struct DeferredCandidate {
+    name: &'static str,
+    path: &'static str,
+    reason: &'static str,
+}
+
+/// The complete approved workspace layer-stack execution surface.
 ///
 /// Entries are deliberately evidence-bearing. `authority_inventory_is_honest`
-/// rejects duplicates, blank reasons, missing definitions, stale callers, stale
-/// tests, and any discovered source candidate not represented here.
+/// rejects duplicates, blank reasons, missing definitions, stale entry callers,
+/// undeclared `pub fn`s, stale result tests, and any discovered source candidate
+/// (in any crate) not represented here or in `DEFERRED_CANDIDATES`.
 const APPROVED_EXECUTION_SEAMS: &[ApprovedSeam] = &[
     ApprovedSeam {
         name: "StackEvaluator",
         definition: "crates/terra-core/src/eval/mod.rs",
         role: SeamRole::Authority,
         justification: "sole CPU authority; owns ProcessorRegistry and performs the authored LayerStack tree walk",
-        production_caller: SourceEvidence {
-            path: "crates/terra-io/src/lib.rs",
-            needle: "StackEvaluator::new",
-        },
+        entry_points: &[
+            EntryPoint {
+                method: "new",
+                caller: SourceEvidence {
+                    path: "crates/terra-io/src/lib.rs",
+                    needle: "StackEvaluator::new",
+                },
+            },
+            EntryPoint {
+                method: "rebuild_all",
+                caller: SourceEvidence {
+                    path: "crates/terra-io/src/lib.rs",
+                    needle: "evaluator.rebuild_all(",
+                },
+            },
+            EntryPoint {
+                method: "rebuild_incremental",
+                caller: SourceEvidence {
+                    path: "crates/terra-core/src/eval/worker.rs",
+                    needle: "evaluator.rebuild_incremental(",
+                },
+            },
+            EntryPoint {
+                method: "evaluate_suffix",
+                caller: SourceEvidence {
+                    path: "crates/terra-app/src/app/eval.rs",
+                    needle: "evaluator.evaluate_suffix(",
+                },
+            },
+            EntryPoint {
+                method: "mark_dirty_from",
+                caller: SourceEvidence {
+                    path: "crates/terra-app/src/app/eval.rs",
+                    needle: "evaluator.mark_dirty_from(",
+                },
+            },
+            EntryPoint {
+                method: "mark_dirty_from_stage",
+                caller: SourceEvidence {
+                    path: "crates/terra-app/src/app/eval.rs",
+                    needle: "evaluator.mark_dirty_from_stage(",
+                },
+            },
+            EntryPoint {
+                method: "mark_dirty_from_eval_stage",
+                caller: SourceEvidence {
+                    path: "crates/terra-app/src/app/actions/scenarios.rs",
+                    needle: "mark_dirty_from_eval_stage(",
+                },
+            },
+            EntryPoint {
+                method: "mark_all_dirty",
+                caller: SourceEvidence {
+                    path: "crates/terra-app/src/app/eval.rs",
+                    needle: "evaluator.mark_all_dirty(",
+                },
+            },
+            EntryPoint {
+                method: "clear_project_caches",
+                caller: SourceEvidence {
+                    path: "crates/terra-app/src/app/project.rs",
+                    needle: "evaluator.clear_project_caches(",
+                },
+            },
+        ],
+        internal_methods: &[InternalMethod {
+            method: "evaluate_nodes",
+            justification: "the authored LayerStack tree-walk recursion StackEvaluator drives itself; never an external entry (the single-authority shape check requires it to exist)",
+        }],
         result_test: ResultTestEvidence {
             path: "crates/terra-core/tests/tropical_island_workflow.rs",
             test_name: "tropical_island_evaluates_with_biome_content",
@@ -83,10 +191,47 @@ const APPROVED_EXECUTION_SEAMS: &[ApprovedSeam] = &[
         definition: "crates/terra-core/src/eval/worker.rs",
         role: SeamRole::Orchestrator,
         justification: "background job transport whose worker thread owns and invokes StackEvaluator",
-        production_caller: SourceEvidence {
-            path: "crates/terra-app/src/app/eval.rs",
-            needle: "self.eval_worker.submit",
-        },
+        entry_points: &[
+            EntryPoint {
+                method: "spawn",
+                caller: SourceEvidence {
+                    path: "crates/terra-app/src/app/mod.rs",
+                    needle: "EvalWorker::spawn",
+                },
+            },
+            EntryPoint {
+                method: "submit",
+                caller: SourceEvidence {
+                    path: "crates/terra-app/src/app/eval.rs",
+                    needle: "eval_worker.submit",
+                },
+            },
+            EntryPoint {
+                method: "try_recv_event",
+                caller: SourceEvidence {
+                    path: "crates/terra-app/src/app/lifecycle.rs",
+                    needle: "eval_worker.try_recv_event(",
+                },
+            },
+            EntryPoint {
+                method: "set_token",
+                caller: SourceEvidence {
+                    path: "crates/terra-app/src/app/eval.rs",
+                    needle: "eval_worker.set_token(",
+                },
+            },
+            EntryPoint {
+                method: "restart",
+                caller: SourceEvidence {
+                    path: "crates/terra-app/src/app/eval.rs",
+                    needle: "eval_worker.restart(",
+                },
+            },
+        ],
+        internal_methods: &[InternalMethod {
+            method: "shutdown",
+            justification: "invoked by Drop and restart to stop the worker thread; not an external entry",
+        }],
         result_test: ResultTestEvidence {
             path: "crates/terra-core/src/eval/worker.rs",
             test_name: "worker_height_mask_uses_layer_input_not_previous_frame",
@@ -95,6 +240,17 @@ const APPROVED_EXECUTION_SEAMS: &[ApprovedSeam] = &[
         },
     },
 ];
+
+/// Workspace-discovered candidates whose honest inventory entry is deferred to a
+/// named follow-up. See `DeferredCandidate` and `deferred_candidates_are_honest`.
+const DEFERRED_CANDIDATES: &[DeferredCandidate] = &[DeferredCandidate {
+    name: "compile_gpu_graph",
+    path: "crates/terra-gpu/src/graph.rs",
+    reason: "GPU compute-graph compiler surfaced by the workspace scan; its pass list is decorative \
+             today (B1-D6, #90). The honest seam entry — role, entry points, result evidence — lands \
+             with that fix, which decides whether the plan is executed or shrunk to cpu_from. Until \
+             then this deferral replaces the old free-text last_graph exemption.",
+}];
 
 const RETIRED_PATHS: &[&str] = &[
     "crates/terra-core/src/terrain_eval",
@@ -117,26 +273,53 @@ const RETIRED_SYMBOLS: &[&str] = &[
     "terrain_eval",
 ];
 
-/// These names are specifically retired from the CPU evaluator. The GPU engine
-/// legitimately has its own `last_graph`, so a workspace-wide ban would conflate
-/// the live GPU authority with the removed terra-core graph generation.
+/// Public eval entry points retired by B1-D5 (#89) as production-dead: named on
+/// the eval surface but never called by production. Banned from *production*
+/// source workspace-wide — this scan strips `cfg(test)`, so `dirty_suffix_ids`
+/// living in a `#[cfg(test)]` module is fine; re-exposing any as a production
+/// item fails. This is B1-D5's revert check: restoring one trips this list.
+const RETIRED_B1_D5_SYMBOLS: &[&str] = &[
+    "run_step",
+    "EvalJob",
+    "evaluate_final_height",
+    "pin_baked",
+    "dirty_suffix_ids",
+];
+
+/// Retired from the *CPU* evaluator (`eval/mod.rs`) only — not workspace-wide.
+/// terra-gpu's `GpuTerrainEngine` legitimately keeps a `last_graph`; rather than
+/// bless that with a free-text exemption (which is where B1-D6 grew unnoticed),
+/// the GPU graph compiler is now discovered by the workspace scan and tracked as
+/// a `DEFERRED_CANDIDATES` entry until B1-D6 (#90) gives it an honest seam entry.
 const RETIRED_EVAL_SYMBOLS: &[&str] = &["last_graph", "compile_graph", "compile_eval_graph"];
 
 #[test]
 fn authority_inventory_is_honest() {
-    let scan = Scan::core();
+    let scan = Scan::workspace();
     let candidates = scan.execution_candidates();
     let actual: BTreeSet<(String, String)> = candidates
         .iter()
         .map(|candidate| (candidate.name.clone(), candidate.path.clone()))
         .collect();
-    let expected: BTreeSet<(String, String)> = APPROVED_EXECUTION_SEAMS
+    let approved: BTreeSet<(String, String)> = APPROVED_EXECUTION_SEAMS
         .iter()
         .map(|seam| (seam.name.to_string(), seam.definition.to_string()))
         .collect();
+    // Deferred candidates are discovered but intentionally lack a full entry (it
+    // lands with a named follow-up). They count as represented so the scan does
+    // not fail on them; `deferred_candidates_are_honest` enforces their freshness.
+    let represented: BTreeSet<(String, String)> = approved
+        .iter()
+        .cloned()
+        .chain(
+            DEFERRED_CANDIDATES
+                .iter()
+                .map(|deferred| (deferred.name.to_string(), deferred.path.to_string())),
+        )
+        .collect();
 
     let mut violations = Vec::new();
-    for (name, path) in actual.difference(&expected) {
+    for (name, path) in actual.difference(&represented) {
         let details = candidates
             .iter()
             .find(|candidate| candidate.name == *name && candidate.path == *path)
@@ -144,10 +327,11 @@ fn authority_inventory_is_honest() {
             .unwrap_or_else(|| format!("{path} ({name})"));
         violations.push(format!(
             "unapproved execution candidate {details}; delete it, route through StackEvaluator, \
-             or add a justified inventory entry with production and result-test evidence"
+             add a justified inventory entry with entry-point and result-test evidence, or (if a \
+             named follow-up owns it) a DEFERRED_CANDIDATES entry"
         ));
     }
-    for (name, path) in expected.difference(&actual) {
+    for (name, path) in approved.difference(&actual) {
         violations.push(format!(
             "APPROVED_EXECUTION_SEAMS entry `{name}` at {path} is stale or no longer matches \
              an authority-sensitive source shape; update or remove it"
@@ -177,7 +361,7 @@ fn authority_inventory_is_honest() {
         }
 
         validate_seam_shape(&scan, seam, &mut violations);
-        validate_production_evidence(seam, &mut violations);
+        validate_seam_entries(&scan, seam, &mut violations);
         validate_result_test_evidence(seam, &mut violations);
     }
 
@@ -221,6 +405,16 @@ fn retired_evaluator_generations_stay_absent() {
                 if tokens.contains(symbol) {
                     violations.push(format!(
                         "{}:{} references retired symbol `{symbol}`",
+                        file.path,
+                        line_index + 1
+                    ));
+                }
+            }
+            for symbol in RETIRED_B1_D5_SYMBOLS {
+                if tokens.contains(symbol) {
+                    violations.push(format!(
+                        "{}:{} reintroduces B1-D5 production-dead entry point `{symbol}`; it was \
+                         retired as an inert eval seam (#89) and must stay out of production",
                         file.path,
                         line_index + 1
                     ));
@@ -329,6 +523,112 @@ fn scanner_ignores_non_production_decoys() {
     );
 }
 
+/// Every `DEFERRED_CANDIDATES` entry must really be discovered by the workspace
+/// scan, carry a reason, and not double as an approved seam. When B1-D6 (#90)
+/// reshapes or shrinks the GPU compiler, its deferral goes stale here and forces
+/// the honest inventory entry (or its removal) — the deferral's revert check.
+#[test]
+fn deferred_candidates_are_honest() {
+    let scan = Scan::workspace();
+    let actual: BTreeSet<(String, String)> = scan
+        .execution_candidates()
+        .into_iter()
+        .map(|candidate| (candidate.name, candidate.path))
+        .collect();
+    let approved: BTreeSet<&str> = APPROVED_EXECUTION_SEAMS.iter().map(|seam| seam.name).collect();
+
+    let mut violations = Vec::new();
+    let mut seen = BTreeSet::new();
+    for deferred in DEFERRED_CANDIDATES {
+        if !seen.insert((deferred.name, deferred.path)) {
+            violations.push(format!(
+                "DEFERRED_CANDIDATES lists `{}` ({}) more than once",
+                deferred.name, deferred.path
+            ));
+        }
+        if deferred.reason.trim().is_empty() {
+            violations.push(format!(
+                "DEFERRED_CANDIDATES entry `{}` has an empty reason",
+                deferred.name
+            ));
+        }
+        if approved.contains(deferred.name) {
+            violations.push(format!(
+                "`{}` is both approved and deferred; a seam with a real inventory entry needs no deferral",
+                deferred.name
+            ));
+        }
+        if !actual.contains(&(deferred.name.to_string(), deferred.path.to_string())) {
+            violations.push(format!(
+                "deferred candidate `{}` ({}) is no longer discovered; its follow-up landed or it \
+                 was renamed — remove the deferral (and add a real inventory entry if it survives)",
+                deferred.name, deferred.path
+            ));
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "deferred-candidate list drifted:\n  {}",
+        violations.join("\n  ")
+    );
+}
+
+/// Revert check (b): an authority-shaped type in *any* crate — not just
+/// terra-core — is discovered, now that the scan is workspace-wide.
+#[test]
+fn authority_shaped_type_outside_core_is_discovered() {
+    let source = r#"
+        pub struct RogueTileExecutor;
+        impl RogueTileExecutor {
+            pub fn execute(&self, stack: &LayerStack) {}
+        }
+    "#;
+    let names: BTreeSet<_> =
+        discover_candidates("crates/terra-render/src/rogue.rs", &production_source(source))
+            .into_iter()
+            .map(|candidate| candidate.name)
+            .collect();
+    assert!(
+        names.contains("RogueTileExecutor"),
+        "a *Executor owning a LayerStack method must be discovered regardless of crate"
+    );
+}
+
+/// Revert check (a): entry-point liveness flags a seam method whose production
+/// caller vanished. `validate_entry_caller` reports a fabricated (absent) needle
+/// against a real production file as a lost-caller violation.
+#[test]
+fn entry_point_liveness_detects_a_missing_caller() {
+    let seam = ApprovedSeam {
+        name: "StackEvaluator",
+        definition: "crates/terra-core/src/eval/mod.rs",
+        role: SeamRole::Authority,
+        justification: "fixture",
+        entry_points: &[EntryPoint {
+            method: "rebuild_all",
+            caller: SourceEvidence {
+                path: "crates/terra-io/src/lib.rs",
+                needle: "evaluator.this_entry_was_removed(",
+            },
+        }],
+        internal_methods: &[],
+        result_test: ResultTestEvidence {
+            path: "",
+            test_name: "",
+            seam_needle: "",
+            result_needle: "",
+        },
+    };
+    let mut violations = Vec::new();
+    validate_entry_caller(&seam, &seam.entry_points[0], &mut violations);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("lost its last production caller")),
+        "an absent entry needle must be reported as a lost caller, got: {violations:?}"
+    );
+}
+
 fn validate_seam_shape(scan: &Scan, seam: &ApprovedSeam, violations: &mut Vec<String>) {
     let Some(file) = scan.files.iter().find(|file| file.path == seam.definition) else {
         violations.push(format!(
@@ -380,37 +680,105 @@ fn validate_seam_shape(scan: &Scan, seam: &ApprovedSeam, violations: &mut Vec<St
     }
 }
 
-fn validate_production_evidence(seam: &ApprovedSeam, violations: &mut Vec<String>) {
-    let evidence = &seam.production_caller;
+/// Prove each entry method has a live external call site, that internal methods
+/// are justified, and that entry + internal declarations account for *every*
+/// `pub fn` the seam exposes (none hidden, none stale).
+fn validate_seam_entries(scan: &Scan, seam: &ApprovedSeam, violations: &mut Vec<String>) {
+    // No method may be declared twice, across either list.
+    let mut declared: BTreeSet<&str> = BTreeSet::new();
+    for method in seam
+        .entry_points
+        .iter()
+        .map(|entry| entry.method)
+        .chain(seam.internal_methods.iter().map(|internal| internal.method))
+    {
+        if !declared.insert(method) {
+            violations.push(format!(
+                "seam `{}` declares method `{}` more than once across entry_points/internal_methods",
+                seam.name, method
+            ));
+        }
+    }
+
+    for internal in seam.internal_methods {
+        if internal.justification.trim().is_empty() {
+            violations.push(format!(
+                "seam `{}` internal method `{}` has an empty justification",
+                seam.name, internal.method
+            ));
+        }
+    }
+
+    for entry in seam.entry_points {
+        validate_entry_caller(seam, entry, violations);
+    }
+
+    // Completeness: reconcile the declared surface against the seam's real
+    // `pub fn`s. `validate_seam_shape` already reported a missing/ambiguous
+    // definition, so bail quietly here rather than double-reporting.
+    let Some(file) = scan.files.iter().find(|file| file.path == seam.definition) else {
+        return;
+    };
+    let matches: Vec<_> = public_structs(&file.production)
+        .into_iter()
+        .filter(|definition| definition.name == seam.name)
+        .collect();
+    let [definition] = matches.as_slice() else {
+        return;
+    };
+    let context = associated_type_source(&file.production, definition);
+    let public_fns = public_fn_names(&context);
+
+    for method in &public_fns {
+        if !declared.contains(method.as_str()) {
+            violations.push(format!(
+                "seam `{}` exposes `pub fn {}` with no entry_points/internal_methods declaration; \
+                 add it as an entry point with a live caller, or justify it as internal",
+                seam.name, method
+            ));
+        }
+    }
+    for method in &declared {
+        if !public_fns.contains(*method) {
+            violations.push(format!(
+                "seam `{}` declares method `{}` that is no longer a `pub fn` on the seam (renamed or removed)",
+                seam.name, method
+            ));
+        }
+    }
+}
+
+/// One entry point's production caller must be a real, live call site: below
+/// some `crates/*/src` (never a test tree), outside the seam's own defining
+/// file, and present in that file's production source (comments, strings, and
+/// `cfg(test)` stripped). A missing needle is a seam method that lost its last
+/// production caller — B1-G2 revert check (a).
+fn validate_entry_caller(seam: &ApprovedSeam, entry: &EntryPoint, violations: &mut Vec<String>) {
+    let evidence = &entry.caller;
+    let label = format!("{}::{}", seam.name, entry.method);
     if !evidence.path.starts_with("crates/")
         || !evidence.path.contains("/src/")
         || evidence.path.contains("/tests/")
     {
         violations.push(format!(
-            "`{}` production evidence must point below crates/*/src: {}",
-            seam.name, evidence.path
+            "`{label}` entry-point caller must point below crates/*/src: {}",
+            evidence.path
         ));
         return;
     }
     if evidence.path == seam.definition {
         violations.push(format!(
-            "`{}` production caller must be outside its defining module",
-            seam.name
+            "`{label}` entry-point caller must be outside the seam's defining module"
         ));
     }
     if evidence.needle.trim().is_empty() {
-        violations.push(format!(
-            "`{}` production caller evidence has an empty needle",
-            seam.name
-        ));
+        violations.push(format!("`{label}` entry-point caller has an empty needle"));
         return;
     }
-
     let path = workspace_root().join(evidence.path);
     if !path.is_file() {
         violations.push(format!(
-            "`{}` production caller {} does not exist",
-            seam.name,
+            "`{label}` entry-point caller {} does not exist",
             path.display()
         ));
         return;
@@ -418,10 +786,32 @@ fn validate_production_evidence(seam: &ApprovedSeam, violations: &mut Vec<String
     let source = production_source(&read(&path));
     if !source.contains(evidence.needle) {
         violations.push(format!(
-            "`{}` production caller evidence is stale: {} no longer contains `{}` outside tests/comments/strings",
-            seam.name, evidence.path, evidence.needle
+            "`{label}` entry-point evidence is stale: {} no longer contains `{}` outside \
+             tests/comments/strings — the seam method lost its last production caller",
+            evidence.path, evidence.needle
         ));
     }
+}
+
+/// Names of inherent `pub fn`s declared in `source` (a seam's struct item plus
+/// its `impl` blocks). `pub(crate)`/`pub(super)` are intentionally excluded —
+/// only the genuinely public surface must be accounted for; trait-impl methods
+/// (`fn default`, `fn drop`) are not `pub fn` and so never appear.
+fn public_fn_names(source: &str) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for line in source.lines() {
+        let trimmed = line.trim_start();
+        let rest = trimmed
+            .strip_prefix("pub fn ")
+            .or_else(|| trimmed.strip_prefix("pub async fn "))
+            .or_else(|| trimmed.strip_prefix("pub unsafe fn "));
+        if let Some(rest) = rest {
+            if let Some(name) = identifiers(rest).first() {
+                names.insert((*name).to_string());
+            }
+        }
+    }
+    names
 }
 
 fn validate_result_test_evidence(seam: &ApprovedSeam, violations: &mut Vec<String>) {
@@ -509,11 +899,10 @@ struct Scan {
 }
 
 impl Scan {
-    fn core() -> Self {
+    fn workspace() -> Self {
         let root = workspace_root();
-        let source_root = root.join("crates/terra-core/src");
         Self {
-            files: source_files_under(&source_root, &root),
+            files: source_files_under(&root.join("crates"), &root),
         }
     }
 
