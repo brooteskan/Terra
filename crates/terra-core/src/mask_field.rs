@@ -53,6 +53,20 @@ impl MaskField {
         self.data[self.idx(i, j)]
     }
 
+    /// Sample with clamp-to-edge; `0.0` when the mask has no samples.
+    ///
+    /// Mirrors [`Heightfield::get_clamped`] so cross-field samplers can index a
+    /// mask baked on a different grid without panicking on out-of-range coords.
+    #[inline]
+    pub fn get_clamped(&self, i: i32, j: i32) -> f32 {
+        if self.metrics.width == 0 || self.metrics.height == 0 {
+            return 0.0;
+        }
+        let ci = i.clamp(0, self.metrics.width as i32 - 1) as u32;
+        let cj = j.clamp(0, self.metrics.height as i32 - 1) as u32;
+        self.get(ci, cj)
+    }
+
     pub fn set(&mut self, i: u32, j: u32, value: f32) {
         let index = self.idx(i, j);
         self.data[index] = value.clamp(0.0, 1.0);
@@ -138,5 +152,24 @@ mod tests {
         assert_eq!(resized.get(3, 0), 2.0);
         assert_eq!(resized.get(0, 3), 4.0);
         assert_eq!(resized.get(3, 3), 8.0);
+    }
+
+    #[test]
+    fn get_clamped_edge_extends_and_survives_empty() {
+        let metrics = HeightfieldMetrics::new(2, 2, 20.0, 20.0);
+        let field = MaskField::from_raw(metrics, &[0.0, 1.0, 2.0, 3.0]);
+        // In range passes through.
+        assert_eq!(field.get_clamped(1, 1), 3.0);
+        // Negative coords clamp to (0, 0).
+        assert_eq!(field.get_clamped(-5, -5), 0.0);
+        // Overshoot clamps to (w-1, h-1).
+        assert_eq!(field.get_clamped(9, 9), 3.0);
+        // Mixed: past-right, in-row-1 clamps to (1, 1).
+        assert_eq!(field.get_clamped(9, 1), 3.0);
+
+        // An empty mask returns 0.0 instead of panicking on clamp(0, -1).
+        let empty = MaskField::zeros(HeightfieldMetrics::new(0, 0, 0.0, 0.0));
+        assert_eq!(empty.get_clamped(0, 0), 0.0);
+        assert_eq!(empty.get_clamped(-1, 3), 0.0);
     }
 }

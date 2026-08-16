@@ -901,6 +901,26 @@ fn mix_height_delta(
     out
 }
 
+/// Borrow `mask` unchanged when its grid matches `target`; nearest-resample otherwise.
+///
+/// Cross-field samplers must not raw-index a mask baked on a different grid (#94).
+/// The equal-dimensions path only pays a compare and borrows; a mismatch degrades
+/// gracefully to a world-aligned resample instead of an out-of-bounds panic.
+fn mask_at(mask: &MaskField, target: HeightfieldMetrics) -> std::borrow::Cow<'_, MaskField> {
+    if mask.metrics.width == target.width && mask.metrics.height == target.height {
+        std::borrow::Cow::Borrowed(mask)
+    } else {
+        log::warn!(
+            "mask grid {}x{} does not match target {}x{}; resampling defensively",
+            mask.metrics.width,
+            mask.metrics.height,
+            target.width,
+            target.height
+        );
+        std::borrow::Cow::Owned(mask.resampled_nearest(target))
+    }
+}
+
 /// Merge child aux maps into the parent context, weighted by the group mask.
 fn merge_aux_masked(
     ctx: &mut EvalContext,
@@ -908,13 +928,18 @@ fn merge_aux_masked(
     mask: &MaskField,
     opacity: f32,
 ) {
+    // Normalize every foreign-grid field to `ctx.metrics` so the inner loop
+    // cannot raw-index a mask, child, or parent aux baked on a different grid (#94).
+    let mask = mask_at(mask, ctx.metrics);
     let child_map = child.to_hashmap();
     for (key, child_field) in child_map {
+        let child_field = child_field.into_resampled_nearest(ctx.metrics);
         let mut out = ctx
             .aux_maps
             .get(&key)
             .cloned()
-            .unwrap_or_else(|| MaskField::zeros(ctx.metrics));
+            .unwrap_or_else(|| MaskField::zeros(ctx.metrics))
+            .into_resampled_nearest(ctx.metrics);
         for j in 0..ctx.metrics.height {
             for i in 0..ctx.metrics.width {
                 let w = (mask.get(i, j) * opacity).clamp(0.0, 1.0);
@@ -1002,6 +1027,9 @@ fn height_fingerprint(h: &Heightfield) -> u64 {
 fn gate_aux_by_mask(ctx: &mut EvalContext, mask: &MaskField) {
     use crate::field_data::keys;
     let mul = |field: &mut MaskField| {
+        // Match the mask to this field's grid so `get` stays in-range by local
+        // construction rather than depending on the producer's metrics (#94).
+        let mask = mask_at(mask, field.metrics);
         let w = field.metrics.width;
         let h = field.metrics.height;
         for j in 0..h {
@@ -1044,6 +1072,65 @@ mod tests {
             }
         }
         set
+    }
+
+    /// #94: gating an 8x8 aux field with a 4x4 mask must not panic (raw
+    /// `mask.get(4, 3)` indexed 16 == len before the clamp/resample) and must
+    /// keep the mask world-aligned. Reverting the `mask_at` guard fails this.
+    #[test]
+    fn gate_aux_by_mask_survives_smaller_mask() {
+        use crate::field_data::keys;
+        let metrics = HeightfieldMetrics::new(8, 8, 80.0, 80.0);
+        let mut ctx = EvalContext::new(metrics);
+        ctx.aux_insert(keys::MATERIALS, MaskField::ones(metrics));
+
+        // Half-resolution mask: left half 0, right half 1.
+        let mut mask = MaskField::zeros(HeightfieldMetrics::new(4, 4, 80.0, 80.0));
+        for j in 0..4 {
+            for i in 2..4 {
+                mask.set(i, j, 1.0);
+            }
+        }
+
+        gate_aux_by_mask(&mut ctx, &mask);
+
+        let gated = ctx.aux.get(keys::MATERIALS).expect("materials aux present");
+        assert_eq!(gated.metrics.width, 8);
+        assert_eq!(gated.get(0, 0), 0.0, "left half gated off");
+        assert_eq!(gated.get(7, 7), 1.0, "right half kept, world-aligned");
+    }
+
+    /// #94: `merge_aux_masked` raw-indexes three cross-context fields (mask,
+    /// child, and the cloned parent aux). A 4x4 for any of them against an 8x8
+    /// `ctx.metrics` panicked before the resample; all three are hardened here.
+    #[test]
+    fn merge_aux_masked_survives_mismatched_mask_child_and_parent_aux() {
+        use crate::field_data::keys;
+        let metrics = HeightfieldMetrics::new(8, 8, 80.0, 80.0);
+        let small = HeightfieldMetrics::new(4, 4, 80.0, 80.0);
+        let mut ctx = EvalContext::new(metrics);
+
+        // Foreign-resolution parent aux (the merge target `out`).
+        ctx.aux_insert(keys::MATERIALS, MaskField::zeros(small));
+
+        // Foreign-resolution child field.
+        let mut child = AuxMaps::default();
+        child.materials = Some(MaskField::ones(small));
+
+        // Foreign-resolution mask: left half 0, right half 1.
+        let mut mask = MaskField::zeros(small);
+        for j in 0..4 {
+            for i in 2..4 {
+                mask.set(i, j, 1.0);
+            }
+        }
+
+        merge_aux_masked(&mut ctx, &child, &mask, 1.0);
+
+        let merged = ctx.aux.get(keys::MATERIALS).expect("materials aux present");
+        assert_eq!(merged.metrics.width, 8, "renormalized to ctx.metrics");
+        assert_eq!(merged.get(0, 0), 0.0, "w=0 keeps parent (zeros)");
+        assert_eq!(merged.get(7, 7), 1.0, "w=1 adopts child (ones)");
     }
 
     #[test]
