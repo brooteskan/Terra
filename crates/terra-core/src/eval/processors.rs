@@ -501,12 +501,12 @@ impl ProcessorRegistry {
                 let mut p = p.clone();
                 match ctx.quality {
                     crate::eval::PreviewQuality::Draft => {
-                        p.iterations = p.iterations.min(8).max(1);
+                        p.iterations = p.iterations.clamp(1, 8);
                         // Fewer Priority-Flood / D8 barriers between incision steps.
                         p.drainage_reuse_stride = p.drainage_reuse_stride.max(2);
                     }
                     crate::eval::PreviewQuality::Medium => {
-                        p.iterations = p.iterations.min(16).max(1);
+                        p.iterations = p.iterations.clamp(1, 16);
                         p.drainage_reuse_stride = p.drainage_reuse_stride.max(1);
                     }
                     _ => {
@@ -579,7 +579,7 @@ impl ProcessorRegistry {
                 let mut p = p.clone();
                 match ctx.quality {
                     crate::eval::PreviewQuality::Draft => {
-                        p.thermal_iters = p.thermal_iters.min(6).max(1);
+                        p.thermal_iters = p.thermal_iters.clamp(1, 6);
                         p.spe_iters = p.spe_iters.min(2);
                         p.level_count = if p.level_count == 0 {
                             2
@@ -588,7 +588,7 @@ impl ProcessorRegistry {
                         };
                     }
                     crate::eval::PreviewQuality::Medium => {
-                        p.thermal_iters = p.thermal_iters.min(10).max(1);
+                        p.thermal_iters = p.thermal_iters.clamp(1, 10);
                         p.spe_iters = p.spe_iters.min(4);
                     }
                     _ => {}
@@ -597,7 +597,7 @@ impl ProcessorRegistry {
                 let ridge_lock = bake_optional_mask(ctx, input, &p.ridge_lock);
                 let levels = match ctx.quality {
                     crate::eval::PreviewQuality::Draft => {
-                        analyze::amplify_sim_levels(ctx.metrics.width, p.level_count.max(1).min(2))
+                        analyze::amplify_sim_levels(ctx.metrics.width, p.level_count.clamp(1, 2))
                     }
                     _ => analyze::amplify_sim_levels(ctx.metrics.width, p.level_count),
                 };

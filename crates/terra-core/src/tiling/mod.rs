@@ -23,7 +23,7 @@ pub fn dirty_class_for(kind: &LayerKind) -> DirtyClass {
 /// evaluated. [`map_tiles_batched`] therefore refreshes halos after every pass.
 pub fn recommended_halo(stencil_radius: u32, iters_per_batch: u32) -> u32 {
     let need = stencil_radius.saturating_mul(iters_per_batch.max(1));
-    need.max(crate::heightfield::DEFAULT_HALO).min(16)
+    need.clamp(crate::heightfield::DEFAULT_HALO, 16)
 }
 
 /// Process tiles with neighbor halo refresh between passes.

@@ -134,7 +134,7 @@ pub(crate) fn try_apply(
                         .stamp_circle(key, wx, wz, radius_m, strength, false);
                 }
             }
-            let res = app.session.document.preview_resolution.min(8192).max(64);
+            let res = app.session.document.preview_resolution.clamp(64, 8192);
             if let Some(layer) = app.session.document.selected_placement_layer_mut() {
                 match tool {
                     terra_core::biome_paint::BiomePaintTool::Smooth => {
@@ -239,7 +239,7 @@ pub(crate) fn try_apply(
             }
         }
         PanelAction::AddHoleLayer { name } => {
-            let res = app.session.document.preview_resolution.min(512).max(64);
+            let res = app.session.document.preview_resolution.clamp(64, 512);
             app.session
                 .document
                 .hole_layers

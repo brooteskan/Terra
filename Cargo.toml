@@ -51,7 +51,7 @@ codegen-units = 1
 # Clippy lint policy (see issue #74). Crates opt in via `[lints] workspace = true`.
 #
 # The CI Clippy step runs `-D warnings`, so every warn-by-default lint is enforced
-# across the workspace. The entries below are the deliberate exceptions. Four tranches
+# across the workspace. The entries below are the deliberate exceptions. Five tranches
 # have been enabled (absent here on purpose); intentional occurrences carry narrowly
 # scoped `#[allow(...)]` with a rationale at the site:
 #   Tranche 1: large_enum_variant, len_without_is_empty, unnecessary_unwrap,
@@ -67,13 +67,14 @@ codegen-units = 1
 #   Tranche 4: needless_bool_assign (no occurrences), absurd_extreme_comparisons
 #              (the paint-debounce scaffolding was removed), let_unit_value,
 #              type_complexity, manual_div_ceil.
+#   Tranche 5: manual_clamp. 44 integer/finite-float sites became `.clamp(lo, hi)`;
+#              the one document-sourced float chain (analyze::apply_transport_model)
+#              keeps an explicit min/max as NaN repair under a scoped allow.
 #
 # Everything below is deferred for a stated reason (not merely "not done yet"):
-#   manual_clamp — min/max chains vs `.clamp()` differ on NaN; not a mechanical rewrite.
 #   field_reassign_with_default — pure style, no rustfix suggestion, large hand churn.
 #   too_many_arguments, needless_range_loop — issue #74 says leave until profiling/API clarity.
 [workspace.lints.clippy]
 field_reassign_with_default = "allow"
-manual_clamp = "allow"
 needless_range_loop = "allow"
 too_many_arguments = "allow"

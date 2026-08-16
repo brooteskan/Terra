@@ -194,8 +194,7 @@ impl AeolianState {
         // Look back far enough to catch dune-scale lee shadows (Paris ~10 m, but
         // authoring grids often use larger cells — keep a minimum cell count).
         let max_steps = ((14.0 / cell).ceil() as i32)
-            .max(8)
-            .min(48)
+            .clamp(8, 48)
             .max(p.transport_length.ceil() as i32);
         let t10 = (10.0f32).to_radians().tan();
         let t15 = (15.0f32).to_radians().tan();

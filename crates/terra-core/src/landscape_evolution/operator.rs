@@ -206,7 +206,7 @@ impl LandscapeEvolutionOperator {
         if p.hillslope_diffusion > 1e-4 {
             let thermal = ThermalErosionParams {
                 talus_angle_deg: p.talus_angle_deg,
-                iterations: ((p.accurate_steps() / 4).max(1)).min(24),
+                iterations: (p.accurate_steps() / 4).clamp(1, 24),
                 strength: p.hillslope_diffusion.clamp(0.0, 1.0),
                 hardness: 0.0,
                 hardness_source: MaskSource::None,

@@ -197,7 +197,7 @@ pub fn fracture_sample(x: f32, z: f32, frequency: f32, seed: u64, scales: u32) -
     let mut sum = 0.0f32;
     let mut amp = 1.0f32;
     let mut wsum = 0.0f32;
-    let n = scales.max(1).min(4);
+    let n = scales.clamp(1, 4);
     for s in 0..n {
         let f = freq * (1.7f32).powi(s as i32);
         let g = sparse_gabor(x, z, f, seed ^ ((s as u64 + 1) * 0x9E37));
@@ -492,7 +492,7 @@ pub fn differential_erode(
         (MaskField::zeros(m), MaskField::zeros(m))
     };
     let mut out = hf.clone();
-    let iters = iterations.max(1).min(8);
+    let iters = iterations.clamp(1, 8);
     let amt = amount / iters as f32;
 
     for _ in 0..iters {
@@ -567,7 +567,7 @@ pub fn deposit_talus(
     if amount < 1e-4 {
         return hf.clone();
     }
-    let iters = iterations.max(1).min(8);
+    let iters = iterations.clamp(1, 8);
     let repose = repose_deg.clamp(18.0, 55.0);
     if let Some(k) = hardness {
         crate::analyze::talus_apron(hf, repose, amount.max(0.5), 0.85, iters, Some(k)).height
@@ -636,7 +636,7 @@ pub fn apply_cliffs(hf: &Heightfield, p: &EffectFilterParams) -> Heightfield {
             &out,
             c.talus * amt * 0.45,
             32.0 + c.rock_hardness * 12.0,
-            p.iterations.max(1).min(6),
+            p.iterations.clamp(1, 6),
             Some(&hardness),
         );
     }
@@ -824,7 +824,7 @@ pub fn apply_rocky_cliffs(hf: &Heightfield, p: &EffectFilterParams) -> Heightfie
             &sharp,
             p.talus_mix * p.amount * 0.3,
             36.0,
-            p.iterations.max(1).min(5),
+            p.iterations.clamp(1, 5),
             Some(&hardness),
         );
     }
@@ -846,13 +846,7 @@ pub fn apply_rocky_hard(hf: &Heightfield, p: &EffectFilterParams) -> Heightfield
         p.seed ^ 0x85AD_u64,
     );
     // Stronger differential: strip soft surrounds, keep hard outcrops.
-    differential_erode(
-        &cliffs,
-        &k,
-        p.amount * 0.35,
-        p.iterations.max(2).min(5),
-        true,
-    )
+    differential_erode(&cliffs, &k, p.amount * 0.35, p.iterations.clamp(2, 5), true)
 }
 
 /// Rocky Plateaus — preserve flats, scarp at margins, incision, talus, optional strata.
@@ -920,7 +914,7 @@ pub fn apply_rocky_plateaus(hf: &Heightfield, p: &EffectFilterParams) -> Heightf
             &incised,
             p.talus_mix * p.amount * 0.28,
             33.0,
-            p.iterations.max(1).min(5),
+            p.iterations.clamp(1, 5),
             Some(&k),
         );
     }

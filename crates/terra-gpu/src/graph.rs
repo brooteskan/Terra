@@ -224,7 +224,7 @@ fn gpu_plan_for_layer(layer: &Layer, mask_assets: &[MaskAsset]) -> Option<GpuLay
         Blur(p) if inplace_composite_supported(layer) => (
             GpuKernel::Blur,
             GpuDirtyPolicy::Local,
-            p.radius.max(1).min(BLUR_MAX_RADIUS),
+            p.radius.clamp(1, BLUR_MAX_RADIUS),
         ),
         EffectFilter(p)
             if matches!(p.kind, EffectFilterKind::Smooth | EffectFilterKind::Inflate)
@@ -233,7 +233,7 @@ fn gpu_plan_for_layer(layer: &Layer, mask_assets: &[MaskAsset]) -> Option<GpuLay
             (
                 GpuKernel::EffectFilter,
                 GpuDirtyPolicy::Local,
-                p.radius.max(1).min(EFFECT_FILTER_MAX_RADIUS),
+                p.radius.clamp(1, EFFECT_FILTER_MAX_RADIUS),
             )
         }
         Blur(_) | EffectFilter(_) => return None,

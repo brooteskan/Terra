@@ -58,8 +58,7 @@ impl TerrainGrid {
         let raw = max_from_idx
             .min(max_from_vert)
             .min(max_from_edges)
-            .min(4097)
-            .max(513);
+            .clamp(513, 4097);
         // Leave a small margin so skirts/underside never push over the limit.
         let safe = raw.saturating_sub(32).max(513);
         crate::clipmap::WorldGridConfig::for_world(safe).grid_size

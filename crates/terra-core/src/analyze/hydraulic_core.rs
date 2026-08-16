@@ -387,6 +387,10 @@ pub fn generate_rainfall_field(
 }
 
 /// Apply transport-model biases onto a base parameter set.
+// `bank_slip`'s `.max(0.2).min(0.35)` chain doubles as NaN repair: these params come
+// from the saved document, and `max(NaN, 0.2)` pins a NaN to the low bound, whereas
+// `.clamp()` would propagate NaN straight into the erosion sim. Kept as an explicit pair.
+#[allow(clippy::manual_clamp)]
 pub fn apply_transport_model(
     base: &HydraulicErosionParams,
     model: TransportModel,

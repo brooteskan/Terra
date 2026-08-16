@@ -1558,7 +1558,7 @@ impl GpuTerrainEngine {
     }
 
     fn blur_iters(p: &terra_core::layer::BlurParams) -> u32 {
-        p.iterations.max(1).min(8)
+        p.iterations.clamp(1, 8)
     }
 
     /// Executed iteration count for a layer's kernel — the single source of truth
@@ -1605,7 +1605,7 @@ impl GpuTerrainEngine {
                 world_x: self.metrics.world_size_x,
                 world_z: self.metrics.world_size_z,
                 mode,
-                radius: p.radius.max(1).min(EFFECT_FILTER_MAX_RADIUS),
+                radius: p.radius.clamp(1, EFFECT_FILTER_MAX_RADIUS),
                 iterations: iters,
                 seed: (p.seed & 0xFFFF_FFFF) as u32,
                 strength: p.strength.clamp(0.0, 1.0),
@@ -2836,7 +2836,7 @@ impl GpuTerrainEngine {
                     let u = BlurU {
                         width: self.metrics.width,
                         height: self.metrics.height,
-                        radius: p.radius.max(1).min(BLUR_MAX_RADIUS),
+                        radius: p.radius.clamp(1, BLUR_MAX_RADIUS),
                         _pad: 0,
                     };
                     let u_buf = self.write_uniform(device, queue, &u);

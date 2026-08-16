@@ -542,7 +542,7 @@ impl TerrainDocument {
             placement_id,
             biome_id,
         };
-        let res = self.preview_resolution.min(1024).max(64);
+        let res = self.preview_resolution.clamp(64, 1024);
         let paint = if self.sparse_paint.has_channel(key) {
             let samples = self.sparse_paint.bake_uv(key, res, res, world_x, world_z);
             crate::mask::PaintBuffer {

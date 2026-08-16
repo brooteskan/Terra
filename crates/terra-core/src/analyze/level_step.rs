@@ -68,7 +68,7 @@ pub fn default_sim_levels(target_res: u32) -> Vec<SimLevel> {
 
 /// Draft quality: coarse + mid level so thermal/hydraulic already look eroded.
 pub fn draft_sim_levels(target_res: u32) -> Vec<SimLevel> {
-    let coarse = target_res.min(128).max(64);
+    let coarse = target_res.clamp(64, 128);
     let mid = target_res.min(192).max(coarse);
     if mid <= coarse {
         vec![SimLevel::new(coarse, 0.65, 1.0)]

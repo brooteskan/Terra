@@ -112,7 +112,7 @@ impl TerraApp {
             self.placement_tint_dirty = false;
             return;
         }
-        let res = doc.preview_resolution.min(512).max(64);
+        let res = doc.preview_resolution.clamp(64, 512);
         let isolate = if layer.isolate_active {
             doc.active_biome
         } else {

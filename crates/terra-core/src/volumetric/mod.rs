@@ -170,7 +170,7 @@ pub fn apply_local_sdf(hf: &Heightfield, p: &LocalSdfParams) -> DualHeightResult
     let j0 = (v0 * m.height as f32).floor() as u32;
     let j1 = ((v1 * m.height as f32).ceil() as u32).min(m.height);
 
-    let y_samples = p.vertical_samples.max(4).min(64);
+    let y_samples = p.vertical_samples.clamp(4, 64);
     let noise_amp = p.noise_amplitude.clamp(0.0, 1.0);
 
     for j in j0..j1 {

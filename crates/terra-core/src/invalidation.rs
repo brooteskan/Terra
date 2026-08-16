@@ -17,9 +17,9 @@ pub fn expand_radius_for(class: DirtyClass, stencil: u32, iterations: u32) -> u3
         DirtyClass::Local => stencil.max(1).saturating_sub(1).max(1),
         DirtyClass::Expanding => {
             let batches = iterations.max(1).div_ceil(8);
-            batches.max(1).min(4)
+            batches.clamp(1, 4)
         }
-        DirtyClass::BasinDependent => iterations.max(1).div_ceil(4).max(2).min(8),
+        DirtyClass::BasinDependent => iterations.max(1).div_ceil(4).clamp(2, 8),
     }
 }
 

@@ -256,7 +256,7 @@ impl TerraApp {
                     if (fu - u).hypot(fv - v) < 0.025 && self.biome_polygon_points.len() >= 3 {
                         let pts = std::mem::take(&mut self.biome_polygon_points);
                         actions.push(PanelAction::BeginBiomePaintStroke { biome });
-                        let res = self.session.document.preview_resolution.min(8192).max(64);
+                        let res = self.session.document.preview_resolution.clamp(64, 8192);
                         if let Some(layer) = self.session.document.selected_placement_layer_mut() {
                             layer.fill_polygon(
                                 biome,
@@ -464,7 +464,7 @@ impl TerraApp {
         let pts = std::mem::take(&mut self.biome_polygon_points);
         let strength = self.ui_state.sculpt_strength.clamp(0.05, 1.0);
         let erase = self.modifiers_alt;
-        let res = self.session.document.preview_resolution.min(8192).max(64);
+        let res = self.session.document.preview_resolution.clamp(64, 8192);
         self.session.document.ensure_placement_layer();
         self.apply_actions(vec![PanelAction::BeginBiomePaintStroke { biome }]);
         if let Some(layer) = self.session.document.selected_placement_layer_mut() {

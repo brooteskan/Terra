@@ -634,7 +634,7 @@ pub fn uplift(metrics: HeightfieldMetrics, p: &UpliftParams) -> Heightfield {
         // Detail: fBm attenuated in low-uplift cells so structure drains coherently.
         let detail_params = NoiseParams {
             seed: p.seed ^ 0xC0FFEE,
-            octaves: p.detail_octaves.max(1).min(8),
+            octaves: p.detail_octaves.clamp(1, 8),
             frequency: p.detail_frequency.max(1e-6),
             amplitude: p.detail_amplitude.max(0.0),
             lacunarity: 2.0,
@@ -711,7 +711,7 @@ pub fn dunes_with_aux(
         wind_warp: 0.25,
         linearity: p.linearity.clamp(0.0, 1.0),
     };
-    state.evolve(&transport, p.iterations.max(1).min(48));
+    state.evolve(&transport, p.iterations.clamp(1, 48));
     let mut result = state.into_result(1.0, &bedrock_hf);
     // Soft floor: lift only the deepest cells with a little noise so we never
     // create a broad exactly-flat interdune slab.
@@ -1301,7 +1301,7 @@ pub fn effect_filter(input: &Heightfield, p: &EffectFilterParams) -> Heightfield
             // (bilateral) — which by design keeps sharp features, including a
             // lone spike, intact and so is the wrong tool for reducing spikes.
             let mut h = input.clone();
-            for _ in 0..p.iterations.max(1).min(4) {
+            for _ in 0..p.iterations.clamp(1, 4) {
                 h = filter_kernels::box_blur(&h, p.radius.max(1));
             }
             h
@@ -1381,7 +1381,7 @@ pub fn effect_filter(input: &Heightfield, p: &EffectFilterParams) -> Heightfield
             let mut h = input.clone();
             let sigma_s = (p.radius.max(1) as f32) * 0.55;
             let sigma_r = p.amount.max(0.5);
-            for _ in 0..p.iterations.max(1).min(4) {
+            for _ in 0..p.iterations.clamp(1, 4) {
                 h = filter_kernels::bilateral(&h, p.radius.max(1), sigma_s, sigma_r);
             }
             h
@@ -1918,7 +1918,7 @@ pub fn sand_simulation_full(
         transport_length: p.transport_length.max(0.5),
         repose_angle_deg: p.slope_angle_deg.clamp(12.0, 45.0),
         slab_size: (cover * 0.08).clamp(0.05, 1.5),
-        avalanche_iters: p.avalanche_iters.max(1).min(64),
+        avalanche_iters: p.avalanche_iters.clamp(1, 64),
         abrasion: p.abrasion.clamp(0.0, 1.0),
         reptation: p.reptation.clamp(0.0, 1.0),
         wind_warp: 0.4,

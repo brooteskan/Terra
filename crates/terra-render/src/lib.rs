@@ -410,8 +410,7 @@ pub async fn init_gpu(
     // Path tracer uses 4 storage textures; request headroom when the adapter allows it.
     limits.max_storage_textures_per_shader_stage = adapter_limits
         .max_storage_textures_per_shader_stage
-        .max(4)
-        .min(16);
+        .clamp(4, 16);
     limits.max_storage_buffers_per_shader_stage = adapter_limits
         .max_storage_buffers_per_shader_stage
         .max(limits.max_storage_buffers_per_shader_stage);

@@ -199,7 +199,7 @@ pub(super) fn wide_flows(input: &Heightfield, p: &EffectFilterParams) -> Heightf
 pub(super) fn talus_fill(input: &Heightfield, p: &EffectFilterParams) -> Heightfield {
     // Layered thermal apron via shared kernel (cliff → scree, hard rock preserved).
     let repose = p.slope_min.clamp(20.0, 55.0);
-    let iters = p.iterations.max(1).min(8);
+    let iters = p.iterations.clamp(1, 8);
     let filled = thermal_talus(input, repose, p.amount.max(0.5), iters);
     let t = p.strength.clamp(0.0, 1.0);
     if (t - 1.0).abs() < 1e-5 {
@@ -1006,7 +1006,7 @@ fn wind_carve_fast(input: &Heightfield, p: &EffectFilterParams) -> Heightfield {
 /// Anisotropic multi-sector Kuwahara (Kyprianidis-inspired).
 pub(super) fn kuwahara(input: &Heightfield, p: &EffectFilterParams) -> Heightfield {
     let mut h = input.clone();
-    let iters = p.iterations.max(1).min(3);
+    let iters = p.iterations.clamp(1, 3);
     let sectors = if p.radius >= 3 { 8 } else { 4 };
     for _ in 0..iters {
         h = kuwahara_anisotropic(&h, p.radius.max(1), sectors);

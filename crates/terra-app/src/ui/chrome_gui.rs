@@ -265,10 +265,7 @@ pub fn draw_menu_bar(
     } else {
         doc.name.as_str()
     };
-    let mut project_w = DrawList::text_width(project_name, FONT_SCALE)
-        .min(160.0)
-        .max(72.0)
-        + 36.0;
+    let mut project_w = DrawList::text_width(project_name, FONT_SCALE).clamp(72.0, 160.0) + 36.0;
     let mut project_r =
         Rect::from_pos_size(size_r.min_x - 14.0 - project_w, y, project_w, TOOLBAR_BTN_H);
 
