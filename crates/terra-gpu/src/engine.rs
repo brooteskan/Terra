@@ -10,8 +10,8 @@
 
 use crate::effect_filter::resolve_effect_mode;
 use crate::graph::{
-    compile_gpu_graph, expand_dirty_rect, gpu_blend_mode, gpu_plan_for_layer, layer_gpu_supported,
-    GpuComputeGraph, GpuKernel,
+    compile_gpu_graph, expand_dirty_rect, gpu_blend_mode, GpuComputeGraph, GpuDirtyPolicy,
+    GpuKernel, BLUR_MAX_RADIUS, EFFECT_FILTER_MAX_RADIUS,
 };
 use crate::{readback_f32, GpuError};
 use bytemuck::{Pod, Zeroable};
@@ -568,6 +568,10 @@ pub struct GpuTerrainEngine {
     pub max_sim_iters_per_tick: u32,
     /// Last compiled GPU pass graph for the evaluated stack.
     pub last_graph: GpuComputeGraph,
+    /// Kernels dispatched by the most recent `evaluate` walk, in order — the
+    /// witness that the executor consumes the compiled plan (B1-D6 revert guard).
+    #[cfg(test)]
+    executed_kernels: Vec<GpuKernel>,
 }
 
 impl GpuTerrainEngine {
@@ -822,6 +826,8 @@ impl GpuTerrainEngine {
             last_quality: None,
             max_sim_iters_per_tick: 8,
             last_graph: GpuComputeGraph::default(),
+            #[cfg(test)]
+            executed_kernels: Vec::new(),
         }
     }
 
@@ -1547,11 +1553,30 @@ impl GpuTerrainEngine {
         }
     }
 
+    fn effect_filter_iters(quality: PreviewQuality, p: &EffectFilterParams) -> u32 {
+        Self::scale_iters(quality, p.iterations.max(1)).min(8)
+    }
+
+    fn blur_iters(p: &terra_core::layer::BlurParams) -> u32 {
+        p.iterations.max(1).min(8)
+    }
+
+    /// Executed iteration count for a layer's kernel — the single source of truth
+    /// shared by the kernel dispatch and the dirty-region halo sizing so the two
+    /// never disagree about how far a filter reaches.
+    fn executed_iterations(quality: PreviewQuality, kind: &LayerKind) -> u32 {
+        match kind {
+            LayerKind::EffectFilter(p) => Self::effect_filter_iters(quality, p),
+            LayerKind::Blur(p) => Self::blur_iters(p),
+            _ => 1,
+        }
+    }
+
     fn dirty_dispatch_extent(&self) -> (u32, u32, u32, u32, u32, u32) {
-        // Returns (region_x, region_y, region_w, region_h, groups_x, groups_y)
+        // Returns (region_x, region_y, region_w, region_h, groups_x, groups_y).
+        // `last_dirty_rect` is already expanded by the plan halo in `evaluate`, so
+        // no further padding here — this is exactly the region the kernels rewrite.
         if let Some((x, y, w, h)) = self.last_dirty_rect {
-            let (x, y, w, h) =
-                expand_dirty_rect((x, y, w, h), 8, self.metrics.width, self.metrics.height);
             let gx = (w + 7) / 8;
             let gy = (h + 7) / 8;
             (x, y, w, h, gx.max(1), gy.max(1))
@@ -1571,7 +1596,7 @@ impl GpuTerrainEngine {
         quality: PreviewQuality,
     ) {
         let mode = resolve_effect_mode(p.kind);
-        let iters = Self::scale_iters(quality, p.iterations.max(1)).min(8);
+        let iters = Self::effect_filter_iters(quality, p);
         let (rx, ry, rw, rh, gx, gy) = self.dirty_dispatch_extent();
         for _ in 0..iters {
             let u = EffectFilterU {
@@ -1580,7 +1605,7 @@ impl GpuTerrainEngine {
                 world_x: self.metrics.world_size_x,
                 world_z: self.metrics.world_size_z,
                 mode,
-                radius: p.radius.max(1).min(16),
+                radius: p.radius.max(1).min(EFFECT_FILTER_MAX_RADIUS),
                 iterations: iters,
                 seed: (p.seed & 0xFFFF_FFFF) as u32,
                 strength: p.strength.clamp(0.0, 1.0),
@@ -1677,7 +1702,12 @@ impl GpuTerrainEngine {
             MaskSource::Slope { min_deg, max_deg } => (2u32, 0.0, *min_deg, *max_deg),
             _ => return Err(GpuError::RequiresCpu),
         };
-        let (rx, ry, rw, rh, gx, gy) = self.dirty_dispatch_extent();
+        // The mask feeds a full-field blend and a full-field layer cache, so it must
+        // be baked over the entire field. A region bake would leave mask = 1.0 outside
+        // the rect (from the mask_ones fill above) and then blend and cache the wrong
+        // band there. region_* = 0 selects the shader's full-field path.
+        let gx = (self.metrics.width + 7) / 8;
+        let gy = (self.metrics.height + 7) / 8;
         let u = MaskBakeU {
             width: self.metrics.width,
             height: self.metrics.height,
@@ -1691,10 +1721,10 @@ impl GpuTerrainEngine {
             strength: entry.mask.strength,
             frequency: 0.0,
             seed: 0.0,
-            region_x: rx,
-            region_y: ry,
-            region_w: rw,
-            region_h: rh,
+            region_x: 0,
+            region_y: 0,
+            region_w: 0,
+            region_h: 0,
         };
         let u_buf = self.write_uniform(device, queue, &u);
         let height_view = if self.current == 0 {
@@ -1796,9 +1826,11 @@ impl GpuTerrainEngine {
 
         let graph = compile_gpu_graph(stack, mask_assets);
         self.last_graph = graph;
-
-        let layer_unsupported =
-            |layer: &Layer| layer.common.enabled && !layer_gpu_supported(layer, mask_assets);
+        // The compiled plan is the sole planning authority for this evaluation: one
+        // slot per flattened layer, indexed here and never re-derived mid-walk.
+        let plans = self.last_graph.plans.clone();
+        #[cfg(test)]
+        self.executed_kernels.clear();
 
         let first_dirty = layers
             .iter()
@@ -1806,7 +1838,11 @@ impl GpuTerrainEngine {
             .unwrap_or(layers.len());
 
         // All clean and fully GPU-cached: restore top cache (no recompute).
-        if first_dirty >= layers.len() && !layers.iter().any(|l| layer_unsupported(l)) {
+        let any_enabled_unsupported = layers
+            .iter()
+            .enumerate()
+            .any(|(i, l)| l.common.enabled && plans[i].is_none());
+        if first_dirty >= layers.len() && !any_enabled_unsupported {
             if let Some(top) = layers.last() {
                 if let Some(cached) = self.layer_cache.get(&top.id()) {
                     if cached.width == metrics.width && cached.height == metrics.height {
@@ -1862,16 +1898,50 @@ impl GpuTerrainEngine {
         });
         self.fill_slot(device, queue, &mut encoder, TexSlot::MaskOnes, 1.0);
 
-        // A full re-evaluation or quality change affects every sample. Local sculpt
-        // edits can instead update only tiles intersecting the supplied stamp bounds.
-        // Filter/layer suffix edits also need a full present (shared path), not a stale
-        // leftover sculpt rect from a prior stroke.
+        // A full re-evaluation or quality change affects every sample and needs a
+        // full present. A local sculpt edit (dirty rect, first_dirty > 0) can instead
+        // update just the touched region — but that region must be sized from the
+        // compiled plan: a full-field-coupled pass (thermal/hydraulic) invalidates any
+        // local rect, and otherwise the rect expands by each executed local pass's
+        // reach (per-iteration halo x its executed iteration count) so the edit
+        // resolves correctly and the present covers every texel the kernels rewrite.
+        // The expanded rect drives both compute dispatch and presentation — one
+        // region, no drift, and no stale leftover rect from a prior stroke.
         let pass_dirty_rect = self.last_dirty_rect;
-        if first_dirty == 0 || quality_changed || pass_dirty_rect.is_none() {
+        let mut halo_texels: u32 = 0;
+        let mut force_full_field = false;
+        for (i, layer) in layers
+            .iter()
+            .enumerate()
+            .skip(first_dirty)
+            .take(execution_end.saturating_sub(first_dirty))
+        {
+            let Some(plan) = plans[i].filter(|_| layer.common.enabled) else {
+                continue;
+            };
+            match plan.dirty_policy {
+                GpuDirtyPolicy::FullField => {
+                    force_full_field = true;
+                    break;
+                }
+                GpuDirtyPolicy::Local => {
+                    halo_texels = halo_texels.saturating_add(
+                        plan.halo_texels
+                            .saturating_mul(Self::executed_iterations(quality, &layer.kind)),
+                    );
+                }
+            }
+        }
+        let framed_rect =
+            pass_dirty_rect.filter(|_| first_dirty != 0 && !quality_changed && !force_full_field);
+        if let Some(rect) = framed_rect {
+            let expanded =
+                expand_dirty_rect(rect, halo_texels, self.metrics.width, self.metrics.height);
+            self.mark_tiles_overlapping_rect(expanded);
+            self.last_dirty_rect = Some(expanded);
+        } else {
             self.mark_all_tiles_dirty();
             self.last_dirty_rect = None;
-        } else if let Some(rect) = pass_dirty_rect {
-            self.mark_tiles_overlapping_rect(rect);
         }
 
         let mut seeded = false;
@@ -1938,7 +2008,8 @@ impl GpuTerrainEngine {
             // Prefix is GPU-supported: dirty from 0 and re-enter.
             let prefix_gpu = layers[..first_dirty]
                 .iter()
-                .all(|l| !l.common.enabled || layer_gpu_supported(l, mask_assets));
+                .enumerate()
+                .all(|(i, l)| !l.common.enabled || plans[i].is_some());
             if prefix_gpu && first_dirty > 0 {
                 drop(encoder);
                 self.dirty.extend(layers.iter().map(|l| l.id()));
@@ -1982,7 +2053,8 @@ impl GpuTerrainEngine {
                 continue;
             }
 
-            if layer_unsupported(layer) {
+            // Enabled but no compiled plan = not GPU-supported (bake cache or passthrough).
+            if plans[layer_index].is_none() {
                 let cached_ok = self
                     .layer_cache
                     .get(&layer.id())
@@ -2052,8 +2124,8 @@ impl GpuTerrainEngine {
                         label: Some("gpu-stack-sculpt"),
                     });
                 }
-                let plan = gpu_plan_for_layer(layer, mask_assets)
-                    .expect("supported layer must retain an executable GPU plan");
+                let plan =
+                    plans[layer_index].expect("supported layer must retain an executable GPU plan");
                 self.eval_layer(device, queue, &mut encoder, layer, plan.kernel, quality)?;
                 if layer_input_independent(&layer.kind) {
                     let needs_new = self
@@ -2235,6 +2307,8 @@ impl GpuTerrainEngine {
         kernel: GpuKernel,
         quality: PreviewQuality,
     ) -> Result<(), GpuError> {
+        #[cfg(test)]
+        self.executed_kernels.push(kernel);
         match (kernel, &layer.kind) {
             (GpuKernel::Sculpt, LayerKind::SculptBase(p)) => {
                 // `layer_tex` was filled by `upload_sculpt_to_layer` just before this call.
@@ -2757,12 +2831,12 @@ impl GpuTerrainEngine {
                 self.run_river_carve(device, queue, encoder, p, quality);
             }
             (GpuKernel::Blur, LayerKind::Blur(p)) => {
-                let iters = p.iterations.max(1).min(8);
+                let iters = Self::blur_iters(p);
                 for _ in 0..iters {
                     let u = BlurU {
                         width: self.metrics.width,
                         height: self.metrics.height,
-                        radius: p.radius.max(1).min(8),
+                        radius: p.radius.max(1).min(BLUR_MAX_RADIUS),
                         _pad: 0,
                     };
                     let u_buf = self.write_uniform(device, queue, &u);
@@ -4164,5 +4238,288 @@ mod smoke_tests {
 
         assert_eq!((result.width, result.height), (32, 48));
         assert_working_texture_dimensions(&engine, 32, 48);
+    }
+
+    /// A spatially varying sculpt buffer so smoothing filters have real gradients
+    /// to act on (a flat fill would make Smooth an identity and hide halo errors).
+    fn varied_sculpt(res: u32) -> SculptParams {
+        let mut sculpt = SculptParams::filled(res, 20.0);
+        for y in 0..res {
+            for x in 0..res {
+                let fx = x as f32;
+                let fy = y as f32;
+                sculpt.samples[(y * res + x) as usize] =
+                    20.0 + 12.0 * (fx * 0.35).sin() + 10.0 * (fy * 0.27).cos();
+            }
+        }
+        sculpt
+    }
+
+    /// B1-D6 revert guard: the executor must dispatch exactly the kernels the
+    /// compiler recorded, in flat order — not a re-derived plan, and not a
+    /// decorative list the walk ignores.
+    #[test]
+    fn engine_executes_kernels_from_the_compiled_plan() {
+        let Some(gpu) = terra_test_gpu::headless() else {
+            return;
+        };
+        let metrics = HeightfieldMetrics::new(48, 48, 96.0, 96.0);
+        let mut stack = LayerStack::new();
+        let base = Layer::new("base", LayerKind::Flat(FlatParams { height: 8.0 }));
+        let base_id = base.id();
+        stack.push(base);
+        stack.push(Layer::new(
+            "noise",
+            LayerKind::NoiseValue(NoiseParams::default()),
+        ));
+        stack.push(Layer::new(
+            "smooth",
+            LayerKind::EffectFilter(EffectFilterParams::smooth()),
+        ));
+
+        let mut engine = GpuTerrainEngine::new(&gpu.device, metrics.width);
+        engine.mark_dirty(base_id);
+        engine
+            .evaluate(
+                &gpu.device,
+                &gpu.queue,
+                &stack,
+                &[],
+                metrics,
+                PreviewQuality::Draft,
+                false,
+                None,
+            )
+            .expect("fully-GPU evaluation");
+
+        let planned: Vec<GpuKernel> = engine
+            .last_graph
+            .plans
+            .iter()
+            .flatten()
+            .map(|plan| plan.kernel)
+            .collect();
+        assert_eq!(
+            planned,
+            vec![GpuKernel::Fill, GpuKernel::Noise, GpuKernel::EffectFilter]
+        );
+        assert_eq!(
+            engine.executed_kernels, planned,
+            "executor must consume the compiled plan, not re-plan or ignore it"
+        );
+    }
+
+    /// B1-D6 / C1-C2 — #90's explicit rect-edge-artifact answer. A flat field with
+    /// a tall bump inside the edit rect: a wide Smooth (radius 16, 2 iters) spreads
+    /// that bump ~32 texels. A probe in the spread ring — outside the retired
+    /// 8-texel halo but inside the true reach — must match the full-field oracle.
+    /// The plan halo covers it; the hardcoded 8-texel halo left the ring unfiltered
+    /// (the visible artifact). Away from the bump the field is flat, so filtered ==
+    /// unfiltered there and the probe isolates exactly the halo coverage.
+    #[test]
+    fn dirty_rect_effect_filter_recomputes_full_kernel_reach() {
+        let Some(gpu) = terra_test_gpu::headless() else {
+            return;
+        };
+        let res = 96u32;
+        let metrics = HeightfieldMetrics::new(res, res, 192.0, 192.0);
+        let rect = (40u32, 40u32, 16u32, 16u32);
+
+        // Flat base at index 0 gives the sculpt a cached prefix (first_dirty > 0 =>
+        // incremental rect path).
+        let build = || {
+            let mut sculpt = SculptParams::filled(res, 20.0);
+            for y in rect.1..rect.1 + rect.3 {
+                for x in rect.0..rect.0 + rect.2 {
+                    sculpt.samples[(y * res + x) as usize] = 420.0;
+                }
+            }
+            let mut stack = LayerStack::new();
+            stack.push(Layer::new(
+                "base",
+                LayerKind::Flat(FlatParams { height: 4.0 }),
+            ));
+            let sculpt_layer = Layer::new("sculpt", LayerKind::SculptBase(sculpt));
+            let sculpt_id = sculpt_layer.id();
+            stack.push(sculpt_layer);
+            stack.push(Layer::new(
+                "smooth",
+                LayerKind::EffectFilter(EffectFilterParams {
+                    radius: 16,
+                    iterations: 2,
+                    strength: 1.0,
+                    ..EffectFilterParams::smooth()
+                }),
+            ));
+            (stack, sculpt_id)
+        };
+
+        let (stack, sculpt_id) = build();
+        let base_id = stack.flatten_layers()[0].id();
+
+        // Warm the caches with a full-field pass.
+        let mut engine = GpuTerrainEngine::new(&gpu.device, metrics.width);
+        engine.mark_dirty(base_id);
+        engine
+            .evaluate(
+                &gpu.device,
+                &gpu.queue,
+                &stack,
+                &[],
+                metrics,
+                PreviewQuality::Draft,
+                false,
+                None,
+            )
+            .expect("warm full evaluation");
+
+        // Incremental rect eval: dirty the sculpt, bound the edit to `rect`.
+        engine.set_dirty_rect(Some(rect));
+        engine.mark_dirty(sculpt_id);
+        let incremental = engine
+            .evaluate(
+                &gpu.device,
+                &gpu.queue,
+                &stack,
+                &[],
+                metrics,
+                PreviewQuality::Draft,
+                true,
+                None,
+            )
+            .expect("incremental rect eval")
+            .cpu
+            .expect("incremental readback");
+
+        // Full-field oracle from a fresh engine.
+        let mut oracle_engine = GpuTerrainEngine::new(&gpu.device, metrics.width);
+        let oracle = oracle_engine
+            .evaluate(
+                &gpu.device,
+                &gpu.queue,
+                &stack,
+                &[],
+                metrics,
+                PreviewQuality::Draft,
+                true,
+                None,
+            )
+            .expect("oracle eval")
+            .cpu
+            .expect("oracle readback");
+
+        // Probe the spread ring: outside rect+8 (the retired halo would leave it
+        // unfiltered) but inside rect+32 (the true reach), where the bump has spread.
+        let (px, py) = (70u32, 48u32);
+        let spread = oracle.get(px, py) - 20.0;
+        assert!(
+            spread > 2.0,
+            "fixture bump did not spread into the probe ring (spread {spread})"
+        );
+        let err = (incremental.get(px, py) - oracle.get(px, py)).abs();
+        assert!(
+            err < 0.5,
+            "incremental filter left the spread ring stale vs the full oracle by {err}; \
+             the recompute halo under-covers the kernel reach (rect-edge artifact)"
+        );
+    }
+
+    /// The mask bake must cover the whole field, not just the edit rect: it feeds a
+    /// full-field blend and a full-field layer cache, so a region-only bake would
+    /// leave mask = 1.0 (and the wrong blended height) outside the rect. This guards
+    /// the mask-bake fix that landed with B1-D6 (#90).
+    #[test]
+    fn dirty_rect_masked_generator_bakes_full_field() {
+        let Some(gpu) = terra_test_gpu::headless() else {
+            return;
+        };
+        let res = 64u32;
+        let metrics = HeightfieldMetrics::new(res, res, 128.0, 128.0);
+        let mask = MaskAsset::new(MaskId::new(), "constant", MaskSource::Constant(0.25));
+        let assets = vec![mask.clone()];
+
+        let build = || {
+            let mut stack = LayerStack::new();
+            stack.push(Layer::new(
+                "base",
+                LayerKind::Flat(FlatParams { height: 4.0 }),
+            ));
+            let sculpt_layer = Layer::new("sculpt", LayerKind::SculptBase(varied_sculpt(res)));
+            let sculpt_id = sculpt_layer.id();
+            stack.push(sculpt_layer);
+            let mut masked = Layer::new("masked add", LayerKind::Flat(FlatParams { height: 50.0 }));
+            masked.common.blend = BlendMode::Add;
+            masked.common.masks.push(MaskRef::new(mask.id));
+            let masked_id = masked.id();
+            stack.push(masked);
+            (stack, sculpt_id, masked_id)
+        };
+
+        // Warm the engine with a full-field pass.
+        let (stack, _sculpt_id, masked_id) = build();
+        let base_id = stack.flatten_layers()[0].id();
+        let mut engine = GpuTerrainEngine::new(&gpu.device, metrics.width);
+        engine.mark_dirty(base_id);
+        engine
+            .evaluate(
+                &gpu.device,
+                &gpu.queue,
+                &stack,
+                &assets,
+                metrics,
+                PreviewQuality::Draft,
+                false,
+                None,
+            )
+            .expect("masked full evaluation");
+
+        // Incremental: re-bake the masked layer under a small dirty rect. No filter is
+        // involved, so a correct full-field bake makes the whole readback match the
+        // oracle; a region-only bake corrupts everything outside the rect.
+        let rect = (24u32, 24u32, 12u32, 12u32);
+        engine.set_dirty_rect(Some(rect));
+        engine.mark_dirty(masked_id);
+        let incremental = engine
+            .evaluate(
+                &gpu.device,
+                &gpu.queue,
+                &stack,
+                &assets,
+                metrics,
+                PreviewQuality::Draft,
+                true,
+                None,
+            )
+            .expect("incremental masked evaluation")
+            .cpu
+            .expect("incremental readback");
+
+        let mut oracle_engine = GpuTerrainEngine::new(&gpu.device, metrics.width);
+        let oracle = oracle_engine
+            .evaluate(
+                &gpu.device,
+                &gpu.queue,
+                &stack,
+                &assets,
+                metrics,
+                PreviewQuality::Draft,
+                true,
+                None,
+            )
+            .expect("oracle masked evaluation")
+            .cpu
+            .expect("oracle readback");
+
+        let mut max_err = 0.0f32;
+        for y in 0..res {
+            for x in 0..res {
+                max_err = max_err.max((incremental.get(x, y) - oracle.get(x, y)).abs());
+            }
+        }
+        assert!(
+            max_err < 0.05,
+            "masked incremental diverged from the full oracle by {max_err}; the mask bake \
+             did not cover the full field outside the dirty rect"
+        );
     }
 }

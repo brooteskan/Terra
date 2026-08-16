@@ -1,24 +1,20 @@
-//! Compile a layer stack into an ordered GPU compute pass list.
+//! Compile a layer stack into per-layer executable GPU plans.
 //!
-//! Artist UI remains layer-based; this IR is the internal execution plan for
-//! `GpuTerrainEngine` (deps, dirty policy, fusion hooks).
+//! Artist UI remains layer-based. `compile_gpu_graph` produces one plan slot per
+//! flattened layer — the executable kernel, its dirty-region policy, and the
+//! per-iteration halo the kernel actually reaches — plus the CPU-resume boundary
+//! (`cpu_from`). `GpuTerrainEngine::evaluate` indexes this plan directly and never
+//! re-derives kernels mid-walk, so planning has a single authority.
 
 use terra_core::layer::{
-    BlendMode, EffectFilterKind, IslandArchetype, Layer, LayerId, LayerKind, LayerStack,
-    TransportModel,
+    BlendMode, EffectFilterKind, IslandArchetype, Layer, LayerKind, LayerStack, TransportModel,
 };
 use terra_core::mask::{MaskAsset, MaskCombine, MaskSource};
-use terra_core::tiling::DirtyClass;
 
-/// Kind of GPU work a compiled pass performs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GpuPassKind {
-    Generator,
-    Filter,
-    Simulation,
-    MaskBake,
-    Blend,
-}
+/// Max per-iteration blur radius the Blur kernel executes (`shaders/blur.wgsl`).
+pub const BLUR_MAX_RADIUS: u32 = 8;
+/// Max per-iteration reach the EffectFilter kernel executes.
+pub const EFFECT_FILTER_MAX_RADIUS: u32 = 16;
 
 /// Concrete executable pipeline selected by the support planner. The engine
 /// consumes this value, so a configuration cannot be advertised merely because
@@ -83,24 +79,27 @@ pub enum GpuDirtyPolicy {
     FullField,
 }
 
-/// One executable GPU pass corresponding to a flattened layer (or mask prep).
-#[derive(Debug, Clone)]
-pub struct GpuPass {
-    pub layer_id: LayerId,
-    pub kind: GpuPassKind,
+/// Executable plan for one GPU-supported layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GpuLayerPlan {
+    /// Concrete pipeline the engine dispatches for this layer.
     pub kernel: GpuKernel,
+    /// Whether the layer couples the whole field or honors a local dirty rect.
     pub dirty_policy: GpuDirtyPolicy,
-    /// Flattened index into `stack.flatten_layers()`.
-    pub flat_index: usize,
-    /// Approximate kernel halo in texels for dirty expansion.
+    /// Per-iteration kernel reach in texels, matching the executed pipeline's
+    /// clamp; the engine multiplies this by the executed iteration count to size
+    /// the dirty-region halo.
     pub halo_texels: u32,
 }
 
-/// Compiled interactive GPU graph.
+/// Compiled interactive GPU plan: one slot per flattened layer plus the CPU
+/// resume boundary.
 #[derive(Debug, Clone, Default)]
 pub struct GpuComputeGraph {
-    pub passes: Vec<GpuPass>,
-    /// First flat index that is not GPU-supported (None = fully GPU).
+    /// One entry per `stack.flatten_layers()` index. `Some` = this layer runs on
+    /// the GPU with the given plan; `None` = disabled or not GPU-supported.
+    pub plans: Vec<Option<GpuLayerPlan>>,
+    /// First flat index that is enabled but not GPU-supported (None = fully GPU).
     pub cpu_from: Option<usize>,
 }
 
@@ -108,14 +107,6 @@ impl GpuComputeGraph {
     pub fn fully_gpu(&self) -> bool {
         self.cpu_from.is_none()
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct GpuLayerPlan {
-    pub(crate) kind: GpuPassKind,
-    pub(crate) kernel: GpuKernel,
-    pub(crate) dirty_policy: GpuDirtyPolicy,
-    pub(crate) halo_texels: u32,
 }
 
 fn gpu_mask_supported(layer: &Layer, assets: &[MaskAsset]) -> bool {
@@ -201,49 +192,30 @@ fn hydraulic_config_supported(p: &terra_core::layer::HydraulicErosionParams) -> 
         && p.level_step_curve.is_empty()
 }
 
-pub(crate) fn gpu_plan_for_layer(layer: &Layer, mask_assets: &[MaskAsset]) -> Option<GpuLayerPlan> {
+fn gpu_plan_for_layer(layer: &Layer, mask_assets: &[MaskAsset]) -> Option<GpuLayerPlan> {
     use LayerKind::*;
     if !gpu_mask_supported(layer, mask_assets) {
         return None;
     }
-    let (kernel, kind, dirty_policy, halo_texels) = match &layer.kind {
-        Flat(_) if gpu_blend_mode(layer.common.blend).is_some() => (
-            GpuKernel::Fill,
-            GpuPassKind::Generator,
-            GpuDirtyPolicy::Local,
-            0,
-        ),
-        Ramp(_) if gpu_blend_mode(layer.common.blend).is_some() => (
-            GpuKernel::Ramp,
-            GpuPassKind::Generator,
-            GpuDirtyPolicy::Local,
-            0,
-        ),
-        SculptBase(_) if gpu_blend_mode(layer.common.blend).is_some() => (
-            GpuKernel::Sculpt,
-            GpuPassKind::Generator,
-            GpuDirtyPolicy::Local,
-            0,
-        ),
+    let (kernel, dirty_policy, halo_texels) = match &layer.kind {
+        Flat(_) if gpu_blend_mode(layer.common.blend).is_some() => {
+            (GpuKernel::Fill, GpuDirtyPolicy::Local, 0)
+        }
+        Ramp(_) if gpu_blend_mode(layer.common.blend).is_some() => {
+            (GpuKernel::Ramp, GpuDirtyPolicy::Local, 0)
+        }
+        SculptBase(_) if gpu_blend_mode(layer.common.blend).is_some() => {
+            (GpuKernel::Sculpt, GpuDirtyPolicy::Local, 0)
+        }
         NoiseValue(p) if seed_supported(p.seed) && gpu_blend_mode(layer.common.blend).is_some() => {
-            (
-                GpuKernel::Noise,
-                GpuPassKind::Generator,
-                GpuDirtyPolicy::Local,
-                2,
-            )
+            (GpuKernel::Noise, GpuDirtyPolicy::Local, 2)
         }
         Island(p)
             if p.archetype == IslandArchetype::VolcanicHighIsland
                 && seed_supported(p.seed)
                 && gpu_blend_mode(layer.common.blend).is_some() =>
         {
-            (
-                GpuKernel::Shape,
-                GpuPassKind::Generator,
-                GpuDirtyPolicy::Local,
-                2,
-            )
+            (GpuKernel::Shape, GpuDirtyPolicy::Local, 2)
         }
         Flat(_) | Ramp(_) | NoiseValue(_) | NoisePerlin(_) | Mountains(_) | Dunes(_)
         | Canyons(_) | DomainWarp(_) | SculptBase(_) | Mesa(_) | Volcano(_) | Island(_)
@@ -251,9 +223,8 @@ pub(crate) fn gpu_plan_for_layer(layer: &Layer, mask_assets: &[MaskAsset]) -> Op
         Fbm(_) | Ridged(_) => return None,
         Blur(p) if inplace_composite_supported(layer) => (
             GpuKernel::Blur,
-            GpuPassKind::Filter,
             GpuDirtyPolicy::Local,
-            p.radius.max(1).min(16),
+            p.radius.max(1).min(BLUR_MAX_RADIUS),
         ),
         EffectFilter(p)
             if matches!(p.kind, EffectFilterKind::Smooth | EffectFilterKind::Inflate)
@@ -261,34 +232,22 @@ pub(crate) fn gpu_plan_for_layer(layer: &Layer, mask_assets: &[MaskAsset]) -> Op
         {
             (
                 GpuKernel::EffectFilter,
-                GpuPassKind::Filter,
                 GpuDirtyPolicy::Local,
-                p.radius.max(1).min(16),
+                p.radius.max(1).min(EFFECT_FILTER_MAX_RADIUS),
             )
         }
         Blur(_) | EffectFilter(_) => return None,
-        Terrace(_) if inplace_composite_supported(layer) => (
-            GpuKernel::Terrace,
-            GpuPassKind::Filter,
-            GpuDirtyPolicy::Local,
-            4,
-        ),
+        Terrace(_) if inplace_composite_supported(layer) => {
+            (GpuKernel::Terrace, GpuDirtyPolicy::Local, 4)
+        }
         Terrace(_) => return None,
-        ThermalErosion(p) if thermal_config_supported(p) && inplace_composite_supported(layer) => (
-            GpuKernel::Thermal,
-            GpuPassKind::Simulation,
-            GpuDirtyPolicy::FullField,
-            0,
-        ),
+        ThermalErosion(p) if thermal_config_supported(p) && inplace_composite_supported(layer) => {
+            (GpuKernel::Thermal, GpuDirtyPolicy::FullField, 0)
+        }
         HydraulicErosion(p)
             if hydraulic_config_supported(p) && inplace_composite_supported(layer) =>
         {
-            (
-                GpuKernel::Hydraulic,
-                GpuPassKind::Simulation,
-                GpuDirtyPolicy::FullField,
-                0,
-            )
+            (GpuKernel::Hydraulic, GpuDirtyPolicy::FullField, 0)
         }
         ThermalErosion(_) | HydraulicErosion(_) | RiverCarve(_) => return None,
         // These CPU operations either modify height without a GPU kernel or publish
@@ -297,7 +256,6 @@ pub(crate) fn gpu_plan_for_layer(layer: &Layer, mask_assets: &[MaskAsset]) -> Op
         _ => return None,
     };
     Some(GpuLayerPlan {
-        kind,
         kernel,
         dirty_policy,
         halo_texels,
@@ -309,30 +267,28 @@ pub fn layer_gpu_supported(layer: &Layer, mask_assets: &[MaskAsset]) -> bool {
     gpu_plan_for_layer(layer, mask_assets).is_some()
 }
 
-/// Compile the preview stack into a GPU pass list.
+/// Compile the preview stack into per-layer GPU plans.
 ///
-/// Stops recording passes at the first unsupported layer (sets `cpu_from`).
+/// Records a plan slot for every flattened layer (`None` = disabled or
+/// unsupported) and sets `cpu_from` to the first enabled layer that cannot run on
+/// the GPU preview path. Supported layers above that boundary still receive a plan
+/// so the engine's speculative suffix walk keeps them live on the GPU.
 pub fn compile_gpu_graph(stack: &LayerStack, mask_assets: &[MaskAsset]) -> GpuComputeGraph {
     let layers: Vec<&Layer> = stack.flatten_layers();
-    let mut graph = GpuComputeGraph::default();
+    let mut plans = Vec::with_capacity(layers.len());
+    let mut cpu_from = None;
     for (flat_index, layer) in layers.iter().enumerate() {
         if !layer.common.enabled {
+            plans.push(None);
             continue;
         }
-        let Some(plan) = gpu_plan_for_layer(layer, mask_assets) else {
-            graph.cpu_from = Some(flat_index);
-            break;
-        };
-        graph.passes.push(GpuPass {
-            layer_id: layer.id(),
-            kind: plan.kind,
-            kernel: plan.kernel,
-            dirty_policy: plan.dirty_policy,
-            flat_index,
-            halo_texels: plan.halo_texels,
-        });
+        let plan = gpu_plan_for_layer(layer, mask_assets);
+        if plan.is_none() && cpu_from.is_none() {
+            cpu_from = Some(flat_index);
+        }
+        plans.push(plan);
     }
-    graph
+    GpuComputeGraph { plans, cpu_from }
 }
 
 /// Expand a dirty rect by halo, clamped to field bounds.
@@ -348,14 +304,6 @@ pub fn expand_dirty_rect(
     let x1 = (x + w).saturating_add(halo).min(width);
     let y1 = (y + h).saturating_add(halo).min(height);
     (x0, y0, x1.saturating_sub(x0), y1.saturating_sub(y0))
-}
-
-/// Map pass dirty policy to core `DirtyClass`.
-pub fn dirty_class_for(policy: GpuDirtyPolicy) -> DirtyClass {
-    match policy {
-        GpuDirtyPolicy::Local => DirtyClass::Local,
-        GpuDirtyPolicy::FullField => DirtyClass::BasinDependent,
-    }
 }
 
 #[cfg(test)]
@@ -432,7 +380,7 @@ mod tests {
             "expected fully GPU graph, cpu_from={:?}",
             g.cpu_from
         );
-        assert!(g.passes.len() >= 2);
+        assert!(g.plans.iter().filter(|p| p.is_some()).count() >= 2);
     }
 
     #[test]
@@ -490,7 +438,8 @@ mod tests {
             assert!(!layer_gpu_supported(&layer, &[]));
             let graph = single_layer_graph(layer.clone());
             assert_eq!(graph.cpu_from, Some(0));
-            assert!(graph.passes.is_empty());
+            assert_eq!(graph.plans.len(), 1);
+            assert!(graph.plans[0].is_none());
         }
     }
 
@@ -508,12 +457,13 @@ mod tests {
                 meta.type_id
             );
             assert_eq!(graph.cpu_from, (!supported).then_some(0));
+            assert_eq!(graph.plans.len(), 1, "{}", meta.type_id);
             if supported {
-                assert_eq!(graph.passes.len(), 1, "{}", meta.type_id);
+                let plan = graph.plans[0].expect("supported builtin retains a plan");
                 assert!(
-                    graph.passes[0].kernel.matches_layer_kind(&layer.kind),
+                    plan.kernel.matches_layer_kind(&layer.kind),
                     "planner selected {:?} for {}",
-                    graph.passes[0].kernel,
+                    plan.kernel,
                     meta.type_id
                 );
             }
@@ -593,8 +543,11 @@ mod tests {
 
         let graph = compile_gpu_graph(&stack, &[]);
         assert_eq!(graph.cpu_from, Some(1));
-        assert_eq!(graph.passes.len(), 1);
-        assert_eq!(graph.passes[0].flat_index, 0);
+        // Per-index plans: layers below AND above the CPU boundary keep a plan
+        // (the speculative suffix runs them); only the unsupported owner is None.
+        assert!(graph.plans[0].is_some());
+        assert!(graph.plans[1].is_none());
+        assert!(graph.plans[2].is_some());
     }
 
     /// Revert check for #50: in-place kernels only implement the default outer
@@ -633,7 +586,8 @@ mod tests {
                 stack.push(layer);
                 let graph = compile_gpu_graph(&stack, &assets);
                 assert_eq!(graph.cpu_from, Some(1), "{reason}");
-                assert_eq!(graph.passes.len(), 1, "{reason}");
+                assert!(graph.plans[0].is_some(), "{reason}");
+                assert!(graph.plans[1].is_none(), "{reason}");
             }
         }
     }
@@ -732,7 +686,7 @@ mod tests {
             stack.push(layer);
             let graph = compile_gpu_graph(&stack, &assets);
             assert_eq!(graph.cpu_from, Some(0), "{reason}");
-            assert!(graph.passes.is_empty(), "{reason}");
+            assert!(graph.plans[0].is_none(), "{reason}");
         }
     }
 

@@ -1,5 +1,5 @@
 //! B1 evaluator-authority ratchet (audit B1-G1, extended by B1-G2; protects
-//! B1-D1 through B1-D5).
+//! B1-D1 through B1-D6).
 //!
 //! `StackEvaluator` is terra-core's sole CPU layer-stack execution authority.
 //! `EvalWorker` is the approved orchestration wrapper: it may retain state,
@@ -39,6 +39,11 @@ use std::path::{Path, PathBuf};
 enum SeamRole {
     Authority,
     Orchestrator,
+    /// A free-function compiler that lowers a `LayerStack` into an execution plan
+    /// another executor consumes (e.g. the GPU preview's `compile_gpu_graph`). It
+    /// owns no `ProcessorRegistry` and performs no tree walk; its honesty is a live
+    /// call site plus a result test, and it is validated as a `pub fn`, not a type.
+    Planner,
 }
 
 struct SourceEvidence {
@@ -239,18 +244,35 @@ const APPROVED_EXECUTION_SEAMS: &[ApprovedSeam] = &[
             result_needle: "r.height.get",
         },
     },
+    ApprovedSeam {
+        name: "compile_gpu_graph",
+        definition: "crates/terra-gpu/src/graph.rs",
+        role: SeamRole::Planner,
+        justification: "GPU preview planner (B1-D6, #90): lowers the LayerStack into per-layer executable plans (kernel, dirty policy, halo) plus the cpu_from boundary. GpuTerrainEngine::evaluate indexes this plan directly and never re-derives a per-layer plan mid-walk",
+        entry_points: &[EntryPoint {
+            method: "compile_gpu_graph",
+            caller: SourceEvidence {
+                path: "crates/terra-gpu/src/engine.rs",
+                needle: "compile_gpu_graph(",
+            },
+        }],
+        internal_methods: &[],
+        result_test: ResultTestEvidence {
+            path: "crates/terra-gpu/tests/support_matrix.rs",
+            test_name: "first_unsupported_configuration_owns_cpu_from",
+            seam_needle: "compile_gpu_graph(",
+            result_needle: "graph.plans",
+        },
+    },
 ];
 
 /// Workspace-discovered candidates whose honest inventory entry is deferred to a
 /// named follow-up. See `DeferredCandidate` and `deferred_candidates_are_honest`.
-const DEFERRED_CANDIDATES: &[DeferredCandidate] = &[DeferredCandidate {
-    name: "compile_gpu_graph",
-    path: "crates/terra-gpu/src/graph.rs",
-    reason: "GPU compute-graph compiler surfaced by the workspace scan; its pass list is decorative \
-             today (B1-D6, #90). The honest seam entry — role, entry points, result evidence — lands \
-             with that fix, which decides whether the plan is executed or shrunk to cpu_from. Until \
-             then this deferral replaces the old free-text last_graph exemption.",
-}];
+///
+/// Empty since B1-D6 (#90): `compile_gpu_graph` graduated from a deferral to a real
+/// `SeamRole::Planner` entry in `APPROVED_EXECUTION_SEAMS` once the engine began
+/// consuming its plan (kernel, dirty policy, halo) instead of re-planning mid-walk.
+const DEFERRED_CANDIDATES: &[DeferredCandidate] = &[];
 
 const RETIRED_PATHS: &[&str] = &[
     "crates/terra-core/src/terrain_eval",
@@ -289,9 +311,17 @@ const RETIRED_B1_D5_SYMBOLS: &[&str] = &[
 /// Retired from the *CPU* evaluator (`eval/mod.rs`) only — not workspace-wide.
 /// terra-gpu's `GpuTerrainEngine` legitimately keeps a `last_graph`; rather than
 /// bless that with a free-text exemption (which is where B1-D6 grew unnoticed),
-/// the GPU graph compiler is now discovered by the workspace scan and tracked as
-/// a `DEFERRED_CANDIDATES` entry until B1-D6 (#90) gives it an honest seam entry.
+/// the GPU graph compiler is discovered by the workspace scan and, since B1-D6
+/// (#90), carries an honest `SeamRole::Planner` entry in `APPROVED_EXECUTION_SEAMS`.
 const RETIRED_EVAL_SYMBOLS: &[&str] = &["last_graph", "compile_graph", "compile_eval_graph"];
+
+/// Retired from the *GPU* engine (`terra-gpu/src/engine.rs`) only. B1-D6 (#90)
+/// made `compile_gpu_graph`'s plan the single planning authority: the engine walk
+/// indexes `last_graph.plans` and must not re-derive per-layer support or kernels
+/// mid-walk. Referencing either helper from engine production reintroduces the
+/// second planner the fix removed — even if `gpu_plan_for_layer`'s visibility is
+/// widened again. This is B1-D6's revert check.
+const RETIRED_GPU_ENGINE_SYMBOLS: &[&str] = &["gpu_plan_for_layer", "layer_gpu_supported"];
 
 #[test]
 fn authority_inventory_is_honest() {
@@ -440,6 +470,18 @@ fn retired_evaluator_generations_stay_absent() {
         ));
     }
 
+    let gpu_engine_path = root.join("crates/terra-gpu/src/engine.rs");
+    let gpu_engine_source = production_source(&read(&gpu_engine_path));
+    for symbol in RETIRED_GPU_ENGINE_SYMBOLS {
+        if contains_ident(&gpu_engine_source, symbol) {
+            violations.push(format!(
+                "{} references `{symbol}`; the GPU engine must consume compile_gpu_graph's plan \
+                 (last_graph.plans), not re-derive per-layer support or kernels (B1-D6 #90)",
+                gpu_engine_path.display()
+            ));
+        }
+    }
+
     let pyramid_path = root.join("crates/terra-core/src/terrain/pyramid.rs");
     let pyramid = production_source(&read(&pyramid_path));
     if !pyramid.contains("pub fn publish_resident") || !pyramid.contains("handle: TilePageHandle") {
@@ -535,7 +577,10 @@ fn deferred_candidates_are_honest() {
         .into_iter()
         .map(|candidate| (candidate.name, candidate.path))
         .collect();
-    let approved: BTreeSet<&str> = APPROVED_EXECUTION_SEAMS.iter().map(|seam| seam.name).collect();
+    let approved: BTreeSet<&str> = APPROVED_EXECUTION_SEAMS
+        .iter()
+        .map(|seam| seam.name)
+        .collect();
 
     let mut violations = Vec::new();
     let mut seen = BTreeSet::new();
@@ -583,11 +628,13 @@ fn authority_shaped_type_outside_core_is_discovered() {
             pub fn execute(&self, stack: &LayerStack) {}
         }
     "#;
-    let names: BTreeSet<_> =
-        discover_candidates("crates/terra-render/src/rogue.rs", &production_source(source))
-            .into_iter()
-            .map(|candidate| candidate.name)
-            .collect();
+    let names: BTreeSet<_> = discover_candidates(
+        "crates/terra-render/src/rogue.rs",
+        &production_source(source),
+    )
+    .into_iter()
+    .map(|candidate| candidate.name)
+    .collect();
     assert!(
         names.contains("RogueTileExecutor"),
         "a *Executor owning a LayerStack method must be discovered regardless of crate"
@@ -637,6 +684,40 @@ fn validate_seam_shape(scan: &Scan, seam: &ApprovedSeam, violations: &mut Vec<St
         ));
         return;
     };
+
+    // A planner is a free function, not a type: require a `pub fn` of the seam's
+    // name that consumes a `LayerStack`, and forbid it from owning layer dispatch
+    // (only StackEvaluator may own a ProcessorRegistry).
+    if seam.role == SeamRole::Planner {
+        let Some((offset, _)) = find_function_item(&file.production, seam.name) else {
+            violations.push(format!(
+                "planner seam `{}` must expose `pub fn {}` in {}",
+                seam.name, seam.name, seam.definition
+            ));
+            return;
+        };
+        let item = extract_item(&file.production, offset).unwrap_or_default();
+        if !public_fn_names(&file.production).contains(seam.name) {
+            violations.push(format!(
+                "planner seam `{}` must be a `pub fn`, not a private or `pub(crate)` function",
+                seam.name
+            ));
+        }
+        if !contains_ident(&item, "LayerStack") {
+            violations.push(format!(
+                "planner `{}` must compile a LayerStack into an execution plan",
+                seam.name
+            ));
+        }
+        if contains_ident(&item, "ProcessorRegistry") {
+            violations.push(format!(
+                "planner `{}` owns or invokes ProcessorRegistry directly; only StackEvaluator may own layer dispatch",
+                seam.name
+            ));
+        }
+        return;
+    }
+
     let definitions: Vec<_> = public_structs(&file.production)
         .into_iter()
         .filter(|definition| definition.name == seam.name)
@@ -677,6 +758,9 @@ fn validate_seam_shape(scan: &Scan, seam: &ApprovedSeam, violations: &mut Vec<St
                 ));
             }
         }
+        // Planners are free functions, validated and returned above before any
+        // struct definition is required.
+        SeamRole::Planner => unreachable!("planner seams return before struct-shape checks"),
     }
 }
 
@@ -711,6 +795,14 @@ fn validate_seam_entries(scan: &Scan, seam: &ApprovedSeam, violations: &mut Vec<
 
     for entry in seam.entry_points {
         validate_entry_caller(seam, entry, violations);
+    }
+
+    // A planner is a single free function, not a type with an impl surface, so
+    // there are no sibling `pub fn`s to reconcile. A second graph compiler landing
+    // in the module is caught instead by `discover_candidates` (any new
+    // compile*graph function becomes an unrepresented candidate).
+    if seam.role == SeamRole::Planner {
+        return;
     }
 
     // Completeness: reconcile the declared surface against the seam's real

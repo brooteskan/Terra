@@ -27,14 +27,14 @@ fn every_builtin_default_has_consistent_public_support_graph_and_kernel() {
             meta.type_id
         );
         if supported {
-            let [pass] = graph.passes.as_slice() else {
-                panic!("{} must compile to exactly one pass", meta.type_id);
+            let [Some(plan)] = graph.plans.as_slice() else {
+                panic!("{} must compile to exactly one GPU plan", meta.type_id);
             };
             assert!(
-                pass.kernel.matches_layer_kind(&layer.kind),
+                plan.kernel.matches_layer_kind(&layer.kind),
                 "{} selected incompatible {:?}",
                 meta.type_id,
-                pass.kernel
+                plan.kernel
             );
         }
     }
@@ -54,7 +54,8 @@ fn every_effect_filter_variant_has_an_explicit_executable_plan() {
         let supported = matches!(kind, EffectFilterKind::Smooth | EffectFilterKind::Inflate);
         assert_eq!(graph.fully_gpu(), supported, "{}", kind.label());
         if supported {
-            assert_eq!(graph.passes[0].kernel, GpuKernel::EffectFilter);
+            let plan = graph.plans[0].expect("supported filter retains a plan");
+            assert_eq!(plan.kernel, GpuKernel::EffectFilter);
         } else {
             assert_eq!(graph.cpu_from, Some(0));
         }
@@ -134,8 +135,11 @@ fn first_unsupported_configuration_owns_cpu_from() {
 
     let graph = compile_gpu_graph(&stack, &[]);
     assert_eq!(graph.cpu_from, Some(1));
-    assert_eq!(graph.passes.len(), 1);
-    assert_eq!(graph.passes[0].flat_index, 0);
+    // Supported layers below and above the CPU boundary keep plans; only the
+    // unsupported owner at index 1 is None.
+    assert!(graph.plans[0].is_some());
+    assert!(graph.plans[1].is_none());
+    assert!(graph.plans[2].is_some());
 }
 
 #[test]
