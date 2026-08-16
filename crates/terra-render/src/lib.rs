@@ -58,8 +58,7 @@ pub use backends::{
 pub use brush::{pick_terrain_uv, pick_terrain_uv_on_surface, BrushGizmo, BrushOverlay};
 pub use camera::OrbitCamera;
 pub use clipmap::{
-    plan_resident_tiles, projected_error_px, ClipmapConfig, ClipmapPresentPlan, ClipmapRingDraw,
-    ClipmapRingLevel, ResidentTileSelection, ViewportTilePlan, WorldGridConfig,
+    ClipmapConfig, ClipmapPresentPlan, ClipmapRingDraw, ClipmapRingLevel, WorldGridConfig,
 };
 pub use frame_graph::{FrameGraph, FrameSchedule, PassKind};
 pub use gpu_timing::GpuTimings;
@@ -82,7 +81,6 @@ use terra_core::heightfield::Heightfield;
 use terra_core::layer::MaterialsParams;
 use terra_core::mask::MaskField;
 use terra_core::tiling::SampleRect;
-use terra_core::{FieldId, NormalizedRect, TerrainPyramid};
 use thiserror::Error;
 use winit::window::Window;
 
@@ -261,12 +259,6 @@ pub struct TerrainRenderer {
     pub last_gpu_timings: GpuTimings,
     /// Terrain mesh resolution drawn last frame (profiler).
     pub last_grid_resolution: u32,
-    /// Desired visible pages resident at the requested pyramid level.
-    pub last_tile_plan_exact: usize,
-    /// Desired visible pages currently covered by a coarser resident ancestor.
-    pub last_tile_plan_fallback: usize,
-    /// Desired visible pages with no resident ancestor yet.
-    pub last_tile_plan_missing: usize,
     /// After first height present, leave orbit target alone so uploads don't fight the user.
     camera_framed: bool,
     /// Sculpt / mask brush ring drawn on the height surface.
@@ -992,9 +984,6 @@ impl TerrainRenderer {
             last_upload_us: 0,
             last_gpu_timings: GpuTimings::default(),
             last_grid_resolution: 0,
-            last_tile_plan_exact: 0,
-            last_tile_plan_fallback: 0,
-            last_tile_plan_missing: 0,
             camera_framed: false,
             brush,
             guides,
@@ -1749,23 +1738,6 @@ impl TerrainRenderer {
 
     pub fn progressive_samples(&self) -> u32 {
         self.progressive.samples()
-    }
-
-    /// Reconcile the full-world footprint with the streamed terrain pyramid.
-    /// When tile-stream sampling is enabled, missing pages fall back to the
-    /// monolithic height texture; these counts describe streamed coverage.
-    pub fn update_visible_tile_plan(&mut self, pyramid: &TerrainPyramid) {
-        let visible = NormalizedRect::new(0.0, 0.0, 1.0, 1.0).expect("unit world rect");
-        let plan = plan_resident_tiles(
-            pyramid,
-            None,
-            &FieldId::Height,
-            pyramid.max_level(),
-            visible,
-        );
-        self.last_tile_plan_exact = plan.exact_tiles;
-        self.last_tile_plan_fallback = plan.fallback_tiles;
-        self.last_tile_plan_missing = plan.missing_tiles;
     }
 
     /// Acquire the swapchain frame, render terrain into it, and return it

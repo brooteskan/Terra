@@ -3,8 +3,6 @@
 //! Mesh vertex count is fixed per ring; the terrain vertex shader samples the
 //! full-resolution height texture regardless of grid spacing.
 
-use terra_core::{FieldId, LayerId, NormalizedRect, TerrainPyramid, TerrainTileKey};
-
 /// Single world-covering displacement grid (coarsest / full fallback).
 #[derive(Debug, Clone)]
 pub struct WorldGridConfig {
@@ -250,78 +248,6 @@ impl ClipmapPresentPlan {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResidentTileSelection {
-    pub requested: TerrainTileKey,
-    pub resident: Option<TerrainTileKey>,
-    pub fallback_levels: u8,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ViewportTilePlan {
-    pub selections: Vec<ResidentTileSelection>,
-    pub exact_tiles: usize,
-    pub fallback_tiles: usize,
-    pub missing_tiles: usize,
-}
-
-/// Resolve desired visible tiles to their finest resident pages, using ancestors as fallback.
-pub fn plan_resident_tiles(
-    pyramid: &TerrainPyramid,
-    layer: Option<LayerId>,
-    field: &FieldId,
-    desired_level: u8,
-    visible: NormalizedRect,
-) -> ViewportTilePlan {
-    let desired_level = desired_level.min(pyramid.max_level());
-    let Some(level) = pyramid.levels.get(desired_level as usize) else {
-        return ViewportTilePlan::default();
-    };
-    let mut plan = ViewportTilePlan::default();
-    for tile in terra_core::RegionSet::from_rect(visible).tiles(&level.metrics) {
-        let requested = TerrainTileKey {
-            layer,
-            field: field.clone(),
-            level: desired_level,
-            tile,
-        };
-        let resident = pyramid.best_resident_ancestor(layer, field, desired_level, requested.tile);
-        let fallback_levels = resident
-            .as_ref()
-            .map_or(0, |key| desired_level.saturating_sub(key.level));
-        match resident.as_ref() {
-            Some(key) if key.level == desired_level => plan.exact_tiles += 1,
-            Some(_) => plan.fallback_tiles += 1,
-            None => plan.missing_tiles += 1,
-        }
-        plan.selections.push(ResidentTileSelection {
-            requested,
-            resident,
-            fallback_levels,
-        });
-    }
-    plan
-}
-
-/// Project world-space geometric error to screen pixels for LOD prioritization.
-pub fn projected_error_px(
-    geometric_error_m: f32,
-    distance_m: f32,
-    fov_y_rad: f32,
-    viewport_height_px: u32,
-) -> f32 {
-    if !geometric_error_m.is_finite()
-        || !distance_m.is_finite()
-        || distance_m <= 1e-3
-        || viewport_height_px == 0
-    {
-        return f32::INFINITY;
-    }
-    let half_fov = (fov_y_rad * 0.5).max(1e-4);
-    let pixels_per_rad = viewport_height_px as f32 / (2.0 * half_fov.tan());
-    (geometric_error_m / distance_m.max(1e-3)) * pixels_per_rad
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,13 +305,6 @@ mod tests {
     }
 
     #[test]
-    fn projected_error_scales_with_distance() {
-        let err_near = projected_error_px(2.0, 50.0, 1.0, 1080);
-        let err_far = projected_error_px(2.0, 500.0, 1.0, 1080);
-        assert!(err_near > err_far);
-    }
-
-    #[test]
     fn ring_origin_snaps_to_spacing_grid() {
         let ring = ClipmapRingLevel {
             grid_size: 65,
@@ -394,39 +313,5 @@ mod tests {
         let (ox, oz) = ring.snap_origin(100.3, 200.7, 4096.0, 4096.0);
         assert!((ox % 8.0).abs() < 1e-4);
         assert!((oz % 8.0).abs() < 1e-4);
-    }
-
-    #[test]
-    fn resident_plan_falls_back_without_leaving_holes() {
-        let mut pyramid = TerrainPyramid::new(terra_core::PyramidConfig::new(1024, 4096.0, 4096.0));
-        pyramid.publish_resident(
-            TerrainTileKey {
-                layer: None,
-                field: FieldId::Height,
-                level: 0,
-                tile: terra_core::TileId { tx: 0, tz: 0 },
-            },
-            terra_core::TilePageHandle {
-                slot: 0,
-                generation: 1,
-            },
-            1,
-            1,
-            0,
-        );
-        let plan = plan_resident_tiles(
-            &pyramid,
-            None,
-            &FieldId::Height,
-            pyramid.max_level(),
-            NormalizedRect::new(0.45, 0.45, 0.55, 0.55).unwrap(),
-        );
-        assert!(!plan.selections.is_empty());
-        assert_eq!(plan.missing_tiles, 0);
-        assert_eq!(plan.fallback_tiles, plan.selections.len());
-        assert!(plan
-            .selections
-            .iter()
-            .all(|selection| selection.fallback_levels > 0));
     }
 }

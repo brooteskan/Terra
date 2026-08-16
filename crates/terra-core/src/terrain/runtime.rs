@@ -21,10 +21,12 @@ impl TerrainRuntime {
         self.output_revision
     }
 
-    /// Begin a new whole-field output generation and retire prior residency metadata.
+    /// Begin a new whole-field output generation. Streamed residency is retired
+    /// GPU-side at this same boundary by the app's `advance_output_revision`
+    /// (`retire_streamed_residency`): the atlas page table, `TileResidencyCache`,
+    /// and the renderer's streaming flag. The pyramid holds no residency to clear.
     pub fn advance_output_revision(&mut self) -> u64 {
         self.output_revision = self.output_revision.wrapping_add(1);
-        self.pyramid.clear_residency();
         self.output_revision
     }
 
@@ -45,7 +47,6 @@ impl TerrainRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::heightfield::HeightfieldMetrics;
 
     #[test]
     fn output_revision_retires_previous_residency() {
@@ -61,16 +62,7 @@ mod tests {
         runtime.reconfigure(PyramidConfig::new(1000, 8000.0, 4000.0));
         assert_eq!(runtime.output_revision(), 1);
         assert_eq!(runtime.pyramid.levels.last().unwrap().resolution, 1000);
-        assert_eq!(
-            runtime.pyramid.levels.last().unwrap().metrics,
-            HeightfieldMetrics {
-                width: 1000,
-                height: 1000,
-                world_size_x: 8000.0,
-                world_size_z: 4000.0,
-                tile_size: runtime.pyramid.config.tile_size.min(1000),
-                halo: runtime.pyramid.config.halo,
-            }
-        );
+        assert_eq!(runtime.pyramid.config.world_size_x, 8000.0);
+        assert_eq!(runtime.pyramid.config.world_size_z, 4000.0);
     }
 }

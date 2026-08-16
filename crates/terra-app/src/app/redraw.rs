@@ -297,7 +297,6 @@ impl TerraApp {
                     contours: ov.contours,
                     shading,
                 });
-                renderer.update_visible_tile_plan(&self.terrain_runtime.pyramid);
             }
             // Frame seam (see TerrainRenderer::render_terrain's contract): this
             // acquires + submits terrain and returns the un-presented frame. The
@@ -346,11 +345,6 @@ impl TerraApp {
             self.ui_state.profile.gpu_terrain_us = renderer.last_gpu_timings.terrain_us;
             self.ui_state.profile.gpu_shadow_us = renderer.last_gpu_timings.shadow_us;
             self.ui_state.profile.gpu_timestamps_supported = renderer.last_gpu_timings.supported;
-            self.ui_state.profile.update_visible_tiles(
-                renderer.last_tile_plan_exact,
-                renderer.last_tile_plan_fallback,
-                renderer.last_tile_plan_missing,
-            );
             let progressive_samples = renderer.progressive_samples();
             self.ui_state.progressive_samples = progressive_samples;
             let render_converged =

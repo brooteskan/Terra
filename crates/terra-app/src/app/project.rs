@@ -905,14 +905,6 @@ mod tests {
             .expect("atlas before reset")
             .lookup(&old_key)
             .expect("old page resident");
-        assert_eq!(
-            app.terrain_runtime
-                .pyramid
-                .record(&old_key)
-                .expect("pyramid mirrors uploaded page")
-                .handle,
-            old_handle
-        );
         assert!(app
             .renderer
             .as_ref()
@@ -932,7 +924,6 @@ mod tests {
         );
         assert_eq!(atlas.residency().stats().resident_tiles, 0);
         assert_eq!(atlas.residency().resolve_handle(old_handle), None);
-        assert!(app.terrain_runtime.pyramid.record(&old_key).is_none());
         assert!(app.pending_tile_uploads.is_empty());
         assert!(!app
             .renderer
@@ -962,14 +953,6 @@ mod tests {
         };
         let atlas = app.tile_atlas.as_mut().expect("atlas after upload");
         let new_handle = atlas.lookup(&new_key).expect("new page resident");
-        assert_eq!(
-            app.terrain_runtime
-                .pyramid
-                .record(&new_key)
-                .expect("pyramid mirrors replacement page")
-                .handle,
-            new_handle
-        );
         assert_eq!(new_handle.slot, old_handle.slot);
         assert_ne!(new_handle.generation, old_handle.generation);
         assert_eq!(atlas.residency().resolve_handle(old_handle), None);
@@ -1034,19 +1017,17 @@ mod tests {
         (app, metrics, key, handle)
     }
 
-    /// Assert both sides of the revision boundary are retired: the CPU pyramid
-    /// no longer records the page, the atlas has no resident tiles and cannot
-    /// resolve the old handle, no uploads remain queued, and the renderer has
-    /// stopped streaming (so the shader falls back to the monolithic texture).
+    /// Assert the revision boundary retired streamed residency: the atlas has no
+    /// resident tiles and cannot resolve the old handle, no uploads remain queued,
+    /// and the renderer has stopped streaming (so the shader falls back to the
+    /// monolithic texture).
     fn assert_streamed_residency_retired(
         app: &TerraApp,
-        old_key: &TerrainTileKey,
         old_handle: terra_core::TilePageHandle,
     ) {
         let atlas = app.tile_atlas.as_ref().expect("atlas retained");
         assert_eq!(atlas.residency().stats().resident_tiles, 0);
         assert_eq!(atlas.residency().resolve_handle(old_handle), None);
-        assert!(app.terrain_runtime.pyramid.record(old_key).is_none());
         assert!(app.pending_tile_uploads.is_empty());
         assert!(!app
             .renderer
@@ -1116,12 +1097,13 @@ mod tests {
     ///
     /// The sources cross-checked are the GPU page table (what the shader actually
     /// samples, authoritative), `atlas.residency().stats()` (the CPU mirror the HUD
-    /// is fed from), `profile.tile_cache_resident` (the count the artist reads), and
-    /// the visible-tile plan derived from the CPU pyramid via `update_visible_tile_plan`.
+    /// is fed from), and `profile.tile_cache_resident` (the count the artist reads).
     /// It also forbids stale rows and pins stream-enable honesty (streaming on only
-    /// with live pages at the current revision). Takes `&mut` because refreshing the
-    /// visible-tile plan mutates the renderer, exactly as the redraw path does.
-    fn assert_residency_sources_agree(app: &mut TerraApp) {
+    /// with live pages at the current revision). With the write-only CPU pyramid
+    /// plan retired (#91), residency has a single authoritative source (the GPU page
+    /// table, mirrored once into the atlas residency cache), so these counts cannot
+    /// diverge by construction.
+    fn assert_residency_sources_agree(app: &TerraApp) {
         let revision = app.terrain_runtime.output_revision();
         let rev_lo = revision as u32;
         let rev_hi = (revision >> 32) as u32;
@@ -1175,40 +1157,6 @@ mod tests {
                 "streaming enabled at a revision the pages are not stamped with"
             );
         }
-
-        // The visible-tile plan is the CPU-pyramid view the HUD's visible-tile
-        // counts come from; drive it exactly as the redraw path does and require it
-        // to agree with page-table residency in direction.
-        if let Some(renderer) = app.renderer.as_mut() {
-            renderer.update_visible_tile_plan(&app.terrain_runtime.pyramid);
-        }
-        let (exact, fallback, missing) = {
-            let renderer = app.renderer.as_ref().expect("renderer");
-            (
-                renderer.last_tile_plan_exact,
-                renderer.last_tile_plan_fallback,
-                renderer.last_tile_plan_missing,
-            )
-        };
-        let total = exact + fallback + missing;
-        assert!(
-            total >= 1,
-            "unit world must contain at least one visible tile"
-        );
-        if live == 0 {
-            assert_eq!(
-                (exact, fallback, missing),
-                (0, 0, total),
-                "with no residency every visible tile must read as missing -- \
-                 the HUD cannot claim coverage the shader does not have"
-            );
-        } else {
-            assert_eq!(
-                missing, 0,
-                "a world-covering resident page must leave no visible tile missing"
-            );
-            assert_eq!(exact + fallback, total);
-        }
     }
 
     /// Revert check for #86: advancing the output revision via `mark_dirty_from`
@@ -1219,14 +1167,14 @@ mod tests {
         let Some(gpu) = terra_test_gpu::headless() else {
             return;
         };
-        let (mut app, metrics, old_key, old_handle) = app_with_one_streamed_page(gpu);
+        let (mut app, metrics, _old_key, old_handle) = app_with_one_streamed_page(gpu);
         let revision_before = app.terrain_runtime.output_revision();
 
         // An unknown layer id dirties the whole stack — the strongest edit shape.
         app.mark_dirty_from(terra_core::LayerId::new());
 
         assert_ne!(app.terrain_runtime.output_revision(), revision_before);
-        assert_streamed_residency_retired(&app, &old_key, old_handle);
+        assert_streamed_residency_retired(&app, old_handle);
 
         // #34 lifecycle: worker completion re-queues tiles and re-enables streaming.
         app.last_height = Some(Heightfield::filled(metrics, 2.0));
@@ -1255,13 +1203,13 @@ mod tests {
         let Some(gpu) = terra_test_gpu::headless() else {
             return;
         };
-        let (mut app, _metrics, old_key, old_handle) = app_with_one_streamed_page(gpu);
+        let (mut app, _metrics, _old_key, old_handle) = app_with_one_streamed_page(gpu);
         let revision_before = app.terrain_runtime.output_revision();
 
         app.mark_dirty_from_stage(terra_core::LayerId::new());
 
         assert_ne!(app.terrain_runtime.output_revision(), revision_before);
-        assert_streamed_residency_retired(&app, &old_key, old_handle);
+        assert_streamed_residency_retired(&app, old_handle);
     }
 
     /// Whole-stack edits advance the revision via `reconfigure`; that boundary
@@ -1271,11 +1219,11 @@ mod tests {
         let Some(gpu) = terra_test_gpu::headless() else {
             return;
         };
-        let (mut app, _metrics, old_key, old_handle) = app_with_one_streamed_page(gpu);
+        let (mut app, _metrics, _old_key, old_handle) = app_with_one_streamed_page(gpu);
 
         app.mark_all_layers_dirty();
 
-        assert_streamed_residency_retired(&app, &old_key, old_handle);
+        assert_streamed_residency_retired(&app, old_handle);
     }
 
     /// Consistency ratchet (#87): the residency counts the HUD reads and the page
@@ -1290,18 +1238,18 @@ mod tests {
         let (mut app, metrics, _old_key, _old_handle) = app_with_one_streamed_page(gpu);
 
         // Stage 1: freshly streamed -- every source reports the one resident page.
-        assert_residency_sources_agree(&mut app);
+        assert_residency_sources_agree(&app);
 
         // Stage 2: the E1-C2 moment. The edit retires residency; no source may
         // still count (or let the shader sample) the prior revision's page.
         app.mark_dirty_from(terra_core::LayerId::new());
-        assert_residency_sources_agree(&mut app);
+        assert_residency_sources_agree(&app);
 
         // Stage 3: worker completion re-streams; every source agrees once more,
         // now at the post-edit revision.
         app.last_height = Some(Heightfield::filled(metrics, 2.0));
         app.queue_final_tile_uploads();
         assert_eq!(app.upload_pending_terrain_tiles(), 1);
-        assert_residency_sources_agree(&mut app);
+        assert_residency_sources_agree(&app);
     }
 }

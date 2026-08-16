@@ -1210,9 +1210,6 @@ pub struct FrameProfile {
     pub tile_cache_budget_mb: f32,
     pub tile_cache_evictions: u64,
     pub tile_uploads_pending: usize,
-    pub visible_tiles_exact: usize,
-    pub visible_tiles_fallback: usize,
-    pub visible_tiles_missing: usize,
     /// GPU terrain pass microseconds (0 if TIMESTAMP_QUERY unsupported).
     pub gpu_terrain_us: u64,
     /// GPU shadow pass microseconds.
@@ -1279,12 +1276,6 @@ impl FrameProfile {
         self.tile_cache_budget_mb = stats.budget_bytes as f32 / MIB;
         self.tile_cache_evictions = stats.evictions;
         self.tile_uploads_pending = pending_uploads;
-    }
-
-    pub fn update_visible_tiles(&mut self, exact: usize, fallback: usize, missing: usize) {
-        self.visible_tiles_exact = exact;
-        self.visible_tiles_fallback = fallback;
-        self.visible_tiles_missing = missing;
     }
 
     pub fn update_progressive(

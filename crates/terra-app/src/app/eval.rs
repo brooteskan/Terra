@@ -258,7 +258,6 @@ impl TerraApp {
                 level,
                 tile: tile_id,
             };
-            let published_key = key.clone();
             let result = self.tile_atlas.as_mut().unwrap().upload_height_tile(
                 &self.gpu.as_ref().unwrap().queue,
                 key,
@@ -267,19 +266,8 @@ impl TerraApp {
                 revision,
             );
             match result {
-                Ok(upload) => {
+                Ok(_) => {
                     uploaded += 1;
-                    let frame = self.runtime_started.elapsed().as_millis() as u64;
-                    for evicted in upload.evicted {
-                        self.terrain_runtime.pyramid.remove_resident(&evicted);
-                    }
-                    self.terrain_runtime.pyramid.publish_resident(
-                        published_key,
-                        upload.handle,
-                        revision,
-                        revision,
-                        frame,
-                    );
                 }
                 Err(error) => {
                     log::warn!("terrain tile upload failed: {error}");
