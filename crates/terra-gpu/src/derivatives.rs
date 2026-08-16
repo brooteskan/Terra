@@ -46,6 +46,7 @@ pub fn run_derivative_gpu(
     let h = m.height;
     let radius_texels = world_radius_texels(radius_m, m).round().max(1.0) as u32;
 
+    terra_core::shader_progress::record_shader_compiled();
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("derivatives"),
         source: wgpu::ShaderSource::Wgsl(include_str!("shaders/derivatives.wgsl").into()),

@@ -19,6 +19,14 @@ impl TerraApp {
             return;
         };
 
+        // Startup: the terrain renderer's pipelines are still compiling on a
+        // worker thread. Present an animated splash from the main-thread-held
+        // surface instead of the (nonexistent) terrain path.
+        if self.is_booting() {
+            self.draw_boot_splash();
+            return;
+        }
+
         // Coalesce fast brush motion: many stamps per frame, one Draft present.
         // Mask paint updates overlay only â€” never force a height eval mid-stroke.
         if self.pending_eval

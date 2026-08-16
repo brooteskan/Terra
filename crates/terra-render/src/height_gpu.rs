@@ -226,6 +226,7 @@ impl HeightGpu {
             ..Default::default()
         });
 
+        terra_core::shader_progress::record_shader_compiled();
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("normals"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/normals.wgsl").into()),

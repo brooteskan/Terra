@@ -342,6 +342,7 @@ struct Pipe {
 }
 
 fn make_pipe(device: &wgpu::Device, label: &str, wgsl: &str, bgl: wgpu::BindGroupLayout) -> Pipe {
+    terra_core::shader_progress::record_shader_compiled();
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some(label),
         source: wgpu::ShaderSource::Wgsl(wgsl.into()),

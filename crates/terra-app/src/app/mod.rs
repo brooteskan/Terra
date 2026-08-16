@@ -34,6 +34,25 @@ use winit::window::Window;
 pub(crate) const EDIT_DEBOUNCE_MS: u128 = 40;
 pub(crate) const REFINE_INTERVAL_MS: u128 = 80;
 
+/// GPU objects built off the main thread during startup, handed back through
+/// [`BootState::rx`]. All three are `wgpu`-backed and therefore `Send`.
+pub(crate) struct BootResult {
+    renderer: TerrainRenderer,
+    tile_atlas: Option<GpuTileAtlas>,
+    gpu_engine: GpuTerrainEngine,
+}
+
+/// Startup state held while the renderer's pipelines/shaders compile on a worker
+/// thread. The main thread keeps the surface (in `pending`) so it can animate the
+/// splash every frame; when the worker sends its [`BootResult`], the surface is
+/// attached and the objects installed into the app.
+pub(crate) struct BootState {
+    pub(crate) gpu: terra_render::GpuContext,
+    pub(crate) pending: terra_render::PendingSurface,
+    pub(crate) rx: std::sync::mpsc::Receiver<BootResult>,
+    pub(crate) started: Instant,
+}
+
 /// Continuous fly keys for the game-engine-style viewport camera.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct CameraKeys {
@@ -121,6 +140,9 @@ pub(crate) struct LayerPointDrag {
 
 pub struct TerraApp {
     window: Option<Arc<Window>>,
+    /// Set only during startup while GPU pipelines compile on a worker thread;
+    /// `None` once the renderer is installed. Drives the animated splash.
+    boot: Option<BootState>,
     renderer: Option<TerrainRenderer>,
     /// App-owned GPU handles. Every GPU consumer (renderer, tile atlas, terrain
     /// engine, GUI) shares clones of this instead of sourcing device/queue
@@ -276,6 +298,7 @@ impl Default for TerraApp {
         ));
         Self {
             window: None,
+            boot: None,
             renderer: None,
             gpu: None,
             session,

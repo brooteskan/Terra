@@ -3,6 +3,7 @@
 mod actions;
 mod bookmarks_gui;
 mod brand;
+pub(crate) use brand::brand_logo;
 mod chrome_gui;
 mod chrome_layout;
 mod command_palette;

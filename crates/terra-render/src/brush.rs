@@ -42,6 +42,7 @@ pub struct BrushOverlay {
 
 impl BrushOverlay {
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+        terra_core::shader_progress::record_shader_compiled();
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("brush-gizmo-shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/brush.wgsl").into()),

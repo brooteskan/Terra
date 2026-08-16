@@ -5,8 +5,8 @@ use crate::ui::{resolve_shortcut_for_input, PanelAction, ShortcutChord, Shortcut
 use terra_core::command::EditorCommand;
 use terra_core::eval::{EvalWorkerEvent, PreviewQuality};
 use terra_gpu::{GpuTerrainEngine, GpuTileAtlas};
-use terra_gui::GuiRenderer;
-use terra_render::TerrainRenderer;
+use terra_gui::{Color, GuiContext, GuiInput, GuiRenderer, GuiState, Rect};
+use terra_render::{GpuContext, TerrainRenderer};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
@@ -31,36 +31,72 @@ impl ApplicationHandler for TerraApp {
                         .with_title("Terra")
                         .with_decorations(false)
                         .with_resizable(true)
+                        // Start hidden so the OS never shows an unpainted (white)
+                        // surface. We reveal it below only after the splash frame
+                        // is on the swapchain.
+                        .with_visible(false)
                         .with_inner_size(winit::dpi::LogicalSize::new(1600, 900)),
                 )
                 .expect("window"),
         );
         let (gpu, target) =
             pollster::block_on(terra_render::init_gpu(window.clone())).expect("gpu init");
-        let renderer = TerrainRenderer::new(&gpu, target);
-        let tile_config = self.terrain_runtime.pyramid.config;
-        let tile_atlas =
-            match GpuTileAtlas::new(&gpu.device, tile_config.tile_size, tile_config.halo, 128) {
-                Ok(atlas) => Some(atlas),
-                Err(error) => {
-                    log::warn!("GPU tile atlas disabled: {error}");
-                    None
-                }
-            };
+        // The GUI renderer only needs the device/queue/format, so it is ready
+        // long before the terrain pipelines. Paint the first splash frame, reveal
+        // the window, then build the heavy GPU pipelines on a worker thread while
+        // the main loop keeps animating the splash — the window stays responsive
+        // instead of freezing on a white void.
+        let mut gui_renderer = GuiRenderer::new(&gpu.device, &gpu.queue, gpu.surface_format);
+        // Count shader compiles from zero for this boot's splash status line.
+        terra_core::shader_progress::reset();
+        let pending = target.into_pending();
+        Self::paint_splash_frame(&pending, &gpu, &mut gui_renderer, &window);
+        window.set_visible(true);
 
-        let gpu_engine = GpuTerrainEngine::new(&gpu.device, 256);
-        let gui_renderer = GuiRenderer::new(&gpu.device, &gpu.queue, gpu.surface_format);
+        // Build TerrainRenderer / engine / tile atlas off-thread. These are the
+        // shader/pipeline compiles; `wgpu` device & queue are Send + Sync, so we
+        // build against a cloned GpuContext and hand the finished objects back.
+        let config = pending.config().clone();
+        let size = pending.size();
+        let tile_config = self.terrain_runtime.pyramid.config;
+        let (tile_size, tile_halo) = (tile_config.tile_size, tile_config.halo);
+        let worker_gpu = gpu.clone();
+        let (tx, rx) = std::sync::mpsc::channel::<super::BootResult>();
+        std::thread::Builder::new()
+            .name("terra-gpu-init".into())
+            .spawn(move || {
+                let renderer = TerrainRenderer::new_detached(&worker_gpu, config, size);
+                let gpu_engine = GpuTerrainEngine::new(&worker_gpu.device, 256);
+                let tile_atlas =
+                    match GpuTileAtlas::new(&worker_gpu.device, tile_size, tile_halo, 128) {
+                        Ok(atlas) => Some(atlas),
+                        Err(error) => {
+                            log::warn!("GPU tile atlas disabled: {error}");
+                            None
+                        }
+                    };
+                // Receiver drop (window closed mid-init) just discards the result.
+                let _ = tx.send(super::BootResult {
+                    renderer,
+                    tile_atlas,
+                    gpu_engine,
+                });
+            })
+            .expect("spawn terra-gpu-init");
+
         self.window = Some(window);
-        self.renderer = Some(renderer);
-        self.gpu = Some(gpu);
-        self.gpu_engine = Some(gpu_engine);
-        self.tile_atlas = tile_atlas;
         self.gui_renderer = Some(gui_renderer);
-        self.refresh_window_title();
-        // Decode 1024² tool thumbs on a background pool before the user opens
-        // Quick Add / Tools — avoids Lucide→3D icon flash on first dialog open.
-        crate::ui::prefetch_tool_thumbnails();
-        // Terrain eval waits until the user opens or creates a project.
+        self.boot = Some(super::BootState {
+            gpu,
+            pending,
+            rx,
+            started: Instant::now(),
+        });
+        // Animate: keep repainting the splash until the worker result lands
+        // (about_to_wait polls `boot.rx` and finalizes).
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -383,6 +419,24 @@ impl ApplicationHandler for TerraApp {
             event_loop.exit();
             return;
         }
+
+        // Startup: poll the GPU-init worker. Until it lands, keep repainting the
+        // splash at ~30 fps so the sweep animates and the window stays responsive.
+        if self.is_booting() {
+            let finished = self.try_finish_boot();
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
+            if finished {
+                event_loop.set_control_flow(ControlFlow::Wait);
+            } else {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(
+                    Instant::now() + Duration::from_millis(33),
+                ));
+            }
+            return;
+        }
+
         self.exporter.poll();
         self.poll_project_io();
         let camera_flying = self.apply_camera_fly();
@@ -749,6 +803,125 @@ impl ApplicationHandler for TerraApp {
 }
 
 impl TerraApp {
+    /// True while GPU pipelines are still compiling on the boot worker.
+    pub(crate) fn is_booting(&self) -> bool {
+        self.boot.is_some()
+    }
+
+    /// Present one animated splash frame from the main-thread-held surface.
+    /// Reads elapsed time (for the sweep) and the live shader count. Called from
+    /// `redraw` while `boot` is set.
+    pub(crate) fn draw_boot_splash(&mut self) {
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        // Disjoint field borrows: `boot` (shared) + `gui_renderer`/`gui_state` (unique).
+        let boot = match self.boot.as_ref() {
+            Some(boot) => boot,
+            None => return,
+        };
+        let Some(gui_renderer) = self.gui_renderer.as_mut() else {
+            return;
+        };
+        let elapsed = boot.started.elapsed().as_secs_f32();
+        let shaders = terra_core::shader_progress::shaders_compiled();
+        let ppp = (window.scale_factor() as f32).max(0.5);
+        let phys = boot.pending.size();
+        let screen_w = (phys.width as f32 / ppp).max(1.0);
+        let screen_h = (phys.height as f32 / ppp).max(1.0);
+        let gui_state = &mut self.gui_state;
+
+        boot.pending.present_splash(&boot.gpu, SPLASH_BG, |view| {
+            let mut gui =
+                GuiContext::begin(screen_w, screen_h, ppp, GuiInput::default(), gui_state);
+            paint_splash(&mut gui, screen_w, screen_h, elapsed, shaders);
+            gui.end();
+            gui_renderer.render(
+                &boot.gpu.device,
+                &boot.gpu.queue,
+                view,
+                &mut gui,
+                phys.width.max(1),
+                phys.height.max(1),
+            );
+        });
+    }
+
+    /// Present the first splash frame during startup, before the worker begins.
+    /// Associated fn so it borrows no `self` fields.
+    fn paint_splash_frame(
+        pending: &terra_render::PendingSurface,
+        gpu: &GpuContext,
+        gui_renderer: &mut GuiRenderer,
+        window: &Window,
+    ) {
+        let ppp = (window.scale_factor() as f32).max(0.5);
+        let phys = pending.size();
+        let screen_w = (phys.width as f32 / ppp).max(1.0);
+        let screen_h = (phys.height as f32 / ppp).max(1.0);
+        let mut gui_state = GuiState::default();
+        let shaders = terra_core::shader_progress::shaders_compiled();
+        pending.present_splash(gpu, SPLASH_BG, |view| {
+            let mut gui =
+                GuiContext::begin(screen_w, screen_h, ppp, GuiInput::default(), &mut gui_state);
+            paint_splash(&mut gui, screen_w, screen_h, 0.0, shaders);
+            gui.end();
+            gui_renderer.render(
+                &gpu.device,
+                &gpu.queue,
+                view,
+                &mut gui,
+                phys.width.max(1),
+                phys.height.max(1),
+            );
+        });
+    }
+
+    /// Poll the boot worker; when it has produced the GPU objects, attach the
+    /// surface and install them. Returns true if the app finished booting this
+    /// call (caller should request a real redraw).
+    pub(crate) fn try_finish_boot(&mut self) -> bool {
+        let Some(boot) = self.boot.as_ref() else {
+            return false;
+        };
+        let result = match boot.rx.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                // Worker panicked before sending — unrecoverable; leave the splash
+                // up rather than crash, but log loudly.
+                log::error!("terra-gpu-init worker disconnected before producing a renderer");
+                return false;
+            }
+        };
+        let boot = self.boot.take().expect("boot present");
+        log::info!(
+            "terra: GPU init complete — {} shaders compiled in {} ms",
+            terra_core::shader_progress::shaders_compiled(),
+            boot.started.elapsed().as_millis()
+        );
+        let super::BootResult {
+            mut renderer,
+            tile_atlas,
+            gpu_engine,
+        } = result;
+        boot.pending.attach(&mut renderer);
+        // Reconcile against the live window size in case it changed during init.
+        if let Some(window) = &self.window {
+            renderer.resize(window.inner_size());
+        }
+        self.renderer = Some(renderer);
+        self.tile_atlas = tile_atlas;
+        self.gpu_engine = Some(gpu_engine);
+        self.gpu = Some(boot.gpu);
+        self.refresh_window_title();
+        self.refresh_viewport_rect();
+        // Decode 1024² tool thumbs on a background pool before the user opens
+        // Quick Add / Tools — avoids Lucide→3D icon flash on first dialog open.
+        crate::ui::prefetch_tool_thumbnails();
+        true
+    }
+
     /// Apply WASD/QE fly when the viewport camera is active and UI isn't capturing text.
     /// Returns true while keys are held (even if movement was gated this frame).
     fn apply_camera_fly(&mut self) -> bool {
@@ -790,4 +963,64 @@ impl TerraApp {
         }
         true
     }
+}
+
+/// Startup splash background — matches the Home viewport clear tone
+/// (see redraw.rs, AppScreen::Home lighting.clear).
+const SPLASH_BG: [f32; 3] = [0.071, 0.082, 0.102];
+
+/// Draw the Terra wordmark, an indeterminate progress sweep, and a status line
+/// with the live shader-compile count. `t` is elapsed seconds; the sweep is purely
+/// time-based so it keeps animating while the GPU-init worker is busy (the window
+/// never looks frozen). `shaders` is the count reported by the render/GPU crates as
+/// each shader module compiles. Uses ASCII "..." — the GUI font has no `…` glyph.
+fn paint_splash(gui: &mut GuiContext, screen_w: f32, screen_h: f32, t: f32, shaders: u32) {
+    // Opaque plate (the clear already matches; this also guards platforms where
+    // the clear color space differs slightly).
+    gui.panel(
+        Rect::from_pos_size(0.0, 0.0, screen_w, screen_h),
+        Color::rgb(SPLASH_BG[0], SPLASH_BG[1], SPLASH_BG[2]),
+    );
+
+    // Centered wordmark, width-fit to a comfortable fraction of the window.
+    let (lw, lh, rgba) = crate::ui::brand_logo();
+    let logo_w = (screen_w * 0.30).clamp(240.0, 520.0);
+    let logo_h = logo_w * (*lh as f32 / (*lw as f32).max(1.0));
+    let lx = (screen_w - logo_w) * 0.5;
+    let ly = (screen_h - logo_h) * 0.5 - 24.0;
+    gui.image(Rect::from_pos_size(lx, ly, logo_w, logo_h), *lw, *lh, rgba);
+
+    // Indeterminate progress sweep under the mark.
+    let bar_w = (screen_w * 0.24).clamp(200.0, 420.0);
+    let bar_h = 3.0;
+    let bar_x = (screen_w - bar_w) * 0.5;
+    let bar_y = ly + logo_h + 22.0;
+    gui.panel_rounded(
+        Rect::from_pos_size(bar_x, bar_y, bar_w, bar_h),
+        Color::rgba(1.0, 1.0, 1.0, 0.08),
+        bar_h * 0.5,
+    );
+    // Ping-pong highlight (Cylon sweep): triangle wave 0..1..0 over ~1.8s.
+    let seg_w = bar_w * 0.32;
+    let ping = 1.0 - (2.0 * (t * 0.55).fract() - 1.0).abs();
+    let seg_x = bar_x + (bar_w - seg_w) * ping;
+    gui.panel_rounded(
+        Rect::from_pos_size(seg_x, bar_y, seg_w, bar_h),
+        Color::rgba(0.36, 0.80, 0.74, 0.90),
+        bar_h * 0.5,
+    );
+
+    // Status line: "Compiling shaders..." with the live count once it starts.
+    let status = if shaders > 0 {
+        format!("Compiling shaders... {shaders}")
+    } else {
+        "Compiling shaders...".to_string()
+    };
+    gui.label_centered(
+        screen_w * 0.5,
+        bar_y + 16.0,
+        &status,
+        Color::rgba(0.72, 0.78, 0.85, 0.85),
+        1.05,
+    );
 }

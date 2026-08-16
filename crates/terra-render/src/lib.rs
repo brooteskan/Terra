@@ -480,6 +480,127 @@ pub async fn init_gpu(
     ))
 }
 
+impl SurfaceTarget {
+    /// Hand the surface to the main thread as a [`PendingSurface`] so the
+    /// renderer's pipelines can be built off-thread (see [`TerrainRenderer::new_detached`])
+    /// while the main thread keeps presenting splash frames. The surface must
+    /// stay on the thread that presents; only `config`/`size` cross to the worker.
+    pub fn into_pending(self) -> PendingSurface {
+        PendingSurface {
+            surface: self.surface,
+            config: self.config,
+            size: self.size,
+        }
+    }
+}
+
+/// The window surface held on the main thread during startup, decoupled from the
+/// renderer whose pipelines are compiling on a worker.
+///
+/// This is the seam that keeps the window responsive while shaders build: the
+/// surface (which must be presented from the thread that owns the window) stays
+/// here so the app can animate a splash via [`Self::present_splash`], while the
+/// heavy [`TerrainRenderer::new_detached`] runs elsewhere. When that returns,
+/// [`Self::attach`] hands the surface to the finished renderer.
+pub struct PendingSurface {
+    surface: wgpu::Surface<'static>,
+    config: wgpu::SurfaceConfiguration,
+    size: winit::dpi::PhysicalSize<u32>,
+}
+
+impl PendingSurface {
+    /// Surface configuration the detached renderer must be built for (format,
+    /// size, present/alpha modes). Clone it to hand to the worker.
+    pub fn config(&self) -> &wgpu::SurfaceConfiguration {
+        &self.config
+    }
+
+    /// Physical size the surface was configured at.
+    pub fn size(&self) -> winit::dpi::PhysicalSize<u32> {
+        self.size
+    }
+
+    /// Present one splash frame: clear the swapchain to `clear`, let `overlay`
+    /// draw over the acquired view, then present — without consuming the surface.
+    ///
+    /// Cosmetic, so a failed surface acquire (e.g. transient `Outdated` during a
+    /// resize) is logged and skipped, never fatal.
+    pub fn present_splash(
+        &self,
+        ctx: &GpuContext,
+        clear: [f32; 3],
+        overlay: impl FnOnce(&wgpu::TextureView),
+    ) {
+        let frame = match self.surface.get_current_texture() {
+            Ok(frame) => frame,
+            Err(err) => {
+                log::warn!("splash: surface acquire failed, skipping: {err}");
+                return;
+            }
+        };
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("splash-clear"),
+            });
+        {
+            // Clear pass: the GUI renderer draws with LoadOp::Load, so the
+            // attachment must be defined before it runs (freshly acquired
+            // swapchain contents are otherwise undefined).
+            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("splash-clear"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: clear[0] as f64,
+                            g: clear[1] as f64,
+                            b: clear[2] as f64,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+        }
+        ctx.queue.submit(std::iter::once(encoder.finish()));
+        overlay(&view);
+        frame.present();
+    }
+
+    /// Attach this surface to a renderer that was built detached (surface `None`)
+    /// on a worker thread, finishing it into a windowed renderer. Reconfigures
+    /// the surface against the renderer's device to be safe.
+    pub fn attach(self, renderer: &mut TerrainRenderer) {
+        self.surface.configure(&renderer.device, &self.config);
+        renderer.config = self.config;
+        renderer.size = self.size;
+        renderer.surface = Some(self.surface);
+    }
+}
+
+impl TerrainRenderer {
+    /// Build every device-only pipeline and render target for a *windowed*
+    /// renderer, but without the surface — so this (the expensive shader/pipeline
+    /// compile) can run on a worker thread while the main thread animates the
+    /// startup splash. Pass `config`/`size` cloned from the [`PendingSurface`];
+    /// finish on the main thread with [`PendingSurface::attach`].
+    pub fn new_detached(
+        ctx: &GpuContext,
+        config: wgpu::SurfaceConfiguration,
+        size: winit::dpi::PhysicalSize<u32>,
+    ) -> Self {
+        Self::init(ctx.device.clone(), ctx.queue.clone(), None, config, size)
+    }
+}
+
 impl TerrainRenderer {
     /// Build the windowed renderer from the app-owned [`GpuContext`] and the
     /// [`SurfaceTarget`] that [`init_gpu`] produced together. The device and
@@ -548,6 +669,7 @@ impl TerrainRenderer {
         let format = config.format;
 
         log::info!("terra-render: compiling terrain shader/pipelines…");
+        terra_core::shader_progress::record_shader_compiled();
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("terrain"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/terrain.wgsl").into()),

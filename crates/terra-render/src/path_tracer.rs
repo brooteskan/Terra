@@ -255,6 +255,7 @@ impl PathTracer {
             ],
         });
 
+        terra_core::shader_progress::record_shader_compiled();
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("path-trace"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/path_trace.wgsl").into()),
