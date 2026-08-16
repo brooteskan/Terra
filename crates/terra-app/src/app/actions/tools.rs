@@ -14,7 +14,7 @@ pub(crate) fn try_apply(
     action: PanelAction,
     ctx: &mut ApplyCtx,
 ) -> Result<(), PanelAction> {
-    let result = match action {
+    match action {
         PanelAction::SetOperationApplyWhere { id, apply: mode } => {
             let (previous, previous_masks) = app
                 .session
@@ -177,6 +177,5 @@ pub(crate) fn try_apply(
         }
         other => return Err(other),
     };
-    let _ = result;
     Ok(())
 }

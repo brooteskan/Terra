@@ -13,7 +13,7 @@ pub(crate) fn try_apply(
     action: PanelAction,
     ctx: &mut ApplyCtx,
 ) -> Result<(), PanelAction> {
-    let result = match action {
+    match action {
         PanelAction::AddBiome { name } => {
             let biome = terra_core::layer::LayerGroup::biome(name);
             let id = biome.id;
@@ -375,7 +375,6 @@ pub(crate) fn try_apply(
         }
         other => return Err(other),
     };
-    let _ = result;
     Ok(())
 }
 

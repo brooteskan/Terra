@@ -693,7 +693,7 @@ impl HeightGpu {
             });
             pass.set_pipeline(&self.normal_pipeline);
             pass.set_bind_group(0, bind, &[]);
-            pass.dispatch_workgroups((region.w + 7) / 8, (region.h + 7) / 8, 1);
+            pass.dispatch_workgroups(region.w.div_ceil(8), region.h.div_ceil(8), 1);
         }
         queue.submit(Some(encoder.finish()));
         std::mem::swap(&mut self.display, &mut self.write);
@@ -784,7 +784,7 @@ impl HeightGpu {
             });
             pass.set_pipeline(&self.normal_pipeline);
             pass.set_bind_group(0, &bind, &[]);
-            pass.dispatch_workgroups((region.w + 7) / 8, (region.h + 7) / 8, 1);
+            pass.dispatch_workgroups(region.w.div_ceil(8), region.h.div_ceil(8), 1);
         }
         queue.submit(Some(encoder.finish()));
     }

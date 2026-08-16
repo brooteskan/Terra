@@ -215,8 +215,8 @@ pub struct TileManifest {
 /// Build a deterministic tile manifest for incremental export / change detection.
 pub fn build_tile_manifest(hf: &Heightfield, tile_size: u32, height_hash: u64) -> TileManifest {
     let tw = tile_size.max(1);
-    let tiles_x = (hf.metrics.width + tw - 1) / tw;
-    let tiles_z = (hf.metrics.height + tw - 1) / tw;
+    let tiles_x = hf.metrics.width.div_ceil(tw);
+    let tiles_z = hf.metrics.height.div_ceil(tw);
     let dx = hf.metrics.dx();
     let dz = hf.metrics.dz();
     let mut tiles = Vec::new();
@@ -511,8 +511,8 @@ pub fn write_collision_obj(
     let dz = hf.metrics.dz();
     let mut verts = String::new();
     let mut faces = String::new();
-    let cols = (w + stride - 1) / stride;
-    let rows = (h + stride - 1) / stride;
+    let cols = w.div_ceil(stride);
+    let rows = h.div_ceil(stride);
     for jj in 0..rows {
         for ii in 0..cols {
             let i = (ii * stride).min(w - 1);

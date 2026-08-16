@@ -132,6 +132,8 @@ fn flat_d8_drainage_matches_flow_graph() {
         HeightfieldMetrics::new(32, 32, 320.0, 320.0),
         HeightfieldMetrics::new(40, 24, 400.0, 240.0),
     ];
+    // (name, builder-fn) fixture table; the fn-pointer tuple is inherent to the test data.
+    #[allow(clippy::type_complexity)]
     let builders: &[(&str, fn(HeightfieldMetrics) -> Heightfield)] = &[
         ("plane", plane),
         ("cone", cone),

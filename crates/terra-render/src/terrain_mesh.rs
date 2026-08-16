@@ -63,8 +63,8 @@ impl TerrainMesh {
         let h = hf.metrics.height;
         // Decimate for viewport if huge
         let step = (w.max(h) / 512).max(1);
-        let gw = (w + step - 1) / step;
-        let gh = (h + step - 1) / step;
+        let gw = w.div_ceil(step);
+        let gh = h.div_ceil(step);
 
         let mut vertices = Vec::with_capacity((gw * gh) as usize);
         let (min_h, max_h) = hf.min_max();

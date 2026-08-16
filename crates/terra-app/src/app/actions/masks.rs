@@ -11,7 +11,7 @@ pub(crate) fn try_apply(
     action: PanelAction,
     ctx: &mut ApplyCtx,
 ) -> Result<(), PanelAction> {
-    let result = match action {
+    match action {
         PanelAction::AddMask(mut asset) => {
             asset.prepare_for_document();
             let id = asset.id;
@@ -428,6 +428,5 @@ pub(crate) fn try_apply(
         }
         other => return Err(other),
     };
-    let _ = result;
     Ok(())
 }

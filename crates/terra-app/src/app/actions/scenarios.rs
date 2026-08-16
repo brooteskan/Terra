@@ -11,7 +11,7 @@ pub(crate) fn try_apply(
     action: PanelAction,
     ctx: &mut ApplyCtx,
 ) -> Result<(), PanelAction> {
-    let result = match action {
+    match action {
         PanelAction::AddSimulationScenario { name } => {
             let scenario = terra_core::simulation_scenario::SimulationScenario::new(name);
             let index = app.session.document.simulation_scenarios.scenarios.len();
@@ -280,6 +280,5 @@ pub(crate) fn try_apply(
         }
         other => return Err(other),
     };
-    let _ = result;
     Ok(())
 }

@@ -244,7 +244,7 @@ fn bake_font(physical_px: u32, ppp: f32) -> BakedFont {
     let cell_h = max_h + pad * 2;
     let cols = 16u32;
     let total = rasters.len() as u32;
-    let rows = (total + cols - 1) / cols;
+    let rows = total.div_ceil(cols);
     let atlas_w = (cols * cell_w).next_power_of_two().max(256);
     let atlas_h = (rows * cell_h).next_power_of_two().max(256);
     let mut atlas = vec![0u8; (atlas_w * atlas_h) as usize];

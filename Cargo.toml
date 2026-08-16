@@ -51,7 +51,7 @@ codegen-units = 1
 # Clippy lint policy (see issue #74). Crates opt in via `[lints] workspace = true`.
 #
 # The CI Clippy step runs `-D warnings`, so every warn-by-default lint is enforced
-# across the workspace. The entries below are the deliberate exceptions. Three tranches
+# across the workspace. The entries below are the deliberate exceptions. Four tranches
 # have been enabled (absent here on purpose); intentional occurrences carry narrowly
 # scoped `#[allow(...)]` with a rationale at the site:
 #   Tranche 1: large_enum_variant, len_without_is_empty, unnecessary_unwrap,
@@ -64,21 +64,16 @@ codegen-units = 1
 #              excessive_precision, ptr_arg, needless_lifetimes,
 #              default_constructed_unit_structs, cloned_ref_to_slice_refs,
 #              disallowed_names, assertions_on_constants, if_same_then_else, identity_op.
+#   Tranche 4: needless_bool_assign (no occurrences), absurd_extreme_comparisons
+#              (the paint-debounce scaffolding was removed), let_unit_value,
+#              type_complexity, manual_div_ceil.
 #
 # Everything below is deferred for a stated reason (not merely "not done yet"):
-#   absurd_extreme_comparisons — the only hits are the always-zero paint-debounce guard;
-#     removing that scaffolding is a separate behavioral change (see `PAINT_DEBOUNCE_MS`).
 #   manual_clamp — min/max chains vs `.clamp()` differ on NaN; not a mechanical rewrite.
-#   manual_div_ceil, field_reassign_with_default — pure style but large churn.
+#   field_reassign_with_default — pure style, no rustfix suggestion, large hand churn.
 #   too_many_arguments, needless_range_loop — issue #74 says leave until profiling/API clarity.
-#   let_unit_value, type_complexity, needless_bool_assign — case-by-case judgment.
 [workspace.lints.clippy]
-absurd_extreme_comparisons = "allow"
 field_reassign_with_default = "allow"
-let_unit_value = "allow"
 manual_clamp = "allow"
-manual_div_ceil = "allow"
-needless_bool_assign = "allow"
 needless_range_loop = "allow"
 too_many_arguments = "allow"
-type_complexity = "allow"

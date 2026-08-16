@@ -1006,7 +1006,7 @@ pub fn draw_quick_add(
         );
         ui.gap(40.0);
     } else {
-        let rows = (items.len() + cols - 1) / cols;
+        let rows = items.len().div_ceil(cols);
         let content_h = rows as f32 * (TILE_H + TILE_GAP) + PAD;
         ui.gap(content_h.max(1.0));
 

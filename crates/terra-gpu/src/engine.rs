@@ -1181,8 +1181,8 @@ impl GpuTerrainEngine {
             pass.set_pipeline(&self.fill.pipeline);
             pass.set_bind_group(0, &bg, &[]);
             pass.dispatch_workgroups(
-                (self.metrics.width + 7) / 8,
-                (self.metrics.height + 7) / 8,
+                self.metrics.width.div_ceil(8),
+                self.metrics.height.div_ceil(8),
                 1,
             );
         }
@@ -1229,8 +1229,8 @@ impl GpuTerrainEngine {
             pass.set_pipeline(&self.copy.pipeline);
             pass.set_bind_group(0, &bg, &[]);
             pass.dispatch_workgroups(
-                (self.metrics.width + 7) / 8,
-                (self.metrics.height + 7) / 8,
+                self.metrics.width.div_ceil(8),
+                self.metrics.height.div_ceil(8),
                 1,
             );
         }
@@ -1294,8 +1294,8 @@ impl GpuTerrainEngine {
             pass.set_pipeline(&self.noise.pipeline);
             pass.set_bind_group(0, &bg, &[]);
             pass.dispatch_workgroups(
-                (self.metrics.width + 7) / 8,
-                (self.metrics.height + 7) / 8,
+                self.metrics.width.div_ceil(8),
+                self.metrics.height.div_ceil(8),
                 1,
             );
         }
@@ -1331,8 +1331,8 @@ impl GpuTerrainEngine {
             pass.set_pipeline(&self.shapes.pipeline);
             pass.set_bind_group(0, &bg, &[]);
             pass.dispatch_workgroups(
-                (self.metrics.width + 7) / 8,
-                (self.metrics.height + 7) / 8,
+                self.metrics.width.div_ceil(8),
+                self.metrics.height.div_ceil(8),
                 1,
             );
         }
@@ -1408,8 +1408,8 @@ impl GpuTerrainEngine {
                 pass.set_pipeline(&self.river_accum.pipeline);
                 pass.set_bind_group(0, &bg, &[]);
                 pass.dispatch_workgroups(
-                    (self.metrics.width + 7) / 8,
-                    (self.metrics.height + 7) / 8,
+                    self.metrics.width.div_ceil(8),
+                    self.metrics.height.div_ceil(8),
                     1,
                 );
             }
@@ -1471,8 +1471,8 @@ impl GpuTerrainEngine {
             pass.set_pipeline(&self.river_carve.pipeline);
             pass.set_bind_group(0, &bg, &[]);
             pass.dispatch_workgroups(
-                (self.metrics.width + 7) / 8,
-                (self.metrics.height + 7) / 8,
+                self.metrics.width.div_ceil(8),
+                self.metrics.height.div_ceil(8),
                 1,
             );
         }
@@ -1535,8 +1535,8 @@ impl GpuTerrainEngine {
             pass.set_pipeline(&self.blend.pipeline);
             pass.set_bind_group(0, &bg, &[]);
             pass.dispatch_workgroups(
-                (self.metrics.width + 7) / 8,
-                (self.metrics.height + 7) / 8,
+                self.metrics.width.div_ceil(8),
+                self.metrics.height.div_ceil(8),
                 1,
             );
         }
@@ -1577,13 +1577,13 @@ impl GpuTerrainEngine {
         // `last_dirty_rect` is already expanded by the plan halo in `evaluate`, so
         // no further padding here — this is exactly the region the kernels rewrite.
         if let Some((x, y, w, h)) = self.last_dirty_rect {
-            let gx = (w + 7) / 8;
-            let gy = (h + 7) / 8;
+            let gx = w.div_ceil(8);
+            let gy = h.div_ceil(8);
             (x, y, w, h, gx.max(1), gy.max(1))
         } else {
             let w = self.metrics.width;
             let h = self.metrics.height;
-            (0, 0, 0, 0, (w + 7) / 8, (h + 7) / 8)
+            (0, 0, 0, 0, w.div_ceil(8), h.div_ceil(8))
         }
     }
 
@@ -1706,8 +1706,8 @@ impl GpuTerrainEngine {
         // be baked over the entire field. A region bake would leave mask = 1.0 outside
         // the rect (from the mask_ones fill above) and then blend and cache the wrong
         // band there. region_* = 0 selects the shader's full-field path.
-        let gx = (self.metrics.width + 7) / 8;
-        let gy = (self.metrics.height + 7) / 8;
+        let gx = self.metrics.width.div_ceil(8);
+        let gy = self.metrics.height.div_ceil(8);
         let u = MaskBakeU {
             width: self.metrics.width,
             height: self.metrics.height,
@@ -2294,7 +2294,7 @@ impl GpuTerrainEngine {
             });
             pass.set_pipeline(&self.copy.pipeline);
             pass.set_bind_group(0, &bg, &[]);
-            pass.dispatch_workgroups((w + 7) / 8, (h + 7) / 8, 1);
+            pass.dispatch_workgroups(w.div_ceil(8), h.div_ceil(8), 1);
         }
     }
 
@@ -2367,8 +2367,8 @@ impl GpuTerrainEngine {
                     pass.set_pipeline(&self.ramp.pipeline);
                     pass.set_bind_group(0, &bg, &[]);
                     pass.dispatch_workgroups(
-                        (self.metrics.width + 7) / 8,
-                        (self.metrics.height + 7) / 8,
+                        self.metrics.width.div_ceil(8),
+                        self.metrics.height.div_ceil(8),
                         1,
                     );
                 }
@@ -2609,8 +2609,8 @@ impl GpuTerrainEngine {
                         pass.set_pipeline(&self.thermal.pipeline);
                         pass.set_bind_group(0, &delta_bg, &[]);
                         pass.dispatch_workgroups(
-                            (self.metrics.width + 7) / 8,
-                            (self.metrics.height + 7) / 8,
+                            self.metrics.width.div_ceil(8),
+                            self.metrics.height.div_ceil(8),
                             1,
                         );
                     }
@@ -2644,8 +2644,8 @@ impl GpuTerrainEngine {
                         pass.set_pipeline(&self.thermal_apply.pipeline);
                         pass.set_bind_group(0, &apply_bg, &[]);
                         pass.dispatch_workgroups(
-                            (self.metrics.width + 7) / 8,
-                            (self.metrics.height + 7) / 8,
+                            self.metrics.width.div_ceil(8),
+                            self.metrics.height.div_ceil(8),
                             1,
                         );
                     }
@@ -2753,8 +2753,8 @@ impl GpuTerrainEngine {
                         pass.set_pipeline(&self.hydraulic_outflow.pipeline);
                         pass.set_bind_group(0, &outflow_bg, &[]);
                         pass.dispatch_workgroups(
-                            (self.metrics.width + 7) / 8,
-                            (self.metrics.height + 7) / 8,
+                            self.metrics.width.div_ceil(8),
+                            self.metrics.height.div_ceil(8),
                             1,
                         );
                     }
@@ -2818,8 +2818,8 @@ impl GpuTerrainEngine {
                         pass.set_pipeline(&self.hydraulic.pipeline);
                         pass.set_bind_group(0, &bg, &[]);
                         pass.dispatch_workgroups(
-                            (self.metrics.width + 7) / 8,
-                            (self.metrics.height + 7) / 8,
+                            self.metrics.width.div_ceil(8),
+                            self.metrics.height.div_ceil(8),
                             1,
                         );
                     }
@@ -2872,8 +2872,8 @@ impl GpuTerrainEngine {
                         pass.set_pipeline(&self.blur.pipeline);
                         pass.set_bind_group(0, &bg, &[]);
                         pass.dispatch_workgroups(
-                            (self.metrics.width + 7) / 8,
-                            (self.metrics.height + 7) / 8,
+                            self.metrics.width.div_ceil(8),
+                            self.metrics.height.div_ceil(8),
                             1,
                         );
                     }
@@ -3107,8 +3107,8 @@ impl GpuTerrainEngine {
                     pass.set_pipeline(&self.terrace.pipeline);
                     pass.set_bind_group(0, &bg, &[]);
                     pass.dispatch_workgroups(
-                        (self.metrics.width + 7) / 8,
-                        (self.metrics.height + 7) / 8,
+                        self.metrics.width.div_ceil(8),
+                        self.metrics.height.div_ceil(8),
                         1,
                     );
                 }
@@ -3141,7 +3141,7 @@ impl GpuTerrainEngine {
         let h = self.metrics.height;
         let unpadded = w * 4;
         let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-        let padded = (unpadded + align - 1) / align * align;
+        let padded = unpadded.div_ceil(align) * align;
         let buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("gpu-readback-buf"),
             size: (padded * h) as u64,

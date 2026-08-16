@@ -477,8 +477,8 @@ impl PathTracer {
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
-            let wg_x = (self.width + 7) / 8;
-            let wg_y = (self.height + 7) / 8;
+            let wg_x = self.width.div_ceil(8);
+            let wg_y = self.height.div_ceil(8);
             pass.dispatch_workgroups(wg_x, wg_y, 1);
         }
 

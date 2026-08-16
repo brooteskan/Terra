@@ -16,7 +16,7 @@ pub(crate) fn try_apply(
     action: PanelAction,
     ctx: &mut ApplyCtx,
 ) -> Result<(), PanelAction> {
-    let result = match action {
+    match action {
         PanelAction::AddLayer(layer) => {
             let kind = layer.kind.clone();
             if layer.kind.is_sculpt_base() {
@@ -1094,6 +1094,5 @@ pub(crate) fn try_apply(
         }
         other => return Err(other),
     };
-    let _ = result;
     Ok(())
 }

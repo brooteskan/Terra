@@ -147,8 +147,8 @@ impl LevelStepSettings {
         }
         let n = levels.len();
         let keep = match quality {
-            crate::quality::PreviewQuality::Draft => (n + 2) / 3,
-            crate::quality::PreviewQuality::Medium => (2 * n + 2) / 3,
+            crate::quality::PreviewQuality::Draft => n.div_ceil(3),
+            crate::quality::PreviewQuality::Medium => (2 * n).div_ceil(3),
             crate::quality::PreviewQuality::Full | crate::quality::PreviewQuality::Export => n,
         }
         .max(1)
