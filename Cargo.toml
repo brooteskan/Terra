@@ -73,6 +73,6 @@ codegen-units = 1
 #
 # Everything below is deferred for a stated reason (not merely "not done yet"):
 #   field_reassign_with_default — pure style, no rustfix suggestion, large hand churn.
-#   too_many_arguments, needless_range_loop — issue #74 says leave until profiling/API clarity.
+# (too_many_arguments and needless_range_loop were resolved in #96 and removed from the allowlist.)
 [workspace.lints.clippy]
 field_reassign_with_default = "allow"
