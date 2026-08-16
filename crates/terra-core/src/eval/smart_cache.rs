@@ -1,7 +1,19 @@
-//! Disk spill for baked layer checkpoints (Gaea-style Smart Cache).
+//! Session-scoped disk spill for baked layer checkpoints (Gaea-style Smart Cache).
 //!
-//! When a layer is marked `cached`, its height + aux maps can be written to disk so
-//! memory can be reclaimed and later rebuilds skip re-running the processor.
+//! When a layer is pinned (`cached`), its height + aux maps can be written to a
+//! single atomic bake file so the pinned output is reclaimed from memory and a
+//! later rebuild in the *same session* skips re-running the processor. This is a
+//! per-instance spill, **not** a cross-session pin store: each live [`LayerCache`]
+//! owns a private root under [`DiskSmartCache::default_location`] that is deleted
+//! when the cache drops, and project-open still marks every layer dirty. The one
+//! deliberate cross-instance handoff is the worker restart in
+//! [`super::EvalWorker`], which carries this store into its replacement evaluator
+//! so bakes written before a panic survive.
+//!
+//! Each bake is one `<layer-uuid>.bake` file written temp-then-rename, so a reader
+//! sees either the previous bake or the new one — never a torn mix — and `load`
+//! additionally validates the payload length against the header, so a truncated or
+//! corrupt file degrades to a miss rather than a false hit.
 
 use super::cache::CachedOutput;
 use super::EvalError;
@@ -10,40 +22,92 @@ use crate::layer::LayerId;
 use crate::mask::MaskField;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Once};
+use std::time::{Duration, SystemTime};
 
-const MAGIC: &[u8; 4] = b"TCS1";
+/// Magic for the single-file bake format introduced by B1-D8. The prior format
+/// used separate `.meta.json` / `.height.bin` / `.aux.*.bin` files; those are
+/// swept, never read, so a new magic is enough to invalidate them.
+const MAGIC: &[u8; 4] = b"TCB1";
 // Bump whenever terrain processors change in a way that makes baked outputs stale.
-// Version 2 invalidates checkpoints produced by the pre-fidelity procedural generators.
-// Version 3 invalidates procedural outputs created before 64-bit seed canonicalization.
-// Version 4 invalidates checkpoints where loose_sediment could contain coarse debris
+// Version 2 invalidated checkpoints from the pre-fidelity procedural generators.
+// Version 3 invalidated procedural outputs created before 64-bit seed canonicalization.
+// Version 4 invalidated checkpoints where loose_sediment could contain coarse debris
 // while sediment_depth held the actual fine-sediment inventory.
-const VERSION: u32 = 4;
+// Version 5 moved to the single-file atomic bake layout (B1-D8); older multi-file
+// spills use a different on-disk shape and are swept, not loaded.
+const VERSION: u32 = 5;
 
+/// Age past which an orphaned per-instance root (whose `RootGuard` never ran,
+/// e.g. a crashed session) is swept. Live instances keep a recent mtime.
+const STALE_INSTANCE_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// Header prefix of a `.bake` file: identity + validation metadata, followed by
+/// the raw f32 blobs (height, then each aux by sorted name).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct DiskMeta {
+struct BakeHeader {
     version: u32,
     metrics: HeightfieldMetrics,
     generation: u64,
     aux_names: Vec<String>,
+    #[serde(default)]
+    strata: Option<Vec<crate::layer::Stratum>>,
 }
 
-/// On-disk bake store keyed by [`LayerId`].
+/// On-disk bake store keyed by [`LayerId`], writing one atomic file per layer.
 #[derive(Debug, Clone)]
 pub struct DiskSmartCache {
     root: PathBuf,
+    /// RAII cleanup for an owned per-instance root; `None` for borrowed roots.
+    /// Held only for its `Drop`, so it is never read directly.
+    #[allow(dead_code)]
+    guard: Option<Arc<RootGuard>>,
+}
+
+#[derive(Debug)]
+struct RootGuard {
+    root: PathBuf,
+}
+
+impl Drop for RootGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
 }
 
 impl DiskSmartCache {
+    /// Borrowed-root store: the caller owns `root` and its lifetime. Used by
+    /// tests and by explicit `LayerCache::with_disk` / `enable_disk` roots.
+    /// Dropping this store does **not** delete `root`.
     pub fn new(root: impl Into<PathBuf>) -> Self {
         let root = root.into();
         let _ = fs::create_dir_all(&root);
-        Self { root }
+        Self { root, guard: None }
     }
 
-    /// `temp_dir()/terra_smart_cache`
+    /// Private per-instance store under [`Self::default_location`]. Each call gets
+    /// its own `<parent>/<uuid>` directory, removed when the last clone drops.
+    /// This is the single-writer root every live [`LayerCache`] owns; instances
+    /// never share a directory. Constructing the first instance in a process also
+    /// sweeps the parent of legacy files and crashed-session leftovers.
+    pub fn owned_instance() -> Self {
+        let parent = Self::default_location();
+        let _ = fs::create_dir_all(&parent);
+        sweep_parent_once(&parent);
+        let root = parent.join(uuid::Uuid::new_v4().to_string());
+        let _ = fs::create_dir_all(&root);
+        Self {
+            guard: Some(Arc::new(RootGuard { root: root.clone() })),
+            root,
+        }
+    }
+
+    /// Shared parent directory `temp_dir()/terra_smart_cache`. Each evaluator
+    /// instance owns a private `<this>/<uuid>` subdirectory; nothing writes bakes
+    /// directly under this parent.
     pub fn default_location() -> PathBuf {
         std::env::temp_dir().join("terra_smart_cache")
     }
@@ -52,47 +116,17 @@ impl DiskSmartCache {
         &self.root
     }
 
-    fn stem(&self, id: LayerId) -> PathBuf {
-        self.root.join(id.0.to_string())
+    fn bake_path(&self, id: LayerId) -> PathBuf {
+        self.root.join(format!("{}.bake", id.0))
     }
 
-    fn meta_path(&self, id: LayerId) -> PathBuf {
-        self.stem(id).with_extension("meta.json")
-    }
-
-    fn height_path(&self, id: LayerId) -> PathBuf {
-        self.stem(id).with_extension("height.bin")
-    }
-
-    fn aux_path(&self, id: LayerId, name: &str) -> PathBuf {
-        // Sanitize aux keys for filesystem safety.
-        let safe: String = name
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        self.stem(id).with_extension(format!("aux.{safe}.bin"))
+    fn bake_tmp_path(&self, id: LayerId) -> PathBuf {
+        self.root.join(format!("{}.bake.tmp", id.0))
     }
 
     pub fn invalidate(&self, id: LayerId) {
-        let _ = fs::remove_file(self.meta_path(id));
-        let _ = fs::remove_file(self.height_path(id));
-        // Best-effort wipe of aux blobs for this layer.
-        if let Ok(entries) = fs::read_dir(&self.root) {
-            let prefix = format!("{}.aux.", id.0);
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                if name.starts_with(&prefix) && name.ends_with(".bin") {
-                    let _ = fs::remove_file(entry.path());
-                }
-            }
-        }
+        let _ = fs::remove_file(self.bake_path(id));
+        let _ = fs::remove_file(self.bake_tmp_path(id));
     }
 
     pub fn clear_all(&self) {
@@ -100,136 +134,197 @@ impl DiskSmartCache {
         let _ = fs::create_dir_all(&self.root);
     }
 
+    /// Write `output` as one atomic `<id>.bake` file (temp + rename).
     pub fn spill(&self, id: LayerId, output: &CachedOutput) -> Result<(), EvalError> {
-        fs::create_dir_all(&self.root).map_err(|e| EvalError::Io(e.to_string()))?;
+        fs::create_dir_all(&self.root).map_err(io_err)?;
 
         let mut aux_names: Vec<String> = output.aux.keys().cloned().collect();
         aux_names.sort();
 
-        let meta = DiskMeta {
+        let header = BakeHeader {
             version: VERSION,
             metrics: output.height.metrics,
             generation: output.generation,
             aux_names: aux_names.clone(),
+            strata: output.strata.clone(),
         };
-        let meta_json =
-            serde_json::to_vec_pretty(&meta).map_err(|e| EvalError::Io(e.to_string()))?;
-        fs::write(self.meta_path(id), meta_json).map_err(|e| EvalError::Io(e.to_string()))?;
+        let header_json = serde_json::to_vec(&header).map_err(io_err)?;
 
-        write_f32_blob(&self.height_path(id), &output.height.to_dense())?;
-
+        let cells = (output.height.metrics.width as usize)
+            .saturating_mul(output.height.metrics.height as usize);
+        let mut buf =
+            Vec::with_capacity(8 + header_json.len() + (1 + aux_names.len()) * cells * 4);
+        buf.extend_from_slice(MAGIC);
+        buf.extend_from_slice(&(header_json.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&header_json);
+        append_f32_le(&mut buf, &output.height.to_dense());
         for name in &aux_names {
-            if let Some(field) = output.aux.get(name) {
-                write_f32_blob(&self.aux_path(id, name), field.data())?;
+            // Every aux blob is exactly width*height f32s; a missing key would
+            // desync the fixed-stride payload, so emit zeros rather than skip.
+            match output.aux.get(name) {
+                Some(field) => append_f32_le(&mut buf, field.data()),
+                None => buf.resize(buf.len() + cells * 4, 0),
             }
         }
-        if let Some(strata) = &output.strata {
-            let path = self.stem(id).with_extension("strata.json");
-            let json =
-                serde_json::to_vec_pretty(strata).map_err(|e| EvalError::Io(e.to_string()))?;
-            fs::write(path, json).map_err(|e| EvalError::Io(e.to_string()))?;
-        }
+
+        let tmp = self.bake_tmp_path(id);
+        let final_path = self.bake_path(id);
+        fs::write(&tmp, &buf).map_err(io_err)?;
+        // Atomic publish: a reader sees either the old bake or the new one, never
+        // a partially written file. On Windows `rename` maps to MoveFileEx with
+        // REPLACE_EXISTING, so this also overwrites any prior bake for this id.
+        fs::rename(&tmp, &final_path).map_err(|e| {
+            let _ = fs::remove_file(&tmp);
+            io_err(e)
+        })?;
         Ok(())
     }
 
-    /// Load a baked checkpoint if present and metrics match.
+    /// Load a baked checkpoint if present, metrics match, and the payload length
+    /// is exactly what the header implies. A truncated / torn / mismatched file
+    /// returns `Ok(None)` (a miss), never partial data as a clean hit.
     pub fn load(
         &self,
         id: LayerId,
         expected: HeightfieldMetrics,
     ) -> Result<Option<CachedOutput>, EvalError> {
-        let meta_path = self.meta_path(id);
-        if !meta_path.exists() {
+        let bytes = match fs::read(self.bake_path(id)) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(io_err(e)),
+        };
+        let Some((header, payload)) = parse_validated(&bytes, expected) else {
             return Ok(None);
-        }
-        let meta_bytes = fs::read(&meta_path).map_err(|e| EvalError::Io(e.to_string()))?;
-        let meta: DiskMeta =
-            serde_json::from_slice(&meta_bytes).map_err(|e| EvalError::Io(e.to_string()))?;
-        if meta.version != VERSION {
-            return Ok(None);
-        }
-        if meta.metrics.width != expected.width
-            || meta.metrics.height != expected.height
-            || (meta.metrics.world_size_x - expected.world_size_x).abs() > 1e-3
-            || (meta.metrics.world_size_z - expected.world_size_z).abs() > 1e-3
-        {
-            return Ok(None);
-        }
+        };
 
-        let height_data = read_f32_blob(&self.height_path(id))?;
-        let expected_len = (expected.width * expected.height) as usize;
-        if height_data.len() != expected_len {
-            return Ok(None);
-        }
-        let height = Heightfield::from_dense(expected, &height_data);
+        let cells = (expected.width * expected.height) as usize;
+        let blob_bytes = cells * 4;
+        let height = Heightfield::from_dense(expected, &read_f32_le(&payload[..blob_bytes]));
 
         let mut aux = HashMap::new();
-        for name in &meta.aux_names {
-            let path = self.aux_path(id, name);
-            if !path.exists() {
-                continue;
-            }
-            let data = read_f32_blob(&path)?;
-            if data.len() != expected_len {
-                continue;
-            }
+        let mut offset = blob_bytes;
+        for name in &header.aux_names {
+            let data = read_f32_le(&payload[offset..offset + blob_bytes]);
             let mut field = MaskField::zeros(expected);
             field.data_mut().copy_from_slice(&data);
             aux.insert(name.clone(), field);
+            offset += blob_bytes;
         }
 
         Ok(Some(CachedOutput {
             height,
-            generation: meta.generation,
+            generation: header.generation,
             dirty: false,
             aux,
-            strata: {
-                let path = self.stem(id).with_extension("strata.json");
-                if path.exists() {
-                    fs::read(&path)
-                        .ok()
-                        .and_then(|b| serde_json::from_slice(&b).ok())
-                } else {
-                    None
-                }
-            },
+            strata: header.strata,
         }))
     }
+
+    /// Whether a valid bake for `id` at `expected` exists — no blob load. Used to
+    /// adopt a surviving spill (worker restart) as a reclaimed entry. Applies the
+    /// same validation as [`Self::load`], so a torn file is not claimed clean.
+    pub fn probe(&self, id: LayerId, expected: HeightfieldMetrics) -> bool {
+        let Ok(bytes) = fs::read(self.bake_path(id)) else {
+            return false;
+        };
+        parse_validated(&bytes, expected).is_some()
+    }
 }
 
-fn write_f32_blob(path: &Path, data: &[f32]) -> Result<(), EvalError> {
-    let mut file = File::create(path).map_err(|e| EvalError::Io(e.to_string()))?;
-    file.write_all(MAGIC)
-        .map_err(|e| EvalError::Io(e.to_string()))?;
-    file.write_all(&(data.len() as u32).to_le_bytes())
-        .map_err(|e| EvalError::Io(e.to_string()))?;
-    for v in data {
-        file.write_all(&v.to_bits().to_le_bytes())
-            .map_err(|e| EvalError::Io(e.to_string()))?;
-    }
-    Ok(())
+fn io_err<E: ToString>(e: E) -> EvalError {
+    EvalError::Io(e.to_string())
 }
 
-fn read_f32_blob(path: &Path) -> Result<Vec<f32>, EvalError> {
-    let mut file = File::open(path).map_err(|e| EvalError::Io(e.to_string()))?;
-    let mut magic = [0u8; 4];
-    file.read_exact(&mut magic)
-        .map_err(|e| EvalError::Io(e.to_string()))?;
-    if &magic != MAGIC {
-        return Err(EvalError::Io("bad smart-cache magic".into()));
+/// Parse and validate a `.bake` buffer. Returns the header and the payload slice
+/// only when magic, version, metrics, and — critically — the exact payload length
+/// all check out. Any shortfall or mismatch yields `None`, i.e. a cache miss.
+fn parse_validated(bytes: &[u8], expected: HeightfieldMetrics) -> Option<(BakeHeader, &[u8])> {
+    if bytes.len() < 8 || &bytes[0..4] != MAGIC {
+        return None;
     }
-    let mut len_buf = [0u8; 4];
-    file.read_exact(&mut len_buf)
-        .map_err(|e| EvalError::Io(e.to_string()))?;
-    let len = u32::from_le_bytes(len_buf) as usize;
-    let mut out = Vec::with_capacity(len);
-    let mut word = [0u8; 4];
-    for _ in 0..len {
-        file.read_exact(&mut word)
-            .map_err(|e| EvalError::Io(e.to_string()))?;
-        out.push(f32::from_le_bytes(word));
+    let header_len = u32::from_le_bytes(bytes[4..8].try_into().ok()?) as usize;
+    let header_end = 8usize.checked_add(header_len)?;
+    let header_bytes = bytes.get(8..header_end)?;
+    let header: BakeHeader = serde_json::from_slice(header_bytes).ok()?;
+    if header.version != VERSION {
+        return None;
     }
-    Ok(out)
+    if header.metrics.width != expected.width
+        || header.metrics.height != expected.height
+        || (header.metrics.world_size_x - expected.world_size_x).abs() > 1e-3
+        || (header.metrics.world_size_z - expected.world_size_z).abs() > 1e-3
+    {
+        return None;
+    }
+
+    let cells = (expected.width as usize).checked_mul(expected.height as usize)?;
+    let blob_bytes = cells.checked_mul(4)?;
+    let n_blobs = 1usize.checked_add(header.aux_names.len())?;
+    let payload_len = blob_bytes.checked_mul(n_blobs)?;
+    let payload = bytes.get(header_end..)?;
+    if payload.len() != payload_len {
+        // Truncated (interrupted write) or oversized (mixed / corrupt) — the very
+        // torn-file case that must never load as a clean checkpoint.
+        return None;
+    }
+    Some((header, payload))
+}
+
+fn append_f32_le(buf: &mut Vec<u8>, data: &[f32]) {
+    buf.reserve(data.len() * 4);
+    for &v in data {
+        buf.extend_from_slice(&v.to_bits().to_le_bytes());
+    }
+}
+
+fn read_f32_le(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_bits(u32::from_le_bytes([c[0], c[1], c[2], c[3]])))
+        .collect()
+}
+
+fn sweep_parent_once(parent: &Path) {
+    static SWEEP: Once = Once::new();
+    SWEEP.call_once(|| sweep_parent(parent));
+}
+
+/// Best-effort reclaim under the shared parent: delete pre-B1-D8 multi-file spills
+/// (which accumulated here until the OS cleared temp) and per-instance roots left
+/// by crashed sessions (whose `RootGuard` never ran).
+fn sweep_parent(parent: &Path) {
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            let stale = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .map(|modified| now.duration_since(modified).unwrap_or_default() > STALE_INSTANCE_AGE)
+                .unwrap_or(false);
+            if stale {
+                let _ = fs::remove_dir_all(&path);
+            }
+        } else if is_legacy_bake_file(&path) {
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
+fn is_legacy_bake_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    name.ends_with(".meta.json")
+        || name.ends_with(".height.bin")
+        || name.ends_with(".strata.json")
+        || (name.contains(".aux.") && name.ends_with(".bin"))
 }
 
 #[cfg(test)]
@@ -239,10 +334,13 @@ mod tests {
     use crate::heightfield::HeightfieldMetrics;
     use std::collections::HashMap;
 
+    fn scratch_dir(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("terra_smart_cache_{tag}_{}", uuid::Uuid::new_v4()))
+    }
+
     #[test]
     fn spill_and_reload_roundtrip() {
-        let dir =
-            std::env::temp_dir().join(format!("terra_smart_cache_test_{}", uuid::Uuid::new_v4()));
+        let dir = scratch_dir("test");
         let cache = DiskSmartCache::new(&dir);
         let metrics = HeightfieldMetrics::new(8, 8, 80.0, 80.0);
         let mut height = Heightfield::zeros(metrics);
@@ -265,16 +363,14 @@ mod tests {
         assert!((loaded.height.get(3, 4) - 12.5).abs() < 1e-5);
         assert!((loaded.aux["flow_acc"].get(1, 1) - 0.75).abs() < 1e-5);
         assert!(!loaded.dirty);
+        assert_eq!(loaded.generation, 7);
         cache.clear_all();
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn layered_inventories_roundtrip_with_canonical_cache_keys() {
-        let dir = std::env::temp_dir().join(format!(
-            "terra_smart_cache_layers_test_{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir = scratch_dir("layers");
         let cache = DiskSmartCache::new(&dir);
         let metrics = HeightfieldMetrics::new(4, 4, 40.0, 40.0);
         let mut maps = AuxMaps::new();
@@ -313,5 +409,96 @@ mod tests {
 
         cache.clear_all();
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// B1-D8 revert check: a structurally plausible bake (valid magic + header)
+    /// whose payload is short must load as a miss, never as a clean hit.
+    #[test]
+    fn torn_bake_with_valid_header_is_a_miss() {
+        let dir = scratch_dir("torn");
+        let cache = DiskSmartCache::new(&dir);
+        let metrics = HeightfieldMetrics::new(8, 8, 80.0, 80.0);
+        let id = LayerId::new();
+
+        let header = BakeHeader {
+            version: VERSION,
+            metrics,
+            generation: 1,
+            aux_names: Vec::new(),
+            strata: None,
+        };
+        let header_json = serde_json::to_vec(&header).unwrap();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(MAGIC);
+        buf.extend_from_slice(&(header_json.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&header_json);
+        // Header promises 8*8 f32 = 256 payload bytes; write far fewer.
+        buf.extend_from_slice(&[0u8; 64]);
+        fs::write(cache.bake_path(id), &buf).unwrap();
+
+        assert!(
+            cache.load(id, metrics).unwrap().is_none(),
+            "a short payload must be a miss"
+        );
+        assert!(
+            !cache.probe(id, metrics),
+            "probe must reject the torn file too"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// B1-D8 revert check: two owned-instance stores never share a directory, so a
+    /// spill in one is invisible to the other for the same `LayerId`.
+    #[test]
+    fn instance_roots_are_isolated() {
+        let a = DiskSmartCache::owned_instance();
+        let b = DiskSmartCache::owned_instance();
+        assert_ne!(a.root(), b.root());
+
+        let metrics = HeightfieldMetrics::new(4, 4, 40.0, 40.0);
+        let id = LayerId::new();
+        a.spill(
+            id,
+            &CachedOutput {
+                height: Heightfield::filled(metrics, 5.0),
+                generation: 1,
+                dirty: false,
+                aux: HashMap::new(),
+                strata: None,
+            },
+        )
+        .unwrap();
+
+        assert!(a.load(id, metrics).unwrap().is_some());
+        assert!(
+            b.load(id, metrics).unwrap().is_none(),
+            "a sibling instance must not see another instance's bake"
+        );
+    }
+
+    /// B1-D8 revert check: an owned-instance root is removed when the store drops.
+    #[test]
+    fn dropping_owned_instance_removes_root() {
+        let metrics = HeightfieldMetrics::new(4, 4, 40.0, 40.0);
+        let id = LayerId::new();
+        let root;
+        {
+            let cache = DiskSmartCache::owned_instance();
+            root = cache.root().to_path_buf();
+            cache
+                .spill(
+                    id,
+                    &CachedOutput {
+                        height: Heightfield::filled(metrics, 5.0),
+                        generation: 1,
+                        dirty: false,
+                        aux: HashMap::new(),
+                        strata: None,
+                    },
+                )
+                .unwrap();
+            assert!(root.exists());
+        }
+        assert!(!root.exists(), "owned root should be swept on drop");
     }
 }

@@ -125,6 +125,10 @@ fn evaluate_document_for_export(
         halo: doc.metrics.halo,
     };
     let mut evaluator = StackEvaluator::new();
+    // Export runs a full rebuild from scratch and never reloads its own baked
+    // checkpoints; spilling export-resolution bakes into the shared cache dir (and
+    // stomping preview bakes) was pure waste. Run memory-only (B1-D8).
+    evaluator.cache.disable_disk();
     let mut ctx = EvalContext::new(metrics);
     ctx.quality = PreviewQuality::Export;
     ctx.level_steps = doc.level_steps.clone();

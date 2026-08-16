@@ -38,8 +38,15 @@ impl Default for EvalScheduler {
 
 impl EvalScheduler {
     pub fn new() -> Self {
+        // The UI-thread evaluator's baked checkpoints have no disk reader: the
+        // hybrid suffix and export never reload spills, and lifecycle GPU ingest
+        // reads in-memory checkpoints. Spilling here only churned the shared cache
+        // directory (deleting/overwriting the worker's bakes), so this evaluator
+        // runs memory-only (B1-D8).
+        let mut evaluator = StackEvaluator::new();
+        evaluator.cache.disable_disk();
         Self {
-            evaluator: StackEvaluator::new(),
+            evaluator,
             current_token: 0,
             last_good: None,
             last_aux: HashMap::new(),

@@ -294,43 +294,54 @@ impl StackEvaluator {
             return Ok(Heightfield::zeros(ctx.metrics));
         }
 
+        let metrics = ctx.metrics;
         let first_dirty = layers.iter().position(|l| {
             if l.common.cached {
-                self.cache.get_or_load(l.id(), ctx.metrics).is_none()
+                // has_clean answers from the entry state (or a header-only disk
+                // probe) without inflating a spilled checkpoint into memory.
+                !self.cache.has_clean(l.id(), metrics)
             } else {
                 self.cache.is_dirty(l.id())
             }
         });
 
-        // All clean: return cached top if dimensions match.
+        // All clean: reuse the cached top, reloading it from a spill if the pinned
+        // top was reclaimed from memory. `get_or_load` returns `Some` only for a
+        // clean, dimensionally matching checkpoint.
         if first_dirty.is_none() {
-            if let Some(top) = self.cache.get(layers.last().unwrap().id()) {
-                if top.height.metrics.width == ctx.metrics.width
-                    && top.height.metrics.height == ctx.metrics.height
-                    && !top.dirty
-                {
-                    for layer in &layers {
-                        record_reused_layer(ctx, layer);
-                    }
-                    return Ok(top.height.clone());
+            if let Some(top) = self.cache.get_or_load(layers.last().unwrap().id(), metrics) {
+                let height = top.height.clone();
+                for layer in &layers {
+                    record_reused_layer(ctx, layer);
                 }
+                return Ok(height);
             }
         }
 
-        let first_dirty = first_dirty.unwrap_or(0);
+        let mut first_dirty = first_dirty.unwrap_or(0);
+        let mut current = if first_dirty == 0 {
+            Heightfield::zeros(metrics)
+        } else {
+            let prev_id = layers[first_dirty - 1].id();
+            match self
+                .cache
+                .get_or_load(prev_id, metrics)
+                .map(|c| c.height.clone())
+            {
+                Some(height) => height,
+                None => {
+                    // The seed checkpoint for the clean prefix could not be
+                    // reloaded (its spill was removed or failed validation).
+                    // Zero-seeding would silently truncate the stack, so fall back
+                    // to a full rebuild from the base instead (B1-D8).
+                    first_dirty = 0;
+                    Heightfield::zeros(metrics)
+                }
+            }
+        };
         for layer in &layers[..first_dirty] {
             record_reused_layer(ctx, layer);
         }
-
-        let mut current = if first_dirty == 0 {
-            Heightfield::zeros(ctx.metrics)
-        } else {
-            let prev_id = layers[first_dirty - 1].id();
-            self.cache
-                .get_or_load(prev_id, ctx.metrics)
-                .map(|c| c.height.clone())
-                .unwrap_or_else(|| Heightfield::zeros(ctx.metrics))
-        };
 
         for layer in &layers[first_dirty..] {
             ctx.check_cancelled()?;
@@ -1128,6 +1139,88 @@ mod tests {
         let out = eval.rebuild_incremental(&stack, &mut ctx).unwrap();
         assert_eq!(out.get(0, 0), 10.0);
         assert!(!eval.cache.is_dirty(baked_id));
+    }
+
+    /// B1-D8 revert check: a pinned layer's checkpoint survives being reclaimed
+    /// from memory (spilled) and is reused via reload when an upper layer edits,
+    /// instead of being recomputed.
+    #[test]
+    fn pinned_layer_survives_reload_through_spill() {
+        let dir = std::env::temp_dir().join(format!("terra_pin_reload_{}", uuid::Uuid::new_v4()));
+        let metrics = HeightfieldMetrics::new(8, 8, 80.0, 80.0);
+        let mut stack = LayerStack::new();
+        let mut base = Layer::new("Base", LayerKind::Flat(FlatParams { height: 50.0 }));
+        base.common.cached = true;
+        let base_id = base.id();
+        let mut upper = Layer::new("Upper", LayerKind::Flat(FlatParams { height: 3.0 }));
+        upper.common.blend = BlendMode::Add;
+        let upper_id = upper.id();
+        stack.push(base);
+        stack.push(upper);
+
+        let mut eval = StackEvaluator::new();
+        eval.cache.enable_disk(&dir);
+        eval.mark_all_dirty(&stack);
+        let mut ctx = EvalContext::new(metrics);
+        let _ = eval.rebuild_incremental(&stack, &mut ctx).unwrap();
+        assert!(
+            eval.cache.is_spilled(base_id),
+            "pinned base should be spilled to disk after bake"
+        );
+
+        eval.cache.mark_dirty(upper_id);
+        let mut ctx2 = EvalContext::new(metrics);
+        let out = eval.rebuild_incremental(&stack, &mut ctx2).unwrap();
+        assert_eq!(out.get(0, 0), 53.0);
+        let base_timing = ctx2
+            .layer_timings
+            .iter()
+            .find(|t| t.layer == base_id)
+            .expect("base appears in timings");
+        assert_eq!(
+            base_timing.status,
+            LayerEvalStatus::CacheHit,
+            "pinned base must be reused from its spill, not recomputed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// B1-D8 revert check: when a pinned seed checkpoint cannot be reloaded, the
+    /// incremental rebuild recomputes from the base rather than zero-seeding
+    /// (which would silently truncate the stack).
+    #[test]
+    fn lost_pinned_seed_recomputes_instead_of_zero_seeding() {
+        let dir = std::env::temp_dir().join(format!("terra_lost_seed_{}", uuid::Uuid::new_v4()));
+        let metrics = HeightfieldMetrics::new(8, 8, 80.0, 80.0);
+        let mut stack = LayerStack::new();
+        let mut base = Layer::new("Base", LayerKind::Flat(FlatParams { height: 50.0 }));
+        base.common.cached = true;
+        let base_id = base.id();
+        let mut upper = Layer::new("Upper", LayerKind::Flat(FlatParams { height: 3.0 }));
+        upper.common.blend = BlendMode::Add;
+        let upper_id = upper.id();
+        stack.push(base);
+        stack.push(upper);
+
+        let mut eval = StackEvaluator::new();
+        eval.cache.enable_disk(&dir);
+        eval.mark_all_dirty(&stack);
+        let mut ctx = EvalContext::new(metrics);
+        let _ = eval.rebuild_incremental(&stack, &mut ctx).unwrap();
+        assert!(eval.cache.is_spilled(base_id));
+
+        // Delete the pinned base's spill behind the cache's back: its entry still
+        // claims clean, but the seed can no longer be reloaded.
+        let bake = dir.join(format!("{}.bake", base_id.0));
+        std::fs::remove_file(&bake).expect("remove spilled base");
+
+        eval.cache.mark_dirty(upper_id);
+        let mut ctx2 = EvalContext::new(metrics);
+        let out = eval.rebuild_incremental(&stack, &mut ctx2).unwrap();
+        // A zero-seed fallback would drop the base and yield 3.0; a correct full
+        // rebuild recomputes the base and yields 53.0.
+        assert_eq!(out.get(0, 0), 53.0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

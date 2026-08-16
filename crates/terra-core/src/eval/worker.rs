@@ -119,8 +119,13 @@ impl EvalWorker {
                                 Ok(result) => result,
                                 Err(payload) => {
                                     // A job-level panic may leave cache state partially updated.
-                                    // Start subsequent requests from a fresh evaluator.
+                                    // Start subsequent requests from a fresh evaluator, but carry
+                                    // the disk spill store (and its private root) across so pinned
+                                    // bakes written before the panic survive the restart as a
+                                    // declared handoff (B1-D8) rather than filesystem coincidence.
+                                    let salvaged_disk = evaluator.cache.take_disk();
                                     evaluator = StackEvaluator::new();
+                                    evaluator.cache.set_disk(salvaged_disk);
                                     Err(EvalError::Panicked(super::panic_payload_message(payload)))
                                 }
                             };
@@ -692,6 +697,122 @@ mod tests {
 
         let recovered = wait_for_result(&mut worker, 51);
         assert_eq!(recovered.height.get(127, 127), 23.0);
+    }
+
+    /// B1-D8 revert check: a pinned bake written by one job survives the worker's
+    /// evaluator restart (triggered by a process-level panic in a later job) via
+    /// the declared disk handoff, so the restarted evaluator adopts it as a cache
+    /// hit. Reverting the `take_disk` / `set_disk` salvage drops the spill and the
+    /// base recomputes (`Computed`).
+    #[test]
+    fn worker_restart_salvages_a_pinned_bake() {
+        let metrics = HeightfieldMetrics::new(128, 128, 128.0, 128.0);
+        let mut base = Layer::new("Base", LayerKind::Flat(FlatParams { height: 10.0 }));
+        base.common.cached = true;
+        let base_id = base.id();
+        let mut base_stack = LayerStack::new();
+        base_stack.push(base);
+
+        let mut worker = EvalWorker::spawn();
+
+        // Job A: bake the pinned base — it spills to the worker evaluator's root.
+        worker
+            .submit(EvalWorkRequest {
+                token: 80,
+                quality: PreviewQuality::Full,
+                stack: base_stack.clone(),
+                masks: Vec::new(),
+                base_metrics: metrics,
+                level_steps: crate::analyze::LevelStepSettings::default(),
+                preview_res: 128,
+                export_res: 128,
+                aux: HashMap::new(),
+                strata: None,
+                mask_reference: None,
+                dirty_from: None,
+                mark_all_dirty: true,
+            })
+            .expect("submit bake job");
+        let baked = wait_for_result(&mut worker, 80);
+        assert_eq!(baked.height.get(0, 0), 10.0);
+
+        // Job B: a malformed aux (claims 64x64 but is empty) panics while resampling
+        // aux into the 128x128 job — outside the per-layer catch — so the worker
+        // restarts its evaluator. `mark_all_dirty:false` keeps the base bake on disk.
+        let malformed: MaskField = serde_json::from_value(serde_json::json!({
+            "metrics": HeightfieldMetrics::new(64, 64, 64.0, 64.0),
+            "data": []
+        }))
+        .expect("deserialize malformed test field");
+        let mut junk_stack = LayerStack::new();
+        junk_stack.push(Layer::new("Junk", LayerKind::Flat(FlatParams { height: 1.0 })));
+        worker
+            .submit(EvalWorkRequest {
+                token: 81,
+                quality: PreviewQuality::Full,
+                stack: junk_stack,
+                masks: Vec::new(),
+                base_metrics: metrics,
+                level_steps: crate::analyze::LevelStepSettings::default(),
+                preview_res: 128,
+                export_res: 128,
+                aux: HashMap::from([("junk".into(), malformed)]),
+                strata: None,
+                mask_reference: None,
+                dirty_from: None,
+                mark_all_dirty: false,
+            })
+            .expect("submit restarting job");
+        let mut restarted = false;
+        for _ in 0..1_000 {
+            if let Some(event) = worker.try_recv_event() {
+                match event {
+                    EvalWorkerEvent::Failed(found) if found.token == 81 => {
+                        restarted = true;
+                        break;
+                    }
+                    EvalWorkerEvent::Disconnected => panic!("worker restart must not disconnect"),
+                    _ => {}
+                }
+            }
+            thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(
+            restarted,
+            "the malformed aux should fail the job at the process level"
+        );
+
+        // Job C: the restarted evaluator adopts the salvaged base spill — CacheHit,
+        // not a recompute.
+        worker
+            .submit(EvalWorkRequest {
+                token: 82,
+                quality: PreviewQuality::Full,
+                stack: base_stack,
+                masks: Vec::new(),
+                base_metrics: metrics,
+                level_steps: crate::analyze::LevelStepSettings::default(),
+                preview_res: 128,
+                export_res: 128,
+                aux: HashMap::new(),
+                strata: None,
+                mask_reference: None,
+                dirty_from: None,
+                mark_all_dirty: false,
+            })
+            .expect("worker accepts the follow-up job");
+        let reused = wait_for_result(&mut worker, 82);
+        assert_eq!(reused.height.get(0, 0), 10.0);
+        let base_timing = reused
+            .layer_timings
+            .iter()
+            .find(|timing| timing.layer == base_id)
+            .expect("base appears in timings");
+        assert_eq!(
+            base_timing.status,
+            super::super::LayerEvalStatus::CacheHit,
+            "the salvaged spill must be reused after the restart, not recomputed"
+        );
     }
 
     #[test]
