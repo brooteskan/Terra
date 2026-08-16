@@ -32,8 +32,6 @@ use winit::event::MouseButton;
 use winit::window::Window;
 
 pub(crate) const EDIT_DEBOUNCE_MS: u128 = 40;
-/// While sculpting/painting, rebuild Draft as soon as the previous preview finishes.
-pub(crate) const PAINT_DEBOUNCE_MS: u128 = 0;
 pub(crate) const REFINE_INTERVAL_MS: u128 = 80;
 
 /// Continuous fly keys for the game-engine-style viewport camera.

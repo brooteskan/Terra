@@ -3,13 +3,10 @@ use std::time::Instant;
 use crate::ui::PanelAction;
 use terra_core::layer::LayerKind;
 
-use super::{LayerPointDrag, LayerPointKind, TerraApp, PAINT_DEBOUNCE_MS};
+use super::{LayerPointDrag, LayerPointKind, TerraApp};
 impl TerraApp {
     pub(crate) fn flush_live_paint_preview(&mut self) {
         if !self.pending_eval {
-            return;
-        }
-        if self.last_refine.elapsed().as_millis() < PAINT_DEBOUNCE_MS {
             return;
         }
         self.pending_eval = false;

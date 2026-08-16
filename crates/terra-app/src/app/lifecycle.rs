@@ -16,7 +16,7 @@ use winit::window::{Window, WindowId};
 use super::helpers::{search_character, ui_tool_search_focused};
 use super::{
     quality_in_flight_progress, quality_stage_progress, AppScreen, TerraApp, EDIT_DEBOUNCE_MS,
-    PAINT_DEBOUNCE_MS, REFINE_INTERVAL_MS,
+    REFINE_INTERVAL_MS,
 };
 
 impl ApplicationHandler for TerraApp {
@@ -575,13 +575,14 @@ impl ApplicationHandler for TerraApp {
                 }
             }
 
-            // Debounced draft eval. During paint/sculpt, key off last eval time â€” stamps
-            // keep resetting last_edit, which would otherwise starve live updates.
+            // Debounced draft eval. Live paint/sculpt has no time window — it rebuilds
+            // Draft as soon as the previous preview finishes, with per-frame coalescing
+            // handled in `redraw`. Manual edits debounce on last_edit.
             if !stall_draft && self.pending_eval {
                 let edit_ms = self.session.rebuild_feedback.prefs.edit_debounce_ms.max(1) as u128;
                 let live_ok = self.session.rebuild_feedback.prefs.live_preview;
                 let ready = if live_paint {
-                    self.last_refine.elapsed().as_millis() >= PAINT_DEBOUNCE_MS
+                    true
                 } else if !live_ok {
                     false
                 } else {
@@ -717,15 +718,10 @@ impl ApplicationHandler for TerraApp {
             ));
         } else if work_pending {
             let wait_ms = if self.pending_eval {
-                if live_paint {
-                    PAINT_DEBOUNCE_MS
-                        .saturating_sub(self.last_refine.elapsed().as_millis())
-                        .max(1)
-                } else {
-                    EDIT_DEBOUNCE_MS
-                        .saturating_sub(self.last_edit.elapsed().as_millis())
-                        .max(1)
-                }
+                // live_paint is impossible here: it took the ControlFlow::Poll arm above.
+                EDIT_DEBOUNCE_MS
+                    .saturating_sub(self.last_edit.elapsed().as_millis())
+                    .max(1)
             } else {
                 REFINE_INTERVAL_MS
                     .saturating_sub(self.last_refine.elapsed().as_millis())
