@@ -313,6 +313,11 @@ pub struct TerrainRenderer {
     tile_stream_halo: f32,
     tile_stream_max_pages: f32,
     tile_stream_level: f32,
+    /// Resolution of the pyramid level the resident pages were cut at. The shader
+    /// denormalizes streamed UVs with this — *not* the monolithic `tex_size` — so a
+    /// coarse (Draft/Medium) result's 2×2/4×4 tile block spans the whole terrain
+    /// instead of a `level_res / tex_size` corner at the origin.
+    tile_stream_res: (f32, f32),
     /// Output revision of the pages currently streamed. The shader rejects any
     /// page-table row whose revision differs, so a stale page can never resolve
     /// even if an invalidation site is missed (defence-in-depth for #86).
@@ -1014,6 +1019,7 @@ impl TerrainRenderer {
             tile_stream_halo: 2.0,
             tile_stream_max_pages: 1.0,
             tile_stream_level: 0.0,
+            tile_stream_res: (1.0, 1.0),
             tile_stream_revision: 0,
         }
     }
@@ -1572,6 +1578,7 @@ impl TerrainRenderer {
         halo: u32,
         max_pages: u32,
         level: u8,
+        level_res: (u32, u32),
         revision: u64,
         enable: bool,
     ) {
@@ -1581,6 +1588,7 @@ impl TerrainRenderer {
         self.tile_stream_halo = halo as f32;
         self.tile_stream_max_pages = max_pages.max(1) as f32;
         self.tile_stream_level = level as f32;
+        self.tile_stream_res = (level_res.0.max(1) as f32, level_res.1.max(1) as f32);
         self.tile_stream_revision = revision;
         // Streaming samples resident pages; the shader falls back to the monolithic
         // height texture on page misses so presentation stays continuous.
@@ -1598,6 +1606,14 @@ impl TerrainRenderer {
 
     pub fn tile_stream_enabled(&self) -> bool {
         self.use_tile_stream
+    }
+
+    /// Resolution of the pyramid level the currently-streamed pages were cut at,
+    /// mirrored into `FrameUniforms.stream2.zw`. Tests pin this to prove the shader
+    /// denormalizes streamed UVs against the page resolution rather than the
+    /// monolithic `tex_size` (the corner-artifact revert check).
+    pub fn tile_stream_res(&self) -> (u32, u32) {
+        (self.tile_stream_res.0 as u32, self.tile_stream_res.1 as u32)
     }
 
     /// The output revision the currently-streamed pages were stamped with, mirrored
@@ -1944,14 +1960,16 @@ impl TerrainRenderer {
                 self.lighting.fog_strength,
                 0.0,
             ],
-            // Carry the revision as raw u32 bits. The value is a small monotonic
-            // counter, so it never reaches the f32 NaN range (~2.1e9) that a
-            // load+bitcast could canonicalize; the bits survive the round trip.
+            // xy: revision as raw u32 bits. The value is a small monotonic counter,
+            // so it never reaches the f32 NaN range (~2.1e9) that a load+bitcast
+            // could canonicalize; the bits survive the round trip.
+            // zw: resolution of the streamed pages' pyramid level — the shader
+            // denormalizes streamed UVs with this, not the monolithic tex_size.
             stream2: [
                 f32::from_bits(self.tile_stream_revision as u32),
                 f32::from_bits((self.tile_stream_revision >> 32) as u32),
-                0.0,
-                0.0,
+                self.tile_stream_res.0,
+                self.tile_stream_res.1,
             ],
         };
         let world_x = self.heights.world_size.0;
@@ -2581,6 +2599,71 @@ mod shader_tests {
             .entry_points
             .iter()
             .any(|entry| entry.name == "fs_ocean"));
+    }
+
+    /// Return the `{ ... }` body of the first WGSL function named `name`.
+    fn fn_body<'a>(src: &'a str, name: &str) -> &'a str {
+        let sig = format!("fn {name}(");
+        let start = src
+            .find(&sig)
+            .unwrap_or_else(|| panic!("fn {name} not found in shader"));
+        let open = start
+            + src[start..]
+                .find('{')
+                .unwrap_or_else(|| panic!("fn {name} has no body brace"));
+        let mut depth = 0i32;
+        for (offset, byte) in src[open..].bytes().enumerate() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &src[open..=open + offset];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced braces in fn {name}");
+    }
+
+    /// Revert check for the corner artifact: the streamed height samplers must
+    /// denormalize UVs with the streamed pages' resolution (`stream_dims`, from
+    /// `stream2.zw`) rather than the monolithic `tex_size` (`u.grid`), and the
+    /// page-miss fallback must renormalize back through the monolithic texture.
+    /// Reverting the shader math to scale streamed UVs by `u.grid` — which drops
+    /// a coarse Draft/Medium result into a `level_res/tex_size` corner — trips this.
+    #[test]
+    fn streamed_sampling_uses_page_resolution_not_monolithic_grid() {
+        let source = include_str!("shaders/terrain.wgsl");
+
+        let dims = fn_body(source, "stream_dims");
+        assert!(
+            dims.contains("stream2"),
+            "stream_dims must read the page resolution from stream2.zw"
+        );
+
+        let uv = fn_body(source, "sample_height_uv");
+        assert!(
+            uv.contains("stream_dims"),
+            "sample_height_uv streamed branch must denormalize with stream_dims(), not u.grid"
+        );
+        assert!(
+            !uv.contains("u.grid"),
+            "sample_height_uv streamed branch must not scale by the monolithic u.grid"
+        );
+
+        let bilinear = fn_body(source, "sample_height_bilinear");
+        assert!(
+            bilinear.contains("stream_dims"),
+            "sample_height_bilinear streamed branch must filter in stream_dims() space"
+        );
+
+        let point = fn_body(source, "sample_height_streamed_point");
+        assert!(
+            point.contains("sample_height_monolithic"),
+            "the page-miss fallback must renormalize to the monolithic texture"
+        );
     }
 
     #[test]

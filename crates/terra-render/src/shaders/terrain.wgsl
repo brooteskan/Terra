@@ -191,6 +191,13 @@ fn find_tile_page(level: u32, tile_x: u32, tile_z: u32) -> i32 {
     return -1;
 }
 
+// Resolution of the streamed pages' pyramid level (stream2.zw). Streamed sample
+// coordinates (sx/sy) live in *this* texel space, not the monolithic tex_size —
+// so a coarse Draft/Medium page block spans the whole terrain, not a corner.
+fn stream_dims() -> vec2<f32> {
+    return max(u.stream2.zw, vec2<f32>(1.0));
+}
+
 fn sample_height_streamed_point(sx: f32, sy: f32) -> f32 {
     let tile_size = max(u.stream.y, 1.0);
     let halo = u.stream.z;
@@ -199,10 +206,11 @@ fn sample_height_streamed_point(sx: f32, sy: f32) -> f32 {
     let tz = u32(floor(sy / tile_size));
     let page = find_tile_page(level, tx, tz);
     if (page < 0) {
-        let dim = textureDimensions(height_tex);
-        let x = i32(clamp(sx, 0.0, f32(dim.x - 1u)));
-        let y = i32(clamp(sy, 0.0, f32(dim.y - 1u)));
-        return textureLoad(height_tex, vec2<i32>(x, y), 0).r;
+        // Miss: renormalize the streamed-space coordinate back to UV and sample
+        // the monolithic texture (which denormalizes with its own size). Treating
+        // sx/sy as raw monolithic texels here would re-introduce the corner.
+        let denom = max(stream_dims() - vec2<f32>(1.0), vec2<f32>(1.0));
+        return sample_height_monolithic(vec2<f32>(sx, sy) / denom);
     }
     let e = page_table[u32(page)];
     let local_x = sx - f32(tx) * tile_size;
@@ -214,10 +222,11 @@ fn sample_height_streamed_point(sx: f32, sy: f32) -> f32 {
 
 fn sample_height_uv(uv: vec2<f32>) -> f32 {
     if (u.stream.x > 0.5) {
-        let tw = max(u.grid.x - 1.0, 1.0);
-        let th = max(u.grid.y - 1.0, 1.0);
+        // Denormalize with the streamed pages' resolution, not the monolithic
+        // tex_size — otherwise a coarse result lands in a tex_size-relative corner.
+        let s = max(stream_dims() - vec2<f32>(1.0), vec2<f32>(1.0));
         let c = clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0));
-        return sample_height_streamed_point(c.x * tw, c.y * th);
+        return sample_height_streamed_point(c.x * s.x, c.y * s.y);
     }
     return sample_height_monolithic(uv);
 }
@@ -305,18 +314,27 @@ fn height_ao(uv: vec2<f32>, h: f32) -> f32 {
 }
 
 fn sample_height_bilinear(uv: vec2<f32>) -> f32 {
+    let uvc = clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0));
+    if (u.stream.x > 0.5) {
+        // Bilinear filter in streamed-page texel space (the resolution the pages
+        // were cut at) rather than the monolithic tex_size, so both the displaced
+        // mesh geometry and its weights track the resident pages.
+        let last = max(stream_dims() - vec2<f32>(1.0), vec2<f32>(0.0));
+        let sp = uvc * last;
+        let sp0 = floor(sp);
+        let sp1 = min(sp0 + vec2<f32>(1.0), last);
+        let sf = fract(sp);
+        let h00 = sample_height_streamed_point(sp0.x, sp0.y);
+        let h10 = sample_height_streamed_point(sp1.x, sp0.y);
+        let h01 = sample_height_streamed_point(sp0.x, sp1.y);
+        let h11 = sample_height_streamed_point(sp1.x, sp1.y);
+        return mix(mix(h00, h10, sf.x), mix(h01, h11, sf.x), sf.y);
+    }
     let dim = textureDimensions(height_tex);
-    let p = clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)) * vec2<f32>(dim - vec2<u32>(1u));
+    let p = uvc * vec2<f32>(dim - vec2<u32>(1u));
     let p0 = vec2<i32>(floor(p));
     let p1 = min(p0 + vec2<i32>(1), vec2<i32>(dim) - vec2<i32>(1));
     let f = fract(p);
-    if (u.stream.x > 0.5) {
-        let h00 = sample_height_streamed_point(f32(p0.x), f32(p0.y));
-        let h10 = sample_height_streamed_point(f32(p1.x), f32(p0.y));
-        let h01 = sample_height_streamed_point(f32(p0.x), f32(p1.y));
-        let h11 = sample_height_streamed_point(f32(p1.x), f32(p1.y));
-        return mix(mix(h00, h10, f.x), mix(h01, h11, f.x), f.y);
-    }
     let h00 = textureLoad(height_tex, p0, 0).r;
     let h10 = textureLoad(height_tex, vec2<i32>(p1.x, p0.y), 0).r;
     let h01 = textureLoad(height_tex, vec2<i32>(p0.x, p1.y), 0).r;

@@ -1252,4 +1252,92 @@ mod tests {
         assert_eq!(app.upload_pending_terrain_tiles(), 1);
         assert_residency_sources_agree(&app);
     }
+
+    /// Revert check for the streamed-tile corner artifact: the streamed resolution
+    /// the renderer hands the shader must track the resident pages (`last_height`),
+    /// independent of the monolithic height-texture size. If the shader
+    /// denormalized streamed UVs by `tex_size` again, a coarse result would render
+    /// into a `page_res / tex_size` corner at the origin.
+    #[test]
+    fn streamed_resolution_tracks_pages_not_monolithic_tex_size() {
+        let Some(gpu) = terra_test_gpu::headless() else {
+            return;
+        };
+        let (mut app, metrics, _key, _handle) = app_with_one_streamed_page(gpu);
+        let page_res = metrics.width;
+
+        {
+            let renderer = app.renderer.as_ref().expect("renderer");
+            assert!(renderer.tile_stream_enabled());
+            assert_eq!(renderer.tile_stream_res(), (page_res, page_res));
+        }
+
+        // Drive the monolithic texture to a larger, different resolution, then
+        // re-sync. The streamed resolution must still equal the resident pages'
+        // resolution, not the monolithic tex_size.
+        let big = HeightfieldMetrics {
+            width: page_res * 2,
+            height: page_res * 2,
+            world_size_x: metrics.world_size_x,
+            world_size_z: metrics.world_size_z,
+            tile_size: metrics.tile_size,
+            halo: metrics.halo,
+        };
+        app.renderer
+            .as_mut()
+            .expect("renderer")
+            .upload_heightfield(&Heightfield::filled(big, 3.0));
+        app.sync_tile_stream_to_renderer();
+
+        let renderer = app.renderer.as_ref().expect("renderer");
+        assert!(renderer.tile_stream_enabled());
+        assert_eq!(
+            renderer.tile_stream_res(),
+            (page_res, page_res),
+            "streamed resolution must track resident pages, not the monolithic tex_size"
+        );
+    }
+
+    /// A result whose resolution is not a pyramid level (e.g. an interactive
+    /// Export-quality field larger than every level) must not stream: the upload
+    /// queue stays empty and the renderer falls back to the monolithic texture,
+    /// instead of stamping pages at a fabricated level the shader samples at a
+    /// different one (the divergent `max_level()` vs `0` fallback this replaces).
+    #[test]
+    fn non_pyramid_resolution_disables_streaming() {
+        let Some(gpu) = terra_test_gpu::headless() else {
+            return;
+        };
+        let (mut app, metrics, _key, _handle) = app_with_one_streamed_page(gpu);
+        assert!(app.renderer.as_ref().expect("renderer").tile_stream_enabled());
+
+        // An odd resolution cannot be a power-of-two pyramid level.
+        let odd = metrics.width * 2 + 1;
+        let non_level = HeightfieldMetrics {
+            width: odd,
+            height: odd,
+            world_size_x: metrics.world_size_x,
+            world_size_z: metrics.world_size_z,
+            tile_size: metrics.tile_size,
+            halo: metrics.halo,
+        };
+        app.last_height = Some(Heightfield::filled(non_level, 1.0));
+        assert_eq!(
+            app.streamed_level_for_last_height(),
+            None,
+            "an odd resolution must not resolve to a pyramid level"
+        );
+
+        app.queue_final_tile_uploads();
+        assert!(
+            app.pending_tile_uploads.is_empty(),
+            "a non-pyramid resolution must not queue tile uploads"
+        );
+
+        app.sync_tile_stream_to_renderer();
+        assert!(
+            !app.renderer.as_ref().expect("renderer").tile_stream_enabled(),
+            "a non-pyramid resolution must fall back to the monolithic path"
+        );
+    }
 }

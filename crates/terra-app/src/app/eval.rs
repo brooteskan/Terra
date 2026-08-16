@@ -204,22 +204,36 @@ impl TerraApp {
         });
     }
 
+    /// The pyramid level matching `last_height`, as `(level_index, resolution)`.
+    /// `None` when there is no `last_height` or its resolution is not a pyramid
+    /// level — e.g. an interactive Export-quality result whose size exceeds every
+    /// level. Both the upload side and the renderer sync read this one authority,
+    /// so a fabricated level can never be stamped on pages the shader then samples
+    /// at a different level (the divergent-fallback bug this replaces).
+    pub(crate) fn streamed_level_for_last_height(&self) -> Option<(u8, u32)> {
+        let width = self.last_height.as_ref()?.metrics.width;
+        self.terrain_runtime
+            .pyramid
+            .levels
+            .iter()
+            .find(|level| level.resolution == width)
+            .map(|level| (level.index, level.resolution))
+    }
+
     pub(crate) fn queue_final_tile_uploads(&mut self) {
         self.pending_tile_uploads.clear();
         if self.tile_atlas.is_none() {
             return;
         }
+        let Some((level, _res)) = self.streamed_level_for_last_height() else {
+            // No pyramid level matches this result's resolution: don't stamp pages
+            // at a fabricated level. Streaming stays off and the monolithic path
+            // (normalized, correct at any resolution) presents.
+            return;
+        };
         let Some(height) = self.last_height.as_ref() else {
             return;
         };
-        let level = self
-            .terrain_runtime
-            .pyramid
-            .levels
-            .iter()
-            .position(|candidate| candidate.resolution == height.metrics.width)
-            .unwrap_or_else(|| self.terrain_runtime.pyramid.max_level() as usize)
-            as u8;
         let revision = self.terrain_runtime.output_revision();
         self.pending_tile_uploads
             .extend(height.tiles().iter().map(|tile| (revision, level, tile.id)));
@@ -300,25 +314,32 @@ impl TerraApp {
                 atlas.max_pages(),
             )
         };
-        let level = self
-            .last_height
-            .as_ref()
-            .and_then(|height| {
-                self.terrain_runtime
-                    .pyramid
-                    .levels
-                    .iter()
-                    .position(|candidate| candidate.resolution == height.metrics.width)
-            })
-            .unwrap_or(0) as u8;
         // Pages just uploaded carry this revision; the shader gate rejects any
         // page-table row that does not match it.
         let revision = self.terrain_runtime.output_revision();
+        let Some((level, level_res)) = self.streamed_level_for_last_height() else {
+            // The result's resolution is not a pyramid level, so the resident pages
+            // (if any) cannot be sampled against a matching grid. Present the
+            // monolithic texture (normalized) instead of streaming into a corner.
+            if let Some(renderer) = self.renderer.as_mut() {
+                renderer.set_use_tile_stream(false);
+            }
+            return;
+        };
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
         renderer.set_tile_stream_resources(
-            atlas_view, page_table, tile_size, halo, max_pages, level, revision,
+            atlas_view,
+            page_table,
+            tile_size,
+            halo,
+            max_pages,
+            level,
+            // The shader denormalizes streamed UVs with this level's resolution, so
+            // the page block spans the whole terrain rather than a tex_size corner.
+            (level_res, level_res),
+            revision,
             // Streamed height is primary; shader falls back to monolithic on miss.
             true,
         );
