@@ -351,7 +351,12 @@ fn writer_never_emits_a_version_lower_than_2() {
     let saved = doc.to_json().expect("document must save");
     let value: serde_json::Value = serde_json::from_str(&saved).expect("valid saved JSON");
     assert_eq!(value["version"], DOCUMENT_VERSION);
-    assert!(DOCUMENT_VERSION >= 2);
+    // Guards the writer-floor invariant; the constant condition is an intentional
+    // build-time contract check, not a mistake.
+    #[allow(clippy::assertions_on_constants)]
+    {
+        assert!(DOCUMENT_VERSION >= 2);
+    }
 }
 
 #[test]

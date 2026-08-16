@@ -678,7 +678,6 @@ fn apply_sculpt_tool(
             ui_state.shape_session_layer = None;
         }
         actions.push(PanelAction::SetEditorTool(tool));
-        return;
     } else if tool == EditorTool::PaintMask {
         let is_painted = |id: MaskId| {
             doc.masks

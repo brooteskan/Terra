@@ -322,7 +322,7 @@ impl Default for TerraApp {
             inspector_gui: InspectorGuiState::default(),
             layers_gui: LayersGuiState::default(),
             windows_gui: WindowsGuiState::default(),
-            dock_gui: DockGuiState::default(),
+            dock_gui: DockGuiState,
             gui_scroll_delta: 0.0,
             gui_text: String::new(),
             gui_backspace: false,

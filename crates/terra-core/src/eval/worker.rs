@@ -76,7 +76,9 @@ impl EvalWorkerEvent {
 pub struct EvalWorkerSubmitError;
 
 enum WorkerMsg {
-    Job(EvalWorkRequest),
+    // Boxed so the common `Shutdown` and idle channel slots aren't sized to the large
+    // `EvalWorkRequest` payload (clippy::large_enum_variant).
+    Job(Box<EvalWorkRequest>),
     Shutdown,
 }
 
@@ -153,7 +155,7 @@ impl EvalWorker {
     pub fn submit(&mut self, request: EvalWorkRequest) -> Result<(), EvalWorkerSubmitError> {
         self.set_token(request.token);
         self.tx
-            .send(WorkerMsg::Job(request))
+            .send(WorkerMsg::Job(Box::new(request)))
             .map_err(|_| EvalWorkerSubmitError)?;
         self.busy = true;
         Ok(())
@@ -745,7 +747,10 @@ mod tests {
         }))
         .expect("deserialize malformed test field");
         let mut junk_stack = LayerStack::new();
-        junk_stack.push(Layer::new("Junk", LayerKind::Flat(FlatParams { height: 1.0 })));
+        junk_stack.push(Layer::new(
+            "Junk",
+            LayerKind::Flat(FlatParams { height: 1.0 }),
+        ));
         worker
             .submit(EvalWorkRequest {
                 token: 81,

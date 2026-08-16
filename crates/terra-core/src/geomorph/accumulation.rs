@@ -231,7 +231,7 @@ mod tests {
             }
         }
         let acc = accumulate_drainage_area(&g, &Precipitation::from_map(map));
-        let left: f32 = (0..8).map(|j| acc[j * 8 + 0]).sum();
+        let left: f32 = (0..8).map(|j| acc[j * 8]).sum();
         let right: f32 = (0..8).map(|j| acc[j * 8 + 7]).sum();
         // Left half has precip; paths drain south — still expect structure.
         assert!(acc.iter().copied().fold(0.0f32, f32::max) > 1.0);

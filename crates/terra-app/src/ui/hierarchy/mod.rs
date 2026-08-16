@@ -1289,9 +1289,7 @@ pub fn draw_layers_gui(
         } else {
             FONT_SCALE * TYPE_BODY
         };
-        let name_color = if dragging_this {
-            style::TEXT_MUTED
-        } else if is_section {
+        let name_color = if dragging_this || is_section {
             style::TEXT_MUTED
         } else if row_dimmed_for_workspace(ui_state, &row_data) {
             style::TEXT_DISABLED
@@ -2499,7 +2497,7 @@ fn draw_layer_context_menu(
             ("cache", "Toggle Cache"),
         ]);
     }
-    if is_mask
+    if (is_mask
         || group.is_some_and(|g| {
             !g.is_biome()
                 && !matches!(
@@ -2507,11 +2505,10 @@ fn draw_layer_context_menu(
                     terra_core::layer::GroupKind::BiomeSection(_)
                         | terra_core::layer::GroupKind::CategoryFolder
                 )
-        })
+        }))
+        && !items.iter().any(|(k, _)| *k == "del")
     {
-        if !items.iter().any(|(k, _)| *k == "del") {
-            items.push(("del", "Delete"));
-        }
+        items.push(("del", "Delete"));
     }
     items.push(("close", "Close"));
 

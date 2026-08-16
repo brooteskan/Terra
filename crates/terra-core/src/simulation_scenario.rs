@@ -124,8 +124,10 @@ impl MatterSource {
 /// Spatial extent where matter may move during the scenario.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum SimulationDomain {
     /// Same as scenario scope.
+    #[default]
     InheritScope,
     EntireWorld,
     /// Named domain label for artist-facing docs (resolved at run time).
@@ -140,12 +142,6 @@ pub enum SimulationDomain {
         #[serde(default)]
         placement: PlacementDefinition,
     },
-}
-
-impl Default for SimulationDomain {
-    fn default() -> Self {
-        Self::InheritScope
-    }
 }
 
 impl SimulationDomain {
@@ -163,8 +159,10 @@ impl SimulationDomain {
 /// Where generated results may affect the project (may be smaller than domain).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum OutputInfluence {
     /// Results apply everywhere the simulation ran.
+    #[default]
     EntireDomain,
     InheritScope,
     Painted {
@@ -175,12 +173,6 @@ pub enum OutputInfluence {
         #[serde(default)]
         placement: PlacementDefinition,
     },
-}
-
-impl Default for OutputInfluence {
-    fn default() -> Self {
-        Self::EntireDomain
-    }
 }
 
 impl OutputInfluence {
@@ -892,8 +884,8 @@ impl MatterSimConfig {
             .outputs
             .iter()
             .filter(|f| !matches!(f, FieldId::Height | FieldId::Named(_)))
-            .cloned()
             .take(4)
+            .cloned()
             .collect();
         if cfg.apply_selected.is_empty() {
             cfg.apply_selected = cfg.outputs.clone();
@@ -1507,6 +1499,9 @@ impl SimulationScenarioLibrary {
 }
 
 /// Undoable scenario commands.
+// Variants intentionally carry full before/after `SimulationScenario` snapshots so
+// undo/redo is self-contained; short-lived on the undo stack, not hot-path allocations.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SimulationScenarioCommand {
     Add {

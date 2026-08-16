@@ -191,8 +191,7 @@ impl TerraApp {
             self.sculpt_stroke_active = true;
             let strength = self.ui_state.sculpt_strength.clamp(0.05, 1.0);
             let radius = self.ui_state.sculpt_radius;
-            let mut actions = Vec::new();
-            actions.push(PanelAction::PaintSculptStamp {
+            let actions = vec![PanelAction::PaintSculptStamp {
                 layer: layer_id,
                 u,
                 v,
@@ -200,7 +199,7 @@ impl TerraApp {
                 strength,
                 stroke_kind,
                 target_height: 0.0,
-            });
+            }];
             self.apply_actions(actions);
             self.last_paint_uv = Some((u, v));
             self.force_draft = true;
@@ -455,7 +454,6 @@ impl TerraApp {
 
     /// Push Draft heights to the GPU while a brush stroke is active.
     /// Call at most once per frame â€” stamps coalesce via `pending_eval`.
-
     pub(crate) fn commit_biome_polygon_fill(&mut self) {
         let Some(biome) = self.session.document.active_biome else {
             return;
@@ -532,7 +530,6 @@ impl TerraApp {
 
     /// Click empty terrain to add a node. Existing Path/Polygon nodes can be
     /// dragged, Shift-dragged vertically, or Ctrl-clicked to delete.
-
     pub(crate) fn update_brush_gizmo(&mut self) {
         let show = self.viewport_paint_tool_armed()
             && self.cursor_in_viewport()
@@ -594,7 +591,6 @@ impl TerraApp {
     }
 
     /// Execute keyboard bindings through the shared command IDs.
-
     pub(crate) fn commit_mask_paint_stroke(&mut self) {
         let Some((mask_id, before, w, h)) = self.mask_paint_stroke_before.take() else {
             return;

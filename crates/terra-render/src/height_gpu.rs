@@ -81,65 +81,6 @@ impl HeightSlot {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use terra_core::heightfield::HeightfieldMetrics;
-
-    fn assert_slot_dimensions(height: &HeightGpu, width: u32, height_px: u32) {
-        assert_eq!(height.tex_size, (width, height_px));
-        for slot in &height.slots {
-            assert_eq!((slot.width, slot.height_px), (width, height_px));
-            assert_eq!(
-                (slot.height.width(), slot.height.height()),
-                (width, height_px)
-            );
-            assert_eq!(
-                (slot.normal.width(), slot.normal.height()),
-                (width, height_px)
-            );
-        }
-    }
-
-    /// Revert check for #35: reset must replace, rather than retain, project-sized slots.
-    #[test]
-    fn project_reset_shrinks_slots_and_defers_old_textures() {
-        let Some(gpu) = terra_test_gpu::headless() else {
-            return;
-        };
-        let mut height = HeightGpu::new(&gpu.device, 64);
-
-        height.reset_project_state(&gpu.device, &gpu.queue, (1000.0, 750.0));
-
-        assert_slot_dimensions(
-            &height,
-            PROJECT_RESET_TEXTURE_EXTENT,
-            PROJECT_RESET_TEXTURE_EXTENT,
-        );
-        assert!(height.shared_height_view.is_none());
-        assert_eq!(height.retirement.pending(), 4);
-        height.tick_retirement(2);
-        assert_eq!(height.retirement.pending(), 4);
-        height.tick_retirement(3);
-        assert_eq!(height.retirement.pending(), 0);
-    }
-
-    #[test]
-    fn upload_after_project_reset_restores_requested_size() {
-        let Some(gpu) = terra_test_gpu::headless() else {
-            return;
-        };
-        let mut height = HeightGpu::new(&gpu.device, 64);
-        height.reset_project_state(&gpu.device, &gpu.queue, (1000.0, 750.0));
-
-        let metrics = HeightfieldMetrics::new(32, 48, 320.0, 480.0);
-        height.upload_and_swap(&gpu.device, &gpu.queue, &Heightfield::zeros(metrics));
-
-        assert_slot_dimensions(&height, 32, 48);
-        assert_eq!(height.world_size, (320.0, 480.0));
-    }
-}
-
 /// Single-channel auxiliary surface map sampled by the terrain material shader.
 struct AuxMap {
     _texture: wgpu::Texture,
@@ -1089,5 +1030,64 @@ impl HeightGpu {
                 depth_or_array_layers: 1,
             },
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use terra_core::heightfield::HeightfieldMetrics;
+
+    fn assert_slot_dimensions(height: &HeightGpu, width: u32, height_px: u32) {
+        assert_eq!(height.tex_size, (width, height_px));
+        for slot in &height.slots {
+            assert_eq!((slot.width, slot.height_px), (width, height_px));
+            assert_eq!(
+                (slot.height.width(), slot.height.height()),
+                (width, height_px)
+            );
+            assert_eq!(
+                (slot.normal.width(), slot.normal.height()),
+                (width, height_px)
+            );
+        }
+    }
+
+    /// Revert check for #35: reset must replace, rather than retain, project-sized slots.
+    #[test]
+    fn project_reset_shrinks_slots_and_defers_old_textures() {
+        let Some(gpu) = terra_test_gpu::headless() else {
+            return;
+        };
+        let mut height = HeightGpu::new(&gpu.device, 64);
+
+        height.reset_project_state(&gpu.device, &gpu.queue, (1000.0, 750.0));
+
+        assert_slot_dimensions(
+            &height,
+            PROJECT_RESET_TEXTURE_EXTENT,
+            PROJECT_RESET_TEXTURE_EXTENT,
+        );
+        assert!(height.shared_height_view.is_none());
+        assert_eq!(height.retirement.pending(), 4);
+        height.tick_retirement(2);
+        assert_eq!(height.retirement.pending(), 4);
+        height.tick_retirement(3);
+        assert_eq!(height.retirement.pending(), 0);
+    }
+
+    #[test]
+    fn upload_after_project_reset_restores_requested_size() {
+        let Some(gpu) = terra_test_gpu::headless() else {
+            return;
+        };
+        let mut height = HeightGpu::new(&gpu.device, 64);
+        height.reset_project_state(&gpu.device, &gpu.queue, (1000.0, 750.0));
+
+        let metrics = HeightfieldMetrics::new(32, 48, 320.0, 480.0);
+        height.upload_and_swap(&gpu.device, &gpu.queue, &Heightfield::zeros(metrics));
+
+        assert_slot_dimensions(&height, 32, 48);
+        assert_eq!(height.world_size, (320.0, 480.0));
     }
 }

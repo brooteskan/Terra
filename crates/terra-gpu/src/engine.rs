@@ -3717,7 +3717,7 @@ mod smoke_tests {
         upper.common.masks.push(MaskRef::new(hardness_id));
         stack.push(upper);
 
-        let graph = compile_gpu_graph(&stack, &[hardness_asset.clone()]);
+        let graph = compile_gpu_graph(&stack, std::slice::from_ref(&hardness_asset));
         assert_eq!(graph.cpu_from, Some(1));
 
         let mut evaluator = StackEvaluator::new();
@@ -3817,7 +3817,7 @@ mod smoke_tests {
                 .any(|height| *height > 1.0 && *height < 99.0),
             "fixture must exercise partial masked filtering"
         );
-        assert_gpu_fallback(&gpu, &stack, std::slice::from_ref(&asset), metrics, 1);
+        assert_gpu_fallback(gpu, &stack, std::slice::from_ref(&asset), metrics, 1);
     }
 
     /// Revert check for #50: a simulation result must be composited with
@@ -3855,7 +3855,7 @@ mod smoke_tests {
             expected.get(8, 8) < 99.0,
             "fixture must exercise partial outer compositing"
         );
-        assert_gpu_fallback(&gpu, &stack, &[], metrics, 1);
+        assert_gpu_fallback(gpu, &stack, &[], metrics, 1);
     }
 
     /// Revert check for #50: unsupported blend equations must never be mapped to
@@ -3879,7 +3879,7 @@ mod smoke_tests {
 
             let expected = cpu_oracle(&stack, metrics);
             assert!(expected.get(8, 8).is_finite(), "CPU oracle for {mode:?}");
-            assert_gpu_fallback(&gpu, &stack, &[], metrics, 1);
+            assert_gpu_fallback(gpu, &stack, &[], metrics, 1);
         }
     }
 

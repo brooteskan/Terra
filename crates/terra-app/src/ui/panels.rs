@@ -229,11 +229,11 @@ pub fn draw_legacy_mask_editor_contents(
                             ui_state.set_editor_tool(crate::ui::EditorTool::Move);
                         }
                     }
-                    if !ui_state.is_mask_view() {
-                        if button_id(ui, Id::new("mask_show"), "Show full Mask editor") {
-                            ui_state.enter_mask_view();
-                            ui_state.show_2d_preview = true;
-                        }
+                    if !ui_state.is_mask_view()
+                        && button_id(ui, Id::new("mask_show"), "Show full Mask editor")
+                    {
+                        ui_state.enter_mask_view();
+                        ui_state.show_2d_preview = true;
                     }
                     if button_id(
                         ui,

@@ -407,10 +407,10 @@ fn stream_power_erode_impl(
             } else {
                 // Lean flat-D8 path: bit-identical to the general graph (guarded
                 // by `flat_d8_drainage_matches_flow_graph`), reusing buffers.
-                if d8_cache.is_none() {
-                    d8_cache = Some(D8Drainage::build(&filled));
+                if let Some(cache) = d8_cache.as_mut() {
+                    cache.rebuild(&filled);
                 } else {
-                    d8_cache.as_mut().unwrap().rebuild(&filled);
+                    d8_cache = Some(D8Drainage::build(&filled));
                 }
                 let cache = d8_cache.as_ref().unwrap();
                 let acc_vec = accumulate_drainage_area_d8(cache, &Precipitation::uniform(1.0));

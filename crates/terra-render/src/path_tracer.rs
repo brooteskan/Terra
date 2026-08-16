@@ -474,7 +474,6 @@ impl PathTracer {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("path-trace-pass"),
                 timestamp_writes,
-                ..Default::default()
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &bind_group, &[]);

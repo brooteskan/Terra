@@ -2026,8 +2026,10 @@ mod tests {
     #[test]
     fn stamp_3d_from_obj_missing_file_reports_obj_read_error_with_path() {
         let metrics = HeightfieldMetrics::new(8, 8, 64.0, 64.0);
-        let path = std::env::temp_dir()
-            .join(format!("terra_stamp3d_missing_{}.obj", uuid::Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!(
+            "terra_stamp3d_missing_{}.obj",
+            uuid::Uuid::new_v4()
+        ));
         let p = Stamp3dParams {
             path: path.to_string_lossy().into_owned(),
             ..Stamp3dParams::default()
@@ -2043,8 +2045,8 @@ mod tests {
     #[test]
     fn stamp_3d_from_obj_without_vertices_reports_no_vertices() {
         let metrics = HeightfieldMetrics::new(8, 8, 64.0, 64.0);
-        let path = std::env::temp_dir()
-            .join(format!("terra_stamp3d_empty_{}.obj", uuid::Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("terra_stamp3d_empty_{}.obj", uuid::Uuid::new_v4()));
         std::fs::write(&path, "# comment only\nvn 0 1 0\nvt 0 0\n").expect("write temp obj");
         let p = Stamp3dParams {
             path: path.to_string_lossy().into_owned(),

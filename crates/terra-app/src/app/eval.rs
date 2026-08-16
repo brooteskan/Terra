@@ -1015,13 +1015,7 @@ impl TerraApp {
                     self.ui_state.preview_rgba = None;
                     return;
                 };
-                let max = flow
-                    .data()
-                    .iter()
-                    .copied()
-                    .into_iter()
-                    .fold(1.0f32, f32::max)
-                    .ln_1p();
+                let max = flow.data().iter().copied().fold(1.0f32, f32::max).ln_1p();
                 flow.data()
                     .iter()
                     .copied()

@@ -152,8 +152,7 @@ impl DiskSmartCache {
 
         let cells = (output.height.metrics.width as usize)
             .saturating_mul(output.height.metrics.height as usize);
-        let mut buf =
-            Vec::with_capacity(8 + header_json.len() + (1 + aux_names.len()) * cells * 4);
+        let mut buf = Vec::with_capacity(8 + header_json.len() + (1 + aux_names.len()) * cells * 4);
         buf.extend_from_slice(MAGIC);
         buf.extend_from_slice(&(header_json.len() as u32).to_le_bytes());
         buf.extend_from_slice(&header_json);
@@ -306,7 +305,9 @@ fn sweep_parent(parent: &Path) {
             let stale = entry
                 .metadata()
                 .and_then(|m| m.modified())
-                .map(|modified| now.duration_since(modified).unwrap_or_default() > STALE_INSTANCE_AGE)
+                .map(|modified| {
+                    now.duration_since(modified).unwrap_or_default() > STALE_INSTANCE_AGE
+                })
                 .unwrap_or(false);
             if stale {
                 let _ = fs::remove_dir_all(&path);

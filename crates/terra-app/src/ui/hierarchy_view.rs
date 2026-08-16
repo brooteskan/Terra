@@ -64,7 +64,6 @@ impl ArtistConcept {
     }
 
     /// World Creator terrain stack order (under Terrain root).
-
     /// WC: Biomes → Biome Layers → Shape Layers → Mask Layers → Simulation Layers.
     pub fn terrain_order() -> &'static [ArtistConcept] {
         &[

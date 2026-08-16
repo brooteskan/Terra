@@ -776,7 +776,7 @@ fn mean_mask(field: Option<&MaskField>) -> f32 {
     let mut sum = 0.0f32;
     let mut n = 0u32;
     // Subsample for speed — binding modulation uses mean influence, not every cell.
-    let step = ((w.max(h) / 64).max(1)) as u32;
+    let step = (w.max(h) / 64).max(1);
     let mut j = 0u32;
     while j < h {
         let mut i = 0u32;
@@ -991,7 +991,7 @@ fn effective_layer_mask(
 fn height_fingerprint(h: &Heightfield) -> u64 {
     let m = h.metrics;
     let mut state = (m.width as u64)
-        .wrapping_mul(0x1000_0000_1b3)
+        .wrapping_mul(0x0100_0000_01b3)
         .wrapping_add(m.height as u64);
     if m.width == 0 || m.height == 0 {
         return state;
@@ -1014,7 +1014,7 @@ fn height_fingerprint(h: &Heightfield) -> u64 {
         let mut i = 0;
         while i < m.width {
             state = state
-                .wrapping_mul(0x1000_0000_1b3)
+                .wrapping_mul(0x0100_0000_01b3)
                 .wrapping_add(h.get(i, j).to_bits() as u64);
             i += step_i;
         }

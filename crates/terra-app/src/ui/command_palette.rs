@@ -15,6 +15,9 @@ pub struct CommandPaletteState {
     pub scroll_y: f32,
 }
 
+// Wraps `PanelAction`, whose size is dominated by the intrinsic `LayerKind` payload;
+// boxing here would only push deref churn onto every palette match site.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum PaletteAction {
     Panel(PanelAction),

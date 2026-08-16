@@ -239,41 +239,6 @@ pub fn fit_shadow_ortho(
     Mat4::orthographic_rh(lo.x - pad, hi.x + pad, lo.y - pad, hi.y + pad, near, far) * view
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn ortho_covers_whole_terrain_for_any_sun() {
-        let world = (4096.0, 2048.0);
-        let heights = (-120.0, 900.0);
-        for az_i in 0..12 {
-            let az = az_i as f32 / 12.0 * std::f32::consts::TAU;
-            for &el_deg in &[5.0f32, 25.0, 55.0, 85.0] {
-                let el = el_deg.to_radians();
-                let ce = el.cos();
-                // Direction from light toward scene (sun above the horizon).
-                let dir = [-(ce * az.cos()), -el.sin(), -(ce * az.sin())];
-                let m = fit_shadow_ortho(dir, world, heights);
-                for &x in &[0.0, world.0] {
-                    for &y in &[heights.0, heights.1] {
-                        for &z in &[0.0, world.1] {
-                            let c = m * glam::Vec4::new(x, y, z, 1.0);
-                            assert!(
-                                c.x.abs() <= 1.0 + 1e-3
-                                    && c.y.abs() <= 1.0 + 1e-3
-                                    && c.z >= -1e-3
-                                    && c.z <= 1.0 + 1e-3,
-                                "corner ({x},{y},{z}) left clip space at az_i={az_i} el={el_deg}: {c:?}"
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
 fn make_shadow_bind_group(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
@@ -332,4 +297,39 @@ pub fn atmosphere_from_sun(
         0.35 + 0.40 * sun_up,
     ];
     (clear, fog)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ortho_covers_whole_terrain_for_any_sun() {
+        let world = (4096.0, 2048.0);
+        let heights = (-120.0, 900.0);
+        for az_i in 0..12 {
+            let az = az_i as f32 / 12.0 * std::f32::consts::TAU;
+            for &el_deg in &[5.0f32, 25.0, 55.0, 85.0] {
+                let el = el_deg.to_radians();
+                let ce = el.cos();
+                // Direction from light toward scene (sun above the horizon).
+                let dir = [-(ce * az.cos()), -el.sin(), -(ce * az.sin())];
+                let m = fit_shadow_ortho(dir, world, heights);
+                for &x in &[0.0, world.0] {
+                    for &y in &[heights.0, heights.1] {
+                        for &z in &[0.0, world.1] {
+                            let c = m * glam::Vec4::new(x, y, z, 1.0);
+                            assert!(
+                                c.x.abs() <= 1.0 + 1e-3
+                                    && c.y.abs() <= 1.0 + 1e-3
+                                    && c.z >= -1e-3
+                                    && c.z <= 1.0 + 1e-3,
+                                "corner ({x},{y},{z}) left clip space at az_i={az_i} el={el_deg}: {c:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

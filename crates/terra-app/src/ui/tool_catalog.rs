@@ -33,6 +33,9 @@ const LAYER_EXPOSURE_REPLACEMENTS: &[LayerExposureReplacement] = &[LayerExposure
 }];
 
 /// What activating a catalog entry does.
+// `AddLayer` carries the intrinsic-size `LayerKind` payload; catalog entries are
+// static/short-lived, so the variance is accepted rather than boxing every match site.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum ToolAction {
     /// Select a sculpt / navigation / paint editor tool.
@@ -260,6 +263,9 @@ fn veg_with_coverage(mut params: VegetationParams, nodes: Vec<DistNode>) -> Vege
 }
 
 /// Full catalog for all modes. One canonical home per wired capability.
+// Built by sequential pushes grouped under section-header comments; a single `vec![]`
+// literal over ~30 multi-line entries would bury those markers and hurt readability.
+#[allow(clippy::vec_init_then_push)]
 pub fn all_tools() -> Vec<ToolDef> {
     let mut tools = Vec::new();
 

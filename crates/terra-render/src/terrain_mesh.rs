@@ -62,7 +62,7 @@ impl TerrainMesh {
         let w = hf.metrics.width;
         let h = hf.metrics.height;
         // Decimate for viewport if huge
-        let step = ((w.max(h) / 512).max(1)) as u32;
+        let step = (w.max(h) / 512).max(1);
         let gw = (w + step - 1) / step;
         let gh = (h + step - 1) / step;
 

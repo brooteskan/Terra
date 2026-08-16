@@ -9,3 +9,6 @@ publish = false
 [dependencies]
 wgpu = { workspace = true }
 pollster = { workspace = true }
+
+[lints]
+workspace = true

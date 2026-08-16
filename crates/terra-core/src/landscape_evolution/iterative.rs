@@ -152,7 +152,7 @@ fn slope_to_receiver(z: &Heightfield, i: usize, j: usize, cache: &DrainageCache)
         let di = ri as i32 - i as i32;
         let dj = rj as i32 - j as i32;
         let dist = if di != 0 && dj != 0 {
-            ((dx * dx + dz * dz) as f32).sqrt()
+            (dx * dx + dz * dz).sqrt()
         } else if di != 0 {
             dx
         } else {
@@ -169,7 +169,7 @@ fn slope_to_receiver(z: &Heightfield, i: usize, j: usize, cache: &DrainageCache)
             continue;
         }
         let dist = if di != 0 && dj != 0 {
-            ((dx * dx + dz * dz) as f32).sqrt()
+            (dx * dx + dz * dz).sqrt()
         } else if di != 0 {
             dx
         } else {

@@ -175,7 +175,7 @@ fn draw_layer_masks_chrome(
 }
 
 /// Expand/collapse flags for Unreal Details–style inspector sections.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct DetailsExpandState {
     pub layer_apply_where: bool,
     pub layer_masks: bool,
@@ -183,19 +183,6 @@ pub struct DetailsExpandState {
     pub layer_advanced: bool,
     /// Noise nested under the Shape tab.
     pub layer_noise: bool,
-}
-
-impl Default for DetailsExpandState {
-    fn default() -> Self {
-        // Start collapsed so inspector chrome is minimized on project entry.
-        Self {
-            layer_apply_where: false,
-            layer_masks: false,
-            layer_parameters: false,
-            layer_advanced: false,
-            layer_noise: false,
-        }
-    }
 }
 
 /// Persistent scroll for the inspector panel.
@@ -907,17 +894,16 @@ pub fn draw_inspector_gui(
             ) {
                 changed = true;
             }
-            if has_separate_noise_tab(&layer.kind) {
-                if collapsible_section(
+            if has_separate_noise_tab(&layer.kind)
+                && collapsible_section(
                     ui,
                     Id::new("insp_sec_noise"),
                     "NOISE",
                     &mut state.details.layer_noise,
-                ) {
-                    if edit_kind(ui, &mut kind, KindEditPane::Noise, id, &mut actions) {
-                        changed = true;
-                    }
-                }
+                )
+                && edit_kind(ui, &mut kind, KindEditPane::Noise, id, &mut actions)
+            {
+                changed = true;
             }
             if changed {
                 actions.push(PanelAction::SetKind { id, kind });
@@ -1072,11 +1058,9 @@ fn draw_inspector_more_menu_inner(
                 "del" if !is_base => actions.push(PanelAction::RemoveSelected),
                 _ => {}
             }
-            if *key != "rename" {
-                state.more_menu_open = false;
-            } else {
-                state.more_menu_open = false;
-            }
+            // Every action dismisses the menu; "rename" then shows the inline rename
+            // field (rendered independently on `rename_buffer`), so it closes too.
+            state.more_menu_open = false;
         }
         iy += 26.0;
     }

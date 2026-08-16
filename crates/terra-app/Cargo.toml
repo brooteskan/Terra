@@ -30,3 +30,6 @@ image = { workspace = true }
 
 [dev-dependencies]
 terra-test-gpu = { workspace = true }
+
+[lints]
+workspace = true

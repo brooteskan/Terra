@@ -108,9 +108,7 @@ fn caption_icon_button(
     ui.icon_centered(
         rect,
         icon,
-        if hovered && is_close {
-            style::TEXT
-        } else if hovered {
+        if hovered {
             style::TEXT
         } else {
             style::TEXT_DIM

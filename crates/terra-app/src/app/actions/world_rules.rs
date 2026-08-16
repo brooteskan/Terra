@@ -3,6 +3,9 @@ use crate::ui::PanelAction;
 use super::super::TerraApp;
 use super::ApplyCtx;
 
+// Returns the unhandled action on `Err` so the next handler in the chain can try it
+// (see actions/mod.rs); that payload is the intrinsic-size `PanelAction` (`LayerKind`).
+#[allow(clippy::result_large_err)]
 pub(crate) fn try_apply(
     app: &mut TerraApp,
     action: PanelAction,
@@ -108,7 +111,7 @@ pub(crate) fn try_apply(
                             .iter()
                             .position(|r| r.id == b)
                     })
-                    .unwrap_or_else(|| app.session.document.world_rules.rules.len());
+                    .unwrap_or(app.session.document.world_rules.rules.len());
                 if let Some(from) = from {
                     app.session.push_world_rule_command(
                         terra_core::world_rules::WorldRuleCommand::Reorder {

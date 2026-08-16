@@ -327,6 +327,9 @@ fn catalog_for_modal(ui_state: &UiState) -> Vec<ToolDef> {
     quick_add_entries()
 }
 
+// Variants ultimately carry the intrinsic-size `LayerKind` editor payload; picker items
+// are transient UI rows, so the variance is accepted rather than boxing every match site.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
 enum PickerItem {
     Tool(ToolDef),
@@ -1186,163 +1189,6 @@ pub fn draw_quick_add(
     actions
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use terra_core::layer::{EffectFilterKind, Layer, LayerKind};
-
-    fn commit_catalog_layer(tool_id: &str) -> (LayerKind, Layer) {
-        let tool = quick_add_entries()
-            .into_iter()
-            .find(|tool| tool.id == tool_id)
-            .unwrap_or_else(|| panic!("Quick Add should expose {tool_id}"));
-        let ToolAction::AddLayer { name, kind } = &tool.action else {
-            panic!("{tool_id} should create a layer");
-        };
-        let expected_name = *name;
-        let expected_kind = kind.clone();
-        let item = PickerItem::Tool(tool);
-        let mut ui_state = UiState::default();
-        let mut state = QuickAddState::default();
-        let mut actions = Vec::new();
-
-        commit_item(&item, &mut ui_state, &mut state, &mut actions);
-
-        assert_eq!(actions.len(), 1);
-        let PanelAction::AddLayer(layer) = actions.remove(0) else {
-            panic!("generic Quick Add should emit AddLayer");
-        };
-        assert_eq!(layer.common.name, expected_name);
-        (expected_kind, layer)
-    }
-
-    fn assert_same_kind(expected: &LayerKind, actual: &LayerKind) {
-        assert_eq!(
-            serde_json::to_value(actual).expect("serialize created layer kind"),
-            serde_json::to_value(expected).expect("serialize catalog layer kind")
-        );
-    }
-
-    fn commit_org(id: &'static str) -> PanelAction {
-        let item = PickerItem::Org {
-            id,
-            label: "Test organisation item",
-            description: "Test organisation item.",
-            icon: Icon::Folder,
-        };
-        let mut ui_state = UiState::default();
-        let mut state = QuickAddState::default();
-        let mut actions = Vec::new();
-
-        commit_item(&item, &mut ui_state, &mut state, &mut actions);
-
-        assert_eq!(actions.len(), 1, "{id} should emit exactly one action");
-        actions.remove(0)
-    }
-
-    #[test]
-    fn scoped_quick_add_includes_registry_derived_routes() {
-        let mut shape_state = UiState::default();
-        shape_state.quick_add_concept = Some(ArtistConcept::Shape);
-        assert!(catalog_for_modal(&shape_state)
-            .iter()
-            .any(|tool| tool.registry_type_id == Some("island")));
-
-        let mut simulation_state = UiState::default();
-        simulation_state.quick_add_category = Some(StackCategory::Simulation);
-        assert!(catalog_for_modal(&simulation_state)
-            .iter()
-            .any(|tool| tool.registry_type_id == Some("river_network")));
-
-        let mut filter_state = UiState::default();
-        filter_state.quick_add_into = Some(terra_core::layer::LayerId::new());
-        filter_state.quick_add_biome_section = Some(BiomeSection::Filters);
-        assert!(catalog_for_modal(&filter_state)
-            .iter()
-            .any(|tool| tool.registry_type_id == Some("blur")));
-    }
-
-    #[test]
-    fn quick_add_commits_direct_island_layer() {
-        let (_, layer) = commit_catalog_layer("gen.island");
-        assert!(matches!(layer.kind, LayerKind::Island(_)));
-    }
-
-    #[test]
-    fn quick_add_preserves_non_default_effect_filter_preset() {
-        let (expected, layer) = commit_catalog_layer("filter.arid.rocky_plateaus");
-
-        let LayerKind::EffectFilter(params) = &layer.kind else {
-            panic!("Rocky Plateaus should remain an effect filter");
-        };
-        assert_eq!(params.kind, EffectFilterKind::RockyPlateaus);
-        assert_ne!(params.kind, EffectFilterKind::Smooth);
-        assert_same_kind(&expected, &layer.kind);
-    }
-
-    #[test]
-    fn quick_add_preserves_non_default_vegetation_preset() {
-        let (expected, layer) = commit_catalog_layer("obj.rocks");
-
-        let LayerKind::Vegetation(params) = &layer.kind else {
-            panic!("Rocks should remain a vegetation preset");
-        };
-        assert_eq!(params.density, 0.22);
-        assert_eq!(params.min_distance, 5.0);
-        assert_eq!(params.min_slope_deg, 22.0);
-        assert_eq!(params.max_slope_deg, 90.0);
-        assert!(!params.coverage.nodes.is_empty());
-        assert_same_kind(&expected, &layer.kind);
-    }
-
-    #[test]
-    fn quick_add_exposes_organisation_items_for_the_active_scope() {
-        let generic = UiState::default();
-        let generic_items = org_items(&generic);
-        let generic_ids: Vec<_> = generic_items.iter().map(PickerItem::id).collect();
-        assert_eq!(
-            generic_ids,
-            ["org.pass", "org.isolated", "org.biome", "org.hole"]
-        );
-
-        let mut biomes = UiState::default();
-        biomes.quick_add_concept = Some(ArtistConcept::Biomes);
-        let biome_items = org_items(&biomes);
-        let biome_ids: Vec<_> = biome_items.iter().map(PickerItem::id).collect();
-        assert_eq!(biome_ids, ["org.biome"]);
-
-        let mut biome_layers = UiState::default();
-        biome_layers.quick_add_concept = Some(ArtistConcept::BiomeLayers);
-        let biome_layer_items = org_items(&biome_layers);
-        let biome_layer_ids: Vec<_> = biome_layer_items.iter().map(PickerItem::id).collect();
-        assert_eq!(biome_layer_ids, ["org.biome_paint"]);
-    }
-
-    #[test]
-    fn quick_add_commits_organisation_items_through_picker_item_org() {
-        assert!(matches!(
-            commit_org("org.pass"),
-            PanelAction::AddGroup { .. }
-        ));
-        assert!(matches!(
-            commit_org("org.isolated"),
-            PanelAction::AddIsolatedGroup { .. }
-        ));
-        assert!(matches!(
-            commit_org("org.biome"),
-            PanelAction::AddBiome { .. }
-        ));
-        assert!(matches!(
-            commit_org("org.hole"),
-            PanelAction::AddHoleLayer { .. }
-        ));
-        assert!(matches!(
-            commit_org("org.biome_paint"),
-            PanelAction::AddBiomePaintLayer { .. }
-        ));
-    }
-}
-
 fn draw_sidebar(ui: &mut GuiContext<'_>, sidebar: Rect, item: &PickerItem) {
     let mut y = sidebar.min_y + PAD;
     ui.label_at(
@@ -1535,4 +1381,161 @@ fn apply_search_input(ui: &GuiContext<'_>, query: &mut String) {
 
 pub fn contextual_suggestion_type_ids(_doc: &TerrainDocument, _ui_state: &UiState) -> Vec<String> {
     Vec::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use terra_core::layer::{EffectFilterKind, Layer, LayerKind};
+
+    fn commit_catalog_layer(tool_id: &str) -> (LayerKind, Layer) {
+        let tool = quick_add_entries()
+            .into_iter()
+            .find(|tool| tool.id == tool_id)
+            .unwrap_or_else(|| panic!("Quick Add should expose {tool_id}"));
+        let ToolAction::AddLayer { name, kind } = &tool.action else {
+            panic!("{tool_id} should create a layer");
+        };
+        let expected_name = *name;
+        let expected_kind = kind.clone();
+        let item = PickerItem::Tool(tool);
+        let mut ui_state = UiState::default();
+        let mut state = QuickAddState::default();
+        let mut actions = Vec::new();
+
+        commit_item(&item, &mut ui_state, &mut state, &mut actions);
+
+        assert_eq!(actions.len(), 1);
+        let PanelAction::AddLayer(layer) = actions.remove(0) else {
+            panic!("generic Quick Add should emit AddLayer");
+        };
+        assert_eq!(layer.common.name, expected_name);
+        (expected_kind, layer)
+    }
+
+    fn assert_same_kind(expected: &LayerKind, actual: &LayerKind) {
+        assert_eq!(
+            serde_json::to_value(actual).expect("serialize created layer kind"),
+            serde_json::to_value(expected).expect("serialize catalog layer kind")
+        );
+    }
+
+    fn commit_org(id: &'static str) -> PanelAction {
+        let item = PickerItem::Org {
+            id,
+            label: "Test organisation item",
+            description: "Test organisation item.",
+            icon: Icon::Folder,
+        };
+        let mut ui_state = UiState::default();
+        let mut state = QuickAddState::default();
+        let mut actions = Vec::new();
+
+        commit_item(&item, &mut ui_state, &mut state, &mut actions);
+
+        assert_eq!(actions.len(), 1, "{id} should emit exactly one action");
+        actions.remove(0)
+    }
+
+    #[test]
+    fn scoped_quick_add_includes_registry_derived_routes() {
+        let mut shape_state = UiState::default();
+        shape_state.quick_add_concept = Some(ArtistConcept::Shape);
+        assert!(catalog_for_modal(&shape_state)
+            .iter()
+            .any(|tool| tool.registry_type_id == Some("island")));
+
+        let mut simulation_state = UiState::default();
+        simulation_state.quick_add_category = Some(StackCategory::Simulation);
+        assert!(catalog_for_modal(&simulation_state)
+            .iter()
+            .any(|tool| tool.registry_type_id == Some("river_network")));
+
+        let mut filter_state = UiState::default();
+        filter_state.quick_add_into = Some(terra_core::layer::LayerId::new());
+        filter_state.quick_add_biome_section = Some(BiomeSection::Filters);
+        assert!(catalog_for_modal(&filter_state)
+            .iter()
+            .any(|tool| tool.registry_type_id == Some("blur")));
+    }
+
+    #[test]
+    fn quick_add_commits_direct_island_layer() {
+        let (_, layer) = commit_catalog_layer("gen.island");
+        assert!(matches!(layer.kind, LayerKind::Island(_)));
+    }
+
+    #[test]
+    fn quick_add_preserves_non_default_effect_filter_preset() {
+        let (expected, layer) = commit_catalog_layer("filter.arid.rocky_plateaus");
+
+        let LayerKind::EffectFilter(params) = &layer.kind else {
+            panic!("Rocky Plateaus should remain an effect filter");
+        };
+        assert_eq!(params.kind, EffectFilterKind::RockyPlateaus);
+        assert_ne!(params.kind, EffectFilterKind::Smooth);
+        assert_same_kind(&expected, &layer.kind);
+    }
+
+    #[test]
+    fn quick_add_preserves_non_default_vegetation_preset() {
+        let (expected, layer) = commit_catalog_layer("obj.rocks");
+
+        let LayerKind::Vegetation(params) = &layer.kind else {
+            panic!("Rocks should remain a vegetation preset");
+        };
+        assert_eq!(params.density, 0.22);
+        assert_eq!(params.min_distance, 5.0);
+        assert_eq!(params.min_slope_deg, 22.0);
+        assert_eq!(params.max_slope_deg, 90.0);
+        assert!(!params.coverage.nodes.is_empty());
+        assert_same_kind(&expected, &layer.kind);
+    }
+
+    #[test]
+    fn quick_add_exposes_organisation_items_for_the_active_scope() {
+        let generic = UiState::default();
+        let generic_items = org_items(&generic);
+        let generic_ids: Vec<_> = generic_items.iter().map(PickerItem::id).collect();
+        assert_eq!(
+            generic_ids,
+            ["org.pass", "org.isolated", "org.biome", "org.hole"]
+        );
+
+        let mut biomes = UiState::default();
+        biomes.quick_add_concept = Some(ArtistConcept::Biomes);
+        let biome_items = org_items(&biomes);
+        let biome_ids: Vec<_> = biome_items.iter().map(PickerItem::id).collect();
+        assert_eq!(biome_ids, ["org.biome"]);
+
+        let mut biome_layers = UiState::default();
+        biome_layers.quick_add_concept = Some(ArtistConcept::BiomeLayers);
+        let biome_layer_items = org_items(&biome_layers);
+        let biome_layer_ids: Vec<_> = biome_layer_items.iter().map(PickerItem::id).collect();
+        assert_eq!(biome_layer_ids, ["org.biome_paint"]);
+    }
+
+    #[test]
+    fn quick_add_commits_organisation_items_through_picker_item_org() {
+        assert!(matches!(
+            commit_org("org.pass"),
+            PanelAction::AddGroup { .. }
+        ));
+        assert!(matches!(
+            commit_org("org.isolated"),
+            PanelAction::AddIsolatedGroup { .. }
+        ));
+        assert!(matches!(
+            commit_org("org.biome"),
+            PanelAction::AddBiome { .. }
+        ));
+        assert!(matches!(
+            commit_org("org.hole"),
+            PanelAction::AddHoleLayer { .. }
+        ));
+        assert!(matches!(
+            commit_org("org.biome_paint"),
+            PanelAction::AddBiomePaintLayer { .. }
+        ));
+    }
 }

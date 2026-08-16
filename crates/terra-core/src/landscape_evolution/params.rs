@@ -16,7 +16,7 @@ pub enum EvolutionSolverMode {
 }
 
 /// How the tectonic uplift field is synthesised.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 pub enum UpliftMode {
     /// Constant uplift rate over the domain (boundary cells forced to 0).
     Uniform,
@@ -29,13 +29,8 @@ pub enum UpliftMode {
     /// Low-frequency procedural uplift with geological-scale smoothness.
     Procedural,
     /// Prefer shape-compiled aux uplift; fall back to LinearBelt if absent.
+    #[default]
     ShapeDerived,
-}
-
-impl Default for UpliftMode {
-    fn default() -> Self {
-        Self::ShapeDerived
-    }
 }
 
 /// Drainage outlet / base-level boundary behaviour.

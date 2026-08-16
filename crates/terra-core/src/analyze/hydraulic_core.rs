@@ -311,10 +311,7 @@ pub fn clamp_timestep_cfl(timestep: f32, dx: f32, max_speed: f32) -> f32 {
 pub fn sanitize_field(data: &mut [f32]) -> u32 {
     let mut hits = 0u32;
     for v in data.iter_mut() {
-        if !v.is_finite() {
-            *v = 0.0;
-            hits += 1;
-        } else if *v < 0.0 {
+        if !v.is_finite() || *v < 0.0 {
             *v = 0.0;
             hits += 1;
         }

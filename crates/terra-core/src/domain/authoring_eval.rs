@@ -120,16 +120,16 @@ fn diagnose_layer(layer: &crate::layer::Layer, out: &mut Vec<SoftDiagnostic>) {
         }
         LayerKind::HydraulicErosion(_)
         | LayerKind::ThermalErosion(_)
-        | LayerKind::StreamPowerErosion(_) => {
-            if !layer.common.enabled {
-                out.push(SoftDiagnostic::new(
-                    "simulation_disabled",
-                    format!(
-                        "Simulation '{}' is present but disabled.",
-                        layer.common.name
-                    ),
-                ));
-            }
+        | LayerKind::StreamPowerErosion(_)
+            if !layer.common.enabled =>
+        {
+            out.push(SoftDiagnostic::new(
+                "simulation_disabled",
+                format!(
+                    "Simulation '{}' is present but disabled.",
+                    layer.common.name
+                ),
+            ));
         }
         _ => {}
     }

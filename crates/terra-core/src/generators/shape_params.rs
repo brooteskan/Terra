@@ -194,18 +194,13 @@ impl Default for Stamp3dParams {
 }
 
 /// Closed polygon raise / carve.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum PolygonHeightMode {
     /// Add a signed elevation delta to the existing terrain.
+    #[default]
     RaiseBy,
     /// Blend toward an absolute world elevation.
     SetElevation,
-}
-
-impl Default for PolygonHeightMode {
-    fn default() -> Self {
-        Self::RaiseBy
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

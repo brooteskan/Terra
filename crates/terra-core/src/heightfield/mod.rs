@@ -281,7 +281,7 @@ impl Heightfield {
     pub fn map_mut<F: Fn(f32) -> f32 + Sync>(&mut self, f: F) {
         use rayon::prelude::*;
         self.tiles.par_iter_mut().for_each(|tile| {
-            tile.map_interior(|v| f(v));
+            tile.map_interior(&f);
         });
     }
 

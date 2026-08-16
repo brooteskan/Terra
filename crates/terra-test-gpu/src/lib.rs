@@ -72,7 +72,7 @@ impl Pixels {
 
     /// True when any pixel equals `rgba`.
     pub fn any(&self, rgba: [u8; 4]) -> bool {
-        self.data.iter().any(|p| *p == rgba)
+        self.data.contains(&rgba)
     }
 }
 

@@ -32,6 +32,10 @@ pub use crate::landscape_evolution::{
 };
 use serde::{Deserialize, Serialize};
 
+// Per-variant payloads are the intrinsic, serialized parameter blocks for each layer
+// type; the size spread is inherent to the data model. Boxing a subset would spread
+// deref/`Box::new` churn across every match site for no real gain.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LayerKind {
     // Artist foundation — painted height buffer (always bottom in default docs)

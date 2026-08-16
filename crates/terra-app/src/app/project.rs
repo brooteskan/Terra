@@ -67,7 +67,7 @@ impl TerraApp {
             }
             ProjectIoResult::Loaded { path, doc } => {
                 let name = doc.name.clone();
-                self.enter_editor(doc, Some(path.clone()), false);
+                self.enter_editor(*doc, Some(path.clone()), false);
                 self.project_prefs.push_recent(&path, &name);
                 save_project_prefs(&self.project_prefs);
                 self.ui_state.status = format!("Loaded {}", path.display());
@@ -178,7 +178,7 @@ impl TerraApp {
         }
     }
 
-    pub(crate) fn remember_recent(&mut self, path: &PathBuf) {
+    pub(crate) fn remember_recent(&mut self, path: &Path) {
         self.project_prefs
             .push_recent(path, &self.session.document.name);
         save_project_prefs(&self.project_prefs);
@@ -1021,10 +1021,7 @@ mod tests {
     /// resident tiles and cannot resolve the old handle, no uploads remain queued,
     /// and the renderer has stopped streaming (so the shader falls back to the
     /// monolithic texture).
-    fn assert_streamed_residency_retired(
-        app: &TerraApp,
-        old_handle: terra_core::TilePageHandle,
-    ) {
+    fn assert_streamed_residency_retired(app: &TerraApp, old_handle: terra_core::TilePageHandle) {
         let atlas = app.tile_atlas.as_ref().expect("atlas retained");
         assert_eq!(atlas.residency().stats().resident_tiles, 0);
         assert_eq!(atlas.residency().resolve_handle(old_handle), None);
@@ -1309,7 +1306,11 @@ mod tests {
             return;
         };
         let (mut app, metrics, _key, _handle) = app_with_one_streamed_page(gpu);
-        assert!(app.renderer.as_ref().expect("renderer").tile_stream_enabled());
+        assert!(app
+            .renderer
+            .as_ref()
+            .expect("renderer")
+            .tile_stream_enabled());
 
         // An odd resolution cannot be a power-of-two pyramid level.
         let odd = metrics.width * 2 + 1;
@@ -1336,7 +1337,10 @@ mod tests {
 
         app.sync_tile_stream_to_renderer();
         assert!(
-            !app.renderer.as_ref().expect("renderer").tile_stream_enabled(),
+            !app.renderer
+                .as_ref()
+                .expect("renderer")
+                .tile_stream_enabled(),
             "a non-pyramid resolution must fall back to the monolithic path"
         );
     }

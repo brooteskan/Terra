@@ -236,8 +236,13 @@ impl LayerCache {
         // only and adopt a lightweight descriptor.
         if let Some(disk) = &self.disk {
             if disk.probe(id, metrics) {
-                self.entries
-                    .insert(id, CacheEntry::Spilled { metrics, dirty: false });
+                self.entries.insert(
+                    id,
+                    CacheEntry::Spilled {
+                        metrics,
+                        dirty: false,
+                    },
+                );
                 return true;
             }
         }
@@ -272,6 +277,10 @@ impl LayerCache {
 
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 
     /// True when `id` is present but its buffers have been spilled to disk and

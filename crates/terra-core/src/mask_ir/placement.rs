@@ -783,10 +783,9 @@ fn decompile_group(node: &DistNode, coverage: &mut Vec<CoverageTerm>) -> Option<
     let mut refinements = Vec::new();
     let mut children = Vec::new();
     for c in &node.children {
-        if let Some(rn) = decompile_node(c, coverage, &mut refinements) {
+        {
+            let rn = decompile_node(c, coverage, &mut refinements)?;
             children.push(rn);
-        } else {
-            return None;
         }
     }
     if !refinements.is_empty() {

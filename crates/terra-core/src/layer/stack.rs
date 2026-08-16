@@ -6,6 +6,9 @@ use crate::mask::Distribution;
 use serde::{Deserialize, Serialize};
 
 /// Nested group or single layer in the stack (bottom → top order in Vec).
+// The `Layer` payload is intrinsic per-node document data and the common case, so
+// boxing it would only add an allocation per node without shrinking the footprint.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum StackNode {
     Layer(Layer),
@@ -863,10 +866,8 @@ fn contains_id(nodes: &[StackNode], id: LayerId) -> bool {
         match n {
             StackNode::Layer(l) if l.id() == id => return true,
             StackNode::Group(g) if g.id == id => return true,
-            StackNode::Group(g) => {
-                if contains_id(&g.children, id) {
-                    return true;
-                }
+            StackNode::Group(g) if contains_id(&g.children, id) => {
+                return true;
             }
             _ => {}
         }

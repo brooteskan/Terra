@@ -277,6 +277,9 @@ fn capsule_xz(
     let paz = z - az;
     let bax = bx - ax;
     let bay = by - ay;
+    // `baz` is the z-component of the (b − a) segment vector (the `pa`/`ba` capsule-SDF
+    // convention), not the placeholder clippy::disallowed_names guards against.
+    #[allow(clippy::disallowed_names)]
     let baz = bz - az;
     let baba = bax * bax + bay * bay + baz * baz;
     let paba = pax * bax + pay * bay + paz * baz;

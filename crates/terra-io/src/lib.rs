@@ -39,7 +39,9 @@ pub struct BuildJob {
 
 enum JobMsg {
     Progress(f32),
-    Done(Result<ExportResult, String>),
+    // Boxed so lighter variants / idle channel slots aren't sized to the large
+    // `ExportResult` payload (clippy::large_enum_variant).
+    Done(Box<Result<ExportResult, String>>),
 }
 
 /// Non-blocking export worker.
@@ -86,10 +88,10 @@ impl BackgroundExporter {
                         ..ExportRequest::default()
                     };
                     let result = export_package(&hf, &ctx, &req).map_err(|e| e.to_string());
-                    let _ = tx.send(JobMsg::Done(result));
+                    let _ = tx.send(JobMsg::Done(Box::new(result)));
                 }
                 Err(e) => {
-                    let _ = tx.send(JobMsg::Done(Err(e.to_string())));
+                    let _ = tx.send(JobMsg::Done(Box::new(Err(e.to_string()))));
                 }
             }
         });
@@ -102,7 +104,7 @@ impl BackgroundExporter {
                 JobMsg::Done(r) => {
                     self.job.progress = 1.0;
                     self.job.done = true;
-                    self.job.result = Some(r);
+                    self.job.result = Some(*r);
                 }
             }
         }
@@ -163,17 +165,37 @@ pub fn load_project(path: &std::path::Path) -> Result<TerrainDocument, IoError> 
 
 enum ProjectIoMsg {
     Progress(&'static str),
-    Saved { path: PathBuf },
-    Loaded { path: PathBuf, doc: TerrainDocument },
-    Failed { path: PathBuf, error: String },
+    Saved {
+        path: PathBuf,
+    },
+    Loaded {
+        path: PathBuf,
+        // Boxed so lighter variants aren't sized to the large `TerrainDocument`
+        // payload (clippy::large_enum_variant).
+        doc: Box<TerrainDocument>,
+    },
+    Failed {
+        path: PathBuf,
+        error: String,
+    },
 }
 
 /// Result of a finished background project I/O job.
 #[derive(Debug)]
 pub enum ProjectIoResult {
-    Saved { path: PathBuf },
-    Loaded { path: PathBuf, doc: TerrainDocument },
-    Failed { path: PathBuf, error: String },
+    Saved {
+        path: PathBuf,
+    },
+    Loaded {
+        path: PathBuf,
+        // Boxed so lighter variants aren't sized to the large `TerrainDocument`
+        // payload (clippy::large_enum_variant).
+        doc: Box<TerrainDocument>,
+    },
+    Failed {
+        path: PathBuf,
+        error: String,
+    },
 }
 
 /// Non-blocking project save/load worker (serialize/parse/fs off the UI thread).
@@ -245,7 +267,10 @@ impl BackgroundProjectIo {
             match std::fs::read_to_string(&path) {
                 Ok(s) => match TerrainDocument::from_json(&s) {
                     Ok(doc) => {
-                        let _ = tx.send(ProjectIoMsg::Loaded { path, doc });
+                        let _ = tx.send(ProjectIoMsg::Loaded {
+                            path,
+                            doc: Box::new(doc),
+                        });
                     }
                     Err(e) => {
                         let _ = tx.send(ProjectIoMsg::Failed {
