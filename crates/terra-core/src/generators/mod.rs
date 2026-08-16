@@ -734,6 +734,10 @@ pub fn dunes_with_aux(
 }
 
 /// Directional band-limited / phasor dune seed (sand thickness in meters).
+// Procedural seeder: metrics plus independent dune parameters (direction,
+// scale, height, supply, sharpness, linearity, seed), each a distinct scalar.
+// Kept flat.
+#[allow(clippy::too_many_arguments)]
 pub fn seed_dune_sand(
     metrics: HeightfieldMetrics,
     direction_deg: f32,

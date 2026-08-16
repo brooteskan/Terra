@@ -217,6 +217,9 @@ pub fn apply_local_sdf(hf: &Heightfield, p: &LocalSdfParams) -> DualHeightResult
 /// Analytic cave SDF: ellipsoid chamber union soft entrance tunnel toward `ent_dir`.
 ///
 /// Negative = void. Noise warps the shell slightly for organic walls (deterministic seed).
+// Signed-distance kernel: sample point + cave centre/radii + entrance/depth/
+// surface + noise, each an independent scalar of the field. Kept flat.
+#[allow(clippy::too_many_arguments)]
 fn cave_sdf(
     x: f32,
     y: f32,
@@ -260,6 +263,9 @@ fn cave_sdf(
     d
 }
 
+// Capsule SDF: sample point (x,y,z), the two segment endpoints (a,b) and the
+// radius — the canonical flat form for this primitive. Kept flat.
+#[allow(clippy::too_many_arguments)]
 fn capsule_xz(
     x: f32,
     y: f32,

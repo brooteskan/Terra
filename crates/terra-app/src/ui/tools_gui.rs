@@ -404,6 +404,9 @@ fn draw_card_grid_prioritized(
     }
 }
 
+// egui card helper: ui + shared UiState/doc/action sink + id + tool + layout
+// rect + suggested flag, each used once to draw one card. Kept flat.
+#[allow(clippy::too_many_arguments)]
 fn tool_card_suggested(
     ui: &mut GuiContext<'_>,
     ui_state: &mut UiState,

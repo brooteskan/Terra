@@ -219,6 +219,10 @@ fn add_mask(
     }
 }
 
+// Convenience constructor whose ten arguments map one-to-one onto the
+// MaterialRule fields it returns; a params struct would just duplicate that
+// type. Kept flat.
+#[allow(clippy::too_many_arguments)]
 fn material_rule(
     name: &str,
     id: u32,

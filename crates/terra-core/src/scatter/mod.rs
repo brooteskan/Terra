@@ -69,6 +69,9 @@ fn accepted(
     s >= p.min_slope_deg && s <= p.max_slope_deg
 }
 
+// Poisson-disk insertion: candidate point + min spacing + cell size + grid dims
+// and the two mutable containers (grid, points) it updates, each distinct. Kept flat.
+#[allow(clippy::too_many_arguments)]
 fn try_add(
     x: f32,
     z: f32,

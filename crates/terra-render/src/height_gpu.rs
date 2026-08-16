@@ -12,6 +12,39 @@ use terra_core::tiling::SampleRect;
 /// Existing upload/presentation paths restore the next document's dimensions.
 const PROJECT_RESET_TEXTURE_EXTENT: u32 = 8;
 
+/// The nine surface aux-map channels uploaded together by
+/// [`HeightGpu::upload_aux_maps_ex`]. Every field is the same
+/// `Option<&MaskField>`, so this struct exists purely so callers match channels
+/// by name rather than by a fragile nine-deep positional argument list. Absent
+/// channels default to `None` (uploaded as a 1×1 zero map).
+#[derive(Default, Clone, Copy)]
+pub struct AuxMaps<'a> {
+    pub materials: Option<&'a MaskField>,
+    pub wetness: Option<&'a MaskField>,
+    pub vegetation: Option<&'a MaskField>,
+    pub temperature: Option<&'a MaskField>,
+    pub rainfall: Option<&'a MaskField>,
+    pub snow: Option<&'a MaskField>,
+    pub soil_moisture: Option<&'a MaskField>,
+    pub biomes: Option<&'a MaskField>,
+    pub flow: Option<&'a MaskField>,
+}
+
+/// Source geometry shared by every GPU height present/copy entry point: the
+/// texture dimensions plus the world-space mapping the shader needs to place
+/// the field. Groups the six values (`width`, `height`, `world_size`,
+/// `height_range`, `dx`, `dz`) that otherwise travel as a positional tail
+/// through the whole present/copy call chain.
+#[derive(Clone, Copy)]
+pub struct HeightPresentGeom {
+    pub width: u32,
+    pub height: u32,
+    pub world_size: (f32, f32),
+    pub height_range: (f32, f32),
+    pub dx: f32,
+    pub dz: f32,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct NormalUniforms {
@@ -509,25 +542,9 @@ impl HeightGpu {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         src: &wgpu::Texture,
-        width: u32,
-        height: u32,
-        world_size: (f32, f32),
-        height_range: (f32, f32),
-        dx: f32,
-        dz: f32,
+        geom: HeightPresentGeom,
     ) {
-        self.copy_from_texture_region_and_swap(
-            device,
-            queue,
-            src,
-            width,
-            height,
-            world_size,
-            height_range,
-            dx,
-            dz,
-            None,
-        );
+        self.copy_from_texture_region_and_swap(device, queue, src, geom, None);
     }
 
     pub fn copy_from_texture_region_and_swap(
@@ -535,14 +552,17 @@ impl HeightGpu {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         src: &wgpu::Texture,
-        width: u32,
-        height: u32,
-        world_size: (f32, f32),
-        height_range: (f32, f32),
-        dx: f32,
-        dz: f32,
+        geom: HeightPresentGeom,
         region: Option<SampleRect>,
     ) {
+        let HeightPresentGeom {
+            width,
+            height,
+            world_size,
+            height_range,
+            dx,
+            dz,
+        } = geom;
         self.shared_height_view = None;
         self.ensure_size(device, width, height);
         self.world_size = world_size;
@@ -633,6 +653,10 @@ impl HeightGpu {
         self.compute_normals_region_and_swap(device, queue, width, height, dx, dz, normal_rect);
     }
 
+    // Carries the normals-dispatch geometry (grid `w`/`h`, spacings `dx`/`dz`,
+    // dirty `region`) — a different, smaller tuple than `HeightPresentGeom` with
+    // no world-space mapping. Two private call sites; kept flat.
+    #[allow(clippy::too_many_arguments)]
     fn compute_normals_region_and_swap(
         &mut self,
         device: &wgpu::Device,
@@ -705,13 +729,16 @@ impl HeightGpu {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         src_view: &wgpu::TextureView,
-        width: u32,
-        height: u32,
-        world_size: (f32, f32),
-        height_range: (f32, f32),
-        dx: f32,
-        dz: f32,
+        geom: HeightPresentGeom,
     ) {
+        let HeightPresentGeom {
+            width,
+            height,
+            world_size,
+            height_range,
+            dx,
+            dz,
+        } = geom;
         self.shared_height_view = Some(src_view.clone());
         self.tex_size = (width, height);
         self.world_size = world_size;
@@ -731,6 +758,9 @@ impl HeightGpu {
         self.dispatch_normals_for_view(device, queue, src_view, width, height, dx, dz, region);
     }
 
+    // Same normals-dispatch geometry as `compute_normals_region_and_swap`, plus
+    // the source view to sample. Two private call sites; kept flat.
+    #[allow(clippy::too_many_arguments)]
     fn dispatch_normals_for_view(
         &mut self,
         device: &wgpu::Device,
@@ -864,58 +894,58 @@ impl HeightGpu {
         vegetation: Option<&MaskField>,
     ) {
         self.upload_aux_maps_ex(
-            device, queue, materials, wetness, vegetation, None, None, None, None, None, None,
+            device,
+            queue,
+            AuxMaps {
+                materials,
+                wetness,
+                vegetation,
+                ..Default::default()
+            },
         );
     }
 
     /// Upload materials/wetness/vegetation plus optional climate aux and flow (Phase H polish).
-    pub fn upload_aux_maps_ex(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        materials: Option<&MaskField>,
-        wetness: Option<&MaskField>,
-        vegetation: Option<&MaskField>,
-        temperature: Option<&MaskField>,
-        rainfall: Option<&MaskField>,
-        snow: Option<&MaskField>,
-        soil_moisture: Option<&MaskField>,
-        biomes: Option<&MaskField>,
-        flow: Option<&MaskField>,
-    ) {
+    pub fn upload_aux_maps_ex(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, aux: AuxMaps) {
         Self::upload_aux_map(
             device,
             queue,
             &mut self.materials,
-            materials,
+            aux.materials,
             "materials-r32",
         );
-        Self::upload_aux_map(device, queue, &mut self.wetness, wetness, "wetness-r32");
+        Self::upload_aux_map(device, queue, &mut self.wetness, aux.wetness, "wetness-r32");
         Self::upload_aux_map(
             device,
             queue,
             &mut self.vegetation,
-            vegetation,
+            aux.vegetation,
             "vegetation-r32",
         );
-        Self::upload_aux_map(device, queue, &mut self.flow, flow, "flow-r32");
+        Self::upload_aux_map(device, queue, &mut self.flow, aux.flow, "flow-r32");
         Self::upload_aux_map(
             device,
             queue,
             &mut self.temperature,
-            temperature,
+            aux.temperature,
             "temperature-r32",
         );
-        Self::upload_aux_map(device, queue, &mut self.rainfall, rainfall, "rainfall-r32");
-        Self::upload_aux_map(device, queue, &mut self.snow, snow, "snow-r32");
+        Self::upload_aux_map(
+            device,
+            queue,
+            &mut self.rainfall,
+            aux.rainfall,
+            "rainfall-r32",
+        );
+        Self::upload_aux_map(device, queue, &mut self.snow, aux.snow, "snow-r32");
         Self::upload_aux_map(
             device,
             queue,
             &mut self.soil_moisture,
-            soil_moisture,
+            aux.soil_moisture,
             "soil-moisture-r32",
         );
-        Self::upload_aux_map(device, queue, &mut self.biomes, biomes, "biomes-r32");
+        Self::upload_aux_map(device, queue, &mut self.biomes, aux.biomes, "biomes-r32");
     }
 
     fn upload_aux_map(

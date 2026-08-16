@@ -906,6 +906,10 @@ fn add_bilinear(
     amount
 }
 
+// Hot droplet-erosion kernel: height/erosion buffers + hardness field + grid
+// dims + brush position/radius/amount, each a distinct scalar. Flat is the
+// idiomatic, hot-path form. Kept flat.
+#[allow(clippy::too_many_arguments)]
 fn erode_particle_brush(
     heights: &mut [f32],
     erosion: &mut [f32],

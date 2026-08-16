@@ -1278,6 +1278,10 @@ impl FrameProfile {
         self.tile_uploads_pending = pending_uploads;
     }
 
+    // Distinct per-frame render-state inputs (scene versions, invalidation,
+    // frame counters, quality/timings, interaction, mode, sample count) with no
+    // natural sub-grouping. Kept flat.
+    #[allow(clippy::too_many_arguments)]
     pub fn update_progressive(
         &mut self,
         versions: terra_render::SceneVersions,
@@ -1454,6 +1458,10 @@ pub struct FrameUiOutput {
 }
 
 /// Draw all editor chrome with terra-gui.
+// Each argument is an independent &mut sub-panel state (chrome/tools/layers/
+// inspector/windows/dock); bundling them into one struct would just alias
+// separate borrows together. Kept flat.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_editor_gui(
     ui: &mut GuiContext<'_>,
     doc: &TerrainDocument,

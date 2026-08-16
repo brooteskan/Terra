@@ -458,6 +458,10 @@ impl ProgressiveRenderer {
         self.last_signature = Some(signature);
     }
 
+    // Progressive-resolve pass: distinct GPU handles (encoder + four views), the
+    // view-projection, and per-pass tuning/timestamp/debug inputs bound once
+    // each. Kept flat.
+    #[allow(clippy::too_many_arguments)]
     pub fn resolve_hdr(
         &mut self,
         device: &wgpu::Device,

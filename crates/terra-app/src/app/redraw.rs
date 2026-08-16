@@ -86,17 +86,17 @@ impl TerraApp {
                     };
                     let aux_fp = aux_maps_fingerprint(&self.scheduler.last_aux);
                     if aux_fp != self.aux_upload_fp {
-                        r.upload_aux_maps_ex(
-                            self.scheduler.last_aux.get("materials"),
-                            self.scheduler.last_aux.get("wetness"),
-                            self.scheduler.last_aux.get("vegetation"),
-                            self.scheduler.last_aux.get("temperature"),
-                            self.scheduler.last_aux.get("rainfall"),
-                            self.scheduler.last_aux.get("snow"),
-                            self.scheduler.last_aux.get("soil_moisture"),
-                            self.scheduler.last_aux.get("biomes"),
-                            self.scheduler.last_aux.get("flow_accumulation"),
-                        );
+                        r.upload_aux_maps_ex(terra_render::AuxMaps {
+                            materials: self.scheduler.last_aux.get("materials"),
+                            wetness: self.scheduler.last_aux.get("wetness"),
+                            vegetation: self.scheduler.last_aux.get("vegetation"),
+                            temperature: self.scheduler.last_aux.get("temperature"),
+                            rainfall: self.scheduler.last_aux.get("rainfall"),
+                            snow: self.scheduler.last_aux.get("snow"),
+                            soil_moisture: self.scheduler.last_aux.get("soil_moisture"),
+                            biomes: self.scheduler.last_aux.get("biomes"),
+                            flow: self.scheduler.last_aux.get("flow_accumulation"),
+                        });
                         self.aux_upload_fp = aux_fp;
                     }
                     r.upload_material_palette(material_palette.as_ref());

@@ -202,6 +202,9 @@ pub fn classify_biomes(
     out
 }
 
+// Predicate over a climate sample: the band plus six independent scalar
+// channels (height/wetness/temp/rain/snow/soil) and a use-climate flag. Kept flat.
+#[allow(clippy::too_many_arguments)]
 fn band_matches(
     band: &BiomeBand,
     h: f32,

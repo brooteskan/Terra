@@ -76,4 +76,3 @@ codegen-units = 1
 #   too_many_arguments, needless_range_loop — issue #74 says leave until profiling/API clarity.
 [workspace.lints.clippy]
 field_reassign_with_default = "allow"
-too_many_arguments = "allow"

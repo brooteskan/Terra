@@ -1701,27 +1701,44 @@ fn collect_rows(
         doc,
         &doc.stack,
         1,
-        collapsed,
-        doc.active_biome,
-        &doc.biome_library,
-        outdated,
+        RowCtx {
+            collapsed,
+            active_biome: doc.active_biome,
+            biome_library: &doc.biome_library,
+            outdated,
+        },
         &mut out,
     );
     out
 }
 // Folder order is driven by ArtistConcept::region_order / world_order.
 
+/// Immutable context threaded through the flat-row builders
+/// ([`emit_concept_stack`], [`walk_node_flat`], [`emit_biome_sections_ordered`]).
+/// Bundles the four read-only lookups every level needs so they stop travelling
+/// as a repeated four-argument tail; the mutable `out` accumulator stays a
+/// separate parameter. `Copy`, so recursive calls just pass it along.
+#[derive(Clone, Copy)]
+struct RowCtx<'a> {
+    collapsed: &'a [LayerId],
+    active_biome: Option<LayerId>,
+    biome_library: &'a terra_core::biome_definition::BiomeLibrary,
+    outdated: &'a [LayerId],
+}
+
 /// Emit stack nodes bucketed into WC terrain concept folders.
 fn emit_concept_stack(
     doc: &TerrainDocument,
     stack: &LayerStack,
     depth: u8,
-    collapsed: &[LayerId],
-    active_biome: Option<LayerId>,
-    biome_library: &terra_core::biome_definition::BiomeLibrary,
-    outdated: &[LayerId],
+    ctx: RowCtx,
     out: &mut Vec<LayerRow>,
 ) {
+    let RowCtx {
+        collapsed,
+        outdated,
+        ..
+    } = ctx;
     let order = ArtistConcept::terrain_order();
 
     let mut buckets: Vec<(ArtistConcept, Vec<(usize, &StackNode)>)> =
@@ -1804,11 +1821,8 @@ fn emit_concept_stack(
                     0,
                     child_depth,
                     *root_idx,
-                    collapsed,
-                    active_biome,
-                    biome_library,
                     Some(concept),
-                    outdated,
+                    ctx,
                     out,
                 );
                 for row in &mut out[before..] {
@@ -1822,11 +1836,8 @@ fn emit_concept_stack(
                     0,
                     child_depth,
                     *root_idx,
-                    collapsed,
-                    active_biome,
-                    biome_library,
                     Some(concept),
-                    outdated,
+                    ctx,
                     out,
                 );
             }
@@ -1974,13 +1985,16 @@ fn walk_node_flat(
     i: usize,
     depth: u8,
     root_idx: usize,
-    collapsed: &[LayerId],
-    active_biome: Option<LayerId>,
-    biome_library: &terra_core::biome_definition::BiomeLibrary,
     parent_concept: Option<ArtistConcept>,
-    outdated: &[LayerId],
+    ctx: RowCtx,
     out: &mut Vec<LayerRow>,
 ) {
+    let RowCtx {
+        collapsed,
+        active_biome,
+        biome_library,
+        outdated,
+    } = ctx;
     match &nodes[i] {
         StackNode::Layer(layer) => {
             let mut row = layer_row(layer, root_idx, depth);
@@ -2007,18 +2021,7 @@ fn walk_node_flat(
 
             if is_category {
                 for ci in (0..g.children.len()).rev() {
-                    walk_node_flat(
-                        &g.children,
-                        ci,
-                        depth,
-                        root_idx,
-                        collapsed,
-                        active_biome,
-                        biome_library,
-                        parent_concept,
-                        outdated,
-                        out,
-                    );
+                    walk_node_flat(&g.children, ci, depth, root_idx, parent_concept, ctx, out);
                 }
                 return;
             }
@@ -2049,11 +2052,8 @@ fn walk_node_flat(
                     g,
                     root_idx,
                     depth.saturating_add(1),
-                    collapsed,
-                    active_biome,
-                    biome_library,
                     parent_concept,
-                    outdated,
+                    ctx,
                     out,
                 );
                 emit_advanced_placement(g, root_idx, depth, collapsed, out);
@@ -2066,11 +2066,8 @@ fn walk_node_flat(
                     ci,
                     child_depth,
                     root_idx,
-                    collapsed,
-                    active_biome,
-                    biome_library,
                     parent_concept,
-                    outdated,
+                    ctx,
                     out,
                 );
             }
@@ -2083,11 +2080,8 @@ fn emit_biome_sections_ordered(
     biome: &terra_core::layer::LayerGroup,
     root_idx: usize,
     depth: u8,
-    collapsed: &[LayerId],
-    active_biome: Option<LayerId>,
-    biome_library: &terra_core::biome_definition::BiomeLibrary,
     parent_concept: Option<ArtistConcept>,
-    outdated: &[LayerId],
+    ctx: RowCtx,
     out: &mut Vec<LayerRow>,
 ) {
     // Non-section children first (rare), then canonical section order.
@@ -2103,11 +2097,8 @@ fn emit_biome_sections_ordered(
                 ci,
                 depth,
                 root_idx,
-                collapsed,
-                active_biome,
-                biome_library,
                 parent_concept,
-                outdated,
+                ctx,
                 out,
             );
         }
@@ -2127,11 +2118,8 @@ fn emit_biome_sections_ordered(
             ci,
             depth,
             root_idx,
-            collapsed,
-            active_biome,
-            biome_library,
             parent_concept,
-            outdated,
+            ctx,
             out,
         );
     }
@@ -2435,6 +2423,9 @@ fn resolve_biome_swatch_color(
     }
     terra_core::layer::palette_preview_color(g.id.0.as_u128())
 }
+// egui context-menu builder: ui + doc/ui_state + the layer id and cursor
+// position + the state/action sink it mutates, each used once. Kept flat.
+#[allow(clippy::too_many_arguments)]
 fn draw_layer_context_menu(
     ui: &mut GuiContext<'_>,
     doc: &TerrainDocument,

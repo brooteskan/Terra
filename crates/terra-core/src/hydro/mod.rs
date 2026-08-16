@@ -331,6 +331,9 @@ fn max_local_slope(hf: &Heightfield, i: u32, j: u32) -> f32 {
 ///
 /// Returns `(rate, step)`: the un-capped incision rate (for the erosion aux) and
 /// the capped per-step incision depth.
+// Stream-power increment: nine independent physical scalars (discharge/slope/
+// k/m/n/softness/dt and the two caps); the flat form is standard for the
+// equation and a struct would group nothing. Kept flat.
 #[allow(clippy::too_many_arguments)]
 pub fn spe_increment(
     q_or_area: f32,

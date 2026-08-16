@@ -1767,6 +1767,10 @@ impl GpuTerrainEngine {
     /// `bridge_prefix` is an optional heightfield representing the stack through the layer
     /// before `first_dirty` (CPU cache / last-good). It lets filters stay live on GPU when
     /// earlier shape layers are not GPU-supported but already baked.
+    // GPU evaluation entry point: the wgpu context plus the independent inputs a
+    // full evaluation needs (stack, mask assets, metrics, quality, flags,
+    // bridge prefix), each used once. Kept flat.
+    #[allow(clippy::too_many_arguments)]
     pub fn evaluate(
         &mut self,
         device: &wgpu::Device,

@@ -278,6 +278,10 @@ impl LandscapeEvolutionOperator {
     }
 }
 
+// Assembles the evolution output from independent by-products (evolved/tectonic
+// fields, incision/erosion buffers, uplift/deposition, metrics, params, original
+// and locks); heterogeneous, each consumed once. Kept flat.
+#[allow(clippy::too_many_arguments)]
 fn finalize(
     mut evolved: Heightfield,
     mut tectonic: Heightfield,

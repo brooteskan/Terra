@@ -658,26 +658,32 @@ impl TerraApp {
                                         && r.h == result.height
                                 });
                                 if full_field {
+                                    let geom = terra_render::HeightPresentGeom {
+                                        width: result.width,
+                                        height: result.height,
+                                        world_size: result.world_size,
+                                        height_range: result.height_range,
+                                        dx,
+                                        dz,
+                                    };
                                     renderer.present_gpu_height_shared(
                                         engine.output_texture(),
                                         engine.output_texture_view(),
-                                        result.width,
-                                        result.height,
-                                        result.world_size,
-                                        result.height_range,
-                                        dx,
-                                        dz,
+                                        geom,
                                         None,
                                     );
                                 } else if let Some(region) = region {
-                                    renderer.present_gpu_height_region(
-                                        engine.output_texture(),
-                                        result.width,
-                                        result.height,
-                                        result.world_size,
-                                        result.height_range,
+                                    let geom = terra_render::HeightPresentGeom {
+                                        width: result.width,
+                                        height: result.height,
+                                        world_size: result.world_size,
+                                        height_range: result.height_range,
                                         dx,
                                         dz,
+                                    };
+                                    renderer.present_gpu_height_region(
+                                        engine.output_texture(),
+                                        geom,
                                         Some(region),
                                     );
                                 }

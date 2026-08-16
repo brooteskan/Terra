@@ -640,6 +640,9 @@ fn draw_viewport_display_bar(
     ui.end_overlay();
 }
 
+// egui toggle-button helper: ui + id/rect + icon/title/tip + active state +
+// radius, each used once to render one control. Kept flat.
+#[allow(clippy::too_many_arguments)]
 fn display_aid_toggle(
     ui: &mut GuiContext<'_>,
     id: Id,
@@ -741,6 +744,9 @@ fn lighting_combo_button(
     clicked
 }
 
+// egui button helper: ui + id/rect + label + visual state (active/font_scale/
+// radius/dropdown), each used once. Kept flat.
+#[allow(clippy::too_many_arguments)]
 fn mode_button(
     ui: &mut GuiContext<'_>,
     id: Id,
@@ -1544,6 +1550,9 @@ fn draw_brush_bar(ui: &mut GuiContext<'_>, state: &mut UiState, vp: Rect) {
     ui.end_overlay();
 }
 
+// egui slider helper: ui + id + layout (x, bar) + label + value and its bounds,
+// each used once to draw one slider. Kept flat.
+#[allow(clippy::too_many_arguments)]
 fn compact_slider(
     ui: &mut GuiContext<'_>,
     id: Id,

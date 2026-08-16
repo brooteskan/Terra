@@ -1158,6 +1158,9 @@ pub fn draw_new_project_templates(
     choice
 }
 
+// egui immediate-mode strip: ui + layout rect/id + the template list and the
+// selection/scroll/settings state it mutates + card metrics, each used once. Kept flat.
+#[allow(clippy::too_many_arguments)]
 fn draw_template_strip(
     ui: &mut GuiContext<'_>,
     strip_id: Id,
@@ -1401,6 +1404,9 @@ fn paint_design_thumb(ui: &mut GuiContext<'_>, template_id: &str, thumb: Rect) {
     );
 }
 
+// egui slider-row helper: ui + layout rect/id + icon/label + value and its
+// bounds + integer flag, consumed once to draw one row. Kept flat.
+#[allow(clippy::too_many_arguments)]
 fn draw_setting_row(
     ui: &mut GuiContext<'_>,
     id: Id,

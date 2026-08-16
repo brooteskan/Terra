@@ -183,6 +183,9 @@ impl BiomeLayer {
     }
 
     /// Stamp a circular brush into the active biome channel.
+    // Paint stamp: target biome id + brush centre (u,v) + radius/strength +
+    // erase flag + resolution, each a distinct scalar. Kept flat.
+    #[allow(clippy::too_many_arguments)]
     pub fn stamp(
         &mut self,
         biome_id: LayerId,

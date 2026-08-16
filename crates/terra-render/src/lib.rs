@@ -64,7 +64,7 @@ pub use frame_graph::{FrameGraph, FrameSchedule, PassKind};
 pub use gpu_timing::GpuTimings;
 pub use grid::TerrainGrid;
 pub use guides::{GuideOverlay, GuideState};
-pub use height_gpu::HeightGpu;
+pub use height_gpu::{AuxMaps, HeightGpu, HeightPresentGeom};
 pub use overhang::OverhangOverlay;
 pub use path_tracer::{PathTraceUniforms, PathTracer};
 pub use render_quality::{
@@ -1025,6 +1025,10 @@ impl TerrainRenderer {
 
     // (pipeline compile complete — logged via terrain shader message above)
 
+    // Assembles one wgpu bind group from eleven distinct GPU handles (buffers,
+    // views, samplers), each bound once by position to build the descriptor — a
+    // params struct would only relocate the same list. Kept flat.
+    #[allow(clippy::too_many_arguments)]
     fn make_bind_group(
         device: &wgpu::Device,
         layout: &wgpu::BindGroupLayout,
@@ -1295,37 +1299,18 @@ impl TerrainRenderer {
         wetness: Option<&MaskField>,
         vegetation: Option<&MaskField>,
     ) {
-        self.upload_aux_maps_ex(
-            materials, wetness, vegetation, None, None, None, None, None, None,
-        );
-    }
-
-    /// Upload materials/wetness/vegetation plus optional climate R32Float aux maps and flow.
-    pub fn upload_aux_maps_ex(
-        &mut self,
-        materials: Option<&MaskField>,
-        wetness: Option<&MaskField>,
-        vegetation: Option<&MaskField>,
-        temperature: Option<&MaskField>,
-        rainfall: Option<&MaskField>,
-        snow: Option<&MaskField>,
-        soil_moisture: Option<&MaskField>,
-        biomes: Option<&MaskField>,
-        flow: Option<&MaskField>,
-    ) {
-        self.heights.upload_aux_maps_ex(
-            &self.device,
-            &self.queue,
+        self.upload_aux_maps_ex(AuxMaps {
             materials,
             wetness,
             vegetation,
-            temperature,
-            rainfall,
-            snow,
-            soil_moisture,
-            biomes,
-            flow,
-        );
+            ..Default::default()
+        });
+    }
+
+    /// Upload materials/wetness/vegetation plus optional climate R32Float aux maps and flow.
+    pub fn upload_aux_maps_ex(&mut self, aux: AuxMaps) {
+        self.heights
+            .upload_aux_maps_ex(&self.device, &self.queue, aux);
         self.recreate_bind_group();
         self.notify_invalidation(InvalidationReason::MaterialChanged);
     }
@@ -1339,28 +1324,14 @@ impl TerrainRenderer {
     }
 
     /// Present a GPU-resident height texture (Wave C — no CPU readback).
-    pub fn present_gpu_height(
-        &mut self,
-        src: &wgpu::Texture,
-        width: u32,
-        height: u32,
-        world_size: (f32, f32),
-        height_range: (f32, f32),
-        dx: f32,
-        dz: f32,
-    ) {
-        self.present_gpu_height_region(src, width, height, world_size, height_range, dx, dz, None);
+    pub fn present_gpu_height(&mut self, src: &wgpu::Texture, geom: HeightPresentGeom) {
+        self.present_gpu_height_region(src, geom, None);
     }
 
     pub fn present_gpu_height_region(
         &mut self,
         src: &wgpu::Texture,
-        width: u32,
-        height: u32,
-        world_size: (f32, f32),
-        height_range: (f32, f32),
-        dx: f32,
-        dz: f32,
+        geom: HeightPresentGeom,
         region: Option<SampleRect>,
     ) {
         profiling::scope!("present_gpu_height");
@@ -1369,12 +1340,7 @@ impl TerrainRenderer {
             &self.device,
             &self.queue,
             src,
-            width,
-            height,
-            world_size,
-            height_range,
-            dx,
-            dz,
+            geom,
             region,
         );
         self.finish_height_present(t0);
@@ -1386,40 +1352,17 @@ impl TerrainRenderer {
         &mut self,
         src: &wgpu::Texture,
         src_view: &wgpu::TextureView,
-        width: u32,
-        height: u32,
-        world_size: (f32, f32),
-        height_range: (f32, f32),
-        dx: f32,
-        dz: f32,
+        geom: HeightPresentGeom,
         region: Option<SampleRect>,
     ) {
         if region.is_some() {
-            self.present_gpu_height_region(
-                src,
-                width,
-                height,
-                world_size,
-                height_range,
-                dx,
-                dz,
-                region,
-            );
+            self.present_gpu_height_region(src, geom, region);
             return;
         }
         profiling::scope!("present_gpu_height_shared");
         let t0 = std::time::Instant::now();
-        self.heights.present_shared_height(
-            &self.device,
-            &self.queue,
-            src_view,
-            width,
-            height,
-            world_size,
-            height_range,
-            dx,
-            dz,
-        );
+        self.heights
+            .present_shared_height(&self.device, &self.queue, src_view, geom);
         self.finish_height_present(t0);
     }
 
@@ -1569,6 +1512,10 @@ impl TerrainRenderer {
     ///
     /// `atlas_view` / `page_table` must remain valid while streaming is enabled
     /// (typically owned by `GpuTileAtlas` in the app).
+    // Installs the tile-stream resources plus their scalar config in one call;
+    // the arguments are heterogeneous (views/buffers + sizes/level/revision/
+    // flag) and each is stored into a distinct field. Kept flat.
+    #[allow(clippy::too_many_arguments)]
     pub fn set_tile_stream_resources(
         &mut self,
         atlas_view: wgpu::TextureView,

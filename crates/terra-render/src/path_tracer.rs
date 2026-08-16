@@ -390,6 +390,10 @@ impl PathTracer {
         &self.outputs.normal_view
     }
 
+    // wgpu compute dispatch: device/queue/encoder + three input views +
+    // uniforms + spp + optional timestamps, each threaded straight into the
+    // pass. Kept flat.
+    #[allow(clippy::too_many_arguments)]
     pub fn dispatch(
         &mut self,
         device: &wgpu::Device,
@@ -488,6 +492,9 @@ impl PathTracer {
     }
 
     /// Convenience builder from camera matrices and lighting.
+    // Camera/lighting → uniforms builder: independent scalars and small tuples
+    // (matrices, fov/near/far, sun/clear/exposure, world/height/tex sizes)
+    // packed once into the uniform struct. Kept flat.
     #[allow(clippy::too_many_arguments)]
     pub fn uniforms_from_scene(
         view_inv: Mat4,

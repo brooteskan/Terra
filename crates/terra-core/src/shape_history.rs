@@ -283,6 +283,9 @@ pub fn is_shape_history_layer(kind: &LayerKind) -> bool {
 }
 
 /// Append or extend a stroke on params (coverage stored on the layer).
+// Sculpt-stroke stamp: the stroke params plus the brush kind, uv position,
+// radius/strength/target and a continuing flag, each used once. Kept flat.
+#[allow(clippy::too_many_arguments)]
 pub fn stamp_stroke(
     params: &mut SculptStrokeParams,
     kind: SculptStrokeKind,
