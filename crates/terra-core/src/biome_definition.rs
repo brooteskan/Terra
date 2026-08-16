@@ -334,10 +334,16 @@ impl BiomeLibrary {
         reef.placement.rules = Some(reef_rules());
         reef.terrain_layers = vec![(
             "Shelf Flatten".into(),
+            // Bilateral (edge-preserving), not the `Smooth` box blur: this layer
+            // sits on the shallow reef shelf directly against deep bathymetry, and
+            // a plain low-pass bleeds the shelf across that discontinuity into the
+            // basin (see #95 / #18). `Denoise`'s range weight (`amount` = sigma in
+            // metres) flattens the shelf's own ripple while preserving the sharp
+            // shelf->basin step.
             LayerKind::EffectFilter(EffectFilterParams {
-                kind: EffectFilterKind::Smooth,
+                kind: EffectFilterKind::Denoise,
                 strength: 0.5,
-                ..EffectFilterParams::smooth()
+                ..EffectFilterParams::denoise()
             }),
         )];
         reef.material_layers = vec![("Reef".into(), LayerKind::Materials(reef_materials()))];
