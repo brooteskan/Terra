@@ -154,9 +154,9 @@ impl TerrainHydroState {
         let height = input.to_dense();
         let (bedrock, loose_sediment, resistance) = if let Some(m) = materials {
             let mut res = vec![m.bedrock_hardness; n];
-            for i in 0..n {
-                if m.loose_sediment[i] > 1e-5 {
-                    res[i] = m.sediment_hardness;
+            for (r, &loose) in res.iter_mut().zip(&m.loose_sediment) {
+                if loose > 1e-5 {
+                    *r = m.sediment_hardness;
                 }
             }
             (m.bedrock.clone(), m.loose_sediment.clone(), res)
@@ -665,6 +665,11 @@ impl HydraulicErosionCore {
         );
         // Flux / velocity proxies from wetness + water depth.
         let wet = result.wetness.data();
+        // Shared `i` fans out across many parallel result/state fields
+        // (water_raw/wet/sediment_raw + water_flux/velocity/suspended/
+        // concentration/loose/bedrock/resistance), several mutated in place —
+        // no clean single-iterator rewrite. Left indexed pending profiling (#96).
+        #[allow(clippy::needless_range_loop)]
         for i in 0..state.water_flux.len() {
             let w = result.water_raw.data()[i].max(0.0);
             let flux = wet[i].max(0.0);

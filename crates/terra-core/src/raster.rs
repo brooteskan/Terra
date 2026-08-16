@@ -262,6 +262,10 @@ fn area_sample_axis(
     let last = end.ceil().min(source_len as f32) as usize;
     let mut sum = 0.0;
     let mut weight = 0.0;
+    // `source_index` is used as a float in the overlap arithmetic
+    // (`source_index as f32`, `(source_index + 1) as f32`), not merely to index
+    // `source`, and the range is a sub-slice `first..last`. Kept indexed.
+    #[allow(clippy::needless_range_loop)]
     for source_index in first..last {
         let overlap =
             (end.min((source_index + 1) as f32) - start.max(source_index as f32)).max(0.0);

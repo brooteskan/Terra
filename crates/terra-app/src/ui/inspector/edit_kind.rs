@@ -1806,9 +1806,9 @@ pub(crate) fn edit_level_step_ex(
             curve.resize(bars, 1.0);
             changed = true;
         }
-        for i in 0..bars {
+        for (i, band) in curve.iter_mut().enumerate() {
             let label_s = format!("L{} Strength", i);
-            if slider_f32(ui, &label_s, &mut curve[i], 0.0, 2.0) {
+            if slider_f32(ui, &label_s, band, 0.0, 2.0) {
                 changed = true;
             }
         }

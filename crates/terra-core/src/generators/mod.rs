@@ -1906,10 +1906,10 @@ pub fn sand_simulation_full(
     let mut state = analyze::AeolianState::from_height_and_sand(input, 0.0, Some(&sand));
     // Treat input height as bedrock + existing cover: peel authored sand off the DEM.
     let dense = input.to_dense();
-    for i in 0..dense.len() {
-        let s = state.sand[i].min(dense[i].max(0.0));
-        state.sand[i] = s;
-        state.bedrock[i] = (dense[i] - s).max(0.0);
+    for ((sand, bedrock), &d) in state.sand.iter_mut().zip(&mut state.bedrock).zip(&dense) {
+        let s = (*sand).min(d.max(0.0));
+        *sand = s;
+        *bedrock = (d - s).max(0.0);
     }
 
     let transport = analyze::AeolianTransportParams {

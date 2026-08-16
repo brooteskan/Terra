@@ -208,6 +208,10 @@ impl BrushOverlay {
         let rx = radius_uv.max(0.002) * wx;
         let rz = radius_uv.max(0.002) * wz;
         let mut out = [0.0f32; VERT_CAP];
+        // `i` drives the ring angle (`i as f32 / RING_SEGMENTS`), not just the
+        // `out[i]` write, and the inclusive range walks one past the segment
+        // count to close the ring. Kept indexed.
+        #[allow(clippy::needless_range_loop)]
         for i in 0..=RING_SEGMENTS {
             let t = (i as f32 / RING_SEGMENTS as f32) * std::f32::consts::TAU;
             let x = cx + t.cos() * rx;

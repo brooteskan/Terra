@@ -32,9 +32,9 @@ impl DrainageCache {
 
         // Single D8 receiver per cell (`usize::MAX` = outlet / sink).
         let mut receiver = vec![usize::MAX; n];
-        for idx in 0..n {
+        for (idx, slot) in receiver.iter_mut().enumerate() {
             if let Some(r) = graph.d8_receiver_index(idx) {
-                receiver[idx] = r;
+                *slot = r;
             }
         }
 
