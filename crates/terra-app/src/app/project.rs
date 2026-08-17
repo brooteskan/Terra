@@ -592,6 +592,11 @@ impl TerraApp {
         use terra_core::shape_history::{
             create_shape_layer, resolve_shape_target, ShapeTargetDecision,
         };
+        // Track the layer selected before the brush resolves its target, so we
+        // can tell the artist when a stroke silently retargets or creates a layer
+        // (e.g. brushing with a generator like "Flat" selected redirects to a
+        // Sculpt-Strokes layer). Fires once per switch, not per stamp.
+        let prev_selected = self.session.document.selected;
         let decision = resolve_shape_target(
             &self.session.document.stack,
             self.session.document.selected,
@@ -607,15 +612,31 @@ impl TerraApp {
                     self.ui_state.shape_session_layer = Some(id);
                 }
                 self.session.document.selected = Some(id);
+                if prev_selected != Some(id) {
+                    let name = self
+                        .session
+                        .document
+                        .stack
+                        .find(id)
+                        .map(|l| l.common.name.clone())
+                        .unwrap_or_else(|| "Shape Layer".into());
+                    let msg = format!("Brush is painting on Shape Layer \"{name}\"");
+                    log::info!("{msg}");
+                    self.ui_state.status = msg;
+                }
                 Some(id)
             }
             ShapeTargetDecision::CreateNew { name, .. } => {
+                let display_name = name.clone();
                 let layer = create_shape_layer(name);
                 let id = layer.id();
                 self.session.document.stack.ensure_category_folders();
                 self.session.document.stack.push_routed(layer, None, false);
                 self.session.document.selected = Some(id);
                 self.ui_state.shape_session_layer = Some(id);
+                let msg = format!("Created new Shape Layer \"{display_name}\" to paint on");
+                log::info!("{msg}");
+                self.ui_state.status = msg;
                 Some(id)
             }
         }
