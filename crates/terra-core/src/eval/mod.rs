@@ -40,6 +40,8 @@ pub enum EvalError {
     LayerPanicked { layer: String, message: String },
     #[error("evaluation panicked: {0}")]
     Panicked(String),
+    #[error("invalid metrics: {0}")]
+    InvalidMetrics(#[from] crate::heightfield::MetricsError),
 }
 
 impl EvalError {

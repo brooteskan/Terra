@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use crate::logging::OperationContext;
 use crate::ui::Preview2dMode;
 use terra_core::eval::{EvalWorkRequest, PreviewQuality};
-use terra_core::heightfield::{Heightfield, HeightfieldMetrics};
+use terra_core::heightfield::Heightfield;
 use terra_core::layer::{LayerId, LayerKind};
 use terra_core::mask::bake_mask_assets;
 use terra_gpu::GpuError;
@@ -585,15 +585,17 @@ impl TerraApp {
             .map(|layer| layer.common.name.clone())
             .or_else(|| Some("terrain".into()));
         let res = quality.resolution(preview, export);
-        let metrics = HeightfieldMetrics {
-            width: res,
-            height: res,
-            world_size_x: base.world_size_x,
-            world_size_z: base.world_size_z,
-            tile_size: base.tile_size.min(res),
-            halo: base.halo,
-        };
         let token = self.eval_token;
+        let metrics = match base.at_resolution(res) {
+            Ok(metrics) => metrics,
+            Err(error) => {
+                // Loads validate metrics, so this is only reachable if the live
+                // document's base metrics were corrupted in memory. Surface it as
+                // an evaluation failure instead of panicking in tile arithmetic.
+                self.handle_evaluation_failure_details(token, quality, None, false, error);
+                return;
+            }
+        };
         let operation_context = self.evaluation_log_context(token, quality);
         // Interactive evaluation must never force a GPU readback/Wait on the UI thread.
         let want_cpu = false;

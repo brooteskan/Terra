@@ -409,3 +409,34 @@ fn rectangular_sculpt_sources_round_trip_in_version_3() {
     );
     assert_eq!(params.samples.len(), 128 * 256);
 }
+
+#[test]
+fn invalid_heightfield_metrics_are_rejected_at_load_without_panicking() {
+    // A structurally valid document whose metrics violate a representation
+    // invariant must fail to load cleanly (a typed error), never panic later in
+    // tile arithmetic. Each case mutates one field of a known-good fixture.
+    for (field, bad) in [
+        ("width", serde_json::json!(0)),
+        ("height", serde_json::json!(0)),
+        ("tile_size", serde_json::json!(0)),
+        ("world_size_x", serde_json::json!(-1.0)),
+        ("world_size_z", serde_json::json!(0.0)),
+    ] {
+        let mut value: serde_json::Value =
+            serde_json::from_str(V2_FIXTURE).expect("valid fixture JSON");
+        assert!(
+            value["metrics"].is_object(),
+            "fixture must carry a metrics object"
+        );
+        value["metrics"][field] = bad.clone();
+        let raw = serde_json::to_string(&value).expect("mutated fixture serializes");
+
+        let error = TerrainDocument::from_json(&raw)
+            .err()
+            .unwrap_or_else(|| panic!("metrics.{field} = {bad} must be rejected"));
+        assert!(
+            error.to_string().contains("invalid heightfield metrics"),
+            "metrics.{field}: expected a metrics validation error, got: {error}"
+        );
+    }
+}

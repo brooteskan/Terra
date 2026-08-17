@@ -91,7 +91,7 @@ pub use domain::{
     workflow_stage_metadata_order, world_eval_outline, DomainBiomeRef, DomainLayerRef,
     DomainParent, DomainRole, DomainView, SoftDiagnostic,
 };
-pub use heightfield::{HeightTile, Heightfield, HeightfieldMetrics, TileId};
+pub use heightfield::{HeightTile, Heightfield, HeightfieldMetrics, MetricsError, TileId};
 pub use landscape_blueprint::{
     preview_resolution_for_world_size, ArchetypeId, EvalStage, LandscapeBlueprint,
 };

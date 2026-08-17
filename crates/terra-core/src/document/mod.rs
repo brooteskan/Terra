@@ -421,6 +421,9 @@ impl TerrainDocument {
                 doc.version, DOCUMENT_VERSION
             )));
         }
+        doc.metrics.validate().map_err(|error| {
+            serde::de::Error::custom(format!("invalid heightfield metrics: {error}"))
+        })?;
         doc.normalize_wc_tree();
         Ok(doc)
     }

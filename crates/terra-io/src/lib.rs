@@ -14,7 +14,7 @@ pub use import::{import_heightmap_png, import_heightmap_raw};
 use std::path::PathBuf;
 use terra_core::document::TerrainDocument;
 use terra_core::eval::{EvalContext, PreviewQuality, StackEvaluator};
-use terra_core::heightfield::{Heightfield, HeightfieldMetrics};
+use terra_core::heightfield::Heightfield;
 use terra_jobs::{spawn_one_shot, CancelToken, JobCtx, JobError, JobHandle, Pending, Pollable};
 use thiserror::Error;
 
@@ -28,6 +28,8 @@ pub enum IoError {
     Json(#[from] serde_json::Error),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Metrics(#[from] terra_core::heightfield::MetricsError),
 }
 
 pub struct BuildJob {
@@ -147,14 +149,7 @@ fn evaluate_document_for_export(
     doc: &TerrainDocument,
     cancel: CancelToken,
 ) -> Result<(Heightfield, EvalContext), terra_core::eval::EvalError> {
-    let metrics = HeightfieldMetrics {
-        width: doc.export_resolution,
-        height: doc.export_resolution,
-        world_size_x: doc.metrics.world_size_x,
-        world_size_z: doc.metrics.world_size_z,
-        tile_size: doc.metrics.tile_size.min(doc.export_resolution),
-        halo: doc.metrics.halo,
-    };
+    let metrics = doc.metrics.at_resolution(doc.export_resolution)?;
     let mut evaluator = StackEvaluator::new();
     // Export runs a full rebuild from scratch and never reloads its own baked
     // checkpoints; spilling export-resolution bakes into the shared cache dir (and
@@ -430,6 +425,19 @@ mod worker_tests {
         assert!(
             matches!(result, Err(terra_core::eval::EvalError::Cancelled)),
             "a cancelled token must abort export eval"
+        );
+    }
+
+    #[test]
+    fn export_rejects_invalid_resolution_without_panicking() {
+        // A zero export resolution would derive a zero-dimension, zero-tile
+        // metrics and panic in tile arithmetic. It must surface as a typed error.
+        let mut doc = flat_doc();
+        doc.export_resolution = 0;
+        let result = evaluate_document_for_export(&doc, CancelToken::never());
+        assert!(
+            matches!(result, Err(terra_core::eval::EvalError::InvalidMetrics(_))),
+            "an invalid export resolution must abort export eval with a typed error"
         );
     }
 

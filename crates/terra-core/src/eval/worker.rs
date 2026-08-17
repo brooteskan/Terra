@@ -254,14 +254,7 @@ fn run_cpu_job(
     }
 
     let res = job.quality.resolution(job.preview_res, job.export_res);
-    let metrics = HeightfieldMetrics {
-        width: res,
-        height: res,
-        world_size_x: job.base_metrics.world_size_x,
-        world_size_z: job.base_metrics.world_size_z,
-        tile_size: job.base_metrics.tile_size.min(res),
-        halo: job.base_metrics.halo,
-    };
+    let metrics = job.base_metrics.at_resolution(res)?;
 
     if job.mark_all_dirty {
         evaluator.mark_all_dirty(&job.stack);
