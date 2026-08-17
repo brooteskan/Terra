@@ -77,7 +77,7 @@ impl SculptParams {
         }
     }
 
-    /// Soft circular stamp. `mode`: 0 = raise, 1 = lower, 2 = smooth.
+    /// Soft circular stamp. `mode`: 0 = raise, 1 = lower, 2 = smooth, 3 = flatten.
     pub fn stamp_circle(&mut self, u: f32, v: f32, radius_uv: f32, strength: f32, mode: u8) {
         self.ensure_buffer();
         let width = self.width;
@@ -130,6 +130,46 @@ impl SculptParams {
             }
             for (idx, val) in updates {
                 self.samples[idx] = val;
+            }
+            return;
+        }
+
+        if mode == 3 {
+            // Flatten: pull the footprint toward its own mean height. This is a
+            // lerp toward an average, so it is bounded by the footprint's existing
+            // range and settles terrain instead of accumulating (mode 0 raise,
+            // which flatten used to fall through to, ran away).
+            let mut sum = 0.0f64;
+            let mut count = 0.0f64;
+            for j in min_j..=max_j {
+                for i in min_i..=max_i {
+                    let x = (i as f32 + 0.5) / width as f32;
+                    let y = (j as f32 + 0.5) / height as f32;
+                    let d = ((x - u).powi(2) + (y - v).powi(2)).sqrt() / radius;
+                    if d > 1.0 {
+                        continue;
+                    }
+                    sum += self.samples[(j * width + i) as usize] as f64;
+                    count += 1.0;
+                }
+            }
+            if count <= 0.0 {
+                return;
+            }
+            let mean = (sum / count) as f32;
+            for j in min_j..=max_j {
+                for i in min_i..=max_i {
+                    let x = (i as f32 + 0.5) / width as f32;
+                    let y = (j as f32 + 0.5) / height as f32;
+                    let d = ((x - u).powi(2) + (y - v).powi(2)).sqrt() / radius;
+                    if d > 1.0 {
+                        continue;
+                    }
+                    let falloff = (1.0 - d * d) * strength.clamp(0.0, 1.0);
+                    let idx = (j * width + i) as usize;
+                    let cur = self.samples[idx];
+                    self.samples[idx] = cur + (mean - cur) * falloff;
+                }
             }
             return;
         }
@@ -250,5 +290,48 @@ impl Default for RampParams {
             height_max: 100.0,
             direction: 0.0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SculptParams;
+
+    fn peak(p: &SculptParams) -> f32 {
+        p.samples.iter().copied().fold(f32::MIN, f32::max)
+    }
+    fn floor(p: &SculptParams) -> f32 {
+        p.samples.iter().copied().fold(f32::MAX, f32::min)
+    }
+
+    #[test]
+    fn flatten_mode_settles_toward_mean_and_never_runs_away() {
+        // Raise a bump, then flatten it. Flatten (mode 3) must pull the footprint
+        // toward its mean without ever exceeding the pre-flatten range — the old
+        // behavior fell through to raise (mode 0) and grew every stamp.
+        let mut p = SculptParams::filled(64, 0.0);
+        p.stamp_circle(0.5, 0.5, 0.3, 50.0, 0);
+        let (peak0, floor0) = (peak(&p), floor(&p));
+        let center0 = p.samples[(32 * 64 + 32) as usize];
+
+        for _ in 0..12 {
+            p.stamp_circle(0.5, 0.5, 0.3, 1.0, 3);
+        }
+
+        assert!(
+            peak(&p) <= peak0 + 1e-3,
+            "flatten raised the peak: {peak0} -> {}",
+            peak(&p)
+        );
+        assert!(
+            floor(&p) >= floor0 - 1e-3,
+            "flatten sank the floor: {floor0} -> {}",
+            floor(&p)
+        );
+        let center1 = p.samples[(32 * 64 + 32) as usize];
+        assert!(
+            center1 < center0,
+            "brush centre was not flattened down: {center0} -> {center1}"
+        );
     }
 }

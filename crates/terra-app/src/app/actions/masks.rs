@@ -347,6 +347,7 @@ pub(crate) fn try_apply(
                         | terra_core::authoring::SculptStrokeKind::Erode => 1u8,
                         terra_core::authoring::SculptStrokeKind::Smooth
                         | terra_core::authoring::SculptStrokeKind::Pinch => 2u8,
+                        terra_core::authoring::SculptStrokeKind::Flatten => 3u8,
                         _ => 0u8,
                     };
                     params.stamp_circle(u, v, radius, strength, mode);
