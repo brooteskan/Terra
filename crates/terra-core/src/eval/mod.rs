@@ -869,6 +869,9 @@ impl StackEvaluator {
                 Ok(g)
             }
             LayerKind::Path(p) => self.generate_scoped_path(ctx, input, p, layer.id(), scope),
+            LayerKind::SculptStrokes(p) => {
+                self.generate_scoped_sculpt(ctx, input, p, layer.id(), scope)
+            }
 
             // Input-independent generators (#110): recompute only the scope tiles
             // into a zero-seeded field via the matching `*_tiles` entry. Values
@@ -1021,6 +1024,74 @@ impl StackEvaluator {
         }
         ctx.aux_insert(keys::WETNESS, wet);
         Ok(g)
+    }
+
+    /// Scoped SculptStrokes recompute (#110): stamp only the scope tiles (plus
+    /// the stroke-footprint fixpoint inside `apply_sculpt_strokes_scoped`) and
+    /// re-merge the five per-texel aux channels over the recomputed tiles,
+    /// seeding clean tiles from the previous cached merge — the tile-scoped
+    /// equivalent of `publish_authoring_merge`.
+    fn generate_scoped_sculpt(
+        &self,
+        ctx: &mut EvalContext,
+        input: &Heightfield,
+        p: &crate::authoring::SculptStrokeParams,
+        layer_id: LayerId,
+        scope: &[TileId],
+    ) -> Result<Heightfield, EvalError> {
+        use crate::field_data::keys;
+        let metrics = ctx.metrics;
+        let result = crate::authoring::apply_sculpt_strokes_scoped(input, p, scope);
+        let aux_keys = [
+            keys::SCULPT_PROTECTION,
+            keys::UPLIFT_RATE,
+            keys::HARDNESS,
+            keys::SEDIMENT_THICKNESS,
+            keys::EDIT_REGION,
+        ];
+        let n = (metrics.width * metrics.height) as usize;
+        for key in aux_keys {
+            // Aux entering from below (a lower layer that also wrote this key),
+            // and the previous merged aux (correct on clean tiles). Re-max the
+            // fresh stamp over `below` on scope tiles; clean tiles keep the merge.
+            //
+            // Work on the raw buffer via `from_raw`, never `MaskField::set`: some
+            // of these channels (uplift_rate, sediment_thickness) exceed the mask's
+            // [0,1] range, and `set` clamps — which the whole-field `from_raw`
+            // publish does not, so `set` would silently corrupt them.
+            let below = ctx.aux_maps.get(key).cloned();
+            let cached = self
+                .cache
+                .get(layer_id)
+                .and_then(|c| c.aux.get(key).cloned());
+            let seed = cached.as_ref().or(below.as_ref());
+            let mut merged = match seed {
+                Some(f) if f.data().len() == n => f.data().to_vec(),
+                _ => vec![0.0; n],
+            };
+            if let Some(fresh) = result.fields.get(key) {
+                let fresh_data = fresh.data();
+                let below_data = below.as_ref().filter(|b| b.data().len() == n);
+                for &id in scope {
+                    let Some(tile) = input.tile(id) else {
+                        continue;
+                    };
+                    let (ox, oz) = tile.interior_origin(&metrics);
+                    for lz in 0..tile.interior_height {
+                        for lx in 0..tile.interior_width {
+                            let idx = ((oz + lz) * metrics.width + (ox + lx)) as usize;
+                            let f = fresh_data[idx];
+                            merged[idx] = match below_data {
+                                Some(b) => b.data()[idx].max(f),
+                                None => f,
+                            };
+                        }
+                    }
+                }
+            }
+            ctx.aux_insert(key, MaskField::from_raw(metrics, &merged));
+        }
+        Ok(result.height)
     }
 
     fn try_reuse_group_cache(

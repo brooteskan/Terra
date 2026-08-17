@@ -22,13 +22,16 @@ use std::collections::HashSet;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
+use terra_core::authoring::SculptStrokeKind;
 use terra_core::eval::{EvalContext, EvalError, LayerEvalTiming, PreviewQuality, StackEvaluator};
+use terra_core::field_data::keys;
 use terra_core::heightfield::{Heightfield, HeightfieldMetrics, TileId};
 use terra_core::layer::{
     BlurParams, CoastalParams, FbmParams, Layer, LayerId, LayerKind, LayerStack, MesaParams,
     MountainParams, PathNode, PathParams, PlateauParams, ProceduralGenerator,
     ProceduralShapeParams, SculptParams, VoronoiParams,
 };
+use terra_core::shape_history::{create_shape_layer, stamp_stroke};
 use terra_core::tiling::measure_seams;
 
 const TS: u32 = 16;
@@ -66,6 +69,30 @@ fn sculpt_gradient(res: u32) -> Layer {
         }
     }
     Layer::new("Sculpt", LayerKind::SculptBase(p))
+}
+
+/// A SculptStrokes layer with only localizable (per-texel) strokes, so a change
+/// below it stays within the reconcile halo (reach 1). Radii are in metres on a
+/// `world_size == res` world, so ~20 samples wide. Flatten is deliberately absent
+/// here: its footprint mean is input-dependent, so a below-change would move it
+/// beyond reach — that case is covered separately with the strokes layer *seeded*
+/// (its input unchanged) in `scoped_sculpt_flatten_as_base_matches_whole_field`.
+fn sculpt_strokes(name: &str) -> Layer {
+    let mut layer = create_shape_layer(name);
+    if let LayerKind::SculptStrokes(p) = &mut layer.kind {
+        stamp_stroke(p, SculptStrokeKind::Raise, 0.5, 0.5, 22.0, 9.0, 0.0, false);
+        stamp_stroke(
+            p,
+            SculptStrokeKind::Uplift,
+            0.4,
+            0.55,
+            16.0,
+            3.0,
+            0.0,
+            false,
+        );
+    }
+    layer
 }
 
 fn all_tiles(m: &HeightfieldMetrics) -> Vec<TileId> {
@@ -126,6 +153,13 @@ fn wetness_bits(ctx: &EvalContext) -> Vec<u32> {
         .unwrap_or_default()
 }
 
+fn aux_bits(ctx: &EvalContext, key: &str) -> Vec<u32> {
+    ctx.aux_maps
+        .get(key)
+        .map(|f| f.data().iter().map(|v| v.to_bits()).collect())
+        .unwrap_or_default()
+}
+
 fn flat_stack(layers: Vec<Layer>) -> (LayerStack, Vec<LayerId>) {
     let mut stack = LayerStack::new();
     let mut ids = Vec::new();
@@ -167,10 +201,10 @@ fn scoped_rebuild(
 
 /// The pool of flat, localizable stacks. Each entry names its layers so a failure
 /// points at the arm. Every arm here is tile-wired or per-texel: SculptBase,
-/// Plateau, Coastal, Blur, and the #110 generator arms (Fbm, Ridged,
-/// VoronoiRegions, Mesa, Mountains, ProceduralShape). Generator layers sit above
-/// the seeded sculpt base so the region mark propagates up and each is
-/// tile-scope-recomputed rather than filled whole-field.
+/// Plateau, Coastal, Blur, the #110 generator arms (Fbm, Ridged, VoronoiRegions,
+/// Mesa, Mountains, ProceduralShape), and SculptStrokes. Generator / stroke
+/// layers sit above the seeded sculpt base so the region mark propagates up and
+/// each is tile-scope-recomputed rather than filled whole-field.
 fn pool(res: u32) -> Vec<(&'static str, Vec<Layer>)> {
     let plateau = || {
         Layer::new(
@@ -267,6 +301,16 @@ fn pool(res: u32) -> Vec<(&'static str, Vec<Layer>)> {
         (
             "sculpt+proc-plateau",
             vec![sculpt_gradient(res), proc_plateau()],
+        ),
+        // SculptStrokes reacting to the region edit below it (localizable strokes
+        // only — see `sculpt_strokes`).
+        (
+            "sculpt+strokes",
+            vec![sculpt_gradient(res), sculpt_strokes("Strokes")],
+        ),
+        (
+            "sculpt+voronoi+strokes",
+            vec![sculpt_gradient(res), voronoi(), sculpt_strokes("Strokes")],
         ),
     ]
 }
@@ -699,6 +743,127 @@ fn scoped_path_matches_whole_field_including_wetness() {
         truth_wet,
         "scoped path wetness diverged from the whole-field merge"
     );
+    assert_eq!(measure_seams(&scoped), 0.0);
+}
+
+#[test]
+fn scoped_sculpt_flatten_matches_whole_field() {
+    // A localized edit ON a SculptStrokes layer that contains a Flatten. The layer
+    // below is unchanged, so the Flatten's footprint mean is stable, and the
+    // fixpoint-expanded scoped stamp is bit-identical to a whole-field apply — the
+    // case a naive scope-only stamp would get wrong. Radii are in metres on a
+    // world == res world.
+    let res = 80; // 5x5 tiles
+    let m = metrics(res);
+    let mut strokes = create_shape_layer("FlattenStrokes");
+    if let LayerKind::SculptStrokes(p) = &mut strokes.kind {
+        stamp_stroke(
+            p,
+            SculptStrokeKind::Raise,
+            0.42,
+            0.42,
+            14.0,
+            12.0,
+            0.0,
+            false,
+        );
+        // A Flatten spanning several tiles and straddling the scope edge, so its
+        // footprint mean is only exact if the fixpoint stamped the whole footprint.
+        stamp_stroke(
+            p,
+            SculptStrokeKind::Flatten,
+            0.5,
+            0.5,
+            34.0,
+            4.0,
+            0.0,
+            false,
+        );
+    }
+    let (stack, ids) = flat_stack(vec![sculpt_gradient(res), strokes]);
+
+    let mut eval = StackEvaluator::new();
+    let mut ctx = EvalContext::new(m);
+    let truth = eval.rebuild_all(&stack, &mut ctx).expect("rebuild_all");
+
+    // Edit the strokes layer itself (its input below stays a cache hit).
+    let region = tiles_in_samples(&m, 50, 50, 50, 50); // one interior tile
+    eval.mark_dirty_from_region(&stack, ids[1], &region);
+    let mut ctx2 = EvalContext::new(m);
+    let scoped = eval.rebuild_incremental(&stack, &mut ctx2).expect("scoped");
+
+    assert!(
+        timing(&ctx2.layer_timings, ids[1])
+            .tiles_recomputed
+            .is_some(),
+        "the strokes layer should recompute tile-scoped, not escalate"
+    );
+    assert_eq!(
+        bits(&scoped),
+        bits(&truth),
+        "scoped Flatten strokes diverged"
+    );
+    assert_eq!(measure_seams(&scoped), 0.0);
+}
+
+#[test]
+fn scoped_sculpt_matches_whole_field_including_aux() {
+    // The scoped SculptStrokes merge must reproduce the whole-field aux (the five
+    // per-texel channels), not just the height — the sculpt analogue of the path
+    // wetness check.
+    let res = 80;
+    let m = metrics(res);
+    let mut strokes = create_shape_layer("AuxStrokes");
+    if let LayerKind::SculptStrokes(p) = &mut strokes.kind {
+        stamp_stroke(p, SculptStrokeKind::Raise, 0.5, 0.5, 22.0, 9.0, 0.0, false);
+        stamp_stroke(
+            p,
+            SculptStrokeKind::Uplift,
+            0.45,
+            0.5,
+            18.0,
+            3.0,
+            0.0,
+            false,
+        );
+        stamp_stroke(
+            p,
+            SculptStrokeKind::Protect,
+            0.55,
+            0.5,
+            18.0,
+            0.8,
+            0.0,
+            false,
+        );
+    }
+    let (stack, ids) = flat_stack(vec![sculpt_gradient(res), strokes]);
+
+    let mut eval = StackEvaluator::new();
+    let mut wctx = EvalContext::new(m);
+    let truth = eval.rebuild_all(&stack, &mut wctx).expect("rebuild_all");
+    let aux_keys = [
+        keys::SCULPT_PROTECTION,
+        keys::UPLIFT_RATE,
+        keys::HARDNESS,
+        keys::SEDIMENT_THICKNESS,
+        keys::EDIT_REGION,
+    ];
+    let truth_aux: Vec<Vec<u32>> = aux_keys.iter().map(|k| aux_bits(&wctx, k)).collect();
+
+    let region = tiles_in_samples(&m, 34, 34, 40, 40);
+    eval.mark_dirty_from_region(&stack, ids[1], &region);
+    let mut sctx = EvalContext::new(m);
+    let scoped = eval.rebuild_incremental(&stack, &mut sctx).expect("scoped");
+
+    assert_eq!(bits(&scoped), bits(&truth), "scoped sculpt height diverged");
+    for (key, truth_field) in aux_keys.iter().zip(&truth_aux) {
+        assert_eq!(
+            &aux_bits(&sctx, key),
+            truth_field,
+            "scoped sculpt aux `{key}` diverged from the whole-field merge"
+        );
+    }
     assert_eq!(measure_seams(&scoped), 0.0);
 }
 

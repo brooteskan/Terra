@@ -5,7 +5,7 @@
 //! resolution independent; only evaluation rasterizes it.
 
 use crate::field_data::keys;
-use crate::heightfield::Heightfield;
+use crate::heightfield::{Heightfield, HeightfieldMetrics, TileId};
 use crate::hydro::{self, StreamPowerParams};
 use crate::mask::{MaskField, MaskSource};
 use serde::{Deserialize, Serialize};
@@ -513,6 +513,173 @@ fn hash_noise(x: i32, y: i32, seed: u64) -> f32 {
     ((n ^ (n >> 31)) as u32 as f32) / u32::MAX as f32 * 2.0 - 1.0
 }
 
+/// The stroke's padded footprint as an inclusive sample rectangle
+/// `(i0, i1, j0, j1)`, or `None` when the stroke has no points (no footprint).
+///
+/// This is exactly the region where `smoothstep_weight` can be non-zero, so the
+/// stamp and flatten-mean scans are bounded to it. #110's scoped apply grows its
+/// working rectangle by this footprint so a Flatten straddling the scope edge
+/// still reads a fully-stamped field when it computes its mean.
+fn stroke_footprint_rect(
+    stroke: &SculptStroke,
+    m: &HeightfieldMetrics,
+) -> Option<(u32, u32, u32, u32)> {
+    if stroke.points.is_empty() {
+        return None;
+    }
+    let ru = stroke.radius_m / m.world_size_x.max(1e-3);
+    let rv = stroke.radius_m / m.world_size_z.max(1e-3);
+    let (mut u0, mut u1, mut v0, mut v1) = (1.0f32, 0.0f32, 1.0f32, 0.0f32);
+    for pt in &stroke.points {
+        u0 = u0.min(pt.u);
+        u1 = u1.max(pt.u);
+        v0 = v0.min(pt.v);
+        v1 = v1.max(pt.v);
+    }
+    let i0 = ((u0 - ru).clamp(0.0, 1.0) * (m.width - 1) as f32) as u32;
+    let i1 = (((u1 + ru).clamp(0.0, 1.0) * (m.width - 1) as f32).ceil() as u32)
+        .min(m.width.saturating_sub(1));
+    let j0 = ((v0 - rv).clamp(0.0, 1.0) * (m.height - 1) as f32) as u32;
+    let j1 = (((v1 + rv).clamp(0.0, 1.0) * (m.height - 1) as f32).ceil() as u32)
+        .min(m.height.saturating_sub(1));
+    Some((i0, i1, j0, j1))
+}
+
+/// Flatten settles the footprint toward the brush-weighted mean of the terrain
+/// it is editing (the accumulated `out`), computed once per stroke over the
+/// stroke's padded footprint. Sampling the same buffer keeps flatten bounded and
+/// idempotent; the app used to pass a target sampled from the composite height,
+/// which drifted above the layer's own terrain and let every stroke stack a
+/// taller spike. Returns `stroke.target_height` for non-Flatten kinds
+/// (HeightStamp keeps its explicit target).
+fn flatten_target_for(stroke: &SculptStroke, out: &Heightfield, m: &HeightfieldMetrics) -> f32 {
+    if !matches!(stroke.kind, SculptStrokeKind::Flatten) {
+        return stroke.target_height;
+    }
+    let Some((i0, i1, j0, j1)) = stroke_footprint_rect(stroke, m) else {
+        return stroke.target_height;
+    };
+    let mut hsum = 0.0f64;
+    let mut wsum = 0.0f64;
+    for j in j0..=j1 {
+        for i in i0..=i1 {
+            let x = m.world_x(i);
+            let z = m.world_z(j);
+            let (distance, pressure) =
+                distance_to_polyline(x, z, &stroke.points, m.world_size_x, m.world_size_z);
+            let w = smoothstep_weight(distance, stroke.radius_m, stroke.falloff) * pressure;
+            if w > 0.0 {
+                hsum += out.get(i, j) as f64 * w as f64;
+                wsum += w as f64;
+            }
+        }
+    }
+    if wsum > 0.0 {
+        (hsum / wsum) as f32
+    } else {
+        stroke.target_height
+    }
+}
+
+/// Apply one stroke's height + semantic-aux contribution at a single sample.
+/// Shared by the whole-field and scoped stamp loops (#110) so they cannot drift.
+/// The four aux channels are max-accumulated in place; `edited` is accumulated by
+/// the caller (identical for every kind). Returns the new height at `(i, j)`.
+#[allow(clippy::too_many_arguments)]
+fn apply_stroke_sample(
+    stroke: &SculptStroke,
+    base: &Heightfield,
+    i: u32,
+    j: u32,
+    h: f32,
+    distance: f32,
+    w: f32,
+    flatten_target: f32,
+    protect: &mut f32,
+    uplift: &mut f32,
+    hardness: &mut f32,
+    sediment: &mut f32,
+) -> f32 {
+    let s = stroke.strength * w;
+    match stroke.kind {
+        SculptStrokeKind::Raise => h + s,
+        SculptStrokeKind::Lower => h - s,
+        SculptStrokeKind::Smooth => h + (neighborhood_average(base, i, j) - h) * w,
+        SculptStrokeKind::Flatten | SculptStrokeKind::HeightStamp => {
+            // Flatten uses the footprint mean (computed by flatten_target_for);
+            // HeightStamp keeps the explicit stroke target.
+            h + (flatten_target - h) * w
+        }
+        SculptStrokeKind::Ridge | SculptStrokeKind::MountainStamp => {
+            let t = (1.0 - distance / stroke.radius_m.max(1.0)).max(0.0);
+            h + s * t * t
+        }
+        SculptStrokeKind::Valley | SculptStrokeKind::ValleyStamp | SculptStrokeKind::RiverPath => {
+            h - s.abs() * (1.0 - distance / stroke.radius_m.max(1.0)).max(0.0)
+        }
+        SculptStrokeKind::Terrace => {
+            let step = stroke.strength.abs().max(0.1);
+            h + ((h / step).round() * step - h) * w
+        }
+        SculptStrokeKind::Roughness | SculptStrokeKind::Noise => {
+            h + hash_noise(i as i32, j as i32, 91) * s
+        }
+        SculptStrokeKind::Uplift => {
+            *uplift = (*uplift).max(s.max(0.0));
+            h
+        }
+        SculptStrokeKind::Hardness => {
+            *hardness = (*hardness).max(s.clamp(0.0, 1.0));
+            h
+        }
+        SculptStrokeKind::Sediment => {
+            *sediment = (*sediment).max(s.max(0.0));
+            h
+        }
+        SculptStrokeKind::Protect => {
+            *protect = (*protect).max(s.clamp(0.0, 1.0));
+            h
+        }
+        SculptStrokeKind::EncourageErosion | SculptStrokeKind::Erode => {
+            *protect = (*protect - s.abs().min(1.0)).max(0.0);
+            h - s.abs() * 0.35
+        }
+        SculptStrokeKind::Pinch => {
+            // Pull heights toward neighbourhood mean (contract detail).
+            let avg = neighborhood_average(base, i, j);
+            h + (avg - h) * w * 1.25
+        }
+        SculptStrokeKind::Inflate => {
+            let t = (1.0 - distance / stroke.radius_m.max(1.0)).max(0.0);
+            h + s * t
+        }
+        SculptStrokeKind::PlateauStamp => {
+            let t = (1.0 - distance / stroke.radius_m.max(1.0)).max(0.0);
+            let plateau = stroke.target_height.max(h + s.abs());
+            h + (plateau - h) * w * t
+        }
+        SculptStrokeKind::CraterStamp => {
+            let t = distance / stroke.radius_m.max(1.0);
+            if t >= 1.0 {
+                h
+            } else if t < 0.55 {
+                // Bowl.
+                h - s.abs() * (1.0 - t / 0.55) * w
+            } else {
+                // Rim.
+                let rim = ((t - 0.55) / 0.45).clamp(0.0, 1.0);
+                let bump = (1.0 - (rim - 0.5).abs() * 2.0).max(0.0);
+                h + s.abs() * 0.45 * bump * w
+            }
+        }
+        SculptStrokeKind::Coastline => {
+            let avg = neighborhood_average(base, i, j);
+            let lowered = h - s.abs() * 0.25;
+            (lowered + (avg - lowered) * 0.55) * w + h * (1.0 - w)
+        }
+    }
+}
+
 pub fn apply_sculpt_strokes(input: &Heightfield, p: &SculptStrokeParams) -> AuthoringResult {
     let m = input.metrics;
     let mut out = input.clone();
@@ -524,51 +691,7 @@ pub fn apply_sculpt_strokes(input: &Heightfield, p: &SculptStrokeParams) -> Auth
     let mut edited: Vec<f32> = vec![0.0; n];
     let base = input.clone();
     for stroke in &p.strokes {
-        // Flatten settles the footprint toward the brush-weighted mean of the
-        // terrain it is editing (the accumulated `out`), computed once per stroke.
-        // Sampling the same buffer keeps flatten bounded and idempotent; the app
-        // used to pass a target sampled from the composite height, which drifted
-        // above the layer's own terrain and let every stroke stack a taller spike.
-        let flatten_target = if matches!(stroke.kind, SculptStrokeKind::Flatten) {
-            // Scan only the stroke's padded footprint.
-            let ru = stroke.radius_m / m.world_size_x.max(1e-3);
-            let rv = stroke.radius_m / m.world_size_z.max(1e-3);
-            let (mut u0, mut u1, mut v0, mut v1) = (1.0f32, 0.0f32, 1.0f32, 0.0f32);
-            for pt in &stroke.points {
-                u0 = u0.min(pt.u);
-                u1 = u1.max(pt.u);
-                v0 = v0.min(pt.v);
-                v1 = v1.max(pt.v);
-            }
-            let i0 = ((u0 - ru).clamp(0.0, 1.0) * (m.width - 1) as f32) as u32;
-            let i1 = (((u1 + ru).clamp(0.0, 1.0) * (m.width - 1) as f32).ceil() as u32)
-                .min(m.width.saturating_sub(1));
-            let j0 = ((v0 - rv).clamp(0.0, 1.0) * (m.height - 1) as f32) as u32;
-            let j1 = (((v1 + rv).clamp(0.0, 1.0) * (m.height - 1) as f32).ceil() as u32)
-                .min(m.height.saturating_sub(1));
-            let mut hsum = 0.0f64;
-            let mut wsum = 0.0f64;
-            for j in j0..=j1 {
-                for i in i0..=i1 {
-                    let x = m.world_x(i);
-                    let z = m.world_z(j);
-                    let (distance, pressure) =
-                        distance_to_polyline(x, z, &stroke.points, m.world_size_x, m.world_size_z);
-                    let w = smoothstep_weight(distance, stroke.radius_m, stroke.falloff) * pressure;
-                    if w > 0.0 {
-                        hsum += out.get(i, j) as f64 * w as f64;
-                        wsum += w as f64;
-                    }
-                }
-            }
-            if wsum > 0.0 {
-                (hsum / wsum) as f32
-            } else {
-                stroke.target_height
-            }
-        } else {
-            stroke.target_height
-        };
+        let flatten_target = flatten_target_for(stroke, &out, &m);
         for j in 0..m.height {
             for i in 0..m.width {
                 let x = m.world_x(i);
@@ -582,86 +705,20 @@ pub fn apply_sculpt_strokes(input: &Heightfield, p: &SculptStrokeParams) -> Auth
                 let idx = (j * m.width + i) as usize;
                 edited[idx] = edited[idx].max(w);
                 let h = out.get(i, j);
-                let s = stroke.strength * w;
-                let next = match stroke.kind {
-                    SculptStrokeKind::Raise => h + s,
-                    SculptStrokeKind::Lower => h - s,
-                    SculptStrokeKind::Smooth => h + (neighborhood_average(&base, i, j) - h) * w,
-                    SculptStrokeKind::Flatten | SculptStrokeKind::HeightStamp => {
-                        // Flatten uses the footprint mean (computed above);
-                        // HeightStamp keeps the explicit stroke target.
-                        h + (flatten_target - h) * w
-                    }
-                    SculptStrokeKind::Ridge | SculptStrokeKind::MountainStamp => {
-                        let t = (1.0 - distance / stroke.radius_m.max(1.0)).max(0.0);
-                        h + s * t * t
-                    }
-                    SculptStrokeKind::Valley
-                    | SculptStrokeKind::ValleyStamp
-                    | SculptStrokeKind::RiverPath => {
-                        h - s.abs() * (1.0 - distance / stroke.radius_m.max(1.0)).max(0.0)
-                    }
-                    SculptStrokeKind::Terrace => {
-                        let step = stroke.strength.abs().max(0.1);
-                        h + ((h / step).round() * step - h) * w
-                    }
-                    SculptStrokeKind::Roughness | SculptStrokeKind::Noise => {
-                        h + hash_noise(i as i32, j as i32, 91) * s
-                    }
-                    SculptStrokeKind::Uplift => {
-                        uplift[idx] = uplift[idx].max(s.max(0.0));
-                        h
-                    }
-                    SculptStrokeKind::Hardness => {
-                        hardness[idx] = hardness[idx].max(s.clamp(0.0, 1.0));
-                        h
-                    }
-                    SculptStrokeKind::Sediment => {
-                        sediment[idx] = sediment[idx].max(s.max(0.0));
-                        h
-                    }
-                    SculptStrokeKind::Protect => {
-                        protect[idx] = protect[idx].max(s.clamp(0.0, 1.0));
-                        h
-                    }
-                    SculptStrokeKind::EncourageErosion | SculptStrokeKind::Erode => {
-                        protect[idx] = (protect[idx] - s.abs().min(1.0)).max(0.0);
-                        h - s.abs() * 0.35
-                    }
-                    SculptStrokeKind::Pinch => {
-                        // Pull heights toward neighbourhood mean (contract detail).
-                        let avg = neighborhood_average(&base, i, j);
-                        h + (avg - h) * w * 1.25
-                    }
-                    SculptStrokeKind::Inflate => {
-                        let t = (1.0 - distance / stroke.radius_m.max(1.0)).max(0.0);
-                        h + s * t
-                    }
-                    SculptStrokeKind::PlateauStamp => {
-                        let t = (1.0 - distance / stroke.radius_m.max(1.0)).max(0.0);
-                        let plateau = stroke.target_height.max(h + s.abs());
-                        h + (plateau - h) * w * t
-                    }
-                    SculptStrokeKind::CraterStamp => {
-                        let t = distance / stroke.radius_m.max(1.0);
-                        if t >= 1.0 {
-                            h
-                        } else if t < 0.55 {
-                            // Bowl.
-                            h - s.abs() * (1.0 - t / 0.55) * w
-                        } else {
-                            // Rim.
-                            let rim = ((t - 0.55) / 0.45).clamp(0.0, 1.0);
-                            let bump = (1.0 - (rim - 0.5).abs() * 2.0).max(0.0);
-                            h + s.abs() * 0.45 * bump * w
-                        }
-                    }
-                    SculptStrokeKind::Coastline => {
-                        let avg = neighborhood_average(&base, i, j);
-                        let lowered = h - s.abs() * 0.25;
-                        (lowered + (avg - lowered) * 0.55) * w + h * (1.0 - w)
-                    }
-                };
+                let next = apply_stroke_sample(
+                    stroke,
+                    &base,
+                    i,
+                    j,
+                    h,
+                    distance,
+                    w,
+                    flatten_target,
+                    &mut protect[idx],
+                    &mut uplift[idx],
+                    &mut hardness[idx],
+                    &mut sediment[idx],
+                );
                 out.set(i, j, next);
             }
         }
@@ -670,6 +727,145 @@ pub fn apply_sculpt_strokes(input: &Heightfield, p: &SculptStrokeParams) -> Auth
         let src = out.clone();
         for j in 0..m.height {
             for i in 0..m.width {
+                let idx = (j * m.width + i) as usize;
+                let a = p.reconcile.clamp(0.0, 1.0) * edited[idx] * 0.35;
+                out.set(
+                    i,
+                    j,
+                    src.get(i, j) + (neighborhood_average(&src, i, j) - src.get(i, j)) * a,
+                );
+            }
+        }
+    }
+    AuthoringResult::new(out)
+        .field(keys::SCULPT_PROTECTION, MaskField::from_raw(m, &protect))
+        .field(keys::UPLIFT_RATE, MaskField::from_raw(m, &uplift))
+        .field(keys::HARDNESS, MaskField::from_raw(m, &hardness))
+        .field(keys::SEDIMENT_THICKNESS, MaskField::from_raw(m, &sediment))
+        .field(keys::EDIT_REGION, MaskField::from_raw(m, &edited))
+}
+
+/// The scope-tile interiors dilated one sample and clamped to the field, as an
+/// inclusive sample rectangle. `None` when no scope tile is in range. The one
+/// sample of padding lets the reconcile 3x3 on every scope sample read stamped
+/// neighbours (#108's `halo_samples: 1`).
+fn scope_rect_dilated(input: &Heightfield, scope: &[TileId]) -> Option<(u32, u32, u32, u32)> {
+    let m = input.metrics;
+    let mut acc: Option<(u32, u32, u32, u32)> = None;
+    for &id in scope {
+        let Some(tile) = input.tile(id) else {
+            continue;
+        };
+        let (ox, oz) = tile.interior_origin(&m);
+        let (ti1, tj1) = (ox + tile.interior_width - 1, oz + tile.interior_height - 1);
+        acc = Some(match acc {
+            None => (ox, ti1, oz, tj1),
+            Some((i0, i1, j0, j1)) => (i0.min(ox), i1.max(ti1), j0.min(oz), j1.max(tj1)),
+        });
+    }
+    let (i0, i1, j0, j1) = acc?;
+    Some((
+        i0.saturating_sub(1),
+        (i1 + 1).min(m.width.saturating_sub(1)),
+        j0.saturating_sub(1),
+        (j1 + 1).min(m.height.saturating_sub(1)),
+    ))
+}
+
+/// Region-scoped [`apply_sculpt_strokes`] (#110).
+///
+/// Produces a height + aux result whose `scope` tiles are bit-identical to the
+/// whole-field pass; samples outside the working rectangle are left at `input`
+/// and are never read by the caller's scoped blend.
+///
+/// The working rectangle `S` starts at the scope interiors dilated one sample,
+/// then grows to the full footprint of every stroke it intersects — a fixpoint.
+/// That guarantees any Flatten whose footprint reaches `S` has that whole
+/// footprint stamped by prior strokes before it computes its mean, so the mean
+/// (and therefore every scope sample) matches the whole-field result exactly.
+/// Strokes that miss `S` are skipped. `S` is bounded by the field, so a giant
+/// footprint degrades to whole-field cost rather than being wrong.
+pub fn apply_sculpt_strokes_scoped(
+    input: &Heightfield,
+    p: &SculptStrokeParams,
+    scope: &[TileId],
+) -> AuthoringResult {
+    let m = input.metrics;
+    let Some((mut i0, mut i1, mut j0, mut j1)) = scope_rect_dilated(input, scope) else {
+        // Empty scope: nothing to recompute. The caller blends no tiles.
+        return AuthoringResult::new(input.clone());
+    };
+    // Fixpoint: absorb the full footprint of every stroke intersecting S.
+    loop {
+        let mut grew = false;
+        for stroke in &p.strokes {
+            let Some((si0, si1, sj0, sj1)) = stroke_footprint_rect(stroke, &m) else {
+                continue;
+            };
+            let intersects = si0 <= i1 && si1 >= i0 && sj0 <= j1 && sj1 >= j0;
+            if intersects {
+                let grown = (i0.min(si0), i1.max(si1), j0.min(sj0), j1.max(sj1));
+                if grown != (i0, i1, j0, j1) {
+                    (i0, i1, j0, j1) = grown;
+                    grew = true;
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+
+    let mut out = input.clone();
+    let n = (m.width * m.height) as usize;
+    let mut protect: Vec<f32> = vec![0.0; n];
+    let mut uplift: Vec<f32> = vec![0.0; n];
+    let mut hardness: Vec<f32> = vec![0.0; n];
+    let mut sediment: Vec<f32> = vec![0.0; n];
+    let mut edited: Vec<f32> = vec![0.0; n];
+    let base = input.clone();
+    for stroke in &p.strokes {
+        // Skip strokes whose footprint does not reach S (no effect inside it).
+        match stroke_footprint_rect(stroke, &m) {
+            Some((si0, si1, sj0, sj1)) if si0 <= i1 && si1 >= i0 && sj0 <= j1 && sj1 >= j0 => {}
+            _ => continue,
+        }
+        let flatten_target = flatten_target_for(stroke, &out, &m);
+        for j in j0..=j1 {
+            for i in i0..=i1 {
+                let x = m.world_x(i);
+                let z = m.world_z(j);
+                let (distance, pressure) =
+                    distance_to_polyline(x, z, &stroke.points, m.world_size_x, m.world_size_z);
+                let w = smoothstep_weight(distance, stroke.radius_m, stroke.falloff) * pressure;
+                if w <= 0.0 {
+                    continue;
+                }
+                let idx = (j * m.width + i) as usize;
+                edited[idx] = edited[idx].max(w);
+                let h = out.get(i, j);
+                let next = apply_stroke_sample(
+                    stroke,
+                    &base,
+                    i,
+                    j,
+                    h,
+                    distance,
+                    w,
+                    flatten_target,
+                    &mut protect[idx],
+                    &mut uplift[idx],
+                    &mut hardness[idx],
+                    &mut sediment[idx],
+                );
+                out.set(i, j, next);
+            }
+        }
+    }
+    if p.reconcile > 0.0 {
+        let src = out.clone();
+        for j in j0..=j1 {
+            for i in i0..=i1 {
                 let idx = (j * m.width + i) as usize;
                 let a = p.reconcile.clamp(0.0, 1.0) * edited[idx] * 0.35;
                 out.set(
@@ -1097,6 +1293,112 @@ mod tests {
         let r = apply_sculpt_strokes(&h, &p);
         assert!(r.height.get(16, 16) > h.get(16, 16));
         assert!((r.height.get(0, 0) - h.get(0, 0)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn scoped_sculpt_matches_whole_field_on_scope_tiles() {
+        // A multi-tile field (tile_size 16 -> 4x4 tile grid on 64^2).
+        let m = HeightfieldMetrics {
+            width: 64,
+            height: 64,
+            world_size_x: 1000.0,
+            world_size_z: 1000.0,
+            tile_size: 16,
+            halo: 2,
+        };
+        let mut h = Heightfield::zeros(m);
+        for j in 0..64 {
+            for i in 0..64 {
+                h.set(
+                    i,
+                    j,
+                    (i as f32) * 0.7 + (j as f32) * 0.3 + ((i * 5 + j * 11) % 17) as f32,
+                );
+            }
+        }
+        // Raise + Smooth (reads the 3x3 base) stamp inside a large Flatten's
+        // footprint; the Flatten (radius 400 on a 1000 m world) straddles the
+        // scope edge, so its footprint mean is only correct if the fixpoint has
+        // grown S to cover the whole footprint and stamped the priors there.
+        let pt = |u, v| SculptPoint {
+            u,
+            v,
+            pressure: 1.0,
+        };
+        let p = SculptStrokeParams {
+            strokes: vec![
+                SculptStroke {
+                    kind: SculptStrokeKind::Raise,
+                    points: vec![pt(0.4, 0.4)],
+                    radius_m: 120.0,
+                    strength: 8.0,
+                    target_height: 0.0,
+                    falloff: 1.5,
+                },
+                SculptStroke {
+                    kind: SculptStrokeKind::Smooth,
+                    points: vec![pt(0.6, 0.5)],
+                    radius_m: 90.0,
+                    strength: 5.0,
+                    target_height: 0.0,
+                    falloff: 1.2,
+                },
+                SculptStroke {
+                    kind: SculptStrokeKind::Flatten,
+                    points: vec![pt(0.5, 0.5)],
+                    radius_m: 400.0,
+                    strength: 4.0,
+                    target_height: 0.0,
+                    falloff: 1.5,
+                },
+                SculptStroke {
+                    kind: SculptStrokeKind::Uplift,
+                    points: vec![pt(0.5, 0.5)],
+                    radius_m: 100.0,
+                    strength: 3.0,
+                    target_height: 0.0,
+                    falloff: 1.5,
+                },
+            ],
+            reconcile: 0.2,
+        };
+        let whole = apply_sculpt_strokes(&h, &p);
+        // Interior tiles plus a partial edge tile.
+        let scope = vec![
+            TileId { tx: 1, tz: 1 },
+            TileId { tx: 2, tz: 1 },
+            TileId { tx: 3, tz: 3 },
+        ];
+        let scoped = apply_sculpt_strokes_scoped(&h, &p, &scope);
+        for &id in &scope {
+            let tile = h.tile(id).expect("scope tile exists");
+            let (ox, oz) = tile.interior_origin(&m);
+            for lz in 0..tile.interior_height {
+                for lx in 0..tile.interior_width {
+                    let (i, j) = (ox + lx, oz + lz);
+                    assert_eq!(
+                        scoped.height.get(i, j).to_bits(),
+                        whole.height.get(i, j).to_bits(),
+                        "height mismatch at ({i},{j}) in tile {id:?}"
+                    );
+                    for key in [
+                        keys::SCULPT_PROTECTION,
+                        keys::UPLIFT_RATE,
+                        keys::HARDNESS,
+                        keys::SEDIMENT_THICKNESS,
+                        keys::EDIT_REGION,
+                    ] {
+                        let wf = whole.fields.get(key).expect("whole aux").get(i, j);
+                        let sf = scoped.fields.get(key).expect("scoped aux").get(i, j);
+                        assert_eq!(
+                            sf.to_bits(),
+                            wf.to_bits(),
+                            "aux {key} mismatch at ({i},{j}) in tile {id:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
