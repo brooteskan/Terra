@@ -1330,8 +1330,8 @@ pub(crate) fn coastal_sample(p: &CoastalParams, h: f32) -> f32 {
 /// and returns `None` if cancellation trips before the fill completes. `f` is a
 /// pure function of world `(x, z)`, so the row chunking cannot change output.
 ///
-/// The row-based shape is kept deliberately so #100's rect/tile restriction
-/// (`try_fill_region`) can slot in later without re-plumbing.
+/// The row-based shape is kept deliberately so #100's tile restriction
+/// ([`try_fill_tiles`]) shares the exact same per-row cancellable fill.
 fn try_fill_world<F: Fn(f32, f32) -> f32 + Sync>(
     metrics: HeightfieldMetrics,
     cancel: &CancelToken,
@@ -1345,6 +1345,55 @@ fn try_fill_world<F: Fn(f32, f32) -> f32 + Sync>(
         f(metrics.world_x(i), metrics.world_z(j))
     });
     filled.then(|| Heightfield::from_dense(metrics, &data))
+}
+
+/// Cancellable tile-scoped world-space fill (#100 phase 3).
+///
+/// Overwrites only the interior samples of the listed `tiles` in `out`, computing
+/// each sample from the same world `(x, z)` closure as [`try_fill_world`] using
+/// the tile's *global* sample indices (`metrics.world_x`/`world_z`). World-space
+/// sampling is therefore exact: a scoped fill of any tile set is bit-identical to
+/// the whole-field fill restricted to those tiles, with no sub-field origin drift.
+///
+/// Each tile interior fills in parallel one interior row per chunk, checking
+/// `cancel` once per row (mirroring [`try_fill_world`]'s granularity). A cancel
+/// trip returns `false` promptly, leaving `out` partially written — the caller
+/// must discard it. Halos are intentionally left stale: refreshing the recomputed
+/// tiles' ghost rings is the scheduler's job (`refresh_halos_for`). Out-of-range
+/// tile ids are skipped.
+#[must_use]
+fn try_fill_tiles<F: Fn(f32, f32) -> f32 + Sync>(
+    out: &mut Heightfield,
+    tiles: &[TileId],
+    cancel: &CancelToken,
+    f: F,
+) -> bool {
+    let metrics = out.metrics;
+    let mut scratch: Vec<f32> = Vec::new();
+    for &id in tiles {
+        let Some(tile) = out.tile_mut(id) else {
+            continue;
+        };
+        let iw = tile.interior_width;
+        let ih = tile.interior_height;
+        let (ox, oz) = tile.interior_origin(&metrics);
+        scratch.clear();
+        scratch.resize((iw * ih) as usize, 0.0);
+        let filled = try_par_fill(cancel, &mut scratch, iw as usize, |idx| {
+            let lx = (idx as u32) % iw;
+            let lz = (idx as u32) / iw;
+            f(metrics.world_x(ox + lx), metrics.world_z(oz + lz))
+        });
+        if !filled {
+            return false;
+        }
+        for lz in 0..ih {
+            for lx in 0..iw {
+                tile.set_interior(lx, lz, scratch[(lz * iw + lx) as usize]);
+            }
+        }
+    }
+    true
 }
 
 fn mix_strength(
@@ -2079,6 +2128,97 @@ mod tests {
             .iter()
             .map(|value| value.to_bits())
             .collect()
+    }
+
+    #[test]
+    fn tile_fill_matches_world_fill_on_scope_tiles() {
+        // A non-square field with a partial edge tile row/col exercises ragged tiles.
+        let metrics = HeightfieldMetrics {
+            width: 40,
+            height: 24,
+            world_size_x: 40.0,
+            world_size_z: 24.0,
+            tile_size: 16,
+            halo: 2,
+        };
+        let f = |x: f32, z: f32| (x * 0.37).sin() + (z * 0.21).cos() * 3.0 + x - z;
+        let whole = try_fill_world(metrics, &CancelToken::never(), f).expect("world fill");
+
+        // Fill a subset of tiles (including a partial edge tile) into a zero field;
+        // the scoped result must be bit-identical to the whole-field fill there.
+        let mut scoped = Heightfield::zeros(metrics);
+        let scope = [
+            TileId { tx: 0, tz: 0 },
+            TileId { tx: 2, tz: 1 }, // partial edge tile (interior 8x8)
+        ];
+        assert!(try_fill_tiles(&mut scoped, &scope, &CancelToken::never(), f));
+
+        for id in scope {
+            let tile = whole.tile(id).expect("scope tile exists");
+            let (ox, oz) = tile.interior_origin(&metrics);
+            for lz in 0..tile.interior_height {
+                for lx in 0..tile.interior_width {
+                    assert_eq!(
+                        scoped.get(ox + lx, oz + lz).to_bits(),
+                        whole.get(ox + lx, oz + lz).to_bits(),
+                        "scope tile {id:?} sample ({lx},{lz}) must match whole-field fill"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pre_cancelled_tile_fill_returns_false() {
+        let metrics = HeightfieldMetrics::new(32, 32, 32.0, 32.0);
+        let (token, flag) = CancelToken::flag();
+        flag.cancel();
+        let mut out = Heightfield::zeros(metrics);
+        let done = try_fill_tiles(&mut out, &[TileId { tx: 0, tz: 0 }], &token, |_, _| 1.0);
+        assert!(!done, "a pre-cancelled token must abort the fill");
+    }
+
+    #[test]
+    fn mid_fill_cancel_stops_tile_fill() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        // Many small tiles so a cancel tripped inside the first tile's fill still
+        // leaves the fill reporting cancellation (mirrors the terra-jobs proof).
+        let metrics = HeightfieldMetrics {
+            width: 256,
+            height: 256,
+            world_size_x: 256.0,
+            world_size_z: 256.0,
+            tile_size: 16,
+            halo: 2,
+        };
+        let mut out = Heightfield::zeros(metrics);
+        let scope: Vec<TileId> = (0..metrics.tiles_z())
+            .flat_map(|tz| (0..metrics.tiles_x()).map(move |tx| TileId { tx, tz }))
+            .collect();
+
+        let (token, flag) = CancelToken::flag();
+        let flag = Arc::new(flag);
+        let tripped = Arc::new(AtomicBool::new(false));
+        let f = {
+            let flag = Arc::clone(&flag);
+            let tripped = Arc::clone(&tripped);
+            move |x: f32, _z: f32| {
+                if x >= 4.0
+                    && tripped
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                {
+                    flag.cancel();
+                }
+                1.0
+            }
+        };
+        assert!(
+            !try_fill_tiles(&mut out, &scope, &token, f),
+            "a mid-fill cancel must report cancellation"
+        );
     }
 
     #[test]
