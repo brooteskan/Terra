@@ -209,10 +209,12 @@ const MODULE_DEPENDENCIES: &[(&str, &[&str])] = &[
             "generators",
             "heightfield",
             "hydro",
+            "invalidation",
             "landscape_blueprint",
             "landscape_evolution",
             "layer",
             "mask",
+            "mask_ir",
             "quality",
             "surface",
             "volumetric",
@@ -232,7 +234,7 @@ const MODULE_DEPENDENCIES: &[(&str, &[&str])] = &[
             "material_schema",
         ],
     ),
-    ("filter_params", &["noise"]),
+    ("filter_params", &["invalidation", "noise"]),
     (
         "generators",
         &[

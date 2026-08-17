@@ -2,6 +2,7 @@
 
 mod cache;
 mod processors;
+pub mod reach;
 mod scheduler;
 mod smart_cache;
 mod worker;
