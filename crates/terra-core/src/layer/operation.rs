@@ -2,7 +2,7 @@
 
 use super::LayerKind;
 use crate::field_data::FieldId;
-use crate::invalidation::DirtyClass;
+use crate::invalidation::{AuxReach, DirtyClass, Reach};
 use serde::{Deserialize, Serialize};
 
 use super::ScaleBand;
@@ -372,25 +372,183 @@ impl LayerKind {
             .collect()
     }
 
+    /// Coarse intrinsic spatial-dependency of this operator's *height* kernel.
+    ///
+    /// Exhaustive by construction (no wildcard): a new `LayerKind` must declare a
+    /// bucket here, so a globally-coupled operator can never silently inherit
+    /// `Local` and be treated as tile-localizable (the #100 correctness hazard).
+    /// This is the height kernel only; auxiliary-field coupling is
+    /// [`Self::aux_reach`] and the resolved per-config answer is
+    /// [`crate::eval::reach::effective_reach`].
     pub fn spatial_dependency(&self) -> DirtyClass {
         match self {
-            LayerKind::Blur(_)
+            // --- Input-independent generators: output ignores the composed input
+            // below; a dirty region only survives through the layer's blend, which
+            // is per-texel. Localizable with no halo.
+            LayerKind::Flat(_)
+            | LayerKind::Ramp(_)
+            | LayerKind::NoiseValue(_)
+            | LayerKind::NoisePerlin(_)
+            | LayerKind::NoiseOpenSimplex(_)
+            | LayerKind::NoiseWorley(_)
+            | LayerKind::Fbm(_)
+            | LayerKind::Ridged(_)
+            | LayerKind::DomainWarp(_)
+            | LayerKind::Mesa(_)
+            | LayerKind::Island(_)
+            | LayerKind::Mountains(_)
+            | LayerKind::Volcano(_)
+            | LayerKind::Uplift(_)
+            | LayerKind::Canyons(_)
+            | LayerKind::VoronoiRegions(_)
+            | LayerKind::ImportHeightmap(_)
+            | LayerKind::ProceduralShape(_)
+            | LayerKind::Stamp2d(_)
+            | LayerKind::Stamp3d(_)
+            // --- Authoring / bounded shape ops: per-texel or bounded-stencil.
+            | LayerKind::SculptBase(_)
+            | LayerKind::SculptStrokes(_)
+            | LayerKind::TerrainConstraints(_)
+            | LayerKind::Plateau(_)
             | LayerKind::Coastal(_)
-            | LayerKind::EffectFilter(_)
-            | LayerKind::Path(_)
             | LayerKind::PolygonHeight(_)
-            | LayerKind::Terrace(_)
-            | LayerKind::Plateau(_) => DirtyClass::Local,
-            LayerKind::ThermalErosion(_)
+            | LayerKind::Path(_)
+            | LayerKind::OverhangStamp(_)
+            | LayerKind::LocalSdf(_)
+            | LayerKind::Materials(_)
+            | LayerKind::Blur(_) => DirtyClass::Local,
+
+            // `EffectFilter` fronts ~60 sub-kinds; defer to the sub-kind so a
+            // Smooth is not lumped with a flow-routing filter.
+            LayerKind::EffectFilter(p) => p.kind.spatial_dependency(),
+
+            // Bounded multi-iteration diffusion (root/soil feedback). The height
+            // kernel is genuinely bounded; its aux is global, which
+            // `effective_reach` folds in separately.
+            LayerKind::EcosystemFeedback(_) => DirtyClass::Expanding,
+
+            // --- Whole-field / basin-coupled. Reclassified out of the old
+            // wildcard-`Local` and `Expanding` buckets, which were unsound:
+            //   Terrace           quantizes against the global field range
+            //   Dunes/Sand        aeolian transport with upwind sheltering rays
+            //   Thermal/Hydraulic level-step pyramid resample + global normalize
+            //   DebrisFlow        sorts all cells by elevation
+            //   Fluid             couples whole depressions
+            //   GradientRecon     screened-Poisson (elliptic, global support)
+            //   LandscapeEvo      priority-flood + D8/D-inf drainage graphs
+            //   HydrologyRepair   full-field SPE before its dilated-region blend
+            //   GeomorphicDetail  flow-accumulation with global normalize
+            //   Biomes            jump-flood coastal distance from every seed
+            //   Vegetation        sequential Poisson-disk scatter over the domain
+            LayerKind::Terrace(_)
+            | LayerKind::Dunes(_)
+            | LayerKind::ThermalErosion(_)
             | LayerKind::HydraulicErosion(_)
             | LayerKind::DebrisFlow(_)
             | LayerKind::SandSimulation(_)
-            | LayerKind::FluidSimulation(_) => DirtyClass::Expanding,
-            LayerKind::StreamPowerErosion(_)
+            | LayerKind::FluidSimulation(_)
+            | LayerKind::GradientReconstruct(_)
+            | LayerKind::LandscapeEvolution(_)
+            | LayerKind::HydrologyRepair(_)
+            | LayerKind::GeomorphicDetail(_)
+            | LayerKind::Biomes(_)
+            | LayerKind::Vegetation(_)
+            | LayerKind::StreamPowerErosion(_)
             | LayerKind::MultiScaleAmplify(_)
             | LayerKind::RiverCarve(_)
             | LayerKind::RiverNetwork(_) => DirtyClass::BasinDependent,
-            _ => DirtyClass::Local,
+        }
+    }
+
+    /// Intrinsic per-side sample halo of the height kernel, as a [`Reach`].
+    ///
+    /// Resolves the coarse [`Self::spatial_dependency`] bucket into an actual
+    /// halo where one is honestly known: `Blur` and the bounded `EffectFilter`
+    /// kernels carry `radius * iterations`; `SculptStrokes` reaches one sample
+    /// past its footprint for the reconcile pass. Every other non-`Local` kind
+    /// returns [`Reach::Full`] here — the localizable cases are exactly the
+    /// explicit arms, so nothing globally-coupled leaks through as a finite halo.
+    pub fn intrinsic_reach(&self) -> Reach {
+        match self {
+            LayerKind::EffectFilter(p) => match p.kind.spatial_dependency() {
+                DirtyClass::Local => Reach::LOCAL,
+                DirtyClass::Expanding => Reach::Localized {
+                    halo_samples: p.kernel_halo(),
+                },
+                DirtyClass::BasinDependent => Reach::Full,
+            },
+            LayerKind::Blur(p) => Reach::Localized {
+                halo_samples: p.radius.saturating_mul(p.iterations.max(1)),
+            },
+            LayerKind::SculptStrokes(_) => Reach::Localized { halo_samples: 1 },
+            other => match other.spatial_dependency() {
+                DirtyClass::Local => Reach::LOCAL,
+                DirtyClass::Expanding | DirtyClass::BasinDependent => Reach::Full,
+            },
+        }
+    }
+
+    /// How this layer's published auxiliary fields behave under a localized edit.
+    ///
+    /// Exhaustive; see [`AuxReach`]. `PerTexel` aux (max-merged stamp footprints,
+    /// height snapshots) can be patched over the dirty texels, so it does not by
+    /// itself force a whole-field recompute; `Global` aux does. `Island` and
+    /// `Materials` are the load-bearing cases: their *height* kernel is `Local`
+    /// yet they emit globally-derived aux, so only this axis catches them.
+    pub fn aux_reach(&self) -> AuxReach {
+        match self {
+            LayerKind::SculptStrokes(_)
+            | LayerKind::TerrainConstraints(_)
+            | LayerKind::Path(_)
+            | LayerKind::OverhangStamp(_)
+            | LayerKind::LocalSdf(_) => AuxReach::PerTexel,
+
+            LayerKind::Island(_)
+            | LayerKind::Dunes(_)
+            | LayerKind::SandSimulation(_)
+            | LayerKind::Materials(_)
+            | LayerKind::Biomes(_)
+            | LayerKind::Vegetation(_)
+            | LayerKind::LandscapeEvolution(_)
+            | LayerKind::HydrologyRepair(_)
+            | LayerKind::GeomorphicDetail(_)
+            | LayerKind::GradientReconstruct(_)
+            | LayerKind::EcosystemFeedback(_)
+            | LayerKind::ThermalErosion(_)
+            | LayerKind::HydraulicErosion(_)
+            | LayerKind::DebrisFlow(_)
+            | LayerKind::StreamPowerErosion(_)
+            | LayerKind::RiverCarve(_)
+            | LayerKind::RiverNetwork(_)
+            | LayerKind::MultiScaleAmplify(_)
+            | LayerKind::FluidSimulation(_) => AuxReach::Global,
+
+            LayerKind::Flat(_)
+            | LayerKind::Ramp(_)
+            | LayerKind::NoiseValue(_)
+            | LayerKind::NoisePerlin(_)
+            | LayerKind::NoiseOpenSimplex(_)
+            | LayerKind::NoiseWorley(_)
+            | LayerKind::Fbm(_)
+            | LayerKind::Ridged(_)
+            | LayerKind::DomainWarp(_)
+            | LayerKind::Terrace(_)
+            | LayerKind::Plateau(_)
+            | LayerKind::Mesa(_)
+            | LayerKind::Mountains(_)
+            | LayerKind::Volcano(_)
+            | LayerKind::Uplift(_)
+            | LayerKind::Canyons(_)
+            | LayerKind::VoronoiRegions(_)
+            | LayerKind::ImportHeightmap(_)
+            | LayerKind::Blur(_)
+            | LayerKind::Coastal(_)
+            | LayerKind::EffectFilter(_)
+            | LayerKind::ProceduralShape(_)
+            | LayerKind::Stamp2d(_)
+            | LayerKind::Stamp3d(_)
+            | LayerKind::PolygonHeight(_)
+            | LayerKind::SculptBase(_) => AuxReach::HeightOnly,
         }
     }
 
@@ -541,5 +699,108 @@ mod tests {
             ScaleBand::MultiScale
         );
         assert!(ScaleBand::Micro.respects_macro_silhouette());
+    }
+
+    #[test]
+    fn wildcard_globals_are_no_longer_local() {
+        use crate::invalidation::DirtyClass;
+        // Kinds that used to fall through the deleted `_ => Local` arm and be
+        // silently treated as tile-localizable.
+        for kind in [
+            LayerKind::Terrace(Default::default()),
+            LayerKind::GradientReconstruct(Default::default()),
+            LayerKind::LandscapeEvolution(Default::default()),
+            LayerKind::HydrologyRepair(Default::default()),
+            LayerKind::GeomorphicDetail(Default::default()),
+            LayerKind::Biomes(Default::default()),
+            LayerKind::Vegetation(Default::default()),
+            LayerKind::Dunes(Default::default()),
+        ] {
+            assert_eq!(
+                kind.spatial_dependency(),
+                DirtyClass::BasinDependent,
+                "{kind:?} must be basin-coupled, not Local"
+            );
+        }
+        // Input-independent generators stay localizable.
+        assert_eq!(
+            LayerKind::VoronoiRegions(Default::default()).spatial_dependency(),
+            DirtyClass::Local
+        );
+    }
+
+    #[test]
+    fn intrinsic_reach_resolves_bounded_halos() {
+        use crate::filter_params::EffectFilterKind;
+        use crate::invalidation::Reach;
+        use crate::layer::BlurParams;
+
+        // Blur: radius x iterations.
+        assert_eq!(
+            LayerKind::Blur(BlurParams {
+                radius: 3,
+                iterations: 2
+            })
+            .intrinsic_reach(),
+            Reach::Localized { halo_samples: 6 }
+        );
+        // Generator: per-texel.
+        assert_eq!(
+            LayerKind::VoronoiRegions(Default::default()).intrinsic_reach(),
+            Reach::LOCAL
+        );
+        // SculptStrokes: one-sample reconcile halo.
+        assert_eq!(
+            LayerKind::SculptStrokes(Default::default()).intrinsic_reach(),
+            Reach::Localized { halo_samples: 1 }
+        );
+        // Basin-coupled kind: whole field.
+        assert_eq!(
+            LayerKind::ThermalErosion(Default::default()).intrinsic_reach(),
+            Reach::Full
+        );
+        // EffectFilter delegates to the sub-kind: bounded kernel vs global.
+        let smooth = EffectFilterParams {
+            kind: EffectFilterKind::Smooth,
+            radius: 4,
+            iterations: 1,
+            ..EffectFilterParams::default()
+        };
+        assert_eq!(
+            LayerKind::EffectFilter(smooth).intrinsic_reach(),
+            Reach::Localized { halo_samples: 4 }
+        );
+        let strata = EffectFilterParams {
+            kind: EffectFilterKind::Strata,
+            ..EffectFilterParams::default()
+        };
+        assert_eq!(
+            LayerKind::EffectFilter(strata).intrinsic_reach(),
+            Reach::Full
+        );
+    }
+
+    #[test]
+    fn aux_reach_catches_local_height_but_global_aux() {
+        use crate::invalidation::AuxReach;
+        // Island's height kernel is Local, but it emits jump-flood bathymetry —
+        // only aux_reach catches that.
+        assert_eq!(
+            LayerKind::Island(Default::default()).spatial_dependency(),
+            DirtyClass::Local
+        );
+        assert_eq!(
+            LayerKind::Island(Default::default()).aux_reach(),
+            AuxReach::Global
+        );
+        // Stamp aux is per-texel; pure generators are height-only.
+        assert_eq!(
+            LayerKind::SculptStrokes(Default::default()).aux_reach(),
+            AuxReach::PerTexel
+        );
+        assert_eq!(
+            LayerKind::Flat(Default::default()).aux_reach(),
+            AuxReach::HeightOnly
+        );
     }
 }

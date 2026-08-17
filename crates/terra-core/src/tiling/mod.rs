@@ -687,8 +687,17 @@ mod tests {
             dirty_class_for(&LayerKind::MultiScaleAmplify(Default::default())),
             DirtyClass::BasinDependent
         );
+        // Thermal erosion resamples the whole field through the level-step
+        // pyramid and normalizes its erosion/deposition aux globally, so it is
+        // basin-coupled — not the bounded `Expanding` it was classified as before
+        // #108 (which also matches the GPU declaring it `FullField`). The only
+        // localizable multi-iteration kind now is `EcosystemFeedback`.
         assert_eq!(
             dirty_class_for(&LayerKind::ThermalErosion(Default::default())),
+            DirtyClass::BasinDependent
+        );
+        assert_eq!(
+            dirty_class_for(&LayerKind::EcosystemFeedback(Default::default())),
             DirtyClass::Expanding
         );
     }
