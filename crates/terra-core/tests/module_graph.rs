@@ -35,7 +35,8 @@
 //!   a DAG. Combined with Rule 4 this makes a cycle impossible to reintroduce,
 //!   even by editing the allowlist.
 //! - **Rule 6** (`purity_allowlist_excludes_forbidden`): a careless edit to
-//!   [`ALLOWED_DEPS`] cannot itself admit `wgpu`/`winit`/`egui`/`terra-*`.
+//!   [`ALLOWED_DEPS`] cannot itself admit `wgpu`/`winit`/`egui`/`terra-*`, save
+//!   the pure leaf siblings named in [`ALLOWED_SIBLING_DEPS`] (`terra-jobs`).
 //!
 //! Kept deliberately dumb — a hand-written source lexer and `serde_json` over
 //! cargo's own output, no `syn`/`regex` — so it grows no new dependencies
@@ -78,6 +79,7 @@ const ALLOWED_DEPS: &[(&str, &[&str])] = &[
             "rayon",
             "serde",
             "serde_json",
+            "terra-jobs",
             "thiserror",
             "uuid",
         ],
@@ -85,6 +87,13 @@ const ALLOWED_DEPS: &[(&str, &[&str])] = &[
     ("build-dependencies", &[]),
     ("dev-dependencies", &["approx"]),
 ];
+
+/// The only `terra-*` sibling crates terra-core is consciously allowed to depend
+/// on: pure leaf primitives that carry no GPU/UI/domain code. `terra-jobs` (issue
+/// #101) is the cancellation + parallel-fill primitive and depends only on
+/// `rayon`. Every other `terra-*` crate stays forbidden by prefix, and listing a
+/// name here still requires a matching [`ALLOWED_DEPS`] entry (Rule 1).
+const ALLOWED_SIBLING_DEPS: &[&str] = &["terra-jobs"];
 
 /// Crate names (exact) that terra-core must never take as any dependency.
 /// `terra-*` crates are rejected by prefix in addition to these. Enforced both
@@ -557,7 +566,9 @@ fn purity_allowlist_excludes_forbidden() {
     let mut violations = Vec::new();
     for (section, names) in ALLOWED_DEPS {
         for name in *names {
-            if FORBIDDEN_DEPS.contains(name) || name.starts_with("terra-") {
+            if FORBIDDEN_DEPS.contains(name)
+                || (name.starts_with("terra-") && !ALLOWED_SIBLING_DEPS.contains(name))
+            {
                 violations.push(format!(
                     "ALLOWED_DEPS[{section}] lists forbidden crate `{name}`"
                 ));
@@ -617,7 +628,9 @@ fn purity_violations(deps: &[DepRecord]) -> Vec<String> {
 
     for d in deps {
         let section = d.kind.section();
-        if FORBIDDEN_DEPS.contains(&d.name.as_str()) || d.name.starts_with("terra-") {
+        if FORBIDDEN_DEPS.contains(&d.name.as_str())
+            || (d.name.starts_with("terra-") && !ALLOWED_SIBLING_DEPS.contains(&d.name.as_str()))
+        {
             v.push(format!(
                 "[{section}] resolves to forbidden dependency `{}`; terra-core must stay free of \
                  GPU/UI and sibling terra-* crates (a rename cannot hide it)",

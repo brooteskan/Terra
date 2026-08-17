@@ -9,6 +9,7 @@ design was reached, but they do not override this document.
 | Crate | Responsibility |
 |-------|----------------|
 | `terra-core` | Domain model: heightfields, layer stack, masks, biomes, CPU evaluation, and editor commands |
+| `terra-jobs` | Cancellation primitive (`CancelToken`) and cancellable parallel-fill helpers shared by CPU eval; a leaf crate below `terra-core` |
 | `terra-gpu` | GPU compute for supported terrain generators, filters, and simulations |
 | `terra-render` | wgpu terrain viewport, clipmaps, camera, lighting, and terrain render pass |
 | `terra-gui` | Reusable, domain-neutral immediate-mode wgpu UI toolkit and design system |

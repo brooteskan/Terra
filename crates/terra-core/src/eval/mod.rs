@@ -21,11 +21,9 @@ use crate::heightfield::{Heightfield, HeightfieldMetrics};
 use crate::layer::{blend_heights, Layer, LayerId, LayerStack, StackNode};
 use crate::mask::{MaskAsset, MaskField, MaskId};
 use std::collections::HashMap;
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc,
-};
+use std::sync::{atomic::AtomicU64, Arc};
 use std::time::Instant;
+use terra_jobs::CancelToken;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -103,8 +101,10 @@ pub struct EvalContext {
     /// Stable outputs published by layers already evaluated below the current layer.
     pub published_outputs: HashMap<crate::layer::OutputId, MaskField>,
     pub cancelled: bool,
-    /// Shared worker generation; a mismatch cancels at the next layer boundary.
-    pub(crate) cancellation_generation: Option<(Arc<AtomicU64>, u64)>,
+    /// Cooperative cancel signal. Checked between layers and, since #101, inside
+    /// the `fill_world` generators so a superseding edit interrupts a long fill
+    /// mid-flight instead of waiting it out.
+    pub(crate) cancel: CancelToken,
     pub quality: PreviewQuality,
     /// Timings for the current pass, in actual layer evaluation order.
     pub layer_timings: Vec<LayerEvalTiming>,
@@ -122,25 +122,39 @@ impl EvalContext {
             published_outputs: HashMap::new(),
             cancelled: false,
             quality: PreviewQuality::Full,
-            cancellation_generation: None,
+            cancel: CancelToken::never(),
             layer_timings: Vec::new(),
         }
     }
 
     pub fn check_cancelled(&self) -> Result<(), EvalError> {
-        let generation_changed = self
-            .cancellation_generation
-            .as_ref()
-            .is_some_and(|(generation, expected)| generation.load(Ordering::Acquire) != *expected);
-        if self.cancelled || generation_changed {
+        if self.cancelled || self.cancel.is_cancelled() {
             Err(EvalError::Cancelled)
         } else {
             Ok(())
         }
     }
 
+    /// Install a generation-based cancel token, as the eval worker does when it
+    /// runs a CPU job. Kept as a distinct helper so `worker.rs` need not name
+    /// [`CancelToken`] directly.
     pub fn set_cancellation_generation(&mut self, generation: Arc<AtomicU64>, expected: u64) {
-        self.cancellation_generation = Some((generation, expected));
+        self.cancel = CancelToken::generation(generation, expected);
+    }
+
+    /// Install an arbitrary cancel token (e.g. the one-shot flag the phase-2
+    /// export executors carry).
+    pub fn set_cancel_token(&mut self, token: CancelToken) {
+        self.cancel = token;
+    }
+
+    /// A cheap clone of the current cancel token for handing to generators.
+    ///
+    /// Note this does not fold in the plain [`cancelled`](Self::cancelled) flag,
+    /// which is set before eval begins and stays covered by the between-layer
+    /// [`check_cancelled`](Self::check_cancelled).
+    pub fn cancel_token(&self) -> CancelToken {
+        self.cancel.clone()
     }
 
     /// Insert an aux map into both typed and string stores.

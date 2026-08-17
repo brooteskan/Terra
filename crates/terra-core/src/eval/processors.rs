@@ -41,6 +41,10 @@ impl ProcessorRegistry {
         input: &Heightfield,
         layer: &Layer,
     ) -> Result<Heightfield, EvalError> {
+        // One cheap clone of the eval's cancel token, handed to every
+        // fill_world-based generator so a superseding edit interrupts a long
+        // fill mid-flight. `None` from a generator means it was cancelled.
+        let cancel = ctx.cancel_token();
         match &layer.kind {
             LayerKind::SculptBase(p) => Ok(generators::sculpt_base(ctx.metrics, p)),
             LayerKind::SculptStrokes(p) => {
@@ -188,28 +192,35 @@ impl ProcessorRegistry {
             }
             LayerKind::Flat(p) => Ok(generators::flat(ctx.metrics, p.height)),
             LayerKind::Ramp(p) => Ok(generators::ramp(ctx.metrics, p)),
-            LayerKind::NoiseValue(p) => Ok(generators::noise_field(
-                ctx.metrics,
-                p,
-                FractalNoiseType::Value,
-            )),
-            LayerKind::NoisePerlin(p) => Ok(generators::noise_field(
-                ctx.metrics,
-                p,
-                FractalNoiseType::Perlin,
-            )),
-            LayerKind::NoiseOpenSimplex(p) => Ok(generators::noise_field(
-                ctx.metrics,
-                p,
-                FractalNoiseType::OpenSimplex,
-            )),
-            LayerKind::NoiseWorley(p) => Ok(generators::worley_field(ctx.metrics, p)),
-            LayerKind::Fbm(p) => Ok(generators::fbm_field(ctx.metrics, p)),
-            LayerKind::Ridged(p) => Ok(generators::ridged_field(ctx.metrics, p)),
-            LayerKind::DomainWarp(p) => Ok(generators::domain_warp_field(ctx.metrics, p)),
+            LayerKind::NoiseValue(p) => {
+                generators::noise_field(ctx.metrics, &cancel, p, FractalNoiseType::Value)
+                    .ok_or(EvalError::Cancelled)
+            }
+            LayerKind::NoisePerlin(p) => {
+                generators::noise_field(ctx.metrics, &cancel, p, FractalNoiseType::Perlin)
+                    .ok_or(EvalError::Cancelled)
+            }
+            LayerKind::NoiseOpenSimplex(p) => {
+                generators::noise_field(ctx.metrics, &cancel, p, FractalNoiseType::OpenSimplex)
+                    .ok_or(EvalError::Cancelled)
+            }
+            LayerKind::NoiseWorley(p) => {
+                generators::worley_field(ctx.metrics, &cancel, p).ok_or(EvalError::Cancelled)
+            }
+            LayerKind::Fbm(p) => {
+                generators::fbm_field(ctx.metrics, &cancel, p).ok_or(EvalError::Cancelled)
+            }
+            LayerKind::Ridged(p) => {
+                generators::ridged_field(ctx.metrics, &cancel, p).ok_or(EvalError::Cancelled)
+            }
+            LayerKind::DomainWarp(p) => {
+                generators::domain_warp_field(ctx.metrics, &cancel, p).ok_or(EvalError::Cancelled)
+            }
             LayerKind::Terrace(p) => Ok(generators::terrace(input, p)),
             LayerKind::Plateau(p) => Ok(generators::plateau(input, p)),
-            LayerKind::Mesa(p) => Ok(generators::mesa(ctx.metrics, p)),
+            LayerKind::Mesa(p) => {
+                generators::mesa(ctx.metrics, &cancel, p).ok_or(EvalError::Cancelled)
+            }
             LayerKind::Island(p) => {
                 let result = generators::island(ctx.metrics, p);
                 ctx.aux_insert(keys::LAND_MASK, result.land);
@@ -221,20 +232,33 @@ impl ProcessorRegistry {
                 ctx.aux_insert(keys::MOUNTAIN_MASK, result.mountain);
                 Ok(result.height)
             }
-            LayerKind::Mountains(p) => Ok(generators::mountains(ctx.metrics, p)),
-            LayerKind::Volcano(p) => Ok(generators::volcano(ctx.metrics, p)),
-            LayerKind::Uplift(p) => Ok(generators::uplift(ctx.metrics, p)),
+            LayerKind::Mountains(p) => {
+                generators::mountains(ctx.metrics, &cancel, p).ok_or(EvalError::Cancelled)
+            }
+            LayerKind::Volcano(p) => {
+                generators::volcano(ctx.metrics, &cancel, p).ok_or(EvalError::Cancelled)
+            }
+            LayerKind::Uplift(p) => {
+                generators::uplift(ctx.metrics, &cancel, p).ok_or(EvalError::Cancelled)
+            }
             LayerKind::Dunes(p) => {
-                let (height, aeolian) = generators::dunes_with_aux(ctx.metrics, p);
+                let (height, aeolian) = generators::dunes_with_aux(ctx.metrics, &cancel, p)
+                    .ok_or(EvalError::Cancelled)?;
                 publish_aeolian_aux(ctx, &aeolian);
                 Ok(height)
             }
-            LayerKind::Canyons(p) => Ok(generators::canyons(ctx.metrics, p)),
-            LayerKind::VoronoiRegions(p) => Ok(generators::voronoi_regions(ctx.metrics, p)),
+            LayerKind::Canyons(p) => {
+                generators::canyons(ctx.metrics, &cancel, p).ok_or(EvalError::Cancelled)
+            }
+            LayerKind::VoronoiRegions(p) => {
+                generators::voronoi_regions(ctx.metrics, &cancel, p).ok_or(EvalError::Cancelled)
+            }
             LayerKind::ImportHeightmap(p) => {
                 generators::import_heightmap(ctx.metrics, p).map_err(EvalError::from)
             }
-            LayerKind::ProceduralShape(p) => Ok(generators::procedural_shape(ctx.metrics, p)),
+            LayerKind::ProceduralShape(p) => {
+                generators::procedural_shape(ctx.metrics, &cancel, p).ok_or(EvalError::Cancelled)
+            }
             LayerKind::Stamp2d(p) => {
                 generators::import_heightmap(ctx.metrics, &p.heightmap).map_err(EvalError::from)
             }

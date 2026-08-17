@@ -6,6 +6,7 @@ license.workspace = true
 description = "Terrain processing domain: heightfields, layers, masks, evaluation"
 
 [dependencies]
+terra-jobs = { workspace = true }
 glam = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -68,6 +68,10 @@ pub use fields::{
 pub use geomorph::{
     analyze_terrain, bake_debug_field, GeomorphAnalysis, GeomorphDebugField, GeomorphOptions,
 };
+/// The cancellation primitive backing eval cancellation. Re-exported so callers
+/// and fixtures have one canonical path and sibling crates need no direct
+/// `terra-jobs` dependency.
+pub use terra_jobs::CancelToken;
 pub use terrain_recipe::{
     build_terrain_recipe_from_stack, recipe_matches_stack, RecipeItem, RecipeItemKind,
     RecipeRebuildStatus,

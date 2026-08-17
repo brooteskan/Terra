@@ -2606,6 +2606,7 @@ dependencies = [
  "rayon",
  "serde",
  "serde_json",
+ "terra-jobs",
  "thiserror 2.0.19",
  "uuid",
 ]
@@ -2650,6 +2651,13 @@ dependencies = [
  "serde_json",
  "terra-core",
  "thiserror 2.0.19",
+]
+
+[[package]]
+name = "terra-jobs"
+version = "0.1.0-beta.1"
+dependencies = [
+ "rayon",
 ]
 
 [[package]]
