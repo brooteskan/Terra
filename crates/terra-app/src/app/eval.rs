@@ -417,6 +417,33 @@ impl TerraApp {
         }
     }
 
+    /// Mirror a stage-scoped UI-evaluator dirty ([`StackEvaluator::mark_dirty_from_eval_stage`])
+    /// onto the background worker's dirty accumulators.
+    ///
+    /// The worker request carries only a single suffix layer (`dirty_from`) or a
+    /// whole-field flag — it has no stage field — so a stage dirty is mirrored by
+    /// dirtying from the earliest in-stack layer at or after `stage`. Every
+    /// stage-dirtied layer has an index at least that earliest one's, so the suffix
+    /// is a superset of the stage set: never an under-dirty, at worst a bounded
+    /// over-recompute of clean lower-stage layers sitting above it. Without this,
+    /// explicit scenario (re)builds dirty only the UI-thread evaluator and the
+    /// worker reuses its stale checkpoint for the (worker-authoritative) sim layers.
+    pub(crate) fn track_worker_dirty_from_eval_stage(
+        &mut self,
+        stack: &terra_core::layer::LayerStack,
+        stage: terra_core::EvalStage,
+    ) {
+        let min_order = stage.order();
+        let earliest = stack.layer_ids().into_iter().find(|id| {
+            stack
+                .find(*id)
+                .is_some_and(|layer| layer.kind.eval_stage().order() >= min_order)
+        });
+        if let Some(id) = earliest {
+            self.track_worker_dirty_from(stack, id);
+        }
+    }
+
     pub(crate) fn mark_all_layers_dirty(&mut self) {
         let preview = self.session.document.preview_eval_stack();
         self.scheduler.evaluator.mark_all_dirty(&preview);
