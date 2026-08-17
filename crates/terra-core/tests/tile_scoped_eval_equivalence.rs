@@ -25,8 +25,9 @@ use std::sync::Arc;
 use terra_core::eval::{EvalContext, EvalError, LayerEvalTiming, PreviewQuality, StackEvaluator};
 use terra_core::heightfield::{Heightfield, HeightfieldMetrics, TileId};
 use terra_core::layer::{
-    BlurParams, CoastalParams, Layer, LayerId, LayerKind, LayerStack, PathNode, PathParams,
-    PlateauParams, SculptParams,
+    BlurParams, CoastalParams, FbmParams, Layer, LayerId, LayerKind, LayerStack, MesaParams,
+    MountainParams, PathNode, PathParams, PlateauParams, ProceduralGenerator,
+    ProceduralShapeParams, SculptParams, VoronoiParams,
 };
 use terra_core::tiling::measure_seams;
 
@@ -60,8 +61,7 @@ fn sculpt_gradient(res: u32) -> Layer {
     let mut p = SculptParams::filled(res, 0.0);
     for j in 0..res {
         for i in 0..res {
-            let v =
-                20.0 + (i as f32) * 0.15 + (j as f32) * 0.11 + ((i * 7 + j * 13) % 23) as f32;
+            let v = 20.0 + (i as f32) * 0.15 + (j as f32) * 0.11 + ((i * 7 + j * 13) % 23) as f32;
             p.samples[(j * res + i) as usize] = v;
         }
     }
@@ -166,8 +166,11 @@ fn scoped_rebuild(
 }
 
 /// The pool of flat, localizable stacks. Each entry names its layers so a failure
-/// points at the arm. All arms here are tile-wired or per-texel: SculptBase,
-/// Plateau, Coastal, Blur.
+/// points at the arm. Every arm here is tile-wired or per-texel: SculptBase,
+/// Plateau, Coastal, Blur, and the #110 generator arms (Fbm, Ridged,
+/// VoronoiRegions, Mesa, Mountains, ProceduralShape). Generator layers sit above
+/// the seeded sculpt base so the region mark propagates up and each is
+/// tile-scope-recomputed rather than filled whole-field.
 fn pool(res: u32) -> Vec<(&'static str, Vec<Layer>)> {
     let plateau = || {
         Layer::new(
@@ -190,6 +193,50 @@ fn pool(res: u32) -> Vec<(&'static str, Vec<Layer>)> {
             }),
         )
     };
+    // A frequency above the 0.002 default so the fBm varies visibly across this
+    // small world, giving a mis-indexed tile fill nowhere to hide.
+    let fbm = || {
+        let mut fp = FbmParams::default();
+        fp.base.frequency = 0.05;
+        Layer::new("Fbm", LayerKind::Fbm(fp))
+    };
+    let ridged = || {
+        let mut fp = FbmParams::default();
+        fp.base.frequency = 0.05;
+        Layer::new("Ridged", LayerKind::Ridged(fp))
+    };
+    let voronoi = || {
+        Layer::new(
+            "Voronoi",
+            LayerKind::VoronoiRegions(VoronoiParams::default()),
+        )
+    };
+    let mesa = || Layer::new("Mesa", LayerKind::Mesa(MesaParams::default()));
+    let mountains = || Layer::new("Mountains", LayerKind::Mountains(MountainParams::default()));
+    let proc_mountain = || {
+        Layer::new(
+            "ProcMountain",
+            LayerKind::ProceduralShape(ProceduralShapeParams {
+                generator: ProceduralGenerator::Mountain,
+                ..ProceduralShapeParams::default()
+            }),
+        )
+    };
+    let proc_plateau = || {
+        let mut p = ProceduralShapeParams {
+            generator: ProceduralGenerator::Plateau,
+            ..ProceduralShapeParams::default()
+        };
+        // Sharpen the fBm base and widen the plateau band so the composite is not
+        // a flat constant (exercises the fbm-then-plateau_sample tile path).
+        p.hills.base.frequency = 0.05;
+        p.plateau = PlateauParams {
+            low: -500.0,
+            high: 500.0,
+            soft: 10.0,
+        };
+        Layer::new("ProcPlateau", LayerKind::ProceduralShape(p))
+    };
     vec![
         ("sculpt-only", vec![sculpt_gradient(res)]),
         ("sculpt+plateau", vec![sculpt_gradient(res), plateau()]),
@@ -198,10 +245,28 @@ fn pool(res: u32) -> Vec<(&'static str, Vec<Layer>)> {
             "sculpt+plateau+coastal",
             vec![sculpt_gradient(res), plateau(), coastal()],
         ),
-        ("sculpt+blur", vec![sculpt_gradient(res), one_tile_blur("Blur")]),
+        (
+            "sculpt+blur",
+            vec![sculpt_gradient(res), one_tile_blur("Blur")],
+        ),
         (
             "sculpt+blur+plateau",
             vec![sculpt_gradient(res), one_tile_blur("Blur"), plateau()],
+        ),
+        ("sculpt+fbm", vec![sculpt_gradient(res), fbm()]),
+        (
+            "sculpt+ridged+mesa",
+            vec![sculpt_gradient(res), ridged(), mesa()],
+        ),
+        ("sculpt+voronoi", vec![sculpt_gradient(res), voronoi()]),
+        ("sculpt+mountains", vec![sculpt_gradient(res), mountains()]),
+        (
+            "sculpt+proc-mountain",
+            vec![sculpt_gradient(res), proc_mountain()],
+        ),
+        (
+            "sculpt+proc-plateau",
+            vec![sculpt_gradient(res), proc_plateau()],
         ),
     ]
 }
@@ -216,7 +281,10 @@ fn scoped_matches_whole_field_across_stacks_and_rects() {
     let rects: Vec<(&str, Vec<TileId>)> = vec![
         ("single-interior", tiles_in_samples(&m, 34, 34, 34, 34)),
         ("corner-crossing", tiles_in_samples(&m, 28, 28, 36, 36)),
-        ("field-edge-partial", tiles_in_samples(&m, res - 3, res - 3, res - 1, res - 1)),
+        (
+            "field-edge-partial",
+            tiles_in_samples(&m, res - 3, res - 3, res - 1, res - 1),
+        ),
         ("whole-field", all_tiles(&m)),
     ];
 
@@ -306,8 +374,16 @@ fn stacked_blur_reach_accumulates() {
 
     let (scoped, timings) = scoped_rebuild(&stack, ids[0], &region, m);
     assert_eq!(timing(&timings, ids[0]).tiles_recomputed, Some(1), "sculpt");
-    assert_eq!(timing(&timings, ids[1]).tiles_recomputed, Some(9), "blur1: 3x3");
-    assert_eq!(timing(&timings, ids[2]).tiles_recomputed, Some(25), "blur2: 5x5");
+    assert_eq!(
+        timing(&timings, ids[1]).tiles_recomputed,
+        Some(9),
+        "blur1: 3x3"
+    );
+    assert_eq!(
+        timing(&timings, ids[2]).tiles_recomputed,
+        Some(25),
+        "blur2: 5x5"
+    );
 
     let control = whole_field_control(&stack, ids[0], m);
     assert_eq!(bits(&scoped), bits(&control));
@@ -340,7 +416,10 @@ fn basin_dependent_escalates_from_that_layer_up() {
     let scoped = eval.rebuild_incremental(&stack, &mut ctx2).expect("scoped");
     let t = &ctx2.layer_timings;
 
-    assert!(timing(t, ids[0]).tiles_recomputed.is_some(), "sculpt scoped");
+    assert!(
+        timing(t, ids[0]).tiles_recomputed.is_some(),
+        "sculpt scoped"
+    );
     assert!(timing(t, ids[1]).tiles_recomputed.is_some(), "blur1 scoped");
     assert_eq!(
         timing(t, ids[2]).tiles_recomputed,
@@ -361,7 +440,9 @@ fn basin_dependent_escalates_from_that_layer_up() {
     cval.mark_dirty_from(&stack, ids[0]);
     let mut cctx2 = EvalContext::new(m);
     cctx2.quality = PreviewQuality::Draft;
-    let control = cval.rebuild_incremental(&stack, &mut cctx2).expect("control");
+    let control = cval
+        .rebuild_incremental(&stack, &mut cctx2)
+        .expect("control");
     assert_eq!(bits(&scoped), bits(&control), "scoped != whole-field");
     assert_eq!(measure_seams(&scoped), 0.0);
 }
@@ -429,7 +510,10 @@ fn bounded_paint_edit_matches_cold_rebuild() {
         let b = e2.rebuild_all(&mut_only, &mut c2).unwrap();
         changed_tiles(&a, &b)
     };
-    assert!(!sculpt_footprint.is_empty(), "the paint edit changed something");
+    assert!(
+        !sculpt_footprint.is_empty(),
+        "the paint edit changed something"
+    );
     assert!(
         changed_tiles(&original, &truth).len() > sculpt_footprint.len(),
         "the two blurs must widen the footprint beyond the sculpt's own tiles"
@@ -563,8 +647,18 @@ fn scoped_path_matches_whole_field_including_wetness() {
         "Path",
         LayerKind::Path(PathParams {
             nodes: vec![
-                PathNode { u: 0.2, v: 0.45, height: -6.0, width: 1.0 },
-                PathNode { u: 0.8, v: 0.55, height: -6.0, width: 1.0 },
+                PathNode {
+                    u: 0.2,
+                    v: 0.45,
+                    height: -6.0,
+                    width: 1.0,
+                },
+                PathNode {
+                    u: 0.8,
+                    v: 0.55,
+                    height: -6.0,
+                    width: 1.0,
+                },
             ],
             width: 10.0,
             falloff: 6.0,
@@ -594,7 +688,9 @@ fn scoped_path_matches_whole_field_including_wetness() {
     let scoped = s.rebuild_incremental(&stack, &mut sctx2).expect("scoped");
 
     assert!(
-        timing(&sctx2.layer_timings, ids[1]).tiles_recomputed.is_some(),
+        timing(&sctx2.layer_timings, ids[1])
+            .tiles_recomputed
+            .is_some(),
         "the path layer should recompute tile-scoped, not escalate"
     );
     assert_eq!(bits(&scoped), bits(&truth), "scoped path height diverged");

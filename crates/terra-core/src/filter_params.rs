@@ -289,20 +289,19 @@ impl EffectFilterKind {
             | NoiseBillow | NoiseGabor | NoisePerlin | NoisePhasor | NoiseRidged | NoiseSimplex
             | NoiseValue | NoiseVoronoi | NoiseWave | NoiseWhite => DirtyClass::Local,
             // Bounded neighbourhood kernels — reach is radius x iterations.
-            Smooth | Denoise | Kuwahara | SpikeRemoval | Inflate | Deflate | Balloon | AngleBlur
-            | DirectionalBlur | SmoothRidges | FlattenFilter | MudSettle | AngleBreak
-            | TalusFill => DirtyClass::Expanding,
+            Smooth | Denoise | Kuwahara | SpikeRemoval | Inflate | Deflate | Balloon
+            | AngleBlur | DirectionalBlur | SmoothRidges | FlattenFilter | MudSettle
+            | AngleBreak | TalusFill => DirtyClass::Expanding,
             // Whole-field: global reductions (field-range remaps, border blends),
             // flow routing / drainage normalize, arbitrary-rotation resample,
             // world-space domain warp / cell tiling (Distortion, Hexagons — whose
             // sample reach depends on world scale), and iterative aeolian carve.
-            Squeeze | Curve | Cutoff | ZeroEdge | Strata | BorderBlend | Swirl | SedimentFillSoft
-            | HydraulicSediment | WashedOff | SedimentFlows | SoftFlows | ThinFlows | RidgedFlows
-            | WideFlows | TerraceSimple | TerraceIrregular | TerraceSteep | RockySharp | RockyWide
-            | RockyLayers | CliffReinforce | RockyPlateaus | RockyCliffs | RockyHard | Canyon
-            | Chipped | Cliffs | Rocky | WindCarve | Distortion | Hexagons => {
-                DirtyClass::BasinDependent
-            }
+            Squeeze | Curve | Cutoff | ZeroEdge | Strata | BorderBlend | Swirl
+            | SedimentFillSoft | HydraulicSediment | WashedOff | SedimentFlows | SoftFlows
+            | ThinFlows | RidgedFlows | WideFlows | TerraceSimple | TerraceIrregular
+            | TerraceSteep | RockySharp | RockyWide | RockyLayers | CliffReinforce
+            | RockyPlateaus | RockyCliffs | RockyHard | Canyon | Chipped | Cliffs | Rocky
+            | WindCarve | Distortion | Hexagons => DirtyClass::BasinDependent,
         }
     }
 }
@@ -1220,7 +1219,11 @@ mod spatial_tests {
         for &k in EffectFilterKind::ALL {
             let _ = k.spatial_dependency();
         }
-        assert_eq!(EffectFilterKind::ALL.len(), 64, "ALL inventory size drifted");
+        assert_eq!(
+            EffectFilterKind::ALL.len(),
+            64,
+            "ALL inventory size drifted"
+        );
     }
 
     #[test]

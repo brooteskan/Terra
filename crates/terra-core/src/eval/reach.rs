@@ -16,7 +16,9 @@
 
 use crate::invalidation::{AuxReach, Reach};
 use crate::layer::Layer;
-use crate::mask_ir::{DistNode, DistNodeKind, Distribution, MaskAsset, MaskOp, MaskRef, MaskSource};
+use crate::mask_ir::{
+    DistNode, DistNodeKind, Distribution, MaskAsset, MaskOp, MaskRef, MaskSource,
+};
 
 /// Effective reach of `layer` given the project's mask assets.
 ///
@@ -124,11 +126,11 @@ fn dist_node_reach(kind: &DistNodeKind, mask_assets: &[MaskAsset]) -> Reach {
         | EffectEdge { .. } => Reach::Localized { halo_samples: 1 },
 
         // Explicit sample-radius neighbourhood nodes.
-        Occlusion { radius, .. }
-        | Roughness { radius, .. }
-        | EffectBlur { radius } => Reach::Localized {
-            halo_samples: *radius,
-        },
+        Occlusion { radius, .. } | Roughness { radius, .. } | EffectBlur { radius } => {
+            Reach::Localized {
+                halo_samples: *radius,
+            }
+        }
 
         // Iterative smear — one sample per iteration.
         EffectSimpleFlow { iterations, .. } => Reach::Localized {
@@ -139,10 +141,9 @@ fn dist_node_reach(kind: &DistNodeKind, mask_assets: &[MaskAsset]) -> Reach {
         // unbounded, a distance field is global, and the morphological
         // expand/contract radii are world-space metres this sample-space walk
         // can't convert without the field metrics — so force whole-field.
-        EffectDistortion { .. }
-        | Distance { .. }
-        | EffectDilate { .. }
-        | EffectErode { .. } => Reach::Full,
+        EffectDistortion { .. } | Distance { .. } | EffectDilate { .. } | EffectErode { .. } => {
+            Reach::Full
+        }
 
         // Asset references resolve to the referenced mask's own reach.
         MaskAsset { mask } | Paint { mask } | ImportedMask { mask } => {
@@ -264,7 +265,10 @@ mod tests {
     fn global_aux_producer_forces_full_despite_local_height_kernel() {
         // Island's height kernel is Local, but it publishes jump-flood aux.
         let l = layer(LayerKind::Island(Default::default()));
-        assert_eq!(l.kind.spatial_dependency(), crate::invalidation::DirtyClass::Local);
+        assert_eq!(
+            l.kind.spatial_dependency(),
+            crate::invalidation::DirtyClass::Local
+        );
         assert_eq!(effective_reach(&l, &[]), Reach::Full);
     }
 
@@ -277,7 +281,10 @@ mod tests {
             ..EffectFilterParams::default()
         };
         let l = layer(LayerKind::EffectFilter(p));
-        assert_eq!(effective_reach(&l, &[]), Reach::Localized { halo_samples: 6 });
+        assert_eq!(
+            effective_reach(&l, &[]),
+            Reach::Localized { halo_samples: 6 }
+        );
     }
 
     #[test]
@@ -285,7 +292,10 @@ mod tests {
         // SculptStrokes publishes only per-texel stamp aux, so it keeps its
         // one-sample reconcile halo.
         let l = layer(LayerKind::SculptStrokes(Default::default()));
-        assert_eq!(effective_reach(&l, &[]), Reach::Localized { halo_samples: 1 });
+        assert_eq!(
+            effective_reach(&l, &[]),
+            Reach::Localized { halo_samples: 1 }
+        );
     }
 
     #[test]
@@ -298,7 +308,10 @@ mod tests {
                 max_deg: 40.0,
             })],
         };
-        assert_eq!(effective_reach(&l, &[]), Reach::Localized { halo_samples: 1 });
+        assert_eq!(
+            effective_reach(&l, &[]),
+            Reach::Localized { halo_samples: 1 }
+        );
     }
 
     #[test]
@@ -321,7 +334,10 @@ mod tests {
             entries: Vec::new(),
             nodes: vec![DistNode::new(DistNodeKind::EffectBlur { radius: 5 })],
         };
-        assert_eq!(effective_reach(&l, &[]), Reach::Localized { halo_samples: 5 });
+        assert_eq!(
+            effective_reach(&l, &[]),
+            Reach::Localized { halo_samples: 5 }
+        );
     }
 
     #[test]

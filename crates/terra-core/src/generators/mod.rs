@@ -2388,7 +2388,12 @@ mod tests {
             TileId { tx: 0, tz: 0 },
             TileId { tx: 2, tz: 1 }, // partial edge tile (interior 8x8)
         ];
-        assert!(try_fill_tiles(&mut scoped, &scope, &CancelToken::never(), f));
+        assert!(try_fill_tiles(
+            &mut scoped,
+            &scope,
+            &CancelToken::never(),
+            f
+        ));
 
         for id in scope {
             let tile = whole.tile(id).expect("scope tile exists");

@@ -320,7 +320,10 @@ impl LayerCache {
             _ => false,
         };
         if can_bound {
-            self.seed_dirty.entry(id).or_default().extend(tiles.iter().copied());
+            self.seed_dirty
+                .entry(id)
+                .or_default()
+                .extend(tiles.iter().copied());
             match self.entries.get_mut(&id) {
                 Some(CacheEntry::Resident(output)) => output.dirty = true,
                 Some(CacheEntry::Spilled { dirty, .. }) => *dirty = true,

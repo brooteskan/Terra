@@ -19,7 +19,7 @@ pub use worker::{
 
 use crate::field_data::AuxMaps;
 use crate::heightfield::{Heightfield, HeightfieldMetrics, TileId};
-use crate::layer::{blend_heights, Layer, LayerId, LayerStack, StackNode};
+use crate::layer::{blend_heights, FractalNoiseType, Layer, LayerId, LayerStack, StackNode};
 use crate::mask::{MaskAsset, MaskField, MaskId};
 use crate::tiling::TileScheduler;
 use std::collections::{HashMap, HashSet};
@@ -793,13 +793,7 @@ impl StackEvaluator {
                     let hin = input.get(i, j);
                     let hlayer = generated.get(i, j);
                     let m = mask.get(i, j);
-                    let v = blend_heights(
-                        layer.common.blend,
-                        hin,
-                        hlayer,
-                        layer.common.opacity,
-                        m,
-                    );
+                    let v = blend_heights(layer.common.blend, hin, hlayer, layer.common.opacity, m);
                     out.set(i, j, v);
                 }
             }
@@ -875,10 +869,108 @@ impl StackEvaluator {
                 Ok(g)
             }
             LayerKind::Path(p) => self.generate_scoped_path(ctx, input, p, layer.id(), scope),
-            // Not yet tile-wired (input-independent generators, etc.): whole-field
-            // generate is still correct because the caller blends only `scope`.
+
+            // Input-independent generators (#110): recompute only the scope tiles
+            // into a zero-seeded field via the matching `*_tiles` entry. Values
+            // outside `scope` stay zero and are never read by the caller's blend;
+            // a cancel maps to `EvalError::Cancelled`.
+            LayerKind::NoiseValue(p) => {
+                Self::scoped_generate(metrics, scope, &ctx.cancel_token(), |g, t, c| {
+                    crate::generators::noise_field_tiles(g, t, c, p, FractalNoiseType::Value)
+                })
+            }
+            LayerKind::NoisePerlin(p) => {
+                Self::scoped_generate(metrics, scope, &ctx.cancel_token(), |g, t, c| {
+                    crate::generators::noise_field_tiles(g, t, c, p, FractalNoiseType::Perlin)
+                })
+            }
+            LayerKind::NoiseOpenSimplex(p) => {
+                Self::scoped_generate(metrics, scope, &ctx.cancel_token(), |g, t, c| {
+                    crate::generators::noise_field_tiles(g, t, c, p, FractalNoiseType::OpenSimplex)
+                })
+            }
+            LayerKind::NoiseWorley(p) => {
+                Self::scoped_generate(metrics, scope, &ctx.cancel_token(), |g, t, c| {
+                    crate::generators::worley_field_tiles(g, t, c, p)
+                })
+            }
+            LayerKind::Fbm(p) => {
+                Self::scoped_generate(metrics, scope, &ctx.cancel_token(), |g, t, c| {
+                    crate::generators::fbm_field_tiles(g, t, c, p)
+                })
+            }
+            LayerKind::Ridged(p) => {
+                Self::scoped_generate(metrics, scope, &ctx.cancel_token(), |g, t, c| {
+                    crate::generators::ridged_field_tiles(g, t, c, p)
+                })
+            }
+            LayerKind::DomainWarp(p) => {
+                Self::scoped_generate(metrics, scope, &ctx.cancel_token(), |g, t, c| {
+                    crate::generators::domain_warp_field_tiles(g, t, c, p)
+                })
+            }
+            LayerKind::Mesa(p) => {
+                Self::scoped_generate(metrics, scope, &ctx.cancel_token(), |g, t, c| {
+                    crate::generators::mesa_tiles(g, t, c, p)
+                })
+            }
+            LayerKind::Mountains(p) => {
+                Self::scoped_generate(metrics, scope, &ctx.cancel_token(), |g, t, c| {
+                    crate::generators::mountains_tiles(g, t, c, p)
+                })
+            }
+            LayerKind::Volcano(p) => {
+                Self::scoped_generate(metrics, scope, &ctx.cancel_token(), |g, t, c| {
+                    crate::generators::volcano_tiles(g, t, c, p)
+                })
+            }
+            LayerKind::Uplift(p) => {
+                Self::scoped_generate(metrics, scope, &ctx.cancel_token(), |g, t, c| {
+                    crate::generators::uplift_tiles(g, t, c, p)
+                })
+            }
+            LayerKind::Canyons(p) => {
+                Self::scoped_generate(metrics, scope, &ctx.cancel_token(), |g, t, c| {
+                    crate::generators::canyons_tiles(g, t, c, p)
+                })
+            }
+            LayerKind::VoronoiRegions(p) => {
+                Self::scoped_generate(metrics, scope, &ctx.cancel_token(), |g, t, c| {
+                    crate::generators::voronoi_regions_tiles(g, t, c, p)
+                })
+            }
+            LayerKind::ProceduralShape(p) => {
+                let cancel = ctx.cancel_token();
+                let mut g = Heightfield::zeros(metrics);
+                match crate::generators::procedural_shape_tiles(&mut g, scope, &cancel, p) {
+                    Some(true) => Ok(g),
+                    Some(false) => Err(EvalError::Cancelled),
+                    // Dunes/Crater have no tile-sliced fill: whole-field generate,
+                    // still correct because the caller blends only `scope`.
+                    None => self.registry.evaluate(ctx, input, layer),
+                }
+            }
+
+            // Not yet tile-wired (coupled sims and other whole-field kinds):
+            // whole-field generate is still correct because the caller blends
+            // only `scope`.
             _ => self.registry.evaluate(ctx, input, layer),
         }
+    }
+
+    /// Zeros-seed a field and fill only `scope` via a tile-scoped generator
+    /// entry (#110), mapping a cancel to [`EvalError::Cancelled`]. Values outside
+    /// `scope` stay zero — the caller's blend never reads them.
+    fn scoped_generate(
+        metrics: HeightfieldMetrics,
+        scope: &[TileId],
+        cancel: &CancelToken,
+        fill: impl FnOnce(&mut Heightfield, &[TileId], &CancelToken) -> bool,
+    ) -> Result<Heightfield, EvalError> {
+        let mut g = Heightfield::zeros(metrics);
+        fill(&mut g, scope, cancel)
+            .then_some(g)
+            .ok_or(EvalError::Cancelled)
     }
 
     /// Scoped Path stamp: patches height per tile and re-maxes the per-texel
@@ -1008,12 +1100,7 @@ fn record_layer_timing(
 
 /// Timing for a layer that ran tile-scoped, tagged with the size of the tile set
 /// it recomputed (the phase-2 recompute counter).
-fn record_scoped_layer_timing(
-    ctx: &mut EvalContext,
-    layer: &Layer,
-    started: Instant,
-    tiles: u32,
-) {
+fn record_scoped_layer_timing(ctx: &mut EvalContext, layer: &Layer, started: Instant, tiles: u32) {
     ctx.layer_timings.push(LayerEvalTiming {
         layer: layer.id(),
         layer_name: layer.common.name.clone(),
