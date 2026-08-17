@@ -614,12 +614,19 @@ fn perf_single_stroke_scoped_is_well_below_whole_field() {
     use std::time::Instant;
 
     // A SculptBase-over-generators flat stack at 1024^2 with default 256 tiling
-    // (4x4 = 16 tiles). Every layer here is tile-wired, so a single-tile stroke
-    // recomputes 1/16 of the field instead of all of it.
+    // (4x4 = 16 tiles). Every layer here is tile-wired — including the Fbm
+    // generator arm — so a single-tile stroke recomputes 1/16 of the field
+    // instead of all of it.
     let res = 1024;
     let m = HeightfieldMetrics::new(res, res, res as f32, res as f32);
+    let fbm = {
+        let mut fp = FbmParams::default();
+        fp.base.frequency = 0.01;
+        Layer::new("Fbm", LayerKind::Fbm(fp))
+    };
     let (stack, ids) = flat_stack(vec![
         sculpt_gradient(res),
+        fbm,
         Layer::new(
             "Plateau",
             LayerKind::Plateau(PlateauParams {
@@ -865,6 +872,92 @@ fn scoped_sculpt_matches_whole_field_including_aux() {
         );
     }
     assert_eq!(measure_seams(&scoped), 0.0);
+}
+
+#[test]
+fn scoped_voronoi_flatten_benchmark_is_tile_proportional() {
+    use std::time::Instant;
+    // The #98/#101 stack (VoronoiRegions + a Flatten SculptStrokes) over a cheap
+    // sculpt base. A single interior-tile edit on the base scope-recomputes
+    // Voronoi (exactly the edit tile, via the #110 generator arm) and the Flatten
+    // (its 1-tile reach ring), instead of the whole 8x8 tile field — the
+    // tile-proportional win. Voronoi's per-texel Worley makes the whole-field
+    // recompute costly, so even a debug build clears a generous time margin.
+    let res = 256;
+    let m = HeightfieldMetrics {
+        width: res,
+        height: res,
+        world_size_x: res as f32,
+        world_size_z: res as f32,
+        tile_size: 32,
+        halo: 2,
+    };
+    let voronoi = Layer::new(
+        "Voronoi",
+        LayerKind::VoronoiRegions(VoronoiParams::default()),
+    );
+    let mut flatten = create_shape_layer("Flatten");
+    if let LayerKind::SculptStrokes(p) = &mut flatten.kind {
+        stamp_stroke(
+            p,
+            SculptStrokeKind::Flatten,
+            0.5,
+            0.5,
+            40.0,
+            4.0,
+            0.0,
+            false,
+        );
+    }
+    let (stack, ids) = flat_stack(vec![sculpt_gradient(res), voronoi, flatten]);
+
+    // Whole-field incremental baseline: every layer recomputed whole-field.
+    let mut w = StackEvaluator::new();
+    let mut wctx = EvalContext::new(m);
+    w.rebuild_all(&stack, &mut wctx).expect("rebuild_all");
+    w.mark_dirty_from(&stack, ids[0]);
+    let mut wctx2 = EvalContext::new(m);
+    let t0 = Instant::now();
+    let whole = w
+        .rebuild_incremental(&stack, &mut wctx2)
+        .expect("whole incremental");
+    let whole_us = t0.elapsed().as_micros();
+
+    // Tile-scoped incremental: a single interior tile edit on the base.
+    let mut s = StackEvaluator::new();
+    let mut sctx = EvalContext::new(m);
+    s.rebuild_all(&stack, &mut sctx).expect("rebuild_all");
+    let region = tiles_in_samples(&m, 140, 140, 140, 140); // one interior tile
+    assert_eq!(region.len(), 1);
+    s.mark_dirty_from_region(&stack, ids[0], &region);
+    let mut sctx2 = EvalContext::new(m);
+    let t1 = Instant::now();
+    let scoped = s
+        .rebuild_incremental(&stack, &mut sctx2)
+        .expect("scoped incremental");
+    let scoped_us = t1.elapsed().as_micros();
+
+    assert_eq!(
+        timing(&sctx2.layer_timings, ids[1]).tiles_recomputed,
+        Some(1),
+        "Voronoi should recompute only the edit tile (generator arm)"
+    );
+    let flatten_tiles = timing(&sctx2.layer_timings, ids[2])
+        .tiles_recomputed
+        .expect("Flatten should recompute tile-scoped");
+    assert!(
+        flatten_tiles <= 9,
+        "Flatten recomputes at most its 1-tile reach ring (<=9), got {flatten_tiles}"
+    );
+    assert_eq!(bits(&scoped), bits(&whole), "scoped must equal whole-field");
+    println!(
+        "256^2 voronoi+flatten single-tile: whole {whole_us} us, scoped {scoped_us} us ({:.1}x)",
+        whole_us as f64 / scoped_us.max(1) as f64
+    );
+    assert!(
+        scoped_us.saturating_mul(2) < whole_us,
+        "scoped ({scoped_us} us) should be well below whole-field ({whole_us} us)"
+    );
 }
 
 #[test]

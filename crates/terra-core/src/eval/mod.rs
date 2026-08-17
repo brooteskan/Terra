@@ -818,8 +818,14 @@ impl StackEvaluator {
 
     /// Produce a height field whose `scope` tiles hold this layer's freshly
     /// generated contribution. Values outside `scope` are never read by the
-    /// caller's blend, so only the scope tiles need be correct. Arms without a
-    /// tile-sliced entry fall back to a whole-field generate (correct, no win).
+    /// caller's blend, so only the scope tiles need be correct.
+    ///
+    /// Tile-sliced arms: the authoring/shape ops (`SculptBase`, `SculptStrokes`,
+    /// `PolygonHeight`, `Plateau`, `Coastal`, `Path`) and the #110
+    /// input-independent generators (noise / worley / fbm / ridged / domain-warp /
+    /// mesa / mountains / volcano / uplift / canyons / voronoi / procedural-shape).
+    /// Everything else — coupled sims, `Blur`, `ProceduralShape`'s Dunes/Crater —
+    /// falls back to a whole-field generate (correct, no compute win).
     fn generate_scoped(
         &self,
         ctx: &mut EvalContext,
