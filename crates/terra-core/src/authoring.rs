@@ -524,6 +524,51 @@ pub fn apply_sculpt_strokes(input: &Heightfield, p: &SculptStrokeParams) -> Auth
     let mut edited: Vec<f32> = vec![0.0; n];
     let base = input.clone();
     for stroke in &p.strokes {
+        // Flatten settles the footprint toward the brush-weighted mean of the
+        // terrain it is editing (the accumulated `out`), computed once per stroke.
+        // Sampling the same buffer keeps flatten bounded and idempotent; the app
+        // used to pass a target sampled from the composite height, which drifted
+        // above the layer's own terrain and let every stroke stack a taller spike.
+        let flatten_target = if matches!(stroke.kind, SculptStrokeKind::Flatten) {
+            // Scan only the stroke's padded footprint.
+            let ru = stroke.radius_m / m.world_size_x.max(1e-3);
+            let rv = stroke.radius_m / m.world_size_z.max(1e-3);
+            let (mut u0, mut u1, mut v0, mut v1) = (1.0f32, 0.0f32, 1.0f32, 0.0f32);
+            for pt in &stroke.points {
+                u0 = u0.min(pt.u);
+                u1 = u1.max(pt.u);
+                v0 = v0.min(pt.v);
+                v1 = v1.max(pt.v);
+            }
+            let i0 = ((u0 - ru).clamp(0.0, 1.0) * (m.width - 1) as f32) as u32;
+            let i1 = (((u1 + ru).clamp(0.0, 1.0) * (m.width - 1) as f32).ceil() as u32)
+                .min(m.width.saturating_sub(1));
+            let j0 = ((v0 - rv).clamp(0.0, 1.0) * (m.height - 1) as f32) as u32;
+            let j1 = (((v1 + rv).clamp(0.0, 1.0) * (m.height - 1) as f32).ceil() as u32)
+                .min(m.height.saturating_sub(1));
+            let mut hsum = 0.0f64;
+            let mut wsum = 0.0f64;
+            for j in j0..=j1 {
+                for i in i0..=i1 {
+                    let x = m.world_x(i);
+                    let z = m.world_z(j);
+                    let (distance, pressure) =
+                        distance_to_polyline(x, z, &stroke.points, m.world_size_x, m.world_size_z);
+                    let w = smoothstep_weight(distance, stroke.radius_m, stroke.falloff) * pressure;
+                    if w > 0.0 {
+                        hsum += out.get(i, j) as f64 * w as f64;
+                        wsum += w as f64;
+                    }
+                }
+            }
+            if wsum > 0.0 {
+                (hsum / wsum) as f32
+            } else {
+                stroke.target_height
+            }
+        } else {
+            stroke.target_height
+        };
         for j in 0..m.height {
             for i in 0..m.width {
                 let x = m.world_x(i);
@@ -543,7 +588,9 @@ pub fn apply_sculpt_strokes(input: &Heightfield, p: &SculptStrokeParams) -> Auth
                     SculptStrokeKind::Lower => h - s,
                     SculptStrokeKind::Smooth => h + (neighborhood_average(&base, i, j) - h) * w,
                     SculptStrokeKind::Flatten | SculptStrokeKind::HeightStamp => {
-                        h + (stroke.target_height - h) * w
+                        // Flatten uses the footprint mean (computed above);
+                        // HeightStamp keeps the explicit stroke target.
+                        h + (flatten_target - h) * w
                     }
                     SculptStrokeKind::Ridge | SculptStrokeKind::MountainStamp => {
                         let t = (1.0 - distance / stroke.radius_m.max(1.0)).max(0.0);
@@ -959,6 +1006,78 @@ mod tests {
             }
         }
         h
+    }
+
+    #[test]
+    fn flatten_stays_within_input_range_and_ignores_passed_target() {
+        // Sloped terrain. A flatten stroke must settle toward the footprint mean
+        // and never exceed the input's own min/max — even if handed an absurd
+        // target_height (which is what the composite-sampled app value used to do,
+        // producing a runaway spike).
+        let h = plane();
+        let (lo, hi) = h.min_max();
+        let p = SculptStrokeParams {
+            strokes: vec![SculptStroke {
+                kind: SculptStrokeKind::Flatten,
+                points: vec![SculptPoint {
+                    u: 0.5,
+                    v: 0.5,
+                    pressure: 1.0,
+                }],
+                radius_m: 300.0,
+                strength: 4.0,
+                target_height: 1_000_000.0, // absurd — must be ignored by Flatten
+                falloff: 1.5,
+            }],
+            ..SculptStrokeParams::default()
+        };
+        let r = apply_sculpt_strokes(&h, &p);
+        let (out_lo, out_hi) = r.height.min_max();
+        assert!(
+            out_lo >= lo - 1e-3 && out_hi <= hi + 1e-3,
+            "flatten escaped input range: in [{lo}, {hi}] out [{out_lo}, {out_hi}]"
+        );
+        assert!(r.height.to_dense().iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn flatten_is_idempotent_no_runaway() {
+        // Applying the same flatten stroke twice must not keep raising the peak.
+        let h = plane();
+        let stroke = SculptStroke {
+            kind: SculptStrokeKind::Flatten,
+            points: vec![SculptPoint {
+                u: 0.5,
+                v: 0.5,
+                pressure: 1.0,
+            }],
+            radius_m: 300.0,
+            strength: 4.0,
+            target_height: 0.0,
+            falloff: 1.5,
+        };
+        let once = apply_sculpt_strokes(
+            &h,
+            &SculptStrokeParams {
+                strokes: vec![stroke.clone()],
+                ..SculptStrokeParams::default()
+            },
+        )
+        .height;
+        let twice = apply_sculpt_strokes(
+            &once,
+            &SculptStrokeParams {
+                strokes: vec![stroke],
+                ..SculptStrokeParams::default()
+            },
+        )
+        .height;
+        let peak_once = once.min_max().1;
+        let peak_twice = twice.min_max().1;
+        assert!(
+            peak_twice <= peak_once + 1e-3,
+            "flatten grew on re-apply: {peak_once} -> {peak_twice}"
+        );
     }
 
     #[test]

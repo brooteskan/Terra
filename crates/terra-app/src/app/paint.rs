@@ -110,8 +110,10 @@ impl TerraApp {
             };
             let radius = self.ui_state.sculpt_radius;
             let target_height = match shape_tool {
-                terra_core::shape_history::ShapeTool::Flatten
-                | terra_core::shape_history::ShapeTool::HeightStamp
+                // HeightStamp / PlateauStamp stamp toward the height under the
+                // cursor. Flatten needs no target here — the sculpt kernel derives
+                // it from the mean of the terrain within the brush footprint.
+                terra_core::shape_history::ShapeTool::HeightStamp
                 | terra_core::shape_history::ShapeTool::PlateauStamp => {
                     // Sample approx from last height field centre if available.
                     self.last_height
