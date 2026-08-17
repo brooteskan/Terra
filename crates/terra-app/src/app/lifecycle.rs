@@ -434,13 +434,15 @@ impl ApplicationHandler for TerraApp {
             return;
         }
 
-        self.exporter.poll();
-        self.poll_project_io();
+        // One registry tick pumps the background subsystems (export, project IO,
+        // tool thumbnails) and folds their pending/wake facts together. The Arc
+        // clone lets `tick` borrow `self` mutably while the fixed entry list is
+        // read through the shared handle. Typed results are drained just below,
+        // where the concrete types are in hand.
+        let jobs = Arc::clone(&self.jobs).tick(self);
+        self.drain_project_io();
         let camera_flying = self.apply_camera_fly();
-        let tool_thumbnail_ready = crate::ui::take_tool_thumbnail_ready_signal();
-        let tool_thumbnails_pending = crate::ui::tool_thumbnails_pending();
         let mut export_busy = !self.exporter.job.done;
-        let project_io_busy = self.project_io.is_busy();
         if export_busy {
             self.ui_state.export_progress = Some(self.exporter.job.progress);
             self.ui_state.status = format!("Export {:.0}%", self.exporter.job.progress * 100.0);
@@ -466,7 +468,7 @@ impl ApplicationHandler for TerraApp {
         // sculpt/paint stroke (GUI overlays must not block live height updates).
         let mut did_eval = false;
         let mut live_paint = false;
-        let mut work_pending = export_busy || project_io_busy;
+        let mut work_pending = export_busy || jobs.any_pending;
 
         if self.screen == AppScreen::Editor {
             let mask_painting = self.ui_state.editor_tool == crate::ui::EditorTool::PaintMask
@@ -753,7 +755,7 @@ impl ApplicationHandler for TerraApp {
                 || self.ui_state.refining
                 || !self.pending_tile_uploads.is_empty()
                 || export_busy
-                || project_io_busy;
+                || jobs.any_pending;
         }
 
         if live_paint && self.pending_eval {
@@ -762,7 +764,7 @@ impl ApplicationHandler for TerraApp {
         } else if camera_flying {
             // Smooth WASD fly while keys are held.
             event_loop.set_control_flow(ControlFlow::Poll);
-        } else if self.worker_refine_pending || tool_thumbnails_pending {
+        } else if self.worker_refine_pending || jobs.animate {
             // Wake often enough to animate progress and pick up the worker result.
             event_loop.set_control_flow(ControlFlow::WaitUntil(
                 Instant::now() + Duration::from_millis(16),
@@ -785,13 +787,7 @@ impl ApplicationHandler for TerraApp {
             event_loop.set_control_flow(ControlFlow::Wait);
         }
 
-        if did_eval
-            || export_busy
-            || project_io_busy
-            || self.needs_height_upload
-            || tool_thumbnail_ready
-            || camera_flying
-        {
+        if did_eval || export_busy || self.needs_height_upload || jobs.redraw || camera_flying {
             if let Some(w) = &self.window {
                 w.request_redraw();
             }

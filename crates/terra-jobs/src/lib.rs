@@ -9,8 +9,11 @@
 //! executor that terra-core's `EvalWorker` is re-implemented over. Phase 4 (issue
 //! #104) adds [`Pool`], a fixed-size worker pool, and [`Debounced`], a coalescing
 //! latest-value-wins worker — the tool-thumbnail decoder and the editor-prefs
-//! saver migrate onto them. The crate depends only on `rayon`, so it stays a leaf
-//! below `terra-core`.
+//! saver migrate onto them. Phase 5 (issue #105) adds [`JobRegistry`], a per-frame
+//! poll registry that pumps every registered [`Pollable`] subsystem once and
+//! aggregates their wakefulness, collapsing the winit loop's scattered
+//! per-subsystem polling into a single tick. The crate depends only on `rayon`, so
+//! it stays a leaf below `terra-core`.
 
 mod cancel;
 mod debounced;
@@ -18,6 +21,7 @@ mod fill;
 mod job;
 mod latest_wins;
 mod pool;
+mod registry;
 
 pub use cancel::{CancelFlag, CancelToken};
 pub use debounced::Debounced;
@@ -25,3 +29,4 @@ pub use fill::try_par_fill;
 pub use job::{spawn_one_shot, JobCtx, JobError, JobHandle};
 pub use latest_wins::{JobEvent, LatestWins, SubmitError};
 pub use pool::Pool;
+pub use registry::{JobRegistry, Pending, Pollable, Tick};

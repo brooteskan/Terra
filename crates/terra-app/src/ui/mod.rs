@@ -30,18 +30,12 @@ mod tools_gui;
 mod viewport_gui;
 mod workspace;
 
-/// Poll completion of lazily decoded tool thumbnails.
-pub fn take_tool_thumbnail_ready_signal() -> bool {
-    tool_thumbs::take_ready_signal()
-}
-/// Keep the event loop awake only while lazy thumbnail work is outstanding.
-pub fn tool_thumbnails_pending() -> bool {
-    tool_thumbs::has_pending_work()
-}
 /// Warm the tool-thumb decode pool (call once after the window is up).
 pub fn prefetch_tool_thumbnails() {
     tool_thumbs::prefetch_all();
 }
+/// Registry adapter that pumps the tool-thumbnail decode pool once per frame.
+pub(crate) use tool_thumbs::ToolThumbPump;
 
 pub use actions::{MaskEditAction, PanelAction, TerrainSettingsUpdate};
 pub use chrome_gui::{

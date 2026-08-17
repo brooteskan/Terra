@@ -72,6 +72,28 @@ pub fn has_pending_work() -> bool {
     }
 }
 
+/// [`terra_jobs::JobRegistry`] adapter for the tool-thumbnail decode pool.
+///
+/// A zero-sized handle: the pool lives in a module-private `OnceLock` static that
+/// only ever hands out `&'static Pool`, so there is nothing to own — `pump` reads
+/// the pool's aggregate signals directly. Warmups animate in, so a busy pool asks
+/// for animation-cadence wakes. The drained ready-latch is read *before* the
+/// pending count — the consumer order [`terra_jobs::Pool`] documents so the final
+/// decode is never left unpainted.
+pub(crate) struct ToolThumbPump;
+
+impl terra_jobs::Pollable for ToolThumbPump {
+    fn pump(&mut self) -> terra_jobs::Pending {
+        let redraw = take_ready_signal();
+        let busy = has_pending_work();
+        terra_jobs::Pending {
+            busy,
+            animate: busy,
+            redraw,
+        }
+    }
+}
+
 /// Kick off background decode for every catalog tool thumb (idempotent).
 ///
 /// Call once at app startup so Quick Add / Tools open with art already warm.

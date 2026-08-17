@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use terra_core::document::TerrainDocument;
 use terra_core::eval::{EvalContext, PreviewQuality, StackEvaluator};
 use terra_core::heightfield::{Heightfield, HeightfieldMetrics};
-use terra_jobs::{spawn_one_shot, CancelToken, JobCtx, JobError, JobHandle};
+use terra_jobs::{spawn_one_shot, CancelToken, JobCtx, JobError, JobHandle, Pending, Pollable};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -183,6 +183,23 @@ impl Default for BackgroundExporter {
     }
 }
 
+impl Pollable for BackgroundExporter {
+    /// Poll the in-flight export, then report whether one is still running. An
+    /// export streams to disk with a progress bar the surrounding frame already
+    /// repaints at loop cadence, so it wants `redraw` while busy but not the
+    /// ~16 ms `animate` wakes. The completion frame (the "one more frame to show
+    /// status" case) is driven app-side off `job.done`, not from here.
+    fn pump(&mut self) -> Pending {
+        self.poll();
+        let busy = !self.job.done;
+        Pending {
+            busy,
+            animate: false,
+            redraw: busy,
+        }
+    }
+}
+
 pub fn save_project(doc: &TerrainDocument, path: &std::path::Path) -> Result<(), IoError> {
     let json = doc.to_json()?;
     std::fs::write(path, json)?;
@@ -344,6 +361,23 @@ impl Default for BackgroundProjectIo {
     }
 }
 
+impl Pollable for BackgroundProjectIo {
+    /// Poll the in-flight save/load, then report whether one is still running.
+    /// The typed result (a `ProjectIoResult`) and the transient status string are
+    /// drained by the app after the tick — this only reports busy/repaint facts.
+    /// Save/load shows a static "Saving…"/"Loading…" status, so it wants `redraw`
+    /// while busy but not `animate` wakes.
+    fn pump(&mut self) -> Pending {
+        self.poll();
+        let busy = self.is_busy();
+        Pending {
+            busy,
+            animate: false,
+            redraw: busy,
+        }
+    }
+}
+
 #[cfg(test)]
 mod worker_tests {
     use super::*;
@@ -484,5 +518,86 @@ mod worker_tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn exporter_pump_reports_busy_while_running_then_idle() {
+        use std::sync::mpsc;
+        use terra_jobs::Pollable;
+
+        let mut exporter = BackgroundExporter::new();
+        // Idle before any job: no busy, no repaint, never animation-cadence.
+        let idle = exporter.pump();
+        assert!(!idle.busy && !idle.redraw && !idle.animate);
+
+        // Gate the body so the export is provably in flight when we pump.
+        let (gate_tx, gate_rx) = mpsc::channel::<()>();
+        exporter.start_job(move |_ctx| {
+            gate_rx.recv().expect("await release");
+            Err("done".to_string())
+        });
+        let busy = exporter.pump();
+        assert!(busy.busy, "export in flight");
+        assert!(busy.redraw, "a busy export repaints its progress");
+        assert!(!busy.animate, "export is not animation-cadence work");
+
+        gate_tx.send(()).expect("release");
+        // Pump reports idle once the job resolves; the "one more frame to show
+        // status" is an app-side concern keyed off job.done, not a pump fact.
+        wait_until(|| {
+            let p = exporter.pump();
+            !p.busy && !p.redraw
+        });
+        assert!(exporter.job.done);
+    }
+
+    #[test]
+    fn exporter_pump_returns_to_idle_after_cancel() {
+        use terra_jobs::Pollable;
+
+        let mut exporter = BackgroundExporter::new();
+        exporter.start_job(|ctx| {
+            while !ctx.token().is_cancelled() {
+                std::thread::yield_now();
+            }
+            Err("produced after cancel — must be discarded".to_string())
+        });
+        assert!(exporter.pump().busy, "busy until cancelled");
+
+        exporter.cancel();
+        wait_until(|| !exporter.pump().busy);
+        assert!(
+            exporter.job.result.is_none(),
+            "a cancelled export leaves no Done result"
+        );
+    }
+
+    #[test]
+    fn project_io_pump_reports_busy_while_running_then_idle() {
+        use std::sync::mpsc;
+        use terra_jobs::Pollable;
+
+        let mut io = BackgroundProjectIo::new();
+        assert!(!io.pump().busy, "idle before any job");
+
+        let (gate_tx, gate_rx) = mpsc::channel::<()>();
+        io.start_job_for_test(PathBuf::from("gated.terra"), move |_| {
+            gate_rx.recv().expect("await release");
+            ProjectIoResult::Saved {
+                path: PathBuf::from("gated.terra"),
+            }
+        });
+        let busy = io.pump();
+        assert!(busy.busy, "save in flight");
+        assert!(busy.redraw, "a busy save repaints its status");
+        assert!(!busy.animate, "project IO is not animation-cadence work");
+
+        gate_tx.send(()).expect("release");
+        wait_until(|| !io.pump().busy);
+        // The typed result survives the pump for the app-side drain.
+        assert!(matches!(
+            io.result.take(),
+            Some(ProjectIoResult::Saved { .. })
+        ));
     }
 }

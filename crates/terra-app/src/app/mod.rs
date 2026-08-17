@@ -169,6 +169,13 @@ pub struct TerraApp {
     project_path: Option<PathBuf>,
     exporter: BackgroundExporter,
     project_io: BackgroundProjectIo,
+    /// Zero-sized registry adapter for the tool-thumbnail decode pool.
+    tool_thumbs: crate::ui::ToolThumbPump,
+    /// Per-frame poll registry: one `about_to_wait` tick pumps the background
+    /// subsystems above (exporter, project IO, thumbnails) and aggregates their
+    /// pending/wake facts. Behind an `Arc` so the tick can take `&mut self` while
+    /// the entry list — fixed at construction — is read through the shared handle.
+    jobs: Arc<terra_jobs::JobRegistry<TerraApp>>,
     /// After async save of a newly created project, enter the editor with this doc.
     pending_enter_after_save: Option<(terra_core::document::TerrainDocument, PathBuf)>,
     mouse_pressed: Option<MouseButton>,
@@ -296,6 +303,13 @@ impl Default for TerraApp {
             metrics.world_size_x,
             metrics.world_size_z,
         ));
+        // Register the background subsystems that `about_to_wait` pumps each
+        // frame, in the order it used to poll them by hand: export, project IO,
+        // then the tool-thumbnail pool.
+        let mut jobs = terra_jobs::JobRegistry::<TerraApp>::new();
+        jobs.register(|app| &mut app.exporter);
+        jobs.register(|app| &mut app.project_io);
+        jobs.register(|app| &mut app.tool_thumbs);
         Self {
             window: None,
             boot: None,
@@ -315,6 +329,8 @@ impl Default for TerraApp {
             project_path: None,
             exporter: BackgroundExporter::new(),
             project_io: BackgroundProjectIo::new(),
+            tool_thumbs: crate::ui::ToolThumbPump,
+            jobs: Arc::new(jobs),
             pending_enter_after_save: None,
             mouse_pressed: None,
             last_cursor: None,

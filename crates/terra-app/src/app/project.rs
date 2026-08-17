@@ -36,8 +36,12 @@ fn open_directory(_path: &Path) -> std::io::Result<()> {
 }
 
 impl TerraApp {
-    pub(crate) fn poll_project_io(&mut self) {
-        self.project_io.poll();
+    /// Drain a finished background save/load into the session and status line.
+    ///
+    /// The poll itself now happens in the [`terra_jobs::JobRegistry`] tick at the
+    /// top of `about_to_wait`; this only consumes what that pump surfaced — the
+    /// transient status string and the typed [`ProjectIoResult`].
+    pub(crate) fn drain_project_io(&mut self) {
         if let Some(status) = self.project_io.status() {
             self.ui_state.status = status.to_string();
             if let Some(w) = &self.window {
