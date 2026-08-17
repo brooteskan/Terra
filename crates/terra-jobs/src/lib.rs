@@ -4,13 +4,17 @@
 //! Phase 1 (issue #101) added the [`CancelToken`] and [`try_par_fill`]. Phase 2
 //! (issue #102) adds [`spawn_one_shot`] and [`JobHandle`] — a named worker thread
 //! with panic containment by construction, atomic progress, and cancellation —
-//! the job unit the export, project-IO, and boot subsystems migrate onto. The
-//! crate depends only on `rayon`, so it stays a leaf below `terra-core`.
+//! the job unit the export, project-IO, and boot subsystems migrate onto. Phase 3
+//! (issue #103) adds [`LatestWins`], a persistent-state, latest-generation-wins
+//! executor that terra-core's `EvalWorker` is re-implemented over. The crate
+//! depends only on `rayon`, so it stays a leaf below `terra-core`.
 
 mod cancel;
 mod fill;
 mod job;
+mod latest_wins;
 
 pub use cancel::{CancelFlag, CancelToken};
 pub use fill::try_par_fill;
 pub use job::{spawn_one_shot, JobCtx, JobError, JobHandle};
+pub use latest_wins::{JobEvent, LatestWins, SubmitError};

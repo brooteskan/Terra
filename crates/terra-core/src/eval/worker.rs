@@ -9,10 +9,16 @@ use crate::layer::{LayerId, LayerStack};
 use crate::mask::{bake_mask_assets, MaskAsset, MaskField};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
-use std::thread::{self, JoinHandle};
 use std::time::Instant;
+use terra_jobs::{CancelToken, JobError, JobEvent, LatestWins};
+
+// The worker thread, its channels, stale-skip, and sleep-based polling now live
+// in `terra-jobs`; only the tests still touch the raw mpsc / thread primitives.
+#[cfg(test)]
+use std::sync::mpsc::{self, Sender, TryRecvError};
+#[cfg(test)]
+use std::thread;
 
 #[derive(Debug, Clone)]
 pub struct EvalWorkRequest {
@@ -75,76 +81,60 @@ impl EvalWorkerEvent {
 #[error("evaluation worker is disconnected")]
 pub struct EvalWorkerSubmitError;
 
-enum WorkerMsg {
-    // Boxed so the common `Shutdown` and idle channel slots aren't sized to the large
-    // `EvalWorkRequest` payload (clippy::large_enum_variant).
-    Job(Box<EvalWorkRequest>),
-    Shutdown,
-}
+/// The value a CPU eval job produces: the request's quality paired with the
+/// evaluation outcome. Domain failures (a cancelled generation, a layer panic
+/// surfaced as `EvalError`) live *inside* this `T`; only a process-level panic
+/// in the body escapes as a `terra_jobs` [`JobError`].
+type JobOutput = (PreviewQuality, Result<EvalWorkResult, EvalError>);
 
 /// Owns a dedicated thread with its own [`StackEvaluator`] and layer cache.
+///
+/// A thin wrapper over a [`LatestWins`] executor: the thread loop, channel
+/// plumbing, dequeue-time stale-skip, per-job panic containment, and
+/// disconnect-once bookkeeping all live in `terra-jobs`. This layer keeps the
+/// eval-specific surface — the generation token the app owns, the best-effort
+/// `busy` flag, and translating a job outcome into an [`EvalWorkerEvent`]
+/// (dropping cancelled results, which publish nothing).
 pub struct EvalWorker {
-    tx: Sender<WorkerMsg>,
-    rx: Receiver<EvalWorkerEvent>,
-    /// Shared cancel / generation id — worker skips jobs with older tokens.
+    inner: LatestWins<EvalWorkRequest, JobOutput>,
+    /// Shared cancel / generation id — the executor skips jobs with older tokens.
+    /// The same `Arc` the executor reads, so `set_token` supersedes in-flight work.
     pub current_token: Arc<AtomicU64>,
-    _handle: JoinHandle<()>,
     /// True while a job may still be running (best-effort).
     pub busy: bool,
-    disconnected_reported: bool,
 }
 
 impl EvalWorker {
     pub fn spawn() -> Self {
-        let (job_tx, job_rx) = mpsc::channel::<WorkerMsg>();
-        let (result_tx, result_rx) = mpsc::channel::<EvalWorkerEvent>();
         let current_token = Arc::new(AtomicU64::new(0));
-        let token_flag = Arc::clone(&current_token);
-
-        let handle = thread::Builder::new()
-            .name("terra-eval-worker".into())
-            .spawn(move || {
-                let mut evaluator = StackEvaluator::new();
-                while let Ok(msg) = job_rx.recv() {
-                    match msg {
-                        WorkerMsg::Shutdown => break,
-                        WorkerMsg::Job(job) => {
-                            let live = token_flag.load(Ordering::Acquire);
-                            if job.token != live {
-                                continue;
-                            }
-                            let result =
-                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    run_cpu_job(&mut evaluator, &job, &token_flag)
-                                }));
-                            let result = match result {
-                                Ok(result) => result,
-                                Err(payload) => {
-                                    // A job-level panic may leave cache state partially updated.
-                                    // Start subsequent requests from a fresh evaluator, but carry
-                                    // the disk spill store (and its private root) across so pinned
-                                    // bakes written before the panic survive the restart as a
-                                    // declared handoff (B1-D8) rather than filesystem coincidence.
-                                    let salvaged_disk = evaluator.cache.take_disk();
-                                    evaluator = StackEvaluator::new();
-                                    evaluator.cache.set_disk(salvaged_disk);
-                                    Err(EvalError::Panicked(super::panic_payload_message(payload)))
-                                }
-                            };
-                            publish_job_result(&result_tx, job.token, job.quality, result);
-                        }
-                    }
-                }
-            })
-            .expect("spawn terra-eval-worker");
+        // The job body reads the live generation directly through this handle, as
+        // it did before the executor existed, so `run_cpu_job` keeps its exact
+        // signature and its cooperative between-layer cancel checks.
+        let job_token = Arc::clone(&current_token);
+        let inner = LatestWins::spawn(
+            "terra-eval-worker",
+            Arc::clone(&current_token),
+            StackEvaluator::new,
+            move |evaluator: &mut StackEvaluator, job: &EvalWorkRequest, _cancel: &CancelToken| {
+                Ok((job.quality, run_cpu_job(evaluator, job, &job_token)))
+            },
+            |mut evaluator: StackEvaluator| {
+                // A job-level panic may leave cache state partially updated. Start
+                // subsequent requests from a fresh evaluator, but carry the disk
+                // spill store (and its private root) across so pinned bakes written
+                // before the panic survive the restart as a declared handoff
+                // (B1-D8) rather than filesystem coincidence.
+                let salvaged_disk = evaluator.cache.take_disk();
+                let mut fresh = StackEvaluator::new();
+                fresh.cache.set_disk(salvaged_disk);
+                fresh
+            },
+        );
 
         Self {
-            tx: job_tx,
-            rx: result_rx,
+            inner,
             current_token,
-            _handle: handle,
             busy: false,
-            disconnected_reported: false,
         }
     }
 
@@ -153,9 +143,9 @@ impl EvalWorker {
     }
 
     pub fn submit(&mut self, request: EvalWorkRequest) -> Result<(), EvalWorkerSubmitError> {
-        self.set_token(request.token);
-        self.tx
-            .send(WorkerMsg::Job(Box::new(request)))
+        let token = request.token;
+        self.inner
+            .submit(request, token)
             .map_err(|_| EvalWorkerSubmitError)?;
         self.busy = true;
         Ok(())
@@ -163,30 +153,56 @@ impl EvalWorker {
 
     /// Non-blocking poll for one worker event.
     ///
-    /// Disconnection is emitted once so a UI polling loop cannot flood logs.
+    /// A cancelled job publishes nothing — that policy lives here, keeping the
+    /// executor generic — so this loops past any suppressed result to return the
+    /// next real event rather than stalling the caller's drain loop. Disconnection
+    /// is emitted once so a UI polling loop cannot flood logs.
     pub fn try_recv_event(&mut self) -> Option<EvalWorkerEvent> {
-        match self.rx.try_recv() {
-            Ok(event) => {
-                if event
+        loop {
+            let event = match self.inner.try_recv()? {
+                JobEvent::Completed {
+                    token,
+                    value: (quality, result),
+                } => match job_result_event(token, quality, result) {
+                    Some(event) => event,
+                    None => continue, // cancelled result: suppressed
+                },
+                JobEvent::Failed {
+                    token,
+                    request,
+                    error,
+                } => {
+                    // The job body always returns `Ok`, so a `JobError` here is a
+                    // process-level panic. Map it to `EvalError::Panicked` with the
+                    // failed request's quality, exactly as the old panic path did.
+                    let eval_error = match error {
+                        JobError::Panicked(message) => EvalError::Panicked(message),
+                        JobError::Cancelled => continue,
+                    };
+                    match job_result_event(token, request.quality, Err(eval_error)) {
+                        Some(event) => event,
+                        None => continue,
+                    }
+                }
+                JobEvent::Disconnected => EvalWorkerEvent::Disconnected,
+            };
+
+            // Clear `busy` on the live generation's events, and always on
+            // disconnect. Suppressed results never reach here, so they leave
+            // `busy` untouched — as when they were filtered before the channel.
+            if matches!(event, EvalWorkerEvent::Disconnected)
+                || event
                     .token()
                     .is_some_and(|token| token == self.current_token.load(Ordering::Acquire))
-                {
-                    self.busy = false;
-                }
-                Some(event)
-            }
-            Err(TryRecvError::Empty) => None,
-            Err(TryRecvError::Disconnected) if !self.disconnected_reported => {
+            {
                 self.busy = false;
-                self.disconnected_reported = true;
-                Some(EvalWorkerEvent::Disconnected)
             }
-            Err(TryRecvError::Disconnected) => None,
+            return Some(event);
         }
     }
 
     pub fn shutdown(&self) {
-        let _ = self.tx.send(WorkerMsg::Shutdown);
+        self.inner.shutdown();
     }
 
     /// Replace the worker thread and its evaluator/cache after an unexpected disconnect.
@@ -196,27 +212,34 @@ impl EvalWorker {
     }
 }
 
+/// Translate a job outcome into a worker event, or `None` when it publishes
+/// nothing. A cancelled evaluation is dropped (the app superseded it); every
+/// other error becomes a contextual [`EvalWorkFailure`].
+fn job_result_event(
+    token: u64,
+    quality: PreviewQuality,
+    result: Result<EvalWorkResult, EvalError>,
+) -> Option<EvalWorkerEvent> {
+    match result {
+        Ok(result) => Some(EvalWorkerEvent::Completed(result)),
+        Err(EvalError::Cancelled) => None,
+        Err(error) => Some(EvalWorkerEvent::Failed(EvalWorkFailure {
+            token,
+            quality,
+            error,
+        })),
+    }
+}
+
+#[cfg(test)]
 fn publish_job_result(
     result_tx: &Sender<EvalWorkerEvent>,
     token: u64,
     quality: PreviewQuality,
     result: Result<EvalWorkResult, EvalError>,
 ) {
-    let event = match result {
-        Ok(result) => EvalWorkerEvent::Completed(result),
-        Err(EvalError::Cancelled) => return,
-        Err(error) => EvalWorkerEvent::Failed(EvalWorkFailure {
-            token,
-            quality,
-            error,
-        }),
-    };
-    let _ = result_tx.send(event);
-}
-
-impl Drop for EvalWorker {
-    fn drop(&mut self) {
-        let _ = self.tx.send(WorkerMsg::Shutdown);
+    if let Some(event) = job_result_event(token, quality, result) {
+        let _ = result_tx.send(event);
     }
 }
 

@@ -57,8 +57,9 @@ struct Completion<T> {
 ///
 /// Mirrors `panic_payload_message` in terra-core's eval module. terra-jobs sits
 /// *below* terra-core in the crate graph and cannot borrow it, so the small
-/// helper is duplicated rather than shared.
-fn panic_payload_message(payload: Box<dyn Any + Send>) -> String {
+/// helper is duplicated rather than shared. Shared within the crate so the
+/// [`crate::latest_wins`] executor reuses it.
+pub(crate) fn panic_payload_message(payload: Box<dyn Any + Send>) -> String {
     if let Some(message) = payload.downcast_ref::<&str>() {
         (*message).to_string()
     } else if let Some(message) = payload.downcast_ref::<String>() {
