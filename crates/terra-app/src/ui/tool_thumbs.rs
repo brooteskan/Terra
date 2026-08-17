@@ -1,20 +1,18 @@
 //! Baked tool thumbnail icons (mockup-style grayscale landform previews).
 //!
-//! Source assets are large (1024²) PNGs. Decoding + downscale is done on a
-//! small background pool so the UI can show Lucide placeholders until ready.
-//! Prefer [`prefetch_all`] at startup so Quick Add / Tools don't hitch on first open.
-
-use std::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
-    OnceLock,
-};
-#[cfg(not(test))]
-use std::sync::{mpsc, Arc, Mutex};
+//! Source assets are large (1024²) PNGs. Decoding + downscale runs on a small
+//! background [`terra_jobs::Pool`] so the UI can show Lucide placeholders until
+//! ready. Prefer [`prefetch_all`] at startup so Quick Add / Tools don't hitch on
+//! first open.
 
 #[cfg(not(test))]
-type ThumbJob = Box<dyn FnOnce() + Send + 'static>;
-static THUMB_READY: AtomicBool = AtomicBool::new(false);
-static THUMBS_PENDING: AtomicUsize = AtomicUsize::new(0);
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
+
+/// The shared decode pool. Lazily spawned on first request, absent in test builds
+/// (where thumbs decode synchronously via the macro's `#[cfg(test)]` path).
+#[cfg(not(test))]
+static POOL: OnceLock<terra_jobs::Pool> = OnceLock::new();
 
 /// Display size baked into the thumb cache (source assets are 1024²).
 const THUMB_PX: u32 = 128;
@@ -45,50 +43,33 @@ fn worker_count() -> usize {
 }
 
 #[cfg(not(test))]
-fn enqueue(job: ThumbJob) {
-    static TX: OnceLock<mpsc::Sender<ThumbJob>> = OnceLock::new();
-    let tx = TX.get_or_init(|| {
-        let (tx, rx) = mpsc::channel::<ThumbJob>();
-        let rx = Arc::new(Mutex::new(rx));
-        let n = worker_count();
-        for i in 0..n {
-            let rx = Arc::clone(&rx);
-            std::thread::Builder::new()
-                .name(format!("terra-tool-thumbs-{i}"))
-                .spawn(move || loop {
-                    let job = {
-                        let Ok(guard) = rx.lock() else {
-                            break;
-                        };
-                        guard.recv()
-                    };
-                    match job {
-                        Ok(job) => {
-                            job();
-                            THUMB_READY.store(true, Ordering::Release);
-                            THUMBS_PENDING.fetch_sub(1, Ordering::AcqRel);
-                        }
-                        Err(_) => break,
-                    }
-                })
-                .expect("spawn tool thumbnail worker");
-        }
-        tx
-    });
-    THUMBS_PENDING.fetch_add(1, Ordering::AcqRel);
-    if tx.send(job).is_err() {
-        THUMBS_PENDING.fetch_sub(1, Ordering::AcqRel);
-    }
+fn enqueue(job: impl FnOnce() + Send + 'static) {
+    POOL.get_or_init(|| terra_jobs::Pool::new("terra-tool-thumbs", worker_count()))
+        .submit(job);
 }
 
 /// True once one or more background thumbnail decodes completed since the last poll.
 pub fn take_ready_signal() -> bool {
-    THUMB_READY.swap(false, Ordering::AcqRel)
+    #[cfg(not(test))]
+    {
+        POOL.get().is_some_and(|pool| pool.take_ready_signal())
+    }
+    #[cfg(test)]
+    {
+        false
+    }
 }
 
 /// True while the decoder has queued or executing work.
 pub fn has_pending_work() -> bool {
-    THUMBS_PENDING.load(Ordering::Acquire) > 0
+    #[cfg(not(test))]
+    {
+        POOL.get().is_some_and(|pool| pool.pending() > 0)
+    }
+    #[cfg(test)]
+    {
+        false
+    }
 }
 
 /// Kick off background decode for every catalog tool thumb (idempotent).
@@ -131,9 +112,9 @@ macro_rules! thumb {
                     .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok()
                 {
-                    enqueue(Box::new(|| {
+                    enqueue(|| {
                         T.get_or_init(|| load(include_bytes!($path)));
-                    }));
+                    });
                 }
                 None
             }
