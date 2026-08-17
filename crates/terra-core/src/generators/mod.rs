@@ -94,7 +94,13 @@ pub fn noise_field(
     p: &NoiseParams,
     kind: FractalNoiseType,
 ) -> Option<Heightfield> {
-    try_fill_world(metrics, cancel, |x, z| {
+    try_fill_world(metrics, cancel, noise_sampler(p, kind))
+}
+
+/// World-space sampler for [`noise_field`]. Shared with the tile-scoped entry
+/// ([`noise_field_tiles`]) so both paths evaluate identical arithmetic (#110).
+fn noise_sampler(p: &NoiseParams, kind: FractalNoiseType) -> impl Fn(f32, f32) -> f32 + Sync + '_ {
+    move |x, z| {
         if p.octaves <= 1 {
             noise::sample_noise(
                 kind,
@@ -105,7 +111,7 @@ pub fn noise_field(
         } else {
             fbm(kind, x, z, p)
         }
-    })
+    }
 }
 
 pub fn worley_field(
@@ -113,7 +119,12 @@ pub fn worley_field(
     cancel: &CancelToken,
     p: &WorleyParams,
 ) -> Option<Heightfield> {
-    try_fill_world(metrics, cancel, |x, z| sample_worley(x, z, p))
+    try_fill_world(metrics, cancel, worley_sampler(p))
+}
+
+/// World-space sampler for [`worley_field`] (see [`noise_sampler`]).
+fn worley_sampler(p: &WorleyParams) -> impl Fn(f32, f32) -> f32 + Sync + '_ {
+    move |x, z| sample_worley(x, z, p)
 }
 
 pub fn fbm_field(
@@ -121,7 +132,12 @@ pub fn fbm_field(
     cancel: &CancelToken,
     p: &FbmParams,
 ) -> Option<Heightfield> {
-    try_fill_world(metrics, cancel, |x, z| fbm(p.noise, x, z, &p.base))
+    try_fill_world(metrics, cancel, fbm_sampler(p))
+}
+
+/// World-space sampler for [`fbm_field`] (see [`noise_sampler`]).
+fn fbm_sampler(p: &FbmParams) -> impl Fn(f32, f32) -> f32 + Sync + '_ {
+    move |x, z| fbm(p.noise, x, z, &p.base)
 }
 
 pub fn ridged_field(
@@ -129,7 +145,12 @@ pub fn ridged_field(
     cancel: &CancelToken,
     p: &FbmParams,
 ) -> Option<Heightfield> {
-    try_fill_world(metrics, cancel, |x, z| ridged_mf(p.noise, x, z, &p.base))
+    try_fill_world(metrics, cancel, ridged_sampler(p))
+}
+
+/// World-space sampler for [`ridged_field`] (see [`noise_sampler`]).
+fn ridged_sampler(p: &FbmParams) -> impl Fn(f32, f32) -> f32 + Sync + '_ {
+    move |x, z| ridged_mf(p.noise, x, z, &p.base)
 }
 
 pub fn domain_warp_field(
@@ -137,9 +158,12 @@ pub fn domain_warp_field(
     cancel: &CancelToken,
     p: &DomainWarpParams,
 ) -> Option<Heightfield> {
-    try_fill_world(metrics, cancel, |x, z| {
-        domain_warp_fbm(x, z, &p.base, p.warp_strength, p.warp_frequency)
-    })
+    try_fill_world(metrics, cancel, domain_warp_sampler(p))
+}
+
+/// World-space sampler for [`domain_warp_field`] (see [`noise_sampler`]).
+fn domain_warp_sampler(p: &DomainWarpParams) -> impl Fn(f32, f32) -> f32 + Sync + '_ {
+    move |x, z| domain_warp_fbm(x, z, &p.base, p.warp_strength, p.warp_frequency)
 }
 
 pub fn terrace(input: &Heightfield, p: &TerraceParams) -> Heightfield {
@@ -186,6 +210,15 @@ pub fn mesa(
     cancel: &CancelToken,
     p: &MesaParams,
 ) -> Option<Heightfield> {
+    try_fill_world(metrics, cancel, mesa_sampler(metrics, p))
+}
+
+/// World-space sampler for [`mesa`] (see [`noise_sampler`]). Metrics-derived
+/// footprint constants are hoisted once, exactly as the whole-field pass did.
+fn mesa_sampler(
+    metrics: HeightfieldMetrics,
+    p: &MesaParams,
+) -> impl Fn(f32, f32) -> f32 + Sync + '_ {
     let short_axis = metrics.world_size_x.min(metrics.world_size_z).max(1.0);
     let radius_m = p.radius.clamp(0.02, 1.0) * short_axis * 0.5;
     let cx = p.center_u.clamp(0.0, 1.0) * metrics.world_size_x;
@@ -197,7 +230,7 @@ pub fn mesa(
     let cap_noise = p.cap_noise.max(0.0);
     // Flat cap occupies most of the interior; remaining annulus is the cliff.
     let cap_r = radius_m * 0.82;
-    try_fill_world(metrics, cancel, |x, z| {
+    move |x, z| {
         let dx = x - cx;
         let dz = z - cz;
         let dist = (dx * dx + dz * dz).sqrt();
@@ -242,7 +275,7 @@ pub fn mesa(
                 );
         let talus = (1.0 - smooth01(t)).powf(1.22);
         (height * 0.13 * talus * talus_noise).max(0.0)
-    })
+    }
 }
 
 /// Height and semantic coastal fields produced by [`island`].
@@ -483,6 +516,14 @@ pub fn mountains(
     cancel: &CancelToken,
     p: &MountainParams,
 ) -> Option<Heightfield> {
+    try_fill_world(metrics, cancel, mountains_sampler(metrics, p))
+}
+
+/// World-space sampler for [`mountains`] (see [`noise_sampler`]).
+fn mountains_sampler(
+    metrics: HeightfieldMetrics,
+    p: &MountainParams,
+) -> impl Fn(f32, f32) -> f32 + Sync + '_ {
     let world_scale = metrics.world_size_x.min(metrics.world_size_z).max(1.0);
     let amplitude = p.base.amplitude.max(0.0);
 
@@ -499,7 +540,7 @@ pub fn mountains(
     detail_params.lacunarity = 2.15;
     detail_params.persistence = 0.52;
 
-    try_fill_world(metrics, cancel, |x, z| {
+    move |x, z| {
         let nx = x / metrics.world_size_x - 0.5;
         let nz = z / metrics.world_size_z - 0.5;
         let ca = p.range_angle.cos();
@@ -545,7 +586,7 @@ pub fn mountains(
         // piling more positive noise onto every crest.
         let detail = (fine - 0.42) * 2.0 * p.crest_detail.max(0.0) * elev_t.powf(0.68) * range_mask;
         (primary + detail).max(0.0)
-    })
+    }
 }
 
 /// Radial cone + optional crater bowl (World Creator Landscape Volcano intent).
@@ -554,6 +595,14 @@ pub fn volcano(
     cancel: &CancelToken,
     p: &VolcanoParams,
 ) -> Option<Heightfield> {
+    try_fill_world(metrics, cancel, volcano_sampler(metrics, p))
+}
+
+/// World-space sampler for [`volcano`] (see [`noise_sampler`]).
+fn volcano_sampler(
+    metrics: HeightfieldMetrics,
+    p: &VolcanoParams,
+) -> impl Fn(f32, f32) -> f32 + Sync + '_ {
     let short_axis = metrics.world_size_x.min(metrics.world_size_z).max(1.0);
     let radius_m = p.radius.clamp(0.01, 1.0) * short_axis * 0.5;
     let cx = p.center_u.clamp(0.0, 1.0) * metrics.world_size_x;
@@ -563,7 +612,7 @@ pub fn volcano(
     let crater_r = (p.crater_radius.clamp(0.0, 0.95) * radius_m).max(0.0);
     let crater_d = p.crater_depth.max(0.0);
     let rough = p.roughness.max(0.0);
-    try_fill_world(metrics, cancel, |x, z| {
+    move |x, z| {
         let dx = x - cx;
         let dz = z - cz;
         let dist = (dx * dx + dz * dz).sqrt();
@@ -609,7 +658,7 @@ pub fn volcano(
             }
         }
         h.max(0.0)
-    })
+    }
 }
 
 /// Coherent ridge-corridor uplift with optional altitude-faded detail.
@@ -622,11 +671,19 @@ pub fn uplift(
     cancel: &CancelToken,
     p: &UpliftParams,
 ) -> Option<Heightfield> {
+    try_fill_world(metrics, cancel, uplift_sampler(metrics, p))
+}
+
+/// World-space sampler for [`uplift`] (see [`noise_sampler`]).
+fn uplift_sampler(
+    metrics: HeightfieldMetrics,
+    p: &UpliftParams,
+) -> impl Fn(f32, f32) -> f32 + Sync + '_ {
     let amp = p.amplitude.max(0.0);
     let corr_w = p.corridor_width.max(1e-3);
     let fade = p.altitude_fade.clamp(0.0, 1.0);
     let seed = p.seed;
-    try_fill_world(metrics, cancel, |x, z| {
+    move |x, z| {
         // Low-frequency warp so corridors meander without breaking coherence.
         let wx = noise::perlin2(x * p.frequency * 0.35, z * p.frequency * 0.35, seed)
             * p.warp_strength
@@ -690,7 +747,7 @@ pub fn uplift(
         };
         let detail_scale = (1.0 - fade) + fade * elev_t;
         primary + detail * detail_scale
-    })
+    }
 }
 
 /// Procedural dunes: directional phasor/wave seed + limited aeolian relaxation.
@@ -841,10 +898,18 @@ pub fn canyons(
     cancel: &CancelToken,
     p: &CanyonParams,
 ) -> Option<Heightfield> {
+    try_fill_world(metrics, cancel, canyons_sampler(metrics, p))
+}
+
+/// World-space sampler for [`canyons`] (see [`noise_sampler`]).
+fn canyons_sampler(
+    metrics: HeightfieldMetrics,
+    p: &CanyonParams,
+) -> impl Fn(f32, f32) -> f32 + Sync + '_ {
     let base_width = p.width.max(1e-3);
     let longitudinal_freq = 1.0 / (base_width * 11.0).max(1.0);
     let seed_phase = noise::canonical_seed32(p.seed) as f32;
-    try_fill_world(metrics, cancel, |x, z| {
+    move |x, z| {
         let broad = noise::perlin2(z * longitudinal_freq, seed_phase * 0.017, p.seed);
         let detail = noise::perlin2(
             z * longitudinal_freq * 3.1,
@@ -883,7 +948,7 @@ pub fn canyons(
         let local_depth = p.depth.max(0.0) * (0.88 + depth_noise * 0.16).max(0.5);
         let strata = 0.96 + 0.04 * (q * 9.0 * std::f32::consts::TAU + wall_noise).sin();
         -local_depth * (wall * 0.78 + inner * 0.22) * strata
-    })
+    }
 }
 
 pub fn voronoi_regions(
@@ -891,7 +956,12 @@ pub fn voronoi_regions(
     cancel: &CancelToken,
     p: &VoronoiParams,
 ) -> Option<Heightfield> {
-    try_fill_world(metrics, cancel, |x, z| {
+    try_fill_world(metrics, cancel, voronoi_sampler(p))
+}
+
+/// World-space sampler for [`voronoi_regions`] (see [`noise_sampler`]).
+fn voronoi_sampler(p: &VoronoiParams) -> impl Fn(f32, f32) -> f32 + Sync + '_ {
+    move |x, z| {
         let w = sample_worley(
             x,
             z,
@@ -907,7 +977,7 @@ pub fn voronoi_regions(
             p.base.seed ^ 0xBEEF,
         );
         w * 0.25 + cell * p.height_per_cell * p.cell_jitter
-    })
+    }
 }
 
 /// Failure loading an external heightmap image or OBJ mesh for a generator.
