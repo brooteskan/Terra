@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::invalidation::DirtyClass;
 use crate::noise::WorleyFeature;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -267,6 +268,54 @@ impl EffectFilterKind {
     pub fn cycle(self) -> Self {
         let idx = Self::ALL.iter().position(|&k| k == self).unwrap_or(0);
         Self::ALL[(idx + 1) % Self::ALL.len()]
+    }
+
+    /// Coarse spatial-dependency bucket for this sub-kind, mirroring
+    /// [`crate::layer::LayerKind::spatial_dependency`] one level down.
+    ///
+    /// `EffectFilter` is a single `LayerKind` fronting ~60 sub-kinds whose reach
+    /// ranges from per-pixel to whole-field, so one class on the parent would be
+    /// dishonest. Exhaustive by construction — a new kind must land in a bucket.
+    /// Param-free and conservative: kinds whose reach depends on parameters in a
+    /// way this coarse bucket can't express (world-space displacement, iterative
+    /// aeolian) sit in `BasinDependent`; the precise, param-aware halo for the
+    /// bounded kernels comes from [`EffectFilterParams::kernel_halo`].
+    pub fn spatial_dependency(&self) -> DirtyClass {
+        use EffectFilterKind::*;
+        match self {
+            // Per-pixel: output texel is a function of the same input texel plus
+            // world position — a dirty region passes through unexpanded.
+            AddSet | Blocks | Ridged | Rugged | DesignVoronoi | ScatterDetail | Shore | Crater
+            | NoiseBillow | NoiseGabor | NoisePerlin | NoisePhasor | NoiseRidged | NoiseSimplex
+            | NoiseValue | NoiseVoronoi | NoiseWave | NoiseWhite => DirtyClass::Local,
+            // Bounded neighbourhood kernels — reach is radius x iterations.
+            Smooth | Denoise | Kuwahara | SpikeRemoval | Inflate | Deflate | Balloon | AngleBlur
+            | DirectionalBlur | SmoothRidges | FlattenFilter | MudSettle | AngleBreak
+            | TalusFill => DirtyClass::Expanding,
+            // Whole-field: global reductions (field-range remaps, border blends),
+            // flow routing / drainage normalize, arbitrary-rotation resample,
+            // world-space domain warp / cell tiling (Distortion, Hexagons — whose
+            // sample reach depends on world scale), and iterative aeolian carve.
+            Squeeze | Curve | Cutoff | ZeroEdge | Strata | BorderBlend | Swirl | SedimentFillSoft
+            | HydraulicSediment | WashedOff | SedimentFlows | SoftFlows | ThinFlows | RidgedFlows
+            | WideFlows | TerraceSimple | TerraceIrregular | TerraceSteep | RockySharp | RockyWide
+            | RockyLayers | CliffReinforce | RockyPlateaus | RockyCliffs | RockyHard | Canyon
+            | Chipped | Cliffs | Rocky | WindCarve | Distortion | Hexagons => {
+                DirtyClass::BasinDependent
+            }
+        }
+    }
+}
+
+impl EffectFilterParams {
+    /// Per-side sample halo for a bounded-kernel effect filter (radius x
+    /// iterations), used when [`EffectFilterKind::spatial_dependency`] is
+    /// [`DirtyClass::Expanding`]. Meaningless for the per-pixel and whole-field
+    /// buckets; callers gate on the class first. Conservative — the processors'
+    /// per-quality iteration clamps only *lower* the real count, so the unclamped
+    /// product never under-estimates the reach.
+    pub fn kernel_halo(&self) -> u32 {
+        self.radius.saturating_mul(self.iterations.max(1))
     }
 }
 
@@ -1156,5 +1205,61 @@ impl EffectFilterParams {
             frequency: 1.0,
             ..Self::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod spatial_tests {
+    use super::*;
+    use crate::invalidation::DirtyClass;
+
+    /// Every sub-kind lands in exactly one bucket — the `ALL` inventory and the
+    /// exhaustive match can't drift apart without this failing.
+    #[test]
+    fn every_kind_is_classified() {
+        for &k in EffectFilterKind::ALL {
+            let _ = k.spatial_dependency();
+        }
+        assert_eq!(EffectFilterKind::ALL.len(), 64, "ALL inventory size drifted");
+    }
+
+    #[test]
+    fn representative_buckets() {
+        assert_eq!(
+            EffectFilterKind::AddSet.spatial_dependency(),
+            DirtyClass::Local
+        );
+        assert_eq!(
+            EffectFilterKind::Smooth.spatial_dependency(),
+            DirtyClass::Expanding
+        );
+        // Global despite the GPU shader approximating it locally (CPU uses the
+        // exact whole-field range).
+        assert_eq!(
+            EffectFilterKind::TerraceSimple.spatial_dependency(),
+            DirtyClass::BasinDependent
+        );
+        assert_eq!(
+            EffectFilterKind::SoftFlows.spatial_dependency(),
+            DirtyClass::BasinDependent
+        );
+    }
+
+    #[test]
+    fn kernel_halo_is_radius_times_iterations() {
+        let p = EffectFilterParams {
+            kind: EffectFilterKind::Smooth,
+            radius: 3,
+            iterations: 4,
+            ..EffectFilterParams::default()
+        };
+        assert_eq!(p.kernel_halo(), 12);
+        // iterations floored to 1.
+        let p0 = EffectFilterParams {
+            radius: 5,
+            iterations: 0,
+            ..p
+        };
+        assert_eq!(p0.kernel_halo(), 5);
     }
 }
