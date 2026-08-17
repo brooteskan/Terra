@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use crate::logging::OperationContext;
 use crate::ui::Preview2dMode;
-use terra_core::eval::{EvalError, EvalWorkRequest, PreviewQuality};
+use terra_core::eval::{EvalWorkRequest, PreviewQuality};
 use terra_core::heightfield::{Heightfield, HeightfieldMetrics};
 use terra_core::layer::{LayerId, LayerKind};
 use terra_core::mask::bake_mask_assets;
@@ -713,6 +713,13 @@ impl TerraApp {
                             // when stacks include unsupported layers (painted masks, SPE, …).
                             let needs_cpu_suffix = result.resume_cpu_from.is_some();
                             self.last_eval_fully_gpu = result.fully_gpu;
+                            // want_cpu=false, so the GPU engine never returns a CPU prefix
+                            // (`result.cpu` is always None) and the UI thread never runs a CPU
+                            // stack eval — every hybrid resume routes to the async worker below.
+                            debug_assert!(
+                                result.cpu.is_none(),
+                                "interactive eval must not carry a CPU prefix (want_cpu=false)"
+                            );
                             if result.resume_cpu_from == Some(0)
                                 && !result.fully_gpu
                                 && !result.did_eval
@@ -723,72 +730,6 @@ impl TerraApp {
                                 eval_completed = true;
                                 if !self.worker_refine_pending {
                                     self.enqueue_async_eval(quality);
-                                }
-                            } else if let (Some(prefix), Some(start)) =
-                                (result.cpu.clone(), result.resume_cpu_from)
-                            {
-                                // Full/Export hybrid only (Draft/Medium no longer read back).
-                                // The GPU result carries height, not aux/published-output state,
-                                // so never seed this generation from scheduler leftovers.
-                                let masks = self.session.document.masks.clone();
-                                let mut ctx = terra_core::eval::EvalContext::new(metrics);
-                                ctx.quality = quality;
-                                ctx.level_steps = self.session.document.level_steps.clone();
-                                ctx.mask_assets = masks.clone();
-                                ctx.masks = terra_core::mask::bake_mask_assets(
-                                    &masks,
-                                    &prefix,
-                                    metrics,
-                                    &std::collections::HashMap::new(),
-                                );
-                                let cpu_result = if start == 0 {
-                                    self.scheduler
-                                        .evaluator
-                                        .rebuild_all(&preview_stack, &mut ctx)
-                                } else {
-                                    self.scheduler.evaluator.evaluate_suffix(
-                                        &preview_stack,
-                                        &mut ctx,
-                                        start,
-                                        prefix,
-                                    )
-                                };
-                                match cpu_result {
-                                    Ok(hf) => {
-                                        ctx.sync_aux_hashmap();
-                                        self.scheduler.last_strata = ctx.aux_maps.strata.clone();
-                                        self.scheduler.last_layer_timings =
-                                            ctx.layer_timings.clone();
-                                        self.ui_state.profile.update_layer_timings(
-                                            &self.scheduler.last_layer_timings,
-                                        );
-                                        self.scheduler.last_aux = ctx.aux;
-                                        self.scheduler.last_good =
-                                            Some(std::sync::Arc::new(hf.clone()));
-                                        self.last_height = Some(hf);
-                                        self.preview_dirty = true;
-                                        self.needs_height_upload = true;
-                                        self.ui_state.profile.path = "GPU+CPU";
-                                        used_gpu = true;
-                                        eval_completed = true;
-                                    }
-                                    Err(error) => {
-                                        match error {
-                                            EvalError::Cancelled => log::debug!(
-                                                target: "terra_app::evaluation",
-                                                "hybrid CPU suffix cancelled; {operation_context}"
-                                            ),
-                                            error => log::error!(
-                                                target: "terra_app::evaluation",
-                                                "hybrid CPU suffix failed: {error}; {operation_context}"
-                                            ),
-                                        }
-                                        used_gpu = true;
-                                        eval_completed = true;
-                                        if !self.worker_refine_pending {
-                                            self.enqueue_async_eval(quality);
-                                        }
-                                    }
                                 }
                             } else {
                                 self.ui_state.profile.path =
