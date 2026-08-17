@@ -980,6 +980,130 @@ fn voronoi_sampler(p: &VoronoiParams) -> impl Fn(f32, f32) -> f32 + Sync + '_ {
     }
 }
 
+// --- Tile-scoped generator entries (#110) ---
+//
+// Each mirrors the matching whole-field generator but fills only the interior of
+// the listed `tiles` in `out`, sharing the exact `*_sampler` closure so scoped
+// and whole-field fills are bit-identical. `out` is seeded by the caller (zeros
+// for these input-independent generators); values outside `tiles` are never read
+// by the scoped blend. Each returns `false` on cancellation (discard `out`).
+
+/// Tile-scoped [`noise_field`].
+pub fn noise_field_tiles(
+    out: &mut Heightfield,
+    tiles: &[TileId],
+    cancel: &CancelToken,
+    p: &NoiseParams,
+    kind: FractalNoiseType,
+) -> bool {
+    try_fill_tiles(out, tiles, cancel, noise_sampler(p, kind))
+}
+
+/// Tile-scoped [`worley_field`].
+pub fn worley_field_tiles(
+    out: &mut Heightfield,
+    tiles: &[TileId],
+    cancel: &CancelToken,
+    p: &WorleyParams,
+) -> bool {
+    try_fill_tiles(out, tiles, cancel, worley_sampler(p))
+}
+
+/// Tile-scoped [`fbm_field`].
+pub fn fbm_field_tiles(
+    out: &mut Heightfield,
+    tiles: &[TileId],
+    cancel: &CancelToken,
+    p: &FbmParams,
+) -> bool {
+    try_fill_tiles(out, tiles, cancel, fbm_sampler(p))
+}
+
+/// Tile-scoped [`ridged_field`].
+pub fn ridged_field_tiles(
+    out: &mut Heightfield,
+    tiles: &[TileId],
+    cancel: &CancelToken,
+    p: &FbmParams,
+) -> bool {
+    try_fill_tiles(out, tiles, cancel, ridged_sampler(p))
+}
+
+/// Tile-scoped [`domain_warp_field`].
+pub fn domain_warp_field_tiles(
+    out: &mut Heightfield,
+    tiles: &[TileId],
+    cancel: &CancelToken,
+    p: &DomainWarpParams,
+) -> bool {
+    try_fill_tiles(out, tiles, cancel, domain_warp_sampler(p))
+}
+
+/// Tile-scoped [`mesa`].
+pub fn mesa_tiles(
+    out: &mut Heightfield,
+    tiles: &[TileId],
+    cancel: &CancelToken,
+    p: &MesaParams,
+) -> bool {
+    let sampler = mesa_sampler(out.metrics, p);
+    try_fill_tiles(out, tiles, cancel, sampler)
+}
+
+/// Tile-scoped [`mountains`].
+pub fn mountains_tiles(
+    out: &mut Heightfield,
+    tiles: &[TileId],
+    cancel: &CancelToken,
+    p: &MountainParams,
+) -> bool {
+    let sampler = mountains_sampler(out.metrics, p);
+    try_fill_tiles(out, tiles, cancel, sampler)
+}
+
+/// Tile-scoped [`volcano`].
+pub fn volcano_tiles(
+    out: &mut Heightfield,
+    tiles: &[TileId],
+    cancel: &CancelToken,
+    p: &VolcanoParams,
+) -> bool {
+    let sampler = volcano_sampler(out.metrics, p);
+    try_fill_tiles(out, tiles, cancel, sampler)
+}
+
+/// Tile-scoped [`uplift`].
+pub fn uplift_tiles(
+    out: &mut Heightfield,
+    tiles: &[TileId],
+    cancel: &CancelToken,
+    p: &UpliftParams,
+) -> bool {
+    let sampler = uplift_sampler(out.metrics, p);
+    try_fill_tiles(out, tiles, cancel, sampler)
+}
+
+/// Tile-scoped [`canyons`].
+pub fn canyons_tiles(
+    out: &mut Heightfield,
+    tiles: &[TileId],
+    cancel: &CancelToken,
+    p: &CanyonParams,
+) -> bool {
+    let sampler = canyons_sampler(out.metrics, p);
+    try_fill_tiles(out, tiles, cancel, sampler)
+}
+
+/// Tile-scoped [`voronoi_regions`].
+pub fn voronoi_regions_tiles(
+    out: &mut Heightfield,
+    tiles: &[TileId],
+    cancel: &CancelToken,
+    p: &VoronoiParams,
+) -> bool {
+    try_fill_tiles(out, tiles, cancel, voronoi_sampler(p))
+}
+
 /// Failure loading an external heightmap image or OBJ mesh for a generator.
 ///
 /// Generator-owned so `generators` need not depend on `eval`; the evaluator
@@ -1172,6 +1296,49 @@ pub fn procedural_shape(
         ProceduralGenerator::Noise => {
             noise_field(metrics, cancel, &p.noise, FractalNoiseType::Perlin)
         }
+    }
+}
+
+/// Tile-scoped [`procedural_shape`] (#110).
+///
+/// Fills only `tiles` in `out`, dispatching to the matching `*_tiles` entry.
+/// Returns `None` for generator variants without a tile-sliced fill — `Dunes`
+/// (its aeolian evolve consumes the whole bedrock field) and `Crater` (its
+/// post-pass is an effect filter, not a per-sample fill) — so the caller falls
+/// back to a whole-field generate. `Some(false)` means a cancel tripped.
+pub fn procedural_shape_tiles(
+    out: &mut Heightfield,
+    tiles: &[TileId],
+    cancel: &CancelToken,
+    p: &ProceduralShapeParams,
+) -> Option<bool> {
+    match p.generator {
+        ProceduralGenerator::Mountain => Some(mountains_tiles(out, tiles, cancel, &p.mountain)),
+        ProceduralGenerator::Hills => Some(fbm_field_tiles(out, tiles, cancel, &p.hills)),
+        ProceduralGenerator::Plateau => {
+            // fBm base then the plateau remap over just the scope tiles, matching
+            // the whole-field `fbm_field` + `plateau()` composition.
+            if !fbm_field_tiles(out, tiles, cancel, &p.hills) {
+                return Some(false);
+            }
+            for &id in tiles {
+                if let Some(dst) = out.tile_mut(id) {
+                    dst.map_interior(|h| plateau_sample(&p.plateau, h));
+                }
+            }
+            Some(true)
+        }
+        ProceduralGenerator::Mesa => Some(mesa_tiles(out, tiles, cancel, &p.mesa)),
+        ProceduralGenerator::Volcano => Some(volcano_tiles(out, tiles, cancel, &p.volcano)),
+        ProceduralGenerator::Canyon => Some(canyons_tiles(out, tiles, cancel, &p.canyon)),
+        ProceduralGenerator::Noise => Some(noise_field_tiles(
+            out,
+            tiles,
+            cancel,
+            &p.noise,
+            FractalNoiseType::Perlin,
+        )),
+        ProceduralGenerator::Dunes | ProceduralGenerator::Crater => None,
     }
 }
 
