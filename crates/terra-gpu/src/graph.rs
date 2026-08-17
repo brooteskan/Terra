@@ -359,6 +359,77 @@ mod tests {
         ]
     }
 
+    /// The CPU spatial-dependency class must never be *more permissive* than the
+    /// GPU dirty policy for the same layer: whatever the GPU refuses to localize,
+    /// the CPU sub-region recompute (#100) must also refuse. Ranks: Local < Expanding
+    /// < BasinDependent on the CPU side; the GPU's `FullField` demands the CPU be
+    /// fully basin-coupled, while GPU `Local` demands nothing (the CPU may be
+    /// stricter — `Terrace` deliberately is, using the exact field range where the
+    /// shader only approximates it).
+    #[test]
+    fn cpu_reach_is_never_more_permissive_than_gpu_policy() {
+        use terra_core::invalidation::DirtyClass;
+
+        fn cpu_rank(c: DirtyClass) -> u8 {
+            match c {
+                DirtyClass::Local => 0,
+                DirtyClass::Expanding => 1,
+                DirtyClass::BasinDependent => 2,
+            }
+        }
+        fn gpu_required_rank(p: GpuDirtyPolicy) -> u8 {
+            match p {
+                GpuDirtyPolicy::Local => 0,
+                GpuDirtyPolicy::FullField => 2,
+            }
+        }
+
+        let mut candidates = inplace_layers();
+        candidates.push(Layer::new("flat", LayerKind::Flat(FlatParams::default())));
+        candidates.push(Layer::new(
+            "noise",
+            LayerKind::NoiseValue(NoiseParams::default()),
+        ));
+
+        let mut saw_full_field = false;
+        for layer in &candidates {
+            let Some(plan) = gpu_plan_for_layer(layer, &[]) else {
+                continue;
+            };
+            let cpu = layer.kind.spatial_dependency();
+            assert!(
+                cpu_rank(cpu) >= gpu_required_rank(plan.dirty_policy),
+                "{:?}: CPU {cpu:?} is more permissive than GPU {:?}",
+                layer.kind,
+                plan.dirty_policy
+            );
+            if plan.dirty_policy == GpuDirtyPolicy::FullField {
+                saw_full_field = true;
+                assert_eq!(
+                    cpu,
+                    DirtyClass::BasinDependent,
+                    "{:?}: GPU FullField requires CPU BasinDependent",
+                    layer.kind
+                );
+            }
+        }
+        assert!(
+            saw_full_field,
+            "expected at least one FullField GPU plan (thermal/hydraulic) to exercise the constraint"
+        );
+
+        // Terrace: GPU localizes it, CPU is deliberately stricter.
+        let terrace = Layer::new("terrace", LayerKind::Terrace(TerraceParams::default()));
+        assert_eq!(
+            gpu_plan_for_layer(&terrace, &[]).map(|p| p.dirty_policy),
+            Some(GpuDirtyPolicy::Local)
+        );
+        assert_eq!(
+            terrace.kind.spatial_dependency(),
+            DirtyClass::BasinDependent
+        );
+    }
+
     #[test]
     fn compiles_generator_filter_stack_as_fully_gpu() {
         let mut stack = LayerStack::new();
