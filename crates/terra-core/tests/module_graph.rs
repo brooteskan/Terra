@@ -374,6 +374,7 @@ const MODULE_DEPENDENCIES: &[(&str, &[&str])] = &[
         ],
     ),
     ("scatter", &["heightfield", "mask", "spatial_kernels"]),
+    ("shader_progress", &[]),
     ("shape_history", &["authoring", "layer"]),
     ("shape_object", &["authoring", "ids"]),
     ("simd_ops", &[]),
