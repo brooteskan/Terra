@@ -35,7 +35,7 @@ pub(crate) const EDIT_DEBOUNCE_MS: u128 = 40;
 pub(crate) const REFINE_INTERVAL_MS: u128 = 80;
 
 /// GPU objects built off the main thread during startup, handed back through
-/// [`BootState::rx`]. All three are `wgpu`-backed and therefore `Send`.
+/// [`BootState::job`]. All three are `wgpu`-backed and therefore `Send`.
 pub(crate) struct BootResult {
     renderer: TerrainRenderer,
     tile_atlas: Option<GpuTileAtlas>,
@@ -49,7 +49,7 @@ pub(crate) struct BootResult {
 pub(crate) struct BootState {
     pub(crate) gpu: terra_render::GpuContext,
     pub(crate) pending: terra_render::PendingSurface,
-    pub(crate) rx: std::sync::mpsc::Receiver<BootResult>,
+    pub(crate) job: terra_jobs::JobHandle<BootResult>,
     pub(crate) started: Instant,
 }
 

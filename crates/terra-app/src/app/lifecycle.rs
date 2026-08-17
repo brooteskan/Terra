@@ -61,39 +61,36 @@ impl ApplicationHandler for TerraApp {
         let tile_config = self.terrain_runtime.pyramid.config;
         let (tile_size, tile_halo) = (tile_config.tile_size, tile_config.halo);
         let worker_gpu = gpu.clone();
-        let (tx, rx) = std::sync::mpsc::channel::<super::BootResult>();
-        std::thread::Builder::new()
-            .name("terra-gpu-init".into())
-            .spawn(move || {
-                let renderer = TerrainRenderer::new_detached(&worker_gpu, config, size);
-                let gpu_engine = GpuTerrainEngine::new(&worker_gpu.device, 256);
-                let tile_atlas =
-                    match GpuTileAtlas::new(&worker_gpu.device, tile_size, tile_halo, 128) {
-                        Ok(atlas) => Some(atlas),
-                        Err(error) => {
-                            log::warn!("GPU tile atlas disabled: {error}");
-                            None
-                        }
-                    };
-                // Receiver drop (window closed mid-init) just discards the result.
-                let _ = tx.send(super::BootResult {
-                    renderer,
-                    tile_atlas,
-                    gpu_engine,
-                });
-            })
-            .expect("spawn terra-gpu-init");
+        // Handle drop (window closed mid-init) just discards the result — the same
+        // discard-on-drop semantics the old receiver-drop had.
+        let job = terra_jobs::spawn_one_shot("terra-gpu-init", move |_ctx| {
+            let renderer = TerrainRenderer::new_detached(&worker_gpu, config, size);
+            let gpu_engine = GpuTerrainEngine::new(&worker_gpu.device, 256);
+            let tile_atlas = match GpuTileAtlas::new(&worker_gpu.device, tile_size, tile_halo, 128)
+            {
+                Ok(atlas) => Some(atlas),
+                Err(error) => {
+                    log::warn!("GPU tile atlas disabled: {error}");
+                    None
+                }
+            };
+            super::BootResult {
+                renderer,
+                tile_atlas,
+                gpu_engine,
+            }
+        });
 
         self.window = Some(window);
         self.gui_renderer = Some(gui_renderer);
         self.boot = Some(super::BootState {
             gpu,
             pending,
-            rx,
+            job,
             started: Instant::now(),
         });
         // Animate: keep repainting the splash until the worker result lands
-        // (about_to_wait polls `boot.rx` and finalizes).
+        // (about_to_wait polls `boot.job` and finalizes).
         if let Some(w) = &self.window {
             w.request_redraw();
         }
@@ -884,13 +881,15 @@ impl TerraApp {
         let Some(boot) = self.boot.as_ref() else {
             return false;
         };
-        let result = match boot.rx.try_recv() {
-            Ok(result) => result,
-            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                // Worker panicked before sending — unrecoverable; leave the splash
-                // up rather than crash, but log loudly.
-                log::error!("terra-gpu-init worker disconnected before producing a renderer");
+        let result = match boot.job.try_take() {
+            Some(Ok(result)) => result,
+            None => return false,
+            Some(Err(error)) => {
+                // Worker panicked before producing a renderer — unrecoverable;
+                // leave the splash up rather than crash, but log loudly. try_take
+                // emptied the slot, so the next poll hits the `None` arm and this
+                // logs exactly once instead of every splash frame.
+                log::error!("terra-gpu-init worker failed before producing a renderer: {error}");
                 return false;
             }
         };
