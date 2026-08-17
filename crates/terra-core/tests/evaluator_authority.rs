@@ -138,13 +138,6 @@ const APPROVED_EXECUTION_SEAMS: &[ApprovedSeam] = &[
                 },
             },
             EntryPoint {
-                method: "evaluate_suffix",
-                caller: SourceEvidence {
-                    path: "crates/terra-app/src/app/eval.rs",
-                    needle: "evaluator.evaluate_suffix(",
-                },
-            },
-            EntryPoint {
                 method: "mark_dirty_from",
                 caller: SourceEvidence {
                     path: "crates/terra-app/src/app/eval.rs",
@@ -180,10 +173,16 @@ const APPROVED_EXECUTION_SEAMS: &[ApprovedSeam] = &[
                 },
             },
         ],
-        internal_methods: &[InternalMethod {
-            method: "evaluate_nodes",
-            justification: "the authored LayerStack tree-walk recursion StackEvaluator drives itself; never an external entry (the single-authority shape check requires it to exist)",
-        }],
+        internal_methods: &[
+            InternalMethod {
+                method: "evaluate_nodes",
+                justification: "the authored LayerStack tree-walk recursion StackEvaluator drives itself; never an external entry (the single-authority shape check requires it to exist)",
+            },
+            InternalMethod {
+                method: "evaluate_suffix",
+                justification: "resumes a CPU suffix eval from a GPU checkpoint at a given layer index; public API retained for CPU/GPU parity tests (terra-gpu engine cfg(test) + parity_matrix), production hybrid resume flows through EvalWorker/rebuild_incremental since b82726c",
+            },
+        ],
         result_test: ResultTestEvidence {
             path: "crates/terra-core/tests/tropical_island_workflow.rs",
             test_name: "tropical_island_evaluates_with_biome_content",
