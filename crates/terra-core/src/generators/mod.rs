@@ -159,21 +159,25 @@ pub fn terrace(input: &Heightfield, p: &TerraceParams) -> Heightfield {
 
 pub fn plateau(input: &Heightfield, p: &PlateauParams) -> Heightfield {
     let mut out = input.clone();
-    let soft = p.soft.max(1e-3);
-    out.map_mut(|h| {
-        if h < p.low {
-            let t = ((h - (p.low - soft)) / soft).clamp(0.0, 1.0);
-            (p.low - soft) + t * soft
-        } else if h > p.high {
-            let t = ((h - p.high) / soft).clamp(0.0, 1.0);
-            p.high + t * soft * 0.25
-        } else {
-            // Flatten toward mid plateau.
-            let mid = (p.low + p.high) * 0.5;
-            h * 0.25 + mid * 0.75
-        }
-    });
+    out.map_mut(|h| plateau_sample(p, h));
     out
+}
+
+/// One-sample plateau remap. Pure `f32 -> f32`, so the whole-field [`plateau`]
+/// pass and the tile-scoped recompute (#100 phase 2) share identical arithmetic.
+pub(crate) fn plateau_sample(p: &PlateauParams, h: f32) -> f32 {
+    let soft = p.soft.max(1e-3);
+    if h < p.low {
+        let t = ((h - (p.low - soft)) / soft).clamp(0.0, 1.0);
+        (p.low - soft) + t * soft
+    } else if h > p.high {
+        let t = ((h - p.high) / soft).clamp(0.0, 1.0);
+        p.high + t * soft * 0.25
+    } else {
+        // Flatten toward mid plateau.
+        let mid = (p.low + p.high) * 0.5;
+        h * 0.25 + mid * 0.75
+    }
 }
 
 /// Hard-cap mesa / butte with steep walls and soft talus skirt.
@@ -1295,25 +1299,29 @@ pub fn blur(input: &Heightfield, p: &BlurParams) -> Heightfield {
 
 pub fn coastal(input: &Heightfield, p: &CoastalParams) -> Heightfield {
     let mut out = input.clone();
-    out.map_mut(|h| {
-        if p.flatten_below && h < p.sea_level {
-            if p.shelf_depth <= 0.0 {
-                p.sea_level
-            } else {
-                let depth = p.sea_level - h;
-                let slope_scale = p.beach_width.max(1e-3);
-                p.sea_level - p.shelf_depth * (1.0 - (-depth / slope_scale).exp())
-            }
-        } else if h < p.sea_level + p.beach_width {
-            let t = ((h - p.sea_level) / p.beach_width.max(1e-3)).clamp(0.0, 1.0);
-            // Smoothstep keeps the beach tangent gentle at sea level and inland.
-            let soft = t * t * (3.0 - 2.0 * t);
-            p.sea_level + soft * p.beach_width
-        } else {
-            h
-        }
-    });
+    out.map_mut(|h| coastal_sample(p, h));
     out
+}
+
+/// One-sample coastal remap. Pure `f32 -> f32`, shared by the whole-field
+/// [`coastal`] pass and the tile-scoped recompute (#100 phase 2).
+pub(crate) fn coastal_sample(p: &CoastalParams, h: f32) -> f32 {
+    if p.flatten_below && h < p.sea_level {
+        if p.shelf_depth <= 0.0 {
+            p.sea_level
+        } else {
+            let depth = p.sea_level - h;
+            let slope_scale = p.beach_width.max(1e-3);
+            p.sea_level - p.shelf_depth * (1.0 - (-depth / slope_scale).exp())
+        }
+    } else if h < p.sea_level + p.beach_width {
+        let t = ((h - p.sea_level) / p.beach_width.max(1e-3)).clamp(0.0, 1.0);
+        // Smoothstep keeps the beach tangent gentle at sea level and inland.
+        let soft = t * t * (3.0 - 2.0 * t);
+        p.sea_level + soft * p.beach_width
+    } else {
+        h
+    }
 }
 
 /// Cancellable world-space fill.

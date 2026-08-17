@@ -8,7 +8,7 @@ mod smart_cache;
 mod worker;
 
 pub use crate::quality::PreviewQuality;
-pub use cache::{CachedOutput, LayerCache};
+pub use cache::{CachedOutput, LayerCache, SeedState};
 pub use processors::ProcessorRegistry;
 pub use scheduler::EvalScheduler;
 pub use smart_cache::DiskSmartCache;
@@ -18,10 +18,11 @@ pub use worker::{
 };
 
 use crate::field_data::AuxMaps;
-use crate::heightfield::{Heightfield, HeightfieldMetrics};
+use crate::heightfield::{Heightfield, HeightfieldMetrics, TileId};
 use crate::layer::{blend_heights, Layer, LayerId, LayerStack, StackNode};
 use crate::mask::{MaskAsset, MaskField, MaskId};
-use std::collections::HashMap;
+use crate::tiling::TileScheduler;
+use std::collections::{HashMap, HashSet};
 use std::sync::{atomic::AtomicU64, Arc};
 use std::time::Instant;
 use terra_jobs::CancelToken;
@@ -85,6 +86,11 @@ pub struct LayerEvalTiming {
     pub layer_kind: &'static str,
     pub elapsed_us: u64,
     pub status: LayerEvalStatus,
+    /// Tiles recomputed when this layer ran tile-scoped (#100 phase 2). `None`
+    /// means whole-field, a cache hit, or disabled; `Some(n)` is the size of the
+    /// expanded dirty set the scoped recompute actually touched. The recompute
+    /// counter the phase-2 equivalence oracle asserts against.
+    pub tiles_recomputed: Option<u32>,
 }
 
 pub struct EvalContext {
@@ -109,6 +115,12 @@ pub struct EvalContext {
     pub quality: PreviewQuality,
     /// Timings for the current pass, in actual layer evaluation order.
     pub layer_timings: Vec<LayerEvalTiming>,
+    /// Initial tile-scoped recompute region for the flat suffix walk (#100 phase
+    /// 2). `None` (the default) recomputes the whole field, exactly as before.
+    /// `Some(tiles)` seeds the cumulative dirty set so a localized edit recomputes
+    /// only the touched tiles plus each downstream layer's reach. Driven directly
+    /// by headless tests this phase; `run_cpu_job` threads it in phase 4.
+    pub initial_scope: Option<Vec<TileId>>,
 }
 
 impl EvalContext {
@@ -125,6 +137,7 @@ impl EvalContext {
             quality: PreviewQuality::Full,
             cancel: CancelToken::never(),
             layer_timings: Vec::new(),
+            initial_scope: None,
         }
     }
 
@@ -221,6 +234,28 @@ impl StackEvaluator {
             }
         } else {
             // Unknown id: dirty everything
+            for &dep in &ids {
+                self.cache.mark_dirty(dep);
+            }
+        }
+    }
+
+    /// Tile-scoped dirty from a layer (#100 phase 2): mark `id` and its suffix
+    /// dirty, but with a bounded seed region instead of the whole field.
+    ///
+    /// The edited layer `id` seeds with the actual edit region `tiles`. Layers
+    /// *above* it have no own-contribution change — only their input moves — so
+    /// they seed empty (dirty, input-driven only). The tile-scoped suffix walk in
+    /// [`Self::rebuild_incremental`] accumulates and reach-expands these seeds; an
+    /// unknown id falls back to whole-field [`Self::mark_dirty_from`] semantics.
+    pub fn mark_dirty_from_region(&mut self, stack: &LayerStack, id: LayerId, tiles: &[TileId]) {
+        let ids = stack.layer_ids();
+        if let Some(start) = ids.iter().position(|&x| x == id) {
+            self.cache.mark_dirty_region(id, tiles);
+            for &dep in &ids[start + 1..] {
+                self.cache.mark_dirty_region(dep, &[]);
+            }
+        } else {
             for &dep in &ids {
                 self.cache.mark_dirty(dep);
             }
@@ -334,6 +369,7 @@ impl StackEvaluator {
         }
 
         let mut first_dirty = first_dirty.unwrap_or(0);
+        let mut fell_back = false;
         let mut current = if first_dirty == 0 {
             Heightfield::zeros(metrics)
         } else {
@@ -348,8 +384,10 @@ impl StackEvaluator {
                     // The seed checkpoint for the clean prefix could not be
                     // reloaded (its spill was removed or failed validation).
                     // Zero-seeding would silently truncate the stack, so fall back
-                    // to a full rebuild from the base instead (B1-D8).
+                    // to a full rebuild from the base instead (B1-D8). The cache is
+                    // incoherent here, so force whole-field — never tile-scoped.
                     first_dirty = 0;
+                    fell_back = true;
                     Heightfield::zeros(metrics)
                 }
             }
@@ -358,13 +396,96 @@ impl StackEvaluator {
             record_reused_layer(ctx, layer);
         }
 
+        // Tile-scoped suffix accumulation (#100 phase 2). `cum` is the cumulative
+        // set of tiles whose composed height differs from the previous cached
+        // composite at the current level; `None` means we escalated to whole-field
+        // and stay there (sticky) for the rest of the walk — reproducing today's
+        // behavior exactly. It seeds from the caller's `initial_scope`.
+        let tile_count = metrics.tile_count();
+        let mut cum: Option<HashSet<TileId>> = if fell_back {
+            None
+        } else {
+            Some(ctx.initial_scope.iter().flatten().copied().collect())
+        };
+
         for layer in &layers[first_dirty..] {
             ctx.check_cancelled()?;
-            current = self.evaluate_layer(ctx, &current, layer)?;
+
+            let scope = self.plan_layer_scope(ctx, &current, layer, &mut cum, tile_count);
+            current = match scope {
+                Some(tiles) => self.evaluate_layer_scoped(ctx, &current, layer, &tiles)?,
+                None => self.evaluate_layer(ctx, &current, layer)?,
+            };
             self.store_cached(layer.id(), &current, ctx, layer.common.cached);
         }
 
         Ok(current)
+    }
+
+    /// Decide how the next suffix layer recomputes: `Some(tiles)` for a tile-scoped
+    /// recompute over `tiles`, or `None` for a whole-field / cache-hit / escalated
+    /// recompute. Mutates `cum` in place — folding in the layer's own seeds and
+    /// reach expansion, or clearing it to `None` on escalation (sticky).
+    fn plan_layer_scope(
+        &self,
+        ctx: &EvalContext,
+        current: &Heightfield,
+        layer: &Layer,
+        cum: &mut Option<HashSet<TileId>>,
+        tile_count: u32,
+    ) -> Option<Vec<TileId>> {
+        // Already whole-field (sticky), or a clean layer whose cached output is
+        // unchanged (its downstream difference set is unchanged): recompute the
+        // normal way and leave `cum` untouched.
+        if cum.is_none() || !self.cache.is_dirty(layer.id()) {
+            return None;
+        }
+
+        // Disabled layers are an identity passthrough: no reach, no escalation (a
+        // disabled basin-coupled layer must not force whole-field). Fold any own
+        // seeds into `cum` — a no-op superset at worst — and pass through.
+        if !layer.common.enabled {
+            if let SeedState::Tiles(seeds) = self.cache.seed_state(layer.id()) {
+                cum.as_mut().unwrap().extend(seeds);
+            }
+            return None;
+        }
+
+        let reach = reach::effective_reach(layer, &ctx.mask_assets);
+        let prev_dims_ok = self.cache.get(layer.id()).is_some_and(|c| {
+            c.height.metrics.width == current.metrics.width
+                && c.height.metrics.height == current.metrics.height
+        });
+
+        match self.cache.seed_state(layer.id()) {
+            // Bounded own-seed, a bounded reach, and a dimensionally usable previous
+            // output: union the seeds, reach-expand the whole cumulative set, and
+            // recompute exactly those tiles — unless expansion filled the field.
+            SeedState::Tiles(seeds) if !reach.is_full() && prev_dims_ok => {
+                let mut set = cum.take().unwrap();
+                set.extend(seeds);
+                let mut sched = TileScheduler {
+                    dirty: set.into_iter().collect(),
+                };
+                sched.expand_for_reach(current, reach);
+                let expanded: HashSet<TileId> = sched.dirty.into_iter().collect();
+                if expanded.len() as u32 >= tile_count {
+                    *cum = None;
+                    None
+                } else {
+                    let scope = expanded.iter().copied().collect();
+                    *cum = Some(expanded);
+                    Some(scope)
+                }
+            }
+            // Whole-field seed (AllTiles), a full reach, or a previous output that
+            // cannot be reused (absent / wrong dims): escalate to whole-field, and
+            // every layer above inherits it (sticky).
+            _ => {
+                *cum = None;
+                None
+            }
+        }
     }
 
     /// Evaluate a node list bottom→top, composing scoped groups as units.
@@ -608,6 +729,208 @@ impl StackEvaluator {
         Ok(out)
     }
 
+    /// Tile-scoped recompute of one layer (#100 phase 2), panic-contained exactly
+    /// like [`Self::evaluate_layer`]. Caller (`plan_layer_scope`) guarantees the
+    /// preconditions: the layer is enabled and dirty, its reach is bounded, and a
+    /// dimensionally-matching previous output exists to carry clean tiles from.
+    fn evaluate_layer_scoped(
+        &mut self,
+        ctx: &mut EvalContext,
+        input: &Heightfield,
+        layer: &Layer,
+        scope: &[TileId],
+    ) -> Result<Heightfield, EvalError> {
+        let layer_name = layer.common.name.clone();
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.evaluate_layer_scoped_inner(ctx, input, layer, scope)
+        })) {
+            Ok(result) => result,
+            Err(payload) => Err(EvalError::LayerPanicked {
+                layer: layer_name,
+                message: panic_payload_message(payload),
+            }),
+        }
+    }
+
+    fn evaluate_layer_scoped_inner(
+        &mut self,
+        ctx: &mut EvalContext,
+        input: &Heightfield,
+        layer: &Layer,
+        scope: &[TileId],
+    ) -> Result<Heightfield, EvalError> {
+        let timing_started = Instant::now();
+        let metrics = ctx.metrics;
+
+        // Seed the output from the previous clean composite; recomputed tiles
+        // overwrite it, clean tiles are carried forward unchanged. If the previous
+        // output is somehow gone, we cannot carry clean tiles — recompute whole.
+        let Some(prev) = self.cache.get(layer.id()).map(|c| c.height.clone()) else {
+            return self.evaluate_layer_inner(ctx, input, layer);
+        };
+
+        // Point-of-use masks rebake against the exact field entering this layer.
+        refresh_point_of_use_masks(ctx, input);
+
+        let scaled_layer = layer_with_world_scale(layer, ctx.level_steps.world_scale);
+        let bound_layer = apply_param_bindings(ctx, &scaled_layer);
+        let generated = self.generate_scoped(ctx, input, &bound_layer, scope)?;
+        let mask = effective_layer_mask(ctx, &layer.common.masks, input);
+
+        let mut out = prev;
+        for &id in scope {
+            let (ox, oz, iw, ih) = {
+                let Some(tile) = out.tile(id) else {
+                    continue;
+                };
+                let (ox, oz) = tile.interior_origin(&metrics);
+                (ox, oz, tile.interior_width, tile.interior_height)
+            };
+            for lz in 0..ih {
+                for lx in 0..iw {
+                    let i = ox + lx;
+                    let j = oz + lz;
+                    let hin = input.get(i, j);
+                    let hlayer = generated.get(i, j);
+                    let m = mask.get(i, j);
+                    let v = blend_heights(
+                        layer.common.blend,
+                        hin,
+                        hlayer,
+                        layer.common.opacity,
+                        m,
+                    );
+                    out.set(i, j, v);
+                }
+            }
+        }
+
+        // Refresh only the ghosts of the recomputed tiles' 8-neighbour ring. A
+        // full `refresh_halos()` would be correct but whole-field; this is the
+        // scoped equivalent and its seam metric must read zero.
+        let seam = TileScheduler {
+            dirty: scope.to_vec(),
+        }
+        .sync_dirty(&mut out);
+        debug_assert!(
+            seam.abs() < 1.0e-3,
+            "scoped halo refresh left a seam of {seam}"
+        );
+
+        publish_layer_outputs(ctx, layer, &out);
+        record_scoped_layer_timing(ctx, layer, timing_started, scope.len() as u32);
+        Ok(out)
+    }
+
+    /// Produce a height field whose `scope` tiles hold this layer's freshly
+    /// generated contribution. Values outside `scope` are never read by the
+    /// caller's blend, so only the scope tiles need be correct. Arms without a
+    /// tile-sliced entry fall back to a whole-field generate (correct, no win).
+    fn generate_scoped(
+        &self,
+        ctx: &mut EvalContext,
+        input: &Heightfield,
+        layer: &Layer,
+        scope: &[TileId],
+    ) -> Result<Heightfield, EvalError> {
+        use crate::layer::LayerKind;
+        let metrics = ctx.metrics;
+        match &layer.kind {
+            LayerKind::SculptBase(p) => {
+                let mut g = Heightfield::zeros(metrics);
+                for &id in scope {
+                    if let Some(dst) = g.tile_mut(id) {
+                        *dst = crate::generators::sculpt_base_tile(metrics, p, id);
+                    }
+                }
+                Ok(g)
+            }
+            LayerKind::PolygonHeight(p) => {
+                let mut g = input.clone();
+                for &id in scope {
+                    if let Some(tile) = crate::generators::polygon_height_tile(input, p, id) {
+                        if let Some(dst) = g.tile_mut(id) {
+                            *dst = tile;
+                        }
+                    }
+                }
+                Ok(g)
+            }
+            LayerKind::Plateau(p) => {
+                let mut g = input.clone();
+                for &id in scope {
+                    if let Some(dst) = g.tile_mut(id) {
+                        dst.map_interior(|h| crate::generators::plateau_sample(p, h));
+                    }
+                }
+                Ok(g)
+            }
+            LayerKind::Coastal(p) => {
+                let mut g = input.clone();
+                for &id in scope {
+                    if let Some(dst) = g.tile_mut(id) {
+                        dst.map_interior(|h| crate::generators::coastal_sample(p, h));
+                    }
+                }
+                Ok(g)
+            }
+            LayerKind::Path(p) => self.generate_scoped_path(ctx, input, p, layer.id(), scope),
+            // Not yet tile-wired (input-independent generators, etc.): whole-field
+            // generate is still correct because the caller blends only `scope`.
+            _ => self.registry.evaluate(ctx, input, layer),
+        }
+    }
+
+    /// Scoped Path stamp: patches height per tile and re-maxes the per-texel
+    /// wetness aux over just the recomputed tiles, seeding clean tiles from the
+    /// previous cached merge — the tile-scoped equivalent of `merge_wetness_max`.
+    fn generate_scoped_path(
+        &self,
+        ctx: &mut EvalContext,
+        input: &Heightfield,
+        p: &crate::layer::PathParams,
+        layer_id: LayerId,
+        scope: &[TileId],
+    ) -> Result<Heightfield, EvalError> {
+        use crate::field_data::keys;
+        let metrics = ctx.metrics;
+        let mut g = input.clone();
+        // Wetness entering from below (already in ctx), and the previous merged
+        // wetness (correct on clean tiles). Re-max the fresh stamp over `below` on
+        // scope tiles only; clean tiles keep the previous merge.
+        let below = ctx.aux_maps.wetness.clone();
+        let mut wet = self
+            .cache
+            .get(layer_id)
+            .and_then(|c| c.aux.get(keys::WETNESS).cloned())
+            .unwrap_or_else(|| below.clone().unwrap_or_else(|| MaskField::zeros(metrics)));
+        for &id in scope {
+            let Some(crate::generators::PathStampTile { height, wetness }) =
+                crate::generators::path_stamp_tile(input, p, id)
+            else {
+                continue;
+            };
+            let (ox, oz) = height.interior_origin(&metrics);
+            let iw = height.interior_width;
+            let ih = height.interior_height;
+            for lz in 0..ih {
+                for lx in 0..iw {
+                    let stamp = wetness[(lz * iw + lx) as usize];
+                    let base = below
+                        .as_ref()
+                        .map(|b| b.get(ox + lx, oz + lz))
+                        .unwrap_or(0.0);
+                    wet.set(ox + lx, oz + lz, base.max(stamp));
+                }
+            }
+            if let Some(dst) = g.tile_mut(id) {
+                *dst = height;
+            }
+        }
+        ctx.aux_insert(keys::WETNESS, wet);
+        Ok(g)
+    }
+
     fn try_reuse_group_cache(
         &mut self,
         group_id: LayerId,
@@ -679,6 +1002,25 @@ fn record_layer_timing(
         layer_kind: layer.kind.type_display_name(),
         elapsed_us: started.elapsed().as_micros() as u64,
         status,
+        tiles_recomputed: None,
+    });
+}
+
+/// Timing for a layer that ran tile-scoped, tagged with the size of the tile set
+/// it recomputed (the phase-2 recompute counter).
+fn record_scoped_layer_timing(
+    ctx: &mut EvalContext,
+    layer: &Layer,
+    started: Instant,
+    tiles: u32,
+) {
+    ctx.layer_timings.push(LayerEvalTiming {
+        layer: layer.id(),
+        layer_name: layer.common.name.clone(),
+        layer_kind: layer.kind.type_display_name(),
+        elapsed_us: started.elapsed().as_micros() as u64,
+        status: LayerEvalStatus::Computed,
+        tiles_recomputed: Some(tiles),
     });
 }
 
@@ -689,6 +1031,7 @@ fn record_reused_layer(ctx: &mut EvalContext, layer: &Layer) {
         layer_kind: layer.kind.type_display_name(),
         elapsed_us: 0,
         status: LayerEvalStatus::CacheHit,
+        tiles_recomputed: None,
     });
 }
 

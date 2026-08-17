@@ -217,6 +217,7 @@ const MODULE_DEPENDENCIES: &[(&str, &[&str])] = &[
             "mask_ir",
             "quality",
             "surface",
+            "tiling",
             "volumetric",
         ],
     ),

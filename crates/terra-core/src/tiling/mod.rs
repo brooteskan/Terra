@@ -6,6 +6,7 @@ pub use crate::invalidation::{expand_radius_for, DirtyClass};
 pub use region::{bounds_from_tiles, rects_from_tiles, SampleRect};
 
 use crate::heightfield::{HeightTile, Heightfield, HeightfieldMetrics, TileId};
+use crate::invalidation::Reach;
 use crate::layer::LayerKind;
 use std::collections::HashSet;
 
@@ -111,6 +112,31 @@ impl TileScheduler {
             _ => {
                 let r = expand_radius_for(class, stencil, iterations);
                 self.expand(hf, r);
+            }
+        }
+    }
+
+    /// Expand the dirty set by a resolved [`Reach`] (#108, #100 phase 2).
+    ///
+    /// A `halo_samples` per-side *sample* halo becomes a Chebyshev *tile* radius of
+    /// `halo_samples.div_ceil(tile_size)` — the number of neighbour tiles a halo of
+    /// that many samples can reach into. `halo_samples == 0` (a pure per-texel pass)
+    /// adds no tiles. [`Reach::Full`] is a caller bug: the tile-scoped walk must
+    /// escalate to whole-field *before* expanding, never expand a `Full`. It is
+    /// asserted in debug and degrades to `mark_all` in release so a stray `Full`
+    /// stays correct (over-recompute), never silently under-expands.
+    pub fn expand_for_reach(&mut self, hf: &Heightfield, reach: Reach) {
+        match reach {
+            Reach::Full => {
+                debug_assert!(
+                    false,
+                    "expand_for_reach called with Reach::Full; escalate to whole-field instead"
+                );
+                self.mark_all(hf);
+            }
+            Reach::Localized { halo_samples } => {
+                let tile_size = hf.metrics.tile_size.max(1);
+                self.expand(hf, halo_samples.div_ceil(tile_size));
             }
         }
     }
@@ -595,6 +621,60 @@ mod tests {
         sched.mark_tile(TileId { tx: 2, tz: 2 });
         sched.expand(&hf, 1);
         assert_eq!(sched.dirty.len(), 9);
+    }
+
+    #[test]
+    fn expand_for_reach_maps_sample_halo_to_tile_radius() {
+        let metrics = HeightfieldMetrics {
+            width: 160,
+            height: 160,
+            world_size_x: 160.0,
+            world_size_z: 160.0,
+            tile_size: 32,
+            halo: 2,
+        };
+        let hf = Heightfield::zeros(metrics);
+
+        // Per-texel reach adds no neighbour tiles.
+        let mut sched = TileScheduler::new();
+        sched.mark_tile(TileId { tx: 2, tz: 2 });
+        sched.expand_for_reach(&hf, Reach::LOCAL);
+        assert_eq!(sched.dirty.len(), 1, "zero halo stays a single tile");
+
+        // A halo within one tile expands by one tile ring (3x3).
+        let mut sched = TileScheduler::new();
+        sched.mark_tile(TileId { tx: 2, tz: 2 });
+        sched.expand_for_reach(&hf, Reach::Localized { halo_samples: 32 });
+        assert_eq!(sched.dirty.len(), 9, "halo == tile_size is one tile radius");
+
+        // A halo just over one tile expands by two tile rings (5x5).
+        let mut sched = TileScheduler::new();
+        sched.mark_tile(TileId { tx: 2, tz: 2 });
+        sched.expand_for_reach(&hf, Reach::Localized { halo_samples: 33 });
+        assert_eq!(
+            sched.dirty.len(),
+            25,
+            "halo just over tile_size is two tile radius"
+        );
+    }
+
+    #[test]
+    fn expand_for_reach_handles_partial_edge_tiles() {
+        // 70x58 over 32-sample tiles: 3x2 tiles, the last column/row partial.
+        let metrics = HeightfieldMetrics {
+            width: 70,
+            height: 58,
+            world_size_x: 70.0,
+            world_size_z: 58.0,
+            tile_size: 32,
+            halo: 2,
+        };
+        let hf = Heightfield::zeros(metrics);
+        let mut sched = TileScheduler::new();
+        // Corner seed: its 3x3 ring is clipped to the 3x2 grid corner (2x2 = 4).
+        sched.mark_tile(TileId { tx: 2, tz: 1 });
+        sched.expand_for_reach(&hf, Reach::Localized { halo_samples: 1 });
+        assert_eq!(sched.dirty.len(), 4, "corner ring clipped to field bounds");
     }
 
     fn batched_blur_bits(
