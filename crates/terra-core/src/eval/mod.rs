@@ -121,7 +121,9 @@ pub struct EvalContext {
     /// 2). `None` (the default) recomputes the whole field, exactly as before.
     /// `Some(tiles)` seeds the cumulative dirty set so a localized edit recomputes
     /// only the touched tiles plus each downstream layer's reach. Driven directly
-    /// by headless tests this phase; `run_cpu_job` threads it in phase 4.
+    /// by headless tests; the production worker path instead seeds the layer cache
+    /// via [`StackEvaluator::mark_dirty_from_region`] (phase 4, from the request's
+    /// `dirty_region`), so `initial_scope` stays a test-only seam.
     pub initial_scope: Option<Vec<TileId>>,
 }
 

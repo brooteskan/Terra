@@ -6,6 +6,7 @@ use terra_core::eval::{EvalWorkRequest, PreviewQuality};
 use terra_core::heightfield::Heightfield;
 use terra_core::layer::{LayerId, LayerKind};
 use terra_core::mask::bake_mask_assets;
+use terra_core::tiling::UvRect;
 use terra_gpu::GpuError;
 
 use super::{quality_stage_progress, TerraApp};
@@ -113,8 +114,22 @@ impl TerraApp {
             .and_then(|id| preview_stack.find(id))
             .map(|layer| layer.common.name.clone())
             .or_else(|| Some("terrain".into()));
-        let mark_all_dirty = std::mem::take(&mut self.worker_mark_all_dirty);
-        let dirty_from = self.worker_dirty_from.take();
+        // Ladder policy (a): a bounded sculpt scope over an already-Full worker
+        // cache is submitted straight at Full, skipping the Draft/Medium CPU rungs
+        // that would otherwise clobber the Full-res checkpoints it reuses.
+        let quality = self.straight_to_full_quality(quality);
+
+        // Copy — not drain — the dirty accumulators. `LatestWins` drops a job that
+        // is superseded before it is dequeued *without running its body*, so a
+        // drained scope on such a job would be lost, leaving stale tiles. Instead
+        // the accumulators are cleared only when a fresh result is consumed (see the
+        // Completed arm in `about_to_wait`); a re-carried scope is idempotent (region
+        // unions, `dirty_from`/`mark_all` are supersets), so at worst a later job
+        // over-recomputes. This is what makes the issue's seed-persistence invariant
+        // hold against dequeue-skip, not just against in-body cancel.
+        let mark_all_dirty = self.worker_mark_all_dirty;
+        let dirty_from = self.worker_dirty_from;
+        let dirty_region = self.worker_dirty_region;
 
         let request = EvalWorkRequest {
             token: self.eval_token,
@@ -132,8 +147,9 @@ impl TerraApp {
             aux: self.scheduler.last_aux.clone(),
             strata: self.scheduler.last_strata.clone(),
             mask_reference: self.scheduler.last_good.clone(),
-            mark_all_dirty,
             dirty_from,
+            dirty_region,
+            mark_all_dirty,
         };
         match self.eval_worker.submit(request) {
             Ok(()) => {
@@ -141,14 +157,15 @@ impl TerraApp {
                 self.ui_state.refining = true;
             }
             Err(error) => {
-                self.worker_mark_all_dirty |= mark_all_dirty;
-                if self.worker_dirty_from.is_none() {
-                    self.worker_dirty_from = dirty_from;
-                }
+                // Nothing was drained, so there is nothing to restore. The restarted
+                // worker's cache is empty (missing == dirty), so a whole-field mark
+                // is the correct reset; drop the now-meaningless scope and cache res.
                 self.eval_worker.restart();
                 self.eval_worker.set_token(self.eval_token);
                 self.worker_mark_all_dirty = true;
                 self.worker_dirty_from = None;
+                self.worker_dirty_region = None;
+                self.worker_cache_res = None;
                 self.handle_evaluation_failure_details(
                     self.eval_token,
                     quality,
@@ -158,6 +175,57 @@ impl TerraApp {
                 );
             }
         }
+    }
+
+    /// Ladder policy (a) (#100 phase 4): if a bounded sculpt scope is pending and
+    /// the worker's persistent cache is already at Full resolution, promote the
+    /// submit to Full and skip the Draft/Medium CPU rungs.
+    ///
+    /// The refine ladder resubmits at each rung's resolution, and the single-slot
+    /// layer cache is keyed only by dimension — so a Draft rung after a Full stroke
+    /// overwrites the Full-res checkpoints the next stroke's scope would reuse, and
+    /// the Full rung then rebuilds whole-field despite a perfect one-tile scope.
+    /// Submitting scoped-Full directly avoids the clobber: a Full eval of a few
+    /// tiles is comparable to a whole-field Draft eval, immediate coarse feedback
+    /// still comes from the GPU present, and the cache stays untouched. On promotion
+    /// the scheduler/UI quality is synced to Full so the lifecycle refine loop
+    /// settles there (`next_refine(Full) == None`) instead of re-queuing Medium.
+    ///
+    /// The gate is deliberately conservative: it fires only with a bounded scope
+    /// (`dirty_region` set, no `mark_all`, a `dirty_from` suffix), an already-Full
+    /// cache (`worker_cache_res`), and a scope mapping to at most a quarter of the
+    /// Full tile grid. A cold cache or first stroke fails the gate and runs today's
+    /// Draft→Medium→Full ladder unchanged.
+    fn straight_to_full_quality(&mut self, requested: PreviewQuality) -> PreviewQuality {
+        if matches!(requested, PreviewQuality::Full | PreviewQuality::Export) {
+            return requested;
+        }
+        if self.worker_mark_all_dirty || self.worker_dirty_from.is_none() {
+            return requested;
+        }
+        let Some(region) = self.worker_dirty_region else {
+            return requested;
+        };
+        let full_res = self
+            .session
+            .document
+            .preview_resolution
+            .min(INTERACTIVE_PREVIEW_CAP);
+        // Only worthwhile once the cache holds Full-res checkpoints to reuse.
+        if self.worker_cache_res != Some(full_res) {
+            return requested;
+        }
+        let Ok(full_metrics) = self.session.document.metrics.at_resolution(full_res) else {
+            return requested;
+        };
+        let budget = (full_metrics.tile_count() / 4).max(1);
+        let tiles = terra_core::tiling::tiles_for_uv_rect(&full_metrics, region);
+        if tiles.len() as u32 > budget {
+            return requested;
+        }
+        self.scheduler.quality = PreviewQuality::Full;
+        self.ui_state.quality = PreviewQuality::Full;
+        PreviewQuality::Full
     }
 
     pub(crate) fn evaluation_log_context(&self, token: u64, quality: PreviewQuality) -> String {
@@ -377,7 +445,8 @@ impl TerraApp {
         let preview = self.session.document.preview_eval_stack();
         self.scheduler.evaluator.mark_dirty_from(&preview, id);
         self.advance_output_revision();
-        self.track_worker_dirty_from(&preview, id);
+        // No spatial footprint (param/structural edit): whole-field suffix.
+        self.track_worker_dirty_from(&preview, id, None);
         if let Some(gpu) = self.gpu_engine.as_mut() {
             gpu.mark_dirty_from(&preview, id);
         }
@@ -387,25 +456,39 @@ impl TerraApp {
         let preview = self.session.document.preview_eval_stack();
         self.scheduler.evaluator.mark_dirty_from_stage(&preview, id);
         self.advance_output_revision();
-        self.track_worker_dirty_from(&preview, id);
+        self.track_worker_dirty_from(&preview, id, None);
         if let Some(gpu) = self.gpu_engine.as_mut() {
             // GPU path still uses suffix dirty; stage-aware CPU cache is the main win.
             gpu.mark_dirty_from(&preview, id);
         }
     }
 
+    /// Mirror a suffix dirty from `id` onto the worker accumulators, folding in an
+    /// optional spatial `footprint` (normalized UV).
+    ///
+    /// `footprint`:
+    /// - `Some(rect)` on the *first* pending edit seeds the bounded scope; on a
+    ///   later edit whose scope is still bounded it unions in; but once any
+    ///   footprint-less edit has escalated the region to `None`, it stays `None`
+    ///   (whole-field suffix) until the accumulators are cleared — never narrowed
+    ///   back to a rect, which would drop the escalated dirt.
+    /// - `None` escalates the region to `None`: an edit with no known footprint
+    ///   dirties the whole suffix, exactly as before this scope existed.
     pub(crate) fn track_worker_dirty_from(
         &mut self,
         stack: &terra_core::layer::LayerStack,
         id: LayerId,
+        footprint: Option<UvRect>,
     ) {
         if self.worker_mark_all_dirty {
             return;
         }
+        let had_pending = self.worker_dirty_from.is_some();
         let ids = stack.layer_ids();
         let Some(next_index) = ids.iter().position(|candidate| *candidate == id) else {
             self.worker_mark_all_dirty = true;
             self.worker_dirty_from = None;
+            self.worker_dirty_region = None;
             return;
         };
         let replace = self
@@ -414,6 +497,19 @@ impl TerraApp {
             .is_none_or(|current_index| next_index < current_index);
         if replace {
             self.worker_dirty_from = Some(id);
+        }
+        match footprint {
+            // First bounded edit since the last clear: seed the scope. A later
+            // bounded edit unions in. A bounded edit *after* an escalation keeps the
+            // escalated whole-field `None` (do not narrow).
+            Some(rect) => {
+                if !had_pending {
+                    self.worker_dirty_region = Some(rect);
+                } else if let Some(existing) = self.worker_dirty_region {
+                    self.worker_dirty_region = Some(existing.union(rect));
+                }
+            }
+            None => self.worker_dirty_region = None,
         }
     }
 
@@ -440,7 +536,8 @@ impl TerraApp {
                 .is_some_and(|layer| layer.kind.eval_stage().order() >= min_order)
         });
         if let Some(id) = earliest {
-            self.track_worker_dirty_from(stack, id);
+            // Stage (re)builds have no spatial footprint: whole-field suffix.
+            self.track_worker_dirty_from(stack, id, None);
         }
     }
 
@@ -458,6 +555,7 @@ impl TerraApp {
         self.retire_streamed_residency();
         self.worker_mark_all_dirty = true;
         self.worker_dirty_from = None;
+        self.worker_dirty_region = None;
         if let Some(gpu) = self.gpu_engine.as_mut() {
             gpu.mark_all_dirty(&preview);
         }
@@ -1102,9 +1200,204 @@ mod tests {
 
     use terra_core::eval::PreviewQuality;
     use terra_core::heightfield::{Heightfield, HeightfieldMetrics};
-    use terra_core::layer::{Layer, LayerKind, LayerStack, StreamPowerParams};
+    use terra_core::layer::{FlatParams, Layer, LayerKind, LayerStack, StreamPowerParams};
+    use terra_core::tiling::UvRect;
 
     use super::TerraApp;
+
+    fn flat(height: f32) -> Layer {
+        Layer::new("Flat", LayerKind::Flat(FlatParams { height }))
+    }
+
+    fn rect(u: f32, v: f32, r: f32) -> UvRect {
+        UvRect::from_center_radius(u, v, r)
+    }
+
+    /// #100 phase 4 (loss-proof transport): `enqueue_async_eval` must *copy* the
+    /// dirty accumulators, not drain them — a job that is stale-skipped on dequeue
+    /// runs no body and applies no marks, so a drained scope would be lost. The
+    /// accumulators are cleared only when a fresh result is consumed.
+    #[test]
+    fn enqueue_copies_dirty_accumulators_instead_of_draining() {
+        let mut app = TerraApp::default();
+        let layer = flat(10.0);
+        let id = layer.id();
+        app.session.document.stack = LayerStack::new();
+        app.session.document.stack.push(layer);
+
+        app.worker_mark_all_dirty = false;
+        app.worker_dirty_from = Some(id);
+        let region = rect(0.4, 0.4, 0.05);
+        app.worker_dirty_region = Some(region);
+
+        app.enqueue_async_eval(PreviewQuality::Draft);
+
+        assert!(app.worker_refine_pending, "the job was submitted");
+        assert_eq!(
+            app.worker_dirty_from,
+            Some(id),
+            "dirty_from must survive submit (copied, not drained)"
+        );
+        assert_eq!(
+            app.worker_dirty_region,
+            Some(region),
+            "the UV scope must survive submit for re-carry on a dequeue-skip"
+        );
+        assert!(!app.worker_mark_all_dirty);
+    }
+
+    /// A bounded sculpt footprint seeds `worker_dirty_region`; a second bounded edit
+    /// unions in; a later footprint-less edit escalates it to whole-field (`None`),
+    /// and — the correctness-critical part — a bounded edit *after* the escalation
+    /// does not narrow it back.
+    #[test]
+    fn track_worker_dirty_from_unions_and_escalates_region() {
+        let mut app = TerraApp::default();
+        let layer = flat(1.0);
+        let id = layer.id();
+        let mut stack = LayerStack::new();
+        stack.push(layer);
+
+        app.worker_mark_all_dirty = false;
+        app.worker_dirty_from = None;
+        app.worker_dirty_region = None;
+
+        let a = rect(0.2, 0.2, 0.03);
+        let b = rect(0.8, 0.8, 0.03);
+        app.track_worker_dirty_from(&stack, id, Some(a));
+        assert_eq!(app.worker_dirty_from, Some(id));
+        assert_eq!(app.worker_dirty_region, Some(a), "first bounded edit seeds");
+
+        app.track_worker_dirty_from(&stack, id, Some(b));
+        assert_eq!(
+            app.worker_dirty_region,
+            Some(a.union(b)),
+            "a second bounded edit unions the scope"
+        );
+
+        app.track_worker_dirty_from(&stack, id, None);
+        assert_eq!(
+            app.worker_dirty_region, None,
+            "a footprint-less edit escalates the scope to whole-field"
+        );
+
+        app.track_worker_dirty_from(&stack, id, Some(a));
+        assert_eq!(
+            app.worker_dirty_region, None,
+            "a bounded edit after escalation must not narrow the whole-field scope"
+        );
+    }
+
+    /// Escalation table: every footprint-less trigger drops `worker_dirty_region` to
+    /// `None`, matching pre-#111 whole-field behavior.
+    #[test]
+    fn footprintless_triggers_escalate_region_to_none() {
+        // Param / structural suffix edit via mark_dirty_from.
+        {
+            let mut app = TerraApp::default();
+            let layer = flat(5.0);
+            let id = layer.id();
+            app.session.document.stack = LayerStack::new();
+            app.session.document.stack.push(layer);
+            app.worker_mark_all_dirty = false;
+            app.worker_dirty_from = Some(id);
+            app.worker_dirty_region = Some(rect(0.5, 0.5, 0.02));
+            app.mark_dirty_from(id);
+            assert_eq!(app.worker_dirty_region, None, "param edit escalates");
+        }
+        // Whole-field invalidation (mask paint commit / undo / resolution change).
+        {
+            let mut app = TerraApp::default();
+            app.session.document.stack = LayerStack::new();
+            app.session.document.stack.push(flat(5.0));
+            app.worker_mark_all_dirty = false;
+            app.worker_dirty_region = Some(rect(0.5, 0.5, 0.02));
+            app.mark_all_layers_dirty();
+            assert!(app.worker_mark_all_dirty);
+            assert_eq!(app.worker_dirty_region, None, "mark_all clears the scope");
+        }
+        // Stage (re)build (scenario / World Rule).
+        {
+            let mut app = TerraApp::default();
+            let layer = flat(5.0);
+            let id = layer.id();
+            app.session.document.stack = LayerStack::new();
+            app.session.document.stack.push(layer);
+            app.worker_mark_all_dirty = false;
+            app.worker_dirty_from = Some(id);
+            app.worker_dirty_region = Some(rect(0.5, 0.5, 0.02));
+            let preview = app.session.document.preview_eval_stack();
+            app.track_worker_dirty_from_eval_stage(&preview, terra_core::EvalStage::Blueprint);
+            assert_eq!(app.worker_dirty_region, None, "stage dirty escalates");
+        }
+    }
+
+    /// Ladder policy (a): the straight-to-Full gate promotes a bounded small-scope
+    /// submit to Full once the worker cache is Full-res, and syncs the scheduler/UI
+    /// quality so the refine loop settles at Full; a cold cache declines.
+    #[test]
+    fn straight_to_full_gate_promotes_only_over_a_full_cache() {
+        let mut app = TerraApp::default();
+        let layer = flat(3.0);
+        let id = layer.id();
+        app.session.document.stack = LayerStack::new();
+        app.session.document.stack.push(layer);
+        let full_res = app
+            .session
+            .document
+            .preview_resolution
+            .min(super::INTERACTIVE_PREVIEW_CAP);
+
+        app.worker_mark_all_dirty = false;
+        app.worker_dirty_from = Some(id);
+        app.worker_dirty_region = Some(rect(0.5, 0.5, 0.02));
+
+        // Cold cache: gate declines, quality unchanged.
+        app.worker_cache_res = None;
+        app.scheduler.quality = PreviewQuality::Draft;
+        assert_eq!(
+            app.straight_to_full_quality(PreviewQuality::Draft),
+            PreviewQuality::Draft,
+            "a cold worker cache keeps today's Draft-first ladder"
+        );
+        assert_eq!(app.scheduler.quality, PreviewQuality::Draft);
+
+        // Full cache + small scope: gate promotes and syncs quality.
+        app.worker_cache_res = Some(full_res);
+        assert_eq!(
+            app.straight_to_full_quality(PreviewQuality::Draft),
+            PreviewQuality::Full,
+            "a bounded scope over a Full cache submits straight at Full"
+        );
+        assert_eq!(app.scheduler.quality, PreviewQuality::Full);
+        assert_eq!(app.ui_state.quality, PreviewQuality::Full);
+    }
+
+    /// The gate declines when there is no bounded scope (whole-field pending), even
+    /// over a Full cache — otherwise a param edit would wrongly skip the ladder.
+    #[test]
+    fn straight_to_full_gate_declines_without_a_bounded_scope() {
+        let mut app = TerraApp::default();
+        let layer = flat(3.0);
+        let id = layer.id();
+        app.session.document.stack = LayerStack::new();
+        app.session.document.stack.push(layer);
+        let full_res = app
+            .session
+            .document
+            .preview_resolution
+            .min(super::INTERACTIVE_PREVIEW_CAP);
+        app.worker_cache_res = Some(full_res);
+        app.worker_mark_all_dirty = false;
+        app.worker_dirty_from = Some(id);
+        app.worker_dirty_region = None; // whole-field suffix
+
+        assert_eq!(
+            app.straight_to_full_quality(PreviewQuality::Draft),
+            PreviewQuality::Draft,
+            "no bounded scope: the ladder runs normally"
+        );
+    }
 
     /// Revert check for #33: restoring a fresh-layer CPU shortcut in
     /// `request_rebuild_immediate` will populate the cache and replace last-good before

@@ -566,6 +566,17 @@ impl ApplicationHandler for TerraApp {
                         self.preview_dirty = true;
                         self.needs_height_upload = true;
                         self.worker_refine_pending = false;
+                        // Loss-proof transport: a *fresh* result for this token proves
+                        // no edit occurred after its submit (an edit bumps the token,
+                        // making the result stale-discarded below), so the accumulators
+                        // still hold exactly what this job carried — clear them now
+                        // (the submit only copied them). Record the resolution the
+                        // worker cache now holds so the straight-to-Full ladder gate
+                        // knows when the Full-res checkpoints exist to reuse.
+                        self.worker_mark_all_dirty = false;
+                        self.worker_dirty_from = None;
+                        self.worker_dirty_region = None;
+                        self.worker_cache_res = Some(height.metrics.width);
                         self.ui_state.profile.eval_us = result.eval_us;
                         self.ui_state.profile.tex_w =
                             self.last_height.as_ref().unwrap().metrics.width;
@@ -617,6 +628,8 @@ impl ApplicationHandler for TerraApp {
                         self.eval_worker.set_token(self.eval_token);
                         self.worker_mark_all_dirty = true;
                         self.worker_dirty_from = None;
+                        self.worker_dirty_region = None;
+                        self.worker_cache_res = None;
                         self.handle_evaluation_failure_details(
                             self.eval_token,
                             self.scheduler.quality,

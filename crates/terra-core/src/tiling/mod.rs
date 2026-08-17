@@ -3,7 +3,7 @@
 mod region;
 
 pub use crate::invalidation::{expand_radius_for, DirtyClass};
-pub use region::{bounds_from_tiles, rects_from_tiles, SampleRect};
+pub use region::{bounds_from_tiles, rects_from_tiles, tiles_for_uv_rect, SampleRect, UvRect};
 
 use crate::heightfield::{HeightTile, Heightfield, HeightfieldMetrics, TileId};
 use crate::invalidation::Reach;

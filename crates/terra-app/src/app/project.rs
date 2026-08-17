@@ -396,6 +396,8 @@ impl TerraApp {
         self.scheduler.evaluator.clear_project_caches();
 
         self.worker_dirty_from = None;
+        self.worker_dirty_region = None;
+        self.worker_cache_res = None;
         self.worker_mark_all_dirty = true;
         self.needs_height_upload = false;
         self.preview_dirty = true;

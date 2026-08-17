@@ -24,6 +24,7 @@ use terra_core::document::EditorSession;
 use terra_core::eval::{EvalScheduler, EvalWorker, PreviewQuality};
 use terra_core::heightfield::{Heightfield, TileId};
 use terra_core::layer::LayerId;
+use terra_core::tiling::UvRect;
 use terra_gpu::{GpuTerrainEngine, GpuTileAtlas};
 use terra_gui::{GuiRenderer, GuiState, Rect, WidgetLabState};
 use terra_io::{BackgroundExporter, BackgroundProjectIo};
@@ -162,6 +163,17 @@ pub struct TerraApp {
     worker_refine_pending: bool,
     /// Earliest edited layer not yet communicated to the persistent worker cache.
     worker_dirty_from: Option<LayerId>,
+    /// Spatial scope (normalized UV) of the pending bounded suffix dirty, carried
+    /// to the worker beside `worker_dirty_from`. `Some` only while a bounded suffix
+    /// is pending; any footprint-less trigger escalates it to `None` (a whole-field
+    /// suffix, today's behavior). Cleared with the other accumulators when a fresh
+    /// result is consumed.
+    worker_dirty_region: Option<UvRect>,
+    /// Resolution the worker's persistent layer cache currently holds (the last
+    /// fresh result's width), or `None` when unknown/invalidated. Gates the
+    /// straight-to-Full sculpt policy: a bounded scope may skip the Draft/Medium
+    /// CPU rungs only when the Full-res checkpoints it would reuse already exist.
+    worker_cache_res: Option<u32>,
     /// Project/stack changes require the worker to discard every cached suffix.
     worker_mark_all_dirty: bool,
 
@@ -324,6 +336,8 @@ impl Default for TerraApp {
             eval_token: 0,
             worker_refine_pending: false,
             worker_dirty_from: None,
+            worker_dirty_region: None,
+            worker_cache_res: None,
             worker_mark_all_dirty: true,
             last_height: None,
             project_path: None,

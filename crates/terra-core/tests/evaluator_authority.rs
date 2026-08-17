@@ -172,6 +172,13 @@ const APPROVED_EXECUTION_SEAMS: &[ApprovedSeam] = &[
                     needle: "evaluator.clear_project_caches(",
                 },
             },
+            EntryPoint {
+                method: "mark_dirty_from_region",
+                caller: SourceEvidence {
+                    path: "crates/terra-core/src/eval/worker.rs",
+                    needle: "evaluator.mark_dirty_from_region(",
+                },
+            },
         ],
         internal_methods: &[
             InternalMethod {
@@ -181,10 +188,6 @@ const APPROVED_EXECUTION_SEAMS: &[ApprovedSeam] = &[
             InternalMethod {
                 method: "evaluate_suffix",
                 justification: "resumes a CPU suffix eval from a GPU checkpoint at a given layer index; public API retained for CPU/GPU parity tests (terra-gpu engine cfg(test) + parity_matrix), production hybrid resume flows through EvalWorker/rebuild_incremental since b82726c",
-            },
-            InternalMethod {
-                method: "mark_dirty_from_region",
-                justification: "#100 phase-2 tile-scoped dirty seed: marks the suffix dirty over a bounded edit region instead of the whole field. Driven directly by the tile_scoped_eval_equivalence oracle this phase; the production caller (run_cpu_job scope plumbing) lands with #100 phase 4",
             },
         ],
         result_test: ResultTestEvidence {

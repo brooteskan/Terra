@@ -384,6 +384,20 @@ pub(crate) fn try_apply(
                     }
                     None => next,
                 });
+                // Retain the same footprint in resolution-free UV for the CPU
+                // worker. A continuing stroke's appended segment sweeps from the
+                // previous point, so cover both endpoints ± radius; `last_paint_uv`
+                // still holds the prior point (it is advanced only after apply).
+                let mut stamp_uv = terra_core::tiling::UvRect::from_center_radius(u, v, radius);
+                if let Some((pu, pv)) = app.last_paint_uv {
+                    stamp_uv = stamp_uv.union(terra_core::tiling::UvRect::from_center_radius(
+                        pu, pv, radius,
+                    ));
+                }
+                ctx.sculpt_dirty_region_uv = Some(match ctx.sculpt_dirty_region_uv {
+                    Some(existing) => existing.union(stamp_uv),
+                    None => stamp_uv,
+                });
             }
         }
         PanelAction::AddDistNode { target, kind } => {
@@ -430,4 +444,56 @@ pub(crate) fn try_apply(
         other => return Err(other),
     };
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::super::TerraApp;
+    use crate::ui::PanelAction;
+    use terra_core::authoring::SculptStrokeKind;
+    use terra_core::layer::LayerStack;
+    use terra_core::shape_history::create_shape_layer;
+
+    /// A sculpt stamp retains its UV footprint through the full apply path
+    /// (`masks::try_apply` → `actions::mod` dispatch → `track_worker_dirty_from`),
+    /// so the CPU worker receives a bounded `worker_dirty_region` covering the stamp
+    /// rather than a whole-field escalation.
+    #[test]
+    fn sculpt_stamp_populates_worker_dirty_region() {
+        let mut app = TerraApp::default();
+        let layer = create_shape_layer("Shape");
+        let id = layer.id();
+        app.session.document.stack = LayerStack::new();
+        app.session.document.stack.push(layer);
+        app.session.document.selected = Some(id);
+
+        // Steady state right after a completed job: nothing pending.
+        app.worker_mark_all_dirty = false;
+        app.worker_dirty_from = None;
+        app.worker_dirty_region = None;
+        app.last_paint_uv = None; // fresh stroke, no previous point
+
+        let (u, v, radius) = (0.5f32, 0.5f32, 0.05f32);
+        app.apply_actions(vec![PanelAction::PaintSculptStamp {
+            layer: id,
+            u,
+            v,
+            radius,
+            strength: 1.0,
+            stroke_kind: SculptStrokeKind::Raise,
+            target_height: 0.0,
+        }]);
+
+        let region = app
+            .worker_dirty_region
+            .expect("a sculpt stamp seeds a bounded worker scope");
+        // A fresh single stamp's footprint is exactly the stamp's clamped UV box.
+        let expected = terra_core::tiling::UvRect::from_center_radius(u, v, radius);
+        assert_eq!(region, expected);
+        assert_eq!(app.worker_dirty_from, Some(id));
+        assert!(
+            !app.worker_mark_all_dirty,
+            "a bounded sculpt edit must not escalate to whole-field"
+        );
+    }
 }

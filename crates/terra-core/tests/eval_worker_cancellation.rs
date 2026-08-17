@@ -67,6 +67,7 @@ fn request(
         strata: None,
         mask_reference: None,
         dirty_from: None,
+        dirty_region: None,
         mark_all_dirty: true,
     }
 }

@@ -38,6 +38,12 @@ pub struct EvalWorkRequest {
     pub mask_reference: Option<std::sync::Arc<Heightfield>>,
     /// When set, only this layer and above are dirty (suffix rebuild).
     pub dirty_from: Option<LayerId>,
+    /// Spatial scope of a suffix rebuild, in normalized UV. Consulted only
+    /// alongside `dirty_from`: `Some(rect)` maps to a tile set at the job's own
+    /// resolution and drives a tile-scoped `mark_dirty_from_region` (#100 phase
+    /// 4); `None` keeps whole-field per-layer marks, exactly as before. UV rather
+    /// than texels/tiles because the worker recomputes its resolution independently.
+    pub dirty_region: Option<crate::tiling::UvRect>,
     pub mark_all_dirty: bool,
 }
 
@@ -259,7 +265,17 @@ fn run_cpu_job(
     if job.mark_all_dirty {
         evaluator.mark_all_dirty(&job.stack);
     } else if let Some(id) = job.dirty_from {
-        evaluator.mark_dirty_from(&job.stack, id);
+        // Soundness invariant: cache seed marks persist until a job actually
+        // stores clean tiles (only `insert`/`insert_baked` clear them), so a
+        // cancelled or superseded job after this point can never lose dirt — the
+        // next job's marks union into the seeds these leave behind.
+        match job.dirty_region {
+            Some(region) => {
+                let tiles = crate::tiling::tiles_for_uv_rect(&metrics, region);
+                evaluator.mark_dirty_from_region(&job.stack, id, &tiles);
+            }
+            None => evaluator.mark_dirty_from(&job.stack, id),
+        }
     }
 
     let mut ctx = EvalContext::new(metrics);
@@ -361,6 +377,7 @@ mod tests {
                 strata: None,
                 mask_reference: None,
                 dirty_from: None,
+                dirty_region: None,
                 mark_all_dirty: true,
             })
             .expect("submit worker job");
@@ -437,6 +454,7 @@ mod tests {
                 strata: None,
                 mask_reference: Some(std::sync::Arc::new(reference)),
                 dirty_from: None,
+                dirty_region: None,
                 mark_all_dirty: true,
             })
             .expect("submit worker job");
@@ -495,6 +513,7 @@ mod tests {
                 strata: None,
                 mask_reference: None,
                 dirty_from: None,
+                dirty_region: None,
                 mark_all_dirty: true,
             })
             .expect("submit Draft worker job");
@@ -516,6 +535,7 @@ mod tests {
                 strata: draft.strata,
                 mask_reference: Some(Arc::new(draft.height)),
                 dirty_from: None,
+                dirty_region: None,
                 mark_all_dirty: false,
             })
             .expect("submit Full worker job");
@@ -570,6 +590,7 @@ mod tests {
             strata: None,
             mask_reference: None,
             dirty_from: None,
+            dirty_region: None,
             mark_all_dirty: true,
         };
         let first = run_cpu_job(&mut evaluator, &request, &live).expect("first build");
@@ -593,6 +614,283 @@ mod tests {
             1
         );
         assert_eq!(second.height.get(16, 16), 25.0);
+    }
+
+    /// #100 phase 4: a request's `dirty_region` (normalized UV) is mapped to tiles
+    /// at the job's resolution and drives a tile-scoped `mark_dirty_from_region`, so
+    /// a bounded edit recomputes only the reached tiles yet stays bit-identical to a
+    /// whole-field rebuild of the edited stack. (Reach *expansion* across a coupled
+    /// downstream pass is covered exhaustively at the evaluator level in
+    /// `tile_scoped_eval_equivalence`; this asserts the worker request wiring on a
+    /// per-texel suffix where scoped and whole-field are bit-exact.)
+    #[test]
+    fn scoped_dirty_region_request_matches_whole_field_and_recomputes_bounded_tiles() {
+        use crate::layer::{CoastalParams, PlateauParams, SculptParams};
+        use crate::tiling::UvRect;
+
+        // 128^2 over 32-sample tiles = a 4x4 grid. A SculptBase with a varying paint
+        // buffer (so tiles genuinely differ) feeding two per-texel passes.
+        let res = 128u32;
+        let ts = 32u32;
+        let base_metrics = HeightfieldMetrics {
+            width: res,
+            height: res,
+            world_size_x: res as f32,
+            world_size_z: res as f32,
+            tile_size: ts,
+            halo: 2,
+        };
+
+        let mut sculpt = SculptParams::filled(res, 0.0);
+        for j in 0..res {
+            for i in 0..res {
+                sculpt.samples[(j * res + i) as usize] = 30.0 + i as f32 * 0.1 + j as f32 * 0.07;
+            }
+        }
+        let base = Layer::new("Sculpt", LayerKind::SculptBase(sculpt));
+        let base_id = base.id();
+        let plateau = Layer::new(
+            "Plateau",
+            LayerKind::Plateau(PlateauParams {
+                low: 25.0,
+                high: 45.0,
+                soft: 6.0,
+            }),
+        );
+        let plateau_id = plateau.id();
+        let coastal = Layer::new(
+            "Coastal",
+            LayerKind::Coastal(CoastalParams {
+                sea_level: 30.0,
+                beach_width: 8.0,
+                flatten_below: true,
+                shelf_depth: 4.0,
+            }),
+        );
+        let coastal_id = coastal.id();
+        let mut stack = LayerStack::new();
+        stack.push(base);
+        stack.push(plateau);
+        stack.push(coastal);
+
+        let make = |token: u64,
+                    stack: LayerStack,
+                    dirty_from: Option<LayerId>,
+                    dirty_region: Option<UvRect>,
+                    mark_all_dirty: bool| EvalWorkRequest {
+            token,
+            quality: PreviewQuality::Full,
+            stack,
+            masks: Vec::new(),
+            base_metrics,
+            level_steps: crate::analyze::LevelStepSettings::default(),
+            preview_res: res,
+            export_res: res,
+            aux: HashMap::new(),
+            strata: None,
+            mask_reference: None,
+            dirty_from,
+            dirty_region,
+            mark_all_dirty,
+        };
+
+        // Full build populates the persistent worker cache.
+        let live = Arc::new(AtomicU64::new(1));
+        let mut evaluator = StackEvaluator::new();
+        run_cpu_job(
+            &mut evaluator,
+            &make(1, stack.clone(), None, None, true),
+            &live,
+        )
+        .expect("full build");
+
+        // Edit paint samples [40,56) x [40,56): well inside tile (1,1)'s interior
+        // and clear of its 32/64 boundaries, so the base's bilinear paint footprint
+        // stays within the one tile (a boundary-hugging edit would spill a sample
+        // into the neighbour and expose a carry, but that is a too-tight-region
+        // authoring bug, not what this test isolates).
+        let mut edited_stack = stack.clone();
+        if let Some(layer) = edited_stack.find_mut(base_id) {
+            if let LayerKind::SculptBase(p) = &mut layer.kind {
+                for j in 40..56u32 {
+                    for i in 40..56u32 {
+                        p.samples[(j * res + i) as usize] += 25.0;
+                    }
+                }
+            }
+        }
+
+        // Scoped incremental over the edited tile: the UV rect for tile (1,1) spans
+        // u,v in [0.25, 0.5]. The token must match the live generation.
+        live.store(2, Ordering::Release);
+        let region = UvRect::from_center_radius(0.375, 0.375, 0.125);
+        let scoped = run_cpu_job(
+            &mut evaluator,
+            &make(2, edited_stack.clone(), Some(base_id), Some(region), false),
+            &live,
+        )
+        .expect("scoped incremental");
+
+        // Whole-field control: a cold evaluator rebuilds the edited stack.
+        let control_live = Arc::new(AtomicU64::new(9));
+        let mut control_eval = StackEvaluator::new();
+        let control = run_cpu_job(
+            &mut control_eval,
+            &make(9, edited_stack, None, None, true),
+            &control_live,
+        )
+        .expect("control build");
+
+        let scoped_bits: Vec<u32> = scoped
+            .height
+            .to_dense()
+            .iter()
+            .map(|f| f.to_bits())
+            .collect();
+        let control_bits: Vec<u32> = control
+            .height
+            .to_dense()
+            .iter()
+            .map(|f| f.to_bits())
+            .collect();
+        assert_eq!(
+            scoped_bits, control_bits,
+            "a scoped dirty_region rebuild diverged from whole-field"
+        );
+
+        // Every per-texel layer recomputed exactly the one edited tile — the UV
+        // scope reached mark_dirty_from_region rather than escalating to whole-field.
+        let recomputed = |id: LayerId| -> Option<u32> {
+            scoped
+                .layer_timings
+                .iter()
+                .find(|t| t.layer == id)
+                .and_then(|t| t.tiles_recomputed)
+        };
+        assert_eq!(
+            recomputed(base_id),
+            Some(1),
+            "base recomputes the one edit tile"
+        );
+        assert_eq!(recomputed(plateau_id), Some(1), "plateau stays tile-scoped");
+        assert_eq!(recomputed(coastal_id), Some(1), "coastal stays tile-scoped");
+    }
+
+    /// Perf (#100 phase 4): on the #98 Voronoi + Flatten stack over a sculpt base,
+    /// a scoped-Full resubmit — the ladder-clobber scenario the app's
+    /// straight-to-Full policy enables — recomputes only a few tiles and is far
+    /// cheaper than the whole-field Full resubmit it replaces. This is the worker
+    /// path (`run_cpu_job` + `dirty_region`) the acceptance measures. Ignored (a
+    /// timing measurement); run with `--ignored --nocapture` to see the numbers.
+    #[test]
+    #[ignore = "perf measurement; run with `--ignored --nocapture` to see the numbers"]
+    fn perf_scoped_full_resubmit_is_well_below_whole_field() {
+        use crate::authoring::SculptStrokeKind;
+        use crate::layer::{SculptParams, VoronoiParams};
+        use crate::shape_history::{create_shape_layer, stamp_stroke};
+        use crate::tiling::UvRect;
+        use std::time::Instant;
+
+        // 512^2 over 128-sample tiles = a 4x4 grid, Full quality.
+        let res = 512u32;
+        let ts = 128u32;
+        let base_metrics = HeightfieldMetrics {
+            width: res,
+            height: res,
+            world_size_x: res as f32,
+            world_size_z: res as f32,
+            tile_size: ts,
+            halo: 2,
+        };
+
+        let mut sculpt = SculptParams::filled(res, 0.0);
+        for j in 0..res {
+            for i in 0..res {
+                sculpt.samples[(j * res + i) as usize] = 30.0 + i as f32 * 0.05 + j as f32 * 0.03;
+            }
+        }
+        let base = Layer::new("Sculpt", LayerKind::SculptBase(sculpt));
+        let base_id = base.id();
+        let voronoi = Layer::new(
+            "Voronoi",
+            LayerKind::VoronoiRegions(VoronoiParams::default()),
+        );
+        let mut flatten = create_shape_layer("Flatten");
+        if let LayerKind::SculptStrokes(p) = &mut flatten.kind {
+            stamp_stroke(
+                p,
+                SculptStrokeKind::Flatten,
+                0.5,
+                0.5,
+                40.0,
+                4.0,
+                0.0,
+                false,
+            );
+        }
+        let mut stack = LayerStack::new();
+        stack.push(base);
+        stack.push(voronoi);
+        stack.push(flatten);
+
+        let make = |token: u64,
+                    dirty_from: Option<LayerId>,
+                    dirty_region: Option<UvRect>,
+                    mark_all_dirty: bool| EvalWorkRequest {
+            token,
+            quality: PreviewQuality::Full,
+            stack: stack.clone(),
+            masks: Vec::new(),
+            base_metrics,
+            level_steps: crate::analyze::LevelStepSettings::default(),
+            preview_res: res,
+            export_res: res,
+            aux: HashMap::new(),
+            strata: None,
+            mask_reference: None,
+            dirty_from,
+            dirty_region,
+            mark_all_dirty,
+        };
+
+        let live = Arc::new(AtomicU64::new(1));
+        let mut evaluator = StackEvaluator::new();
+        run_cpu_job(&mut evaluator, &make(1, None, None, true), &live).expect("build");
+
+        // Baseline: a whole-field-suffix Full resubmit (dirty_region None) — the
+        // Full rung that rebuilds the whole field despite a one-tile edit today.
+        live.store(2, Ordering::Release);
+        let t0 = Instant::now();
+        run_cpu_job(&mut evaluator, &make(2, Some(base_id), None, false), &live).expect("whole");
+        let whole_us = t0.elapsed().as_micros();
+
+        // Scoped: the same Full resubmit carrying a one-tile UV scope.
+        live.store(3, Ordering::Release);
+        let region = UvRect::from_center_radius(0.3, 0.3, 0.02);
+        let t1 = Instant::now();
+        let scoped = run_cpu_job(
+            &mut evaluator,
+            &make(3, Some(base_id), Some(region), false),
+            &live,
+        )
+        .expect("scoped");
+        let scoped_us = t1.elapsed().as_micros();
+
+        let recomputed: u32 = scoped
+            .layer_timings
+            .iter()
+            .filter_map(|t| t.tiles_recomputed)
+            .sum();
+        println!(
+            "Voronoi+Flatten Full resubmit @ {res}^2 ({} tiles): whole-field {whole_us} us, \
+             scoped {scoped_us} us ({:.1}x, {recomputed} tile-recomputes)",
+            base_metrics.tile_count(),
+            whole_us as f64 / scoped_us.max(1) as f64
+        );
+        assert!(
+            scoped_us.saturating_mul(2) < whole_us,
+            "scoped Full ({scoped_us} us) should be well below whole-field ({whole_us} us)"
+        );
     }
 
     #[test]
@@ -669,6 +967,7 @@ mod tests {
                 strata: None,
                 mask_reference: None,
                 dirty_from: None,
+                dirty_region: None,
                 mark_all_dirty: true,
             })
             .expect("submit panicking job");
@@ -709,6 +1008,7 @@ mod tests {
                 strata: None,
                 mask_reference: None,
                 dirty_from: None,
+                dirty_region: None,
                 mark_all_dirty: true,
             })
             .expect("worker should accept a later job");
@@ -748,6 +1048,7 @@ mod tests {
                 strata: None,
                 mask_reference: None,
                 dirty_from: None,
+                dirty_region: None,
                 mark_all_dirty: true,
             })
             .expect("submit bake job");
@@ -781,6 +1082,7 @@ mod tests {
                 strata: None,
                 mask_reference: None,
                 dirty_from: None,
+                dirty_region: None,
                 mark_all_dirty: false,
             })
             .expect("submit restarting job");
@@ -819,6 +1121,7 @@ mod tests {
                 strata: None,
                 mask_reference: None,
                 dirty_from: None,
+                dirty_region: None,
                 mark_all_dirty: false,
             })
             .expect("worker accepts the follow-up job");
@@ -864,6 +1167,7 @@ mod tests {
             strata: None,
             mask_reference: None,
             dirty_from: None,
+            dirty_region: None,
             mark_all_dirty: true,
         };
         assert_eq!(worker.submit(request), Err(EvalWorkerSubmitError));
@@ -889,6 +1193,7 @@ mod tests {
                 strata: None,
                 mask_reference: None,
                 dirty_from: None,
+                dirty_region: None,
                 mark_all_dirty: true,
             })
             .expect("restarted worker accepts work");

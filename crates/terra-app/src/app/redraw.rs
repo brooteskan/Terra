@@ -646,6 +646,7 @@ impl TerraApp {
             if ui_out.request_retry_evaluation {
                 self.worker_mark_all_dirty = true;
                 self.worker_dirty_from = None;
+                self.worker_dirty_region = None;
                 self.request_rebuild();
             }
             if ui_out.request_save_bookmark {

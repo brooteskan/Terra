@@ -11,6 +11,7 @@ mod world_rules;
 
 use crate::ui::PanelAction;
 use terra_core::layer::LayerId;
+use terra_core::tiling::UvRect;
 
 use super::TerraApp;
 
@@ -18,6 +19,10 @@ use super::TerraApp;
 pub(crate) struct ApplyCtx {
     pub dirty_from: Option<LayerId>,
     pub sculpt_dirty_rect: Option<(u32, u32, u32, u32)>,
+    /// The same sculpt footprint as `sculpt_dirty_rect`, but in resolution-free
+    /// normalized UV — carried to the CPU worker so a stroke recomputes only its
+    /// tiles at the worker's own resolution (#100 phase 4).
+    pub sculpt_dirty_region_uv: Option<UvRect>,
     pub doc_mutated: bool,
     pub mask_assets_mutated: bool,
     pub deferred_rebuild: bool,
@@ -29,6 +34,7 @@ impl ApplyCtx {
         Self {
             dirty_from: None,
             sculpt_dirty_rect: None,
+            sculpt_dirty_region_uv: None,
             doc_mutated: false,
             mask_assets_mutated: false,
             deferred_rebuild: false,
@@ -123,7 +129,13 @@ impl TerraApp {
                         Some(terra_core::layer::LayerKind::SculptBase(_))
                     );
                 self.scheduler.evaluator.mark_dirty_from(&preview, id);
-                self.track_worker_dirty_from(&preview, id);
+                // Sculpt stamps carry a UV footprint; other suffix edits are whole-field.
+                let footprint = if sculpt_stamp {
+                    ctx.sculpt_dirty_region_uv
+                } else {
+                    None
+                };
+                self.track_worker_dirty_from(&preview, id, footprint);
                 self.advance_output_revision();
                 if let Some(gpu) = self.gpu_engine.as_mut() {
                     if sculpt_only {
