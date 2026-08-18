@@ -52,6 +52,8 @@ pub(crate) struct BootState {
     pub(crate) pending: terra_render::PendingSurface,
     pub(crate) job: terra_jobs::JobHandle<BootResult>,
     pub(crate) started: Instant,
+    /// Boot worker failure, parked here while the failure splash is shown.
+    pub(crate) failure: Option<crate::startup::StartupError>,
 }
 
 /// Continuous fly keys for the game-engine-style viewport camera.
@@ -238,6 +240,10 @@ pub struct TerraApp {
     gui_wants_pointer: bool,
     /// Quit requested from the custom caption close button.
     pending_exit: bool,
+    /// Startup failure stored for reporting after the event loop exits.
+    startup_failure: Option<crate::startup::StartupError>,
+    /// The failure was already shown on the boot-failure splash (skip dialog).
+    failure_presented: bool,
     /// True while GUI has active pointer capture (drag/scroll/text) â€” not hover.
     gui_interacting: bool,
     /// A sculpt gesture changed the base buffer; represented in History as an annotation.
@@ -381,6 +387,8 @@ impl Default for TerraApp {
             gui_enter: false,
             gui_wants_pointer: false,
             pending_exit: false,
+            startup_failure: None,
+            failure_presented: false,
             gui_interacting: false,
             sculpt_stroke_active: false,
             last_paint_uv: None,
@@ -412,6 +420,14 @@ impl Default for TerraApp {
             last_mask_overlay_id: None,
             mask_paint_stroke_before: None,
         }
+    }
+}
+
+impl TerraApp {
+    pub fn take_startup_failure(&mut self) -> Option<(crate::startup::StartupError, bool)> {
+        self.startup_failure
+            .take()
+            .map(|e| (e, self.failure_presented))
     }
 }
 

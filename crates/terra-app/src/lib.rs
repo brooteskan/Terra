@@ -2,4 +2,5 @@
 
 pub mod app;
 pub mod logging;
+pub mod startup;
 pub mod ui;

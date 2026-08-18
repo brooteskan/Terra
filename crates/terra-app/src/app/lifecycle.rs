@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::startup::{self, StartupError};
 use crate::ui::{resolve_shortcut_for_input, PanelAction, ShortcutChord, ShortcutModifiers};
 use terra_core::command::EditorCommand;
 use terra_core::eval::{EvalWorkerEvent, PreviewQuality};
@@ -24,23 +25,40 @@ impl ApplicationHandler for TerraApp {
         if self.window.is_some() {
             return;
         }
-        let window = Arc::new(
-            event_loop
-                .create_window(
-                    Window::default_attributes()
-                        .with_title("Terra")
-                        .with_decorations(false)
-                        .with_resizable(true)
-                        // Start hidden so the OS never shows an unpainted (white)
-                        // surface. We reveal it below only after the splash frame
-                        // is on the swapchain.
-                        .with_visible(false)
-                        .with_inner_size(winit::dpi::LogicalSize::new(1600, 900)),
-                )
-                .expect("window"),
-        );
-        let (gpu, target) =
-            pollster::block_on(terra_render::init_gpu(window.clone())).expect("gpu init");
+
+        let window = match event_loop.create_window(
+            Window::default_attributes()
+                .with_title("Terra")
+                .with_decorations(false)
+                .with_resizable(true)
+                .with_visible(false)
+                .with_inner_size(winit::dpi::LogicalSize::new(1600, 900)),
+        ) {
+            Ok(w) => Arc::new(w),
+            Err(error) => {
+                self.startup_failure = Some(StartupError::Window(error));
+                event_loop.exit();
+                return;
+            }
+        };
+
+        if startup::injected_fault("gpu-init") {
+            self.startup_failure = Some(StartupError::Gpu(
+                terra_render::RenderError::Msg("injected gpu-init fault".into()),
+            ));
+            event_loop.exit();
+            return;
+        }
+
+        let (gpu, target) = match pollster::block_on(terra_render::init_gpu(window.clone())) {
+            Ok(result) => result,
+            Err(error) => {
+                self.startup_failure = Some(StartupError::Gpu(error));
+                event_loop.exit();
+                return;
+            }
+        };
+
         // The GUI renderer only needs the device/queue/format, so it is ready
         // long before the terrain pipelines. Paint the first splash frame, reveal
         // the window, then build the heavy GPU pipelines on a worker thread while
@@ -61,9 +79,11 @@ impl ApplicationHandler for TerraApp {
         let tile_config = self.terrain_runtime.pyramid.config;
         let (tile_size, tile_halo) = (tile_config.tile_size, tile_config.halo);
         let worker_gpu = gpu.clone();
-        // Handle drop (window closed mid-init) just discards the result — the same
-        // discard-on-drop semantics the old receiver-drop had.
+        let inject_boot_fault = startup::injected_fault("boot-worker");
         let job = terra_jobs::spawn_one_shot("terra-gpu-init", move |_ctx| {
+            if inject_boot_fault {
+                panic!("injected boot-worker fault");
+            }
             let renderer = TerrainRenderer::new_detached(&worker_gpu, config, size);
             let gpu_engine = GpuTerrainEngine::new(&worker_gpu.device, 256);
             let tile_atlas = match GpuTileAtlas::new(&worker_gpu.device, tile_size, tile_halo, 128)
@@ -88,6 +108,7 @@ impl ApplicationHandler for TerraApp {
             pending,
             job,
             started: Instant::now(),
+            failure: None,
         });
         // Animate: keep repainting the splash until the worker result lands
         // (about_to_wait polls `boot.job` and finalizes).
@@ -97,6 +118,34 @@ impl ApplicationHandler for TerraApp {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        // Guard: if a startup failure is already stored (surfaces 3–4) or
+        // pending exit, swallow events so straggler redraws can't reach the
+        // editor path with renderer: None.
+        if self.startup_failure.is_some() {
+            return;
+        }
+
+        // Boot-failure splash: the boot worker failed and its error is parked
+        // in boot.failure. Any key press, mouse click, or close request
+        // acknowledges it and exits.
+        if let Some(boot) = &self.boot {
+            if boot.failure.is_some() {
+                let dismiss = matches!(
+                    event,
+                    WindowEvent::CloseRequested
+                        | WindowEvent::KeyboardInput { .. }
+                        | WindowEvent::MouseInput { .. }
+                );
+                if dismiss {
+                    let failure = self.boot.as_mut().unwrap().failure.take().unwrap();
+                    self.startup_failure = Some(failure);
+                    self.failure_presented = true;
+                    event_loop.exit();
+                }
+                return;
+            }
+        }
+
         let mut want_redraw = false;
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
@@ -412,19 +461,25 @@ impl ApplicationHandler for TerraApp {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if self.pending_exit {
+        if self.pending_exit || self.startup_failure.is_some() {
             event_loop.exit();
             return;
         }
 
         // Startup: poll the GPU-init worker. Until it lands, keep repainting the
         // splash at ~30 fps so the sweep animates and the window stays responsive.
+        // When the worker has failed, the failure splash is static — switch to
+        // Wait (input-driven) and request one final redraw for the failure frame.
         if self.is_booting() {
             let finished = self.try_finish_boot();
+            let boot_failed = self
+                .boot
+                .as_ref()
+                .is_some_and(|b| b.failure.is_some());
             if let Some(w) = &self.window {
                 w.request_redraw();
             }
-            if finished {
+            if finished || boot_failed {
                 event_loop.set_control_flow(ControlFlow::Wait);
             } else {
                 event_loop.set_control_flow(ControlFlow::WaitUntil(
@@ -816,13 +871,12 @@ impl TerraApp {
     }
 
     /// Present one animated splash frame from the main-thread-held surface.
-    /// Reads elapsed time (for the sweep) and the live shader count. Called from
-    /// `redraw` while `boot` is set.
+    /// When the boot worker has failed, paints a static failure frame instead
+    /// of the animated sweep. Called from `redraw` while `boot` is set.
     pub(crate) fn draw_boot_splash(&mut self) {
         let Some(window) = self.window.clone() else {
             return;
         };
-        // Disjoint field borrows: `boot` (shared) + `gui_renderer`/`gui_state` (unique).
         let boot = match self.boot.as_ref() {
             Some(boot) => boot,
             None => return,
@@ -830,28 +884,46 @@ impl TerraApp {
         let Some(gui_renderer) = self.gui_renderer.as_mut() else {
             return;
         };
-        let elapsed = boot.started.elapsed().as_secs_f32();
-        let shaders = terra_core::shader_progress::shaders_compiled();
         let ppp = (window.scale_factor() as f32).max(0.5);
         let phys = boot.pending.size();
         let screen_w = (phys.width as f32 / ppp).max(1.0);
         let screen_h = (phys.height as f32 / ppp).max(1.0);
         let gui_state = &mut self.gui_state;
 
-        boot.pending.present_splash(&boot.gpu, SPLASH_BG, |view| {
-            let mut gui =
-                GuiContext::begin(screen_w, screen_h, ppp, GuiInput::default(), gui_state);
-            paint_splash(&mut gui, screen_w, screen_h, elapsed, shaders);
-            gui.end();
-            gui_renderer.render(
-                &boot.gpu.device,
-                &boot.gpu.queue,
-                view,
-                &mut gui,
-                phys.width.max(1),
-                phys.height.max(1),
-            );
-        });
+        if let Some(error) = &boot.failure {
+            let lines = startup::failure_splash_lines(error, None);
+            boot.pending.present_splash(&boot.gpu, SPLASH_BG, |view| {
+                let mut gui =
+                    GuiContext::begin(screen_w, screen_h, ppp, GuiInput::default(), gui_state);
+                paint_failure_splash(&mut gui, screen_w, screen_h, &lines);
+                gui.end();
+                gui_renderer.render(
+                    &boot.gpu.device,
+                    &boot.gpu.queue,
+                    view,
+                    &mut gui,
+                    phys.width.max(1),
+                    phys.height.max(1),
+                );
+            });
+        } else {
+            let elapsed = boot.started.elapsed().as_secs_f32();
+            let shaders = terra_core::shader_progress::shaders_compiled();
+            boot.pending.present_splash(&boot.gpu, SPLASH_BG, |view| {
+                let mut gui =
+                    GuiContext::begin(screen_w, screen_h, ppp, GuiInput::default(), gui_state);
+                paint_splash(&mut gui, screen_w, screen_h, elapsed, shaders);
+                gui.end();
+                gui_renderer.render(
+                    &boot.gpu.device,
+                    &boot.gpu.queue,
+                    view,
+                    &mut gui,
+                    phys.width.max(1),
+                    phys.height.max(1),
+                );
+            });
+        }
     }
 
     /// Present the first splash frame during startup, before the worker begins.
@@ -885,21 +957,29 @@ impl TerraApp {
     }
 
     /// Poll the boot worker; when it has produced the GPU objects, attach the
-    /// surface and install them. Returns true if the app finished booting this
-    /// call (caller should request a real redraw).
+    /// surface and install them. Returns `true` if the app finished booting
+    /// this call (caller should request a real redraw). Returns `false` when
+    /// the worker is still running, has already been consumed, or has failed
+    /// (in which case `boot.failure` is set and the splash becomes a failure
+    /// frame until the user acknowledges it).
     pub(crate) fn try_finish_boot(&mut self) -> bool {
         let Some(boot) = self.boot.as_ref() else {
             return false;
         };
-        let result = match boot.job.try_take() {
-            Some(Ok(result)) => result,
-            None => return false,
-            Some(Err(error)) => {
-                // Worker panicked before producing a renderer — unrecoverable;
-                // leave the splash up rather than crash, but log loudly. try_take
-                // emptied the slot, so the next poll hits the `None` arm and this
-                // logs exactly once instead of every splash frame.
-                log::error!("terra-gpu-init worker failed before producing a renderer: {error}");
+        if boot.failure.is_some() {
+            return false;
+        }
+        let result = match startup::classify_boot_poll(boot.job.try_take()) {
+            startup::BootPoll::Pending => return false,
+            startup::BootPoll::Ready(value) => value,
+            startup::BootPoll::Failed(error) => {
+                startup::report_failure(&error, None, false);
+                self.boot.as_mut().expect("boot present").failure = Some(error);
+                return false;
+            }
+            startup::BootPoll::Shutdown => {
+                self.boot.take();
+                self.pending_exit = true;
                 return false;
             }
         };
@@ -1032,4 +1112,44 @@ fn paint_splash(gui: &mut GuiContext, screen_w: f32, screen_h: f32, t: f32, shad
         Color::rgba(0.72, 0.78, 0.85, 0.85),
         1.05,
     );
+}
+
+/// Paint the boot-failure splash: logo, a red status bar, and the error lines.
+fn paint_failure_splash(gui: &mut GuiContext, screen_w: f32, screen_h: f32, lines: &[String]) {
+    gui.panel(
+        Rect::from_pos_size(0.0, 0.0, screen_w, screen_h),
+        Color::rgb(SPLASH_BG[0], SPLASH_BG[1], SPLASH_BG[2]),
+    );
+
+    let (lw, lh, rgba) = crate::ui::brand_logo();
+    let logo_w = (screen_w * 0.30).clamp(240.0, 520.0);
+    let logo_h = logo_w * (*lh as f32 / (*lw as f32).max(1.0));
+    let lx = (screen_w - logo_w) * 0.5;
+    let ly = (screen_h * 0.15).max(16.0);
+    gui.image(Rect::from_pos_size(lx, ly, logo_w, logo_h), *lw, *lh, rgba);
+
+    // Static red bar replaces the animated sweep.
+    let bar_w = (screen_w * 0.24).clamp(200.0, 420.0);
+    let bar_h = 3.0;
+    let bar_x = (screen_w - bar_w) * 0.5;
+    let bar_y = ly + logo_h + 22.0;
+    gui.panel_rounded(
+        Rect::from_pos_size(bar_x, bar_y, bar_w, bar_h),
+        Color::rgba(0.85, 0.25, 0.20, 0.90),
+        bar_h * 0.5,
+    );
+
+    let mut y = bar_y + 28.0;
+    let line_height = 18.0;
+    let text_color = Color::rgba(0.78, 0.80, 0.85, 0.90);
+    let dim_color = Color::rgba(0.55, 0.58, 0.65, 0.75);
+    for (i, line) in lines.iter().enumerate() {
+        if line.is_empty() {
+            y += line_height * 0.5;
+            continue;
+        }
+        let color = if i == lines.len() - 1 { dim_color } else { text_color };
+        gui.label_centered(screen_w * 0.5, y, line, color, 1.0);
+        y += line_height;
+    }
 }

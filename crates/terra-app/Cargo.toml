@@ -25,6 +25,7 @@ log = { workspace = true }
 profiling = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
 rfd = { workspace = true }
 directories = { workspace = true }
 image = { workspace = true }

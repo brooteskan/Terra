@@ -14,6 +14,9 @@ use super::prefs::{save_editor_prefs, EditorPrefs};
 use super::{AppScreen, PendingProjectAction, TerraApp};
 impl TerraApp {
     pub(crate) fn redraw(&mut self) {
+        if self.startup_failure.is_some() {
+            return;
+        }
         let frame_t0 = Instant::now();
         let Some(window) = self.window.clone() else {
             return;

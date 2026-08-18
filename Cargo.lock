@@ -2591,6 +2591,7 @@ dependencies = [
  "terra-jobs",
  "terra-render",
  "terra-test-gpu",
+ "thiserror 2.0.19",
  "wgpu",
  "winit",
 ]
