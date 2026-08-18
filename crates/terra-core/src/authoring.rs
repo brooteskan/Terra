@@ -81,7 +81,7 @@ impl SculptStrokeKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct SculptPoint {
     pub u: f32,
     pub v: f32,
@@ -99,7 +99,7 @@ impl Default for SculptPoint {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SculptStroke {
     pub kind: SculptStrokeKind,
     #[serde(default)]
@@ -146,7 +146,7 @@ impl Default for SculptStroke {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SculptStrokeParams {
     #[serde(default)]
     pub strokes: Vec<SculptStroke>,
@@ -550,17 +550,63 @@ fn hash_noise(x: i32, y: i32, seed: u64) -> f32 {
     ((n ^ (n >> 31)) as u32 as f32) / u32::MAX as f32 * 2.0 - 1.0
 }
 
-/// The stroke's padded footprint as an inclusive sample rectangle
-/// `(i0, i1, j0, j1)`, or `None` when the stroke has no points (no footprint).
+/// A resolution-free normalized-UV rectangle `[min_u, max_u] × [min_v, max_v]`.
 ///
-/// This is exactly the region where `smoothstep_weight` can be non-zero, so the
-/// stamp and flatten-mean scans are bounded to it. #110's scoped apply grows its
-/// working rectangle by this footprint so a Flatten straddling the scope edge
-/// still reads a fully-stamped field when it computes its mean.
-fn stroke_footprint_rect(
-    stroke: &SculptStroke,
-    m: &HeightfieldMetrics,
-) -> Option<(u32, u32, u32, u32)> {
+/// Structurally mirrors [`crate::tiling::UvRect`], but is defined here so the
+/// low-level `authoring` module stays independent of the higher-level `tiling`
+/// module (`tiling` depends on `layer`, which depends on `authoring`; an
+/// `authoring → tiling` edge would close a cycle). The app / eval layers lift a
+/// stroke-edit footprint into a `UvRect` when handing it to the worker scope.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct UvBounds {
+    pub min_u: f32,
+    pub min_v: f32,
+    pub max_u: f32,
+    pub max_v: f32,
+}
+
+impl UvBounds {
+    /// The smallest box covering both.
+    pub fn union(self, other: UvBounds) -> UvBounds {
+        UvBounds {
+            min_u: self.min_u.min(other.min_u),
+            min_v: self.min_v.min(other.min_v),
+            max_u: self.max_u.max(other.max_u),
+            max_v: self.max_v.max(other.max_v),
+        }
+    }
+
+    /// Axis-aligned overlap (inclusive edges — touching counts, the safe direction
+    /// for a dirty-region union).
+    pub fn intersects(self, other: UvBounds) -> bool {
+        self.min_u <= other.max_u
+            && other.min_u <= self.max_u
+            && self.min_v <= other.max_v
+            && other.min_v <= self.max_v
+    }
+
+    /// Grow by `pad` on every side, clamped to `[0,1]²`.
+    pub fn padded(self, pad: f32) -> UvBounds {
+        UvBounds {
+            min_u: (self.min_u - pad).clamp(0.0, 1.0),
+            min_v: (self.min_v - pad).clamp(0.0, 1.0),
+            max_u: (self.max_u + pad).clamp(0.0, 1.0),
+            max_v: (self.max_v + pad).clamp(0.0, 1.0),
+        }
+    }
+}
+
+/// The stroke's padded footprint in normalized UV: the points' UV bounding box
+/// grown by `radius_m` on each axis, clamped to `[0,1]²`. `None` when the stroke
+/// has no points (no footprint).
+///
+/// `smoothstep_weight` is exactly zero at `distance >= radius_m`, and
+/// `distance_to_polyline` measures metres with per-axis world scaling, so the pad
+/// is anisotropic (`radius_m / world_size_{x,z}`) and this rect is *exactly* the
+/// support of the stroke — the region an edit to it can change. This is the
+/// resolution-free form fed to the CPU worker scope (#121); the sample-rect
+/// [`stroke_footprint_rect`] the #110 fixpoint uses is derived from it.
+pub fn stroke_footprint_uv(stroke: &SculptStroke, m: &HeightfieldMetrics) -> Option<UvBounds> {
     if stroke.points.is_empty() {
         return None;
     }
@@ -573,13 +619,144 @@ fn stroke_footprint_rect(
         v0 = v0.min(pt.v);
         v1 = v1.max(pt.v);
     }
-    let i0 = ((u0 - ru).clamp(0.0, 1.0) * (m.width - 1) as f32) as u32;
-    let i1 = (((u1 + ru).clamp(0.0, 1.0) * (m.width - 1) as f32).ceil() as u32)
-        .min(m.width.saturating_sub(1));
-    let j0 = ((v0 - rv).clamp(0.0, 1.0) * (m.height - 1) as f32) as u32;
-    let j1 = (((v1 + rv).clamp(0.0, 1.0) * (m.height - 1) as f32).ceil() as u32)
-        .min(m.height.saturating_sub(1));
+    Some(UvBounds {
+        min_u: (u0 - ru).clamp(0.0, 1.0),
+        min_v: (v0 - rv).clamp(0.0, 1.0),
+        max_u: (u1 + ru).clamp(0.0, 1.0),
+        max_v: (v1 + rv).clamp(0.0, 1.0),
+    })
+}
+
+/// The stroke's padded footprint as an inclusive sample rectangle
+/// `(i0, i1, j0, j1)`, or `None` when the stroke has no points (no footprint).
+///
+/// This is exactly the region where `smoothstep_weight` can be non-zero, so the
+/// stamp and flatten-mean scans are bounded to it. #110's scoped apply grows its
+/// working rectangle by this footprint so a Flatten straddling the scope edge
+/// still reads a fully-stamped field when it computes its mean. Sample-space form
+/// of [`stroke_footprint_uv`] with the floor/ceil rounding that fixpoint depends on.
+fn stroke_footprint_rect(
+    stroke: &SculptStroke,
+    m: &HeightfieldMetrics,
+) -> Option<(u32, u32, u32, u32)> {
+    let uv = stroke_footprint_uv(stroke, m)?;
+    let i0 = (uv.min_u * (m.width - 1) as f32) as u32;
+    let i1 = ((uv.max_u * (m.width - 1) as f32).ceil() as u32).min(m.width.saturating_sub(1));
+    let j0 = (uv.min_v * (m.height - 1) as f32) as u32;
+    let j1 = ((uv.max_v * (m.height - 1) as f32).ceil() as u32).min(m.height.saturating_sub(1));
     Some((i0, i1, j0, j1))
+}
+
+/// The normalized-UV region an edit from `prev` to `next` stroke params can
+/// change, or `None` when the edit has no bounded footprint and the caller must
+/// recompute whole-field.
+///
+/// `None` when the layer-wide `reconcile` slider changed: it re-weights every
+/// stroke's reconcile pass across the whole field, so no per-stroke box bounds it
+/// (out of scope for #121).
+///
+/// Otherwise the region is the union of [`stroke_footprint_uv`] over every stroke
+/// that differs between the two lists — found by trimming the common prefix and
+/// suffix, so a single slider edit, an enable toggle, a delete, an insert, or a
+/// reorder each yield a tight changed-set from one code path (a radius grow/shrink
+/// unions old+new extents automatically, since both sides contribute their box) —
+/// then a Flatten fixpoint, then padded by `pad_uv` on every side.
+///
+/// **Flatten coupling.** A Flatten stroke settles toward the brush-weighted mean
+/// of the *running field* over its own footprint ([`flatten_target_for`]).
+/// Editing an earlier stroke changes that running field, so any later enabled
+/// Flatten whose footprint overlaps the edited region shifts across its *entire*
+/// footprint, not just the overlap — and the scoped evaluator only *publishes*
+/// the tiles this region names, so the region must name them. The fixpoint unions
+/// in every enabled Flatten (from either list) whose footprint intersects the
+/// accumulated region, until stable. No other kind couples across samples:
+/// Smooth/Pinch/Coastline read the *layer input* 3×3 (unchanged by a stroke
+/// edit), and every other kind accumulates per-sample.
+///
+/// **Reconcile halo.** The reconcile pass reads a 3×3, so a changed sample at the
+/// very edge of a stroke's support can shift the reconciled value one sample into
+/// an overlapping stroke's support. `pad_uv` (pass one Full-res texel,
+/// `1.0 / preview_resolution`) covers that one-sample dilation so a
+/// boundary-hugging edit cannot leave a stale tile across a tile seam.
+pub fn sculpt_edit_footprint(
+    prev: &SculptStrokeParams,
+    next: &SculptStrokeParams,
+    m: &HeightfieldMetrics,
+    pad_uv: f32,
+) -> Option<UvBounds> {
+    if prev.reconcile != next.reconcile {
+        return None;
+    }
+    let a = &prev.strokes;
+    let b = &next.strokes;
+
+    // Trim the common prefix/suffix; only the changed middle contributes.
+    let mut lo = 0usize;
+    while lo < a.len() && lo < b.len() && a[lo] == b[lo] {
+        lo += 1;
+    }
+    let (mut hi_a, mut hi_b) = (a.len(), b.len());
+    while hi_a > lo && hi_b > lo && a[hi_a - 1] == b[hi_b - 1] {
+        hi_a -= 1;
+        hi_b -= 1;
+    }
+
+    fn union_into(acc: &mut Option<UvBounds>, rect: Option<UvBounds>) {
+        if let Some(rect) = rect {
+            *acc = Some(match *acc {
+                Some(existing) => existing.union(rect),
+                None => rect,
+            });
+        }
+    }
+
+    let mut region: Option<UvBounds> = None;
+    for stroke in a[lo..hi_a].iter().chain(b[lo..hi_b].iter()) {
+        union_into(&mut region, stroke_footprint_uv(stroke, m));
+    }
+
+    // Flatten coupling fixpoint (see doc comment). Only runs when something
+    // changed; a no-op for paint-shaped edits that append the last stroke.
+    if region.is_some() {
+        let flattens: Vec<UvBounds> = a
+            .iter()
+            .chain(b.iter())
+            .filter(|s| s.enabled && matches!(s.kind, SculptStrokeKind::Flatten))
+            .filter_map(|s| stroke_footprint_uv(s, m))
+            .collect();
+        // Monotone growth over a finite set: converges in at most one pass per
+        // Flatten (a Flatten reachable only through another is absorbed the pass
+        // after that other joins). The bound also caps any degenerate case.
+        for _ in 0..=flattens.len() {
+            let current = region.expect("region is Some in this branch");
+            let mut grown = current;
+            for &f in &flattens {
+                if current.intersects(f) {
+                    grown = grown.union(f);
+                }
+            }
+            region = Some(grown);
+            if grown == current {
+                break;
+            }
+        }
+    }
+
+    // Identical params (no changed strokes): a degenerate box at the first stroke
+    // so the edit stays bounded to ~one tile rather than escalating whole-field.
+    // The inspector only emits on a real change, so this is belt-and-braces.
+    let region = region.unwrap_or_else(|| {
+        a.first()
+            .or_else(|| b.first())
+            .and_then(|s| stroke_footprint_uv(s, m))
+            .unwrap_or(UvBounds {
+                min_u: 0.0,
+                min_v: 0.0,
+                max_u: 0.0,
+                max_v: 0.0,
+            })
+    });
+    Some(region.padded(pad_uv))
 }
 
 /// Flatten settles the footprint toward the brush-weighted mean of the terrain
@@ -1469,5 +1646,316 @@ mod tests {
         );
         assert!(r.height.get(16, 16) > h.get(16, 16));
         assert!(r.height.to_dense().iter().all(|v| v.is_finite()));
+    }
+
+    // ---- #121: per-stroke edit footprint (scoped invalidation) ----
+
+    fn fp_metrics() -> HeightfieldMetrics {
+        HeightfieldMetrics {
+            width: 64,
+            height: 64,
+            world_size_x: 1000.0,
+            world_size_z: 1000.0,
+            tile_size: 16,
+            halo: 2,
+        }
+    }
+
+    fn fp_field(m: HeightfieldMetrics) -> Heightfield {
+        let mut h = Heightfield::zeros(m);
+        for j in 0..m.height {
+            for i in 0..m.width {
+                h.set(
+                    i,
+                    j,
+                    (i as f32) * 0.7 + (j as f32) * 0.3 + ((i * 5 + j * 11) % 17) as f32,
+                );
+            }
+        }
+        h
+    }
+
+    fn mk_stroke(kind: SculptStrokeKind, u: f32, v: f32, radius_m: f32) -> SculptStroke {
+        SculptStroke {
+            kind,
+            points: vec![SculptPoint {
+                u,
+                v,
+                pressure: 1.0,
+            }],
+            radius_m,
+            strength: 8.0,
+            target_height: 0.0,
+            falloff: 1.5,
+            enabled: true,
+        }
+    }
+
+    fn mk_params(strokes: Vec<SculptStroke>) -> SculptStrokeParams {
+        SculptStrokeParams {
+            strokes,
+            reconcile: 0.2,
+        }
+    }
+
+    fn uv_covers(outer: UvBounds, inner: UvBounds) -> bool {
+        outer.min_u <= inner.min_u
+            && outer.min_v <= inner.min_v
+            && outer.max_u >= inner.max_u
+            && outer.max_v >= inner.max_v
+    }
+
+    /// Lift an authoring `UvBounds` into the `tiling::UvRect` the tile mapper takes
+    /// (the same trivial conversion the app/eval layers do).
+    fn uv_rect(b: UvBounds) -> crate::tiling::UvRect {
+        crate::tiling::UvRect {
+            min_u: b.min_u,
+            min_v: b.min_v,
+            max_u: b.max_u,
+            max_v: b.max_v,
+        }
+    }
+
+    #[test]
+    fn stroke_footprint_uv_pads_per_axis_and_none_for_empty() {
+        // Non-square world: 2000 m wide, 500 m tall. radius 100 m => UV pad
+        // 100/2000 = 0.05 in u, 100/500 = 0.2 in v.
+        let m = HeightfieldMetrics {
+            width: 64,
+            height: 64,
+            world_size_x: 2000.0,
+            world_size_z: 500.0,
+            tile_size: 16,
+            halo: 2,
+        };
+        let s = mk_stroke(SculptStrokeKind::Raise, 0.5, 0.5, 100.0);
+        let uv = stroke_footprint_uv(&s, &m).expect("has points");
+        assert!((uv.min_u - 0.45).abs() < 1e-6 && (uv.max_u - 0.55).abs() < 1e-6);
+        assert!((uv.min_v - 0.30).abs() < 1e-6 && (uv.max_v - 0.70).abs() < 1e-6);
+
+        let mut empty = s.clone();
+        empty.points.clear();
+        assert!(stroke_footprint_uv(&empty, &m).is_none());
+    }
+
+    #[test]
+    fn footprint_rect_still_matches_the_uv_form() {
+        // The refactor must not perturb the sample-rect rounding #110 relies on.
+        let m = fp_metrics();
+        for &(u, v, r) in &[(0.5, 0.5, 120.0), (0.1, 0.9, 60.0), (0.99, 0.01, 300.0)] {
+            let s = mk_stroke(SculptStrokeKind::Raise, u, v, r);
+            let uv = stroke_footprint_uv(&s, &m).unwrap();
+            let (i0, i1, j0, j1) = stroke_footprint_rect(&s, &m).unwrap();
+            assert_eq!(i0, (uv.min_u * (m.width - 1) as f32) as u32);
+            assert_eq!(
+                i1,
+                ((uv.max_u * (m.width - 1) as f32).ceil() as u32).min(m.width - 1)
+            );
+            assert_eq!(j0, (uv.min_v * (m.height - 1) as f32) as u32);
+            assert_eq!(
+                j1,
+                ((uv.max_v * (m.height - 1) as f32).ceil() as u32).min(m.height - 1)
+            );
+        }
+    }
+
+    #[test]
+    fn edit_footprint_reconcile_change_is_whole_field() {
+        let m = fp_metrics();
+        let a = mk_params(vec![mk_stroke(SculptStrokeKind::Raise, 0.5, 0.5, 100.0)]);
+        let mut b = a.clone();
+        b.reconcile += 0.1;
+        assert!(
+            sculpt_edit_footprint(&a, &b, &m, 1.0 / 64.0).is_none(),
+            "the layer-wide reconcile slider stays whole-field"
+        );
+    }
+
+    #[test]
+    fn edit_footprint_strength_only_is_the_stroke_box() {
+        let m = fp_metrics();
+        let s = mk_stroke(SculptStrokeKind::Raise, 0.3, 0.3, 100.0);
+        let a = mk_params(vec![s.clone()]);
+        let mut s2 = s.clone();
+        s2.strength += 5.0;
+        let b = mk_params(vec![s2]);
+        let fp = sculpt_edit_footprint(&a, &b, &m, 0.0).expect("bounded");
+        assert_eq!(fp, stroke_footprint_uv(&s, &m).unwrap());
+    }
+
+    #[test]
+    fn edit_footprint_radius_change_unions_both_extents() {
+        let m = fp_metrics();
+        let small = mk_stroke(SculptStrokeKind::Raise, 0.5, 0.5, 50.0);
+        let mut big = small.clone();
+        big.radius_m = 200.0;
+        let expect = stroke_footprint_uv(&small, &m)
+            .unwrap()
+            .union(stroke_footprint_uv(&big, &m).unwrap());
+        let grow = sculpt_edit_footprint(&mk_params(vec![small.clone()]), &mk_params(vec![big.clone()]), &m, 0.0).unwrap();
+        let shrink = sculpt_edit_footprint(&mk_params(vec![big]), &mk_params(vec![small]), &m, 0.0).unwrap();
+        assert_eq!(grow, expect, "grow unions old+new");
+        assert_eq!(shrink, expect, "shrink is symmetric");
+    }
+
+    #[test]
+    fn edit_footprint_toggle_and_delete_isolate_the_affected_stroke() {
+        let m = fp_metrics();
+        let keep = mk_stroke(SculptStrokeKind::Raise, 0.2, 0.2, 60.0);
+        let target = mk_stroke(SculptStrokeKind::Raise, 0.7, 0.7, 60.0);
+        let a = mk_params(vec![keep.clone(), target.clone()]);
+        let expect = stroke_footprint_uv(&target, &m).unwrap();
+
+        let mut off = target.clone();
+        off.enabled = false;
+        let toggled = sculpt_edit_footprint(&a, &mk_params(vec![keep.clone(), off]), &m, 0.0).unwrap();
+        assert_eq!(toggled, expect, "toggle isolates the toggled stroke's box");
+
+        let deleted = sculpt_edit_footprint(&a, &mk_params(vec![keep]), &m, 0.0).unwrap();
+        assert_eq!(
+            deleted, expect,
+            "delete's footprint is the removed stroke's box — no index-shift over-dirty"
+        );
+    }
+
+    #[test]
+    fn edit_footprint_identical_params_stay_bounded() {
+        // Belt-and-braces: identical params (no changed stroke) must not escalate to
+        // whole-field — they collapse to the first stroke's box, a ~one-tile recompute.
+        let m = fp_metrics();
+        let s = mk_stroke(SculptStrokeKind::Raise, 0.4, 0.4, 80.0);
+        let a = mk_params(vec![s.clone()]);
+        let fp = sculpt_edit_footprint(&a, &a, &m, 0.0).expect("identical params stay bounded");
+        assert_eq!(fp, stroke_footprint_uv(&s, &m).unwrap());
+    }
+
+    #[test]
+    fn edit_footprint_expands_over_overlapping_flatten_only() {
+        let m = fp_metrics();
+        let raise = mk_stroke(SculptStrokeKind::Raise, 0.3, 0.3, 80.0); // u∈[0.22,0.38]
+        let near = mk_stroke(SculptStrokeKind::Flatten, 0.4, 0.4, 200.0); // u∈[0.2,0.6]
+        let far = mk_stroke(SculptStrokeKind::Flatten, 0.9, 0.9, 40.0); // u∈[0.86,0.94]
+        let a = mk_params(vec![raise.clone(), near.clone(), far.clone()]);
+        let mut raise2 = raise.clone();
+        raise2.strength += 5.0;
+        let b = mk_params(vec![raise2, near.clone(), far.clone()]);
+
+        let fp = sculpt_edit_footprint(&a, &b, &m, 0.0).unwrap();
+        assert!(
+            uv_covers(fp, stroke_footprint_uv(&near, &m).unwrap()),
+            "an overlapping enabled Flatten must be unioned in"
+        );
+        assert!(
+            !fp.intersects(stroke_footprint_uv(&far, &m).unwrap()),
+            "a disjoint Flatten must stay out (tightness)"
+        );
+    }
+
+    #[test]
+    fn edit_footprint_flatten_chain_is_transitive() {
+        let m = fp_metrics();
+        let raise = mk_stroke(SculptStrokeKind::Raise, 0.2, 0.5, 100.0); // u∈[0.1,0.3]
+        let flat_a = mk_stroke(SculptStrokeKind::Flatten, 0.4, 0.5, 150.0); // u∈[0.25,0.55]
+        let flat_b = mk_stroke(SculptStrokeKind::Flatten, 0.65, 0.5, 150.0); // u∈[0.5,0.8]
+        let a = mk_params(vec![raise.clone(), flat_a.clone(), flat_b.clone()]);
+        let mut raise2 = raise.clone();
+        raise2.strength += 5.0;
+        let b = mk_params(vec![raise2, flat_a.clone(), flat_b.clone()]);
+
+        // raise∩flat_a and flat_a∩flat_b overlap, but raise∩flat_b is disjoint — so
+        // flat_b can only be pulled in transitively through flat_a.
+        let fp = sculpt_edit_footprint(&a, &b, &m, 0.0).unwrap();
+        assert!(uv_covers(fp, stroke_footprint_uv(&flat_a, &m).unwrap()));
+        assert!(
+            uv_covers(fp, stroke_footprint_uv(&flat_b, &m).unwrap()),
+            "a Flatten reachable only through another Flatten must still be absorbed"
+        );
+    }
+
+    fn assert_edit_contained(
+        m: HeightfieldMetrics,
+        h: &Heightfield,
+        prev: &SculptStrokeParams,
+        next: &SculptStrokeParams,
+        label: &str,
+    ) {
+        // One texel of pad on the shorter axis guarantees ≥1 sample both ways.
+        let pad = 1.0 / m.width.min(m.height) as f32;
+        let fp = sculpt_edit_footprint(prev, next, &m, pad)
+            .unwrap_or_else(|| panic!("{label}: expected a bounded footprint"));
+        let tiles = crate::tiling::tiles_for_uv_rect(&m, uv_rect(fp));
+        let mut covered = vec![false; (m.width * m.height) as usize];
+        for id in &tiles {
+            let x0 = id.tx * m.tile_size;
+            let y0 = id.tz * m.tile_size;
+            let x1 = (x0 + m.tile_size).min(m.width);
+            let y1 = (y0 + m.tile_size).min(m.height);
+            for j in y0..y1 {
+                for i in x0..x1 {
+                    covered[(j * m.width + i) as usize] = true;
+                }
+            }
+        }
+        let wp = apply_sculpt_strokes(h, prev);
+        let wn = apply_sculpt_strokes(h, next);
+        let aux_keys = [
+            keys::SCULPT_PROTECTION,
+            keys::UPLIFT_RATE,
+            keys::HARDNESS,
+            keys::SEDIMENT_THICKNESS,
+            keys::EDIT_REGION,
+        ];
+        for j in 0..m.height {
+            for i in 0..m.width {
+                if covered[(j * m.width + i) as usize] {
+                    continue;
+                }
+                assert_eq!(
+                    wp.height.get(i, j).to_bits(),
+                    wn.height.get(i, j).to_bits(),
+                    "{label}: height changed OUTSIDE the reported footprint at ({i},{j})"
+                );
+                for key in aux_keys {
+                    let a = wp.fields.get(key).unwrap().get(i, j);
+                    let b = wn.fields.get(key).unwrap().get(i, j);
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "{label}: aux {key} changed OUTSIDE the reported footprint at ({i},{j})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn edit_footprint_contains_every_changed_sample() {
+        // The invariant the whole fix rests on: whole-field prev vs next differ ONLY
+        // inside the tiles the reported footprint names — height and every aux field.
+        // The stack puts a large Flatten *after* a Raise and a Smooth, so editing an
+        // upstream stroke shifts the Flatten across its whole footprint; a footprint
+        // missing the Flatten fixpoint would leave changed samples uncovered here.
+        let m = fp_metrics();
+        let h = fp_field(m);
+        let base = vec![
+            mk_stroke(SculptStrokeKind::Raise, 0.35, 0.4, 120.0),
+            mk_stroke(SculptStrokeKind::Smooth, 0.6, 0.55, 90.0),
+            mk_stroke(SculptStrokeKind::Flatten, 0.5, 0.5, 300.0),
+            mk_stroke(SculptStrokeKind::Uplift, 0.5, 0.5, 100.0),
+        ];
+        let prev = mk_params(base.clone());
+        let edited = |f: &dyn Fn(&mut Vec<SculptStroke>)| {
+            let mut s = base.clone();
+            f(&mut s);
+            mk_params(s)
+        };
+
+        assert_edit_contained(m, &h, &prev, &edited(&|s| s[0].strength += 6.0), "strength@0");
+        assert_edit_contained(m, &h, &prev, &edited(&|s| s[0].radius_m = 80.0), "radius-shrink@0");
+        assert_edit_contained(m, &h, &prev, &edited(&|s| s[0].radius_m = 180.0), "radius-grow@0");
+        assert_edit_contained(m, &h, &prev, &edited(&|s| s[1].enabled = false), "toggle-smooth@1");
+        assert_edit_contained(m, &h, &prev, &edited(&|s| { s.remove(1); }), "delete-smooth@1");
+        assert_edit_contained(m, &h, &prev, &edited(&|s| s[2].target_height = 40.0), "flatten-target@2");
+        assert_edit_contained(m, &h, &prev, &edited(&|s| s[2].strength += 3.0), "flatten-strength@2");
     }
 }

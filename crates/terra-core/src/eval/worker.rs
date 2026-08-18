@@ -776,6 +776,182 @@ mod tests {
         assert_eq!(recomputed(coastal_id), Some(1), "coastal stays tile-scoped");
     }
 
+    /// #121 end-to-end oracle: a warm-Full cache built from `prev` stroke params,
+    /// then a scoped resubmit of `next` carrying `sculpt_edit_footprint(prev, next)`
+    /// as its `dirty_region`, reproduces the whole-field rebuild of `next`
+    /// bit-for-bit across the ENTIRE field. Tiles outside the scope come straight
+    /// from the `prev` cache, so this fails unless the reported footprint names
+    /// every tile the edit actually changes — the Flatten the upstream edit couples
+    /// into (its whole footprint shifts) and the reconcile halo — AND the scope
+    /// reach-expands (#108) across a downstream 6-sample-halo Smooth filter before
+    /// the per-texel Plateau. Exercises the real evaluator cache + reach +
+    /// `generate_scoped_sculpt` path, not just `apply_sculpt_strokes`.
+    #[test]
+    fn scoped_stroke_edit_matches_whole_field() {
+        use crate::authoring::{
+            sculpt_edit_footprint, SculptPoint, SculptStroke, SculptStrokeKind, SculptStrokeParams,
+        };
+        use crate::layer::{EffectFilterKind, EffectFilterParams, PlateauParams, SculptParams};
+        use crate::tiling::UvRect;
+
+        // 128^2 over 32-sample tiles = a 4x4 grid, Full quality.
+        let res = 128u32;
+        let ts = 32u32;
+        let base_metrics = HeightfieldMetrics {
+            width: res,
+            height: res,
+            world_size_x: res as f32,
+            world_size_z: res as f32,
+            tile_size: ts,
+            halo: 2,
+        };
+
+        // A varying sculpt base so tiles genuinely differ.
+        let mut sculpt = SculptParams::filled(res, 0.0);
+        for j in 0..res {
+            for i in 0..res {
+                sculpt.samples[(j * res + i) as usize] = 30.0 + i as f32 * 0.06 + j as f32 * 0.04;
+            }
+        }
+        let pt = |u, v| SculptPoint {
+            u,
+            v,
+            pressure: 1.0,
+        };
+        let stroke = |kind, u, v, radius_m, strength| SculptStroke {
+            kind,
+            points: vec![pt(u, v)],
+            radius_m,
+            strength,
+            target_height: 0.0,
+            falloff: 1.5,
+            enabled: true,
+        };
+        // Raise, Smooth (reads the base 3×3), a Flatten overlapping both, and an
+        // aux-only Uplift. Editing an upstream stroke shifts the Flatten's mean.
+        let prev_params = SculptStrokeParams {
+            strokes: vec![
+                stroke(SculptStrokeKind::Raise, 0.35, 0.4, 24.0, 8.0),
+                stroke(SculptStrokeKind::Smooth, 0.6, 0.55, 18.0, 5.0),
+                stroke(SculptStrokeKind::Flatten, 0.5, 0.5, 34.0, 4.0),
+                stroke(SculptStrokeKind::Uplift, 0.45, 0.5, 20.0, 3.0),
+            ],
+            reconcile: 0.2,
+        };
+
+        // Fixed ids across build/scoped/control so the warm cache keys line up.
+        let mut prev_stack = LayerStack::new();
+        prev_stack.push(Layer::new("Sculpt", LayerKind::SculptBase(sculpt)));
+        let strokes_layer =
+            Layer::new("Strokes", LayerKind::SculptStrokes(prev_params.clone()));
+        let strokes_id = strokes_layer.id();
+        prev_stack.push(strokes_layer);
+        // A coupled downstream pass with a 6-sample halo: the scope must reach-expand
+        // (#108) across it, or its tiles beyond the stroke footprint go stale.
+        prev_stack.push(Layer::new(
+            "Smooth",
+            LayerKind::EffectFilter(EffectFilterParams {
+                kind: EffectFilterKind::Smooth,
+                radius: 3,
+                iterations: 2,
+                ..EffectFilterParams::default()
+            }),
+        ));
+        prev_stack.push(Layer::new(
+            "Plateau",
+            LayerKind::Plateau(PlateauParams {
+                low: 25.0,
+                high: 60.0,
+                soft: 6.0,
+            }),
+        ));
+
+        let make = |token: u64,
+                    stack: LayerStack,
+                    dirty_from: Option<LayerId>,
+                    dirty_region: Option<UvRect>,
+                    mark_all_dirty: bool| EvalWorkRequest {
+            token,
+            quality: PreviewQuality::Full,
+            stack,
+            masks: Vec::new(),
+            base_metrics,
+            level_steps: crate::analyze::LevelStepSettings::default(),
+            preview_res: res,
+            export_res: res,
+            aux: HashMap::new(),
+            strata: None,
+            mask_reference: None,
+            dirty_from,
+            dirty_region,
+            mark_all_dirty,
+        };
+
+        let check = |next_params: SculptStrokeParams, label: &str| {
+            let mut edited = prev_stack.clone();
+            if let Some(l) = edited.find_mut(strokes_id) {
+                l.kind = LayerKind::SculptStrokes(next_params.clone());
+            }
+            let bounds =
+                sculpt_edit_footprint(&prev_params, &next_params, &base_metrics, 1.0 / res as f32)
+                    .expect("bounded footprint");
+            let region = UvRect {
+                min_u: bounds.min_u,
+                min_v: bounds.min_v,
+                max_u: bounds.max_u,
+                max_v: bounds.max_v,
+            };
+
+            // Warm Full cache from prev, then scoped resubmit of next.
+            let live = Arc::new(AtomicU64::new(1));
+            let mut evaluator = StackEvaluator::new();
+            run_cpu_job(&mut evaluator, &make(1, prev_stack.clone(), None, None, true), &live)
+                .expect("warm build");
+            live.store(2, Ordering::Release);
+            let scoped = run_cpu_job(
+                &mut evaluator,
+                &make(2, edited.clone(), Some(strokes_id), Some(region), false),
+                &live,
+            )
+            .expect("scoped resubmit");
+
+            // Cold whole-field control of next.
+            let control_live = Arc::new(AtomicU64::new(9));
+            let mut control_eval = StackEvaluator::new();
+            let control = run_cpu_job(&mut control_eval, &make(9, edited, None, None, true), &control_live)
+                .expect("control build");
+
+            let scoped_bits: Vec<u32> =
+                scoped.height.to_dense().iter().map(|f| f.to_bits()).collect();
+            let control_bits: Vec<u32> =
+                control.height.to_dense().iter().map(|f| f.to_bits()).collect();
+            assert_eq!(
+                scoped_bits, control_bits,
+                "{label}: a scoped stroke edit diverged from the whole-field rebuild"
+            );
+        };
+
+        // Upstream strength edit — couples into the downstream Flatten's mean.
+        let mut strength = prev_params.clone();
+        strength.strokes[0].strength = 20.0;
+        check(strength, "raise-strength");
+
+        // Radius shrink on the Raise — unions old+new extents.
+        let mut radius = prev_params.clone();
+        radius.strokes[0].radius_m = 14.0;
+        check(radius, "raise-radius-shrink");
+
+        // Toggle the mid-list Smooth off — still shifts the later Flatten.
+        let mut toggled = prev_params.clone();
+        toggled.strokes[1].enabled = false;
+        check(toggled, "toggle-smooth");
+
+        // Delete the mid-list Smooth — trim-diff isolates it (no index-shift dirt).
+        let mut deleted = prev_params.clone();
+        deleted.strokes.remove(1);
+        check(deleted, "delete-smooth");
+    }
+
     /// Perf (#100 phase 4): on the #98 Voronoi + Flatten stack over a sculpt base,
     /// a scoped-Full resubmit — the ladder-clobber scenario the app's
     /// straight-to-Full policy enables — recomputes only a few tiles and is far
