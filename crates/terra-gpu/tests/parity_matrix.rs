@@ -4,14 +4,15 @@ use terra_core::eval::{EvalContext, PreviewQuality, StackEvaluator};
 use terra_core::heightfield::{Heightfield, HeightfieldMetrics};
 use terra_core::layer::{
     BlendMode, BlurParams, EffectFilterKind, EffectFilterParams, FlatParams,
-    HydraulicErosionParams, IslandParams, Layer, LayerKind, LayerStack, NoiseParams, RampParams,
-    SculptParams, TerraceParams, ThermalErosionParams,
+    HydraulicErosionParams, IslandParams, Layer, LayerKind, LayerStack, LandscapeEvolutionParams,
+    NoiseParams, RampParams, SculptParams, SculptPoint, SculptStroke, SculptStrokeKind,
+    SculptStrokeParams, TerraceParams, ThermalErosionParams,
 };
 use terra_core::mask::{bake_mask_assets, MaskAsset, MaskId, MaskRef, MaskSource};
 use terra_gpu::parity::{
     assert_field_parity, BLUR_PREVIEW, EXACT_HEIGHT, HYDRAULIC_PREVIEW, INFLATE_FILTER_PREVIEW,
-    SIMPLE_MASK, SMOOTH_FILTER_PREVIEW, TERRACE_PREVIEW, THERMAL_PREVIEW, VALUE_NOISE_PREVIEW,
-    VOLCANIC_ISLAND_PREVIEW,
+    SCULPT_STROKES_PREVIEW, SIMPLE_MASK, SMOOTH_FILTER_PREVIEW, TERRACE_PREVIEW, THERMAL_PREVIEW,
+    VALUE_NOISE_PREVIEW, VOLCANIC_ISLAND_PREVIEW,
 };
 use terra_gpu::GpuTerrainEngine;
 
@@ -279,6 +280,193 @@ fn gpu_required_volcanic_island_approximation_is_bounded() {
     let cpu = cpu_oracle(&stack, &[], metrics);
     let gpu = gpu_eval(&stack, &[], metrics);
     assert_field_parity("island.volcanic-high", &gpu, &cpu, VOLCANIC_ISLAND_PREVIEW);
+}
+
+fn pt(u: f32, v: f32, pressure: f32) -> SculptPoint {
+    SculptPoint { u, v, pressure }
+}
+
+/// Stroke set exercising every GPU-supported kind (per-sample maps + distance
+/// stamps + an alias + an aux-only kind), with multi-point polylines, varied
+/// pressure, and a single-point stroke.
+fn supported_stroke_set(reconcile: f32) -> SculptStrokeParams {
+    let stroke = |kind, points, radius_m, strength, target_height| SculptStroke {
+        kind,
+        points,
+        radius_m,
+        strength,
+        target_height,
+        falloff: 1.5,
+    };
+    SculptStrokeParams {
+        strokes: vec![
+            stroke(
+                SculptStrokeKind::Raise,
+                vec![pt(0.25, 0.3, 1.0), pt(0.45, 0.4, 0.7)],
+                70.0,
+                10.0,
+                0.0,
+            ),
+            stroke(SculptStrokeKind::Lower, vec![pt(0.7, 0.65, 1.0)], 60.0, 6.0, 0.0),
+            stroke(
+                SculptStrokeKind::Ridge,
+                vec![pt(0.2, 0.7, 1.0), pt(0.4, 0.75, 1.0), pt(0.55, 0.6, 0.5)],
+                55.0,
+                8.0,
+                0.0,
+            ),
+            stroke(
+                SculptStrokeKind::Valley,
+                vec![pt(0.6, 0.2, 0.9), pt(0.8, 0.35, 1.0)],
+                50.0,
+                7.0,
+                0.0,
+            ),
+            stroke(SculptStrokeKind::Inflate, vec![pt(0.5, 0.5, 1.0)], 65.0, 5.0, 0.0),
+            stroke(SculptStrokeKind::Terrace, vec![pt(0.35, 0.5, 1.0)], 80.0, 5.0, 0.0),
+            stroke(SculptStrokeKind::Noise, vec![pt(0.5, 0.8, 1.0)], 60.0, 4.0, 0.0),
+            stroke(
+                SculptStrokeKind::HeightStamp,
+                vec![pt(0.8, 0.8, 1.0)],
+                45.0,
+                6.0,
+                30.0,
+            ),
+            stroke(
+                SculptStrokeKind::PlateauStamp,
+                vec![pt(0.2, 0.2, 1.0)],
+                50.0,
+                6.0,
+                25.0,
+            ),
+            stroke(SculptStrokeKind::CraterStamp, vec![pt(0.65, 0.5, 1.0)], 55.0, 9.0, 0.0),
+            // Alias of Ridge; aux-only kind exercises the reconcile edit weight.
+            stroke(SculptStrokeKind::MountainStamp, vec![pt(0.15, 0.5, 1.0)], 45.0, 7.0, 0.0),
+            stroke(SculptStrokeKind::Uplift, vec![pt(0.5, 0.15, 1.0)], 50.0, 3.0, 0.0),
+        ],
+        reconcile,
+    }
+}
+
+fn sculpt_strokes_stack(reconcile: f32) -> (LayerStack, HeightfieldMetrics) {
+    let metrics = HeightfieldMetrics::new(48, 48, 480.0, 480.0);
+    let mut stack = LayerStack::new();
+    stack.push(Layer::new(
+        "base",
+        LayerKind::SculptBase(patterned_sculpt(48, 48)),
+    ));
+    stack.push(Layer::new(
+        "strokes",
+        LayerKind::SculptStrokes(supported_stroke_set(reconcile)),
+    ));
+    (stack, metrics)
+}
+
+#[test]
+fn gpu_required_sculpt_strokes_match_cpu_with_and_without_reconcile() {
+    for reconcile in [0.2, 0.0] {
+        let (stack, metrics) = sculpt_strokes_stack(reconcile);
+        let cpu = cpu_oracle(&stack, &[], metrics);
+        let gpu = gpu_eval(&stack, &[], metrics);
+        assert_field_parity(
+            "authoring.sculpt-strokes",
+            &gpu,
+            &cpu,
+            SCULPT_STROKES_PREVIEW,
+        );
+    }
+}
+
+#[test]
+fn gpu_required_sculpt_strokes_match_cpu_under_add_blend_and_mask() {
+    // The stamped field flows through the standard blend, so a non-default outer
+    // composite (Add + opacity + a Constant mask) must still match the CPU.
+    let metrics = HeightfieldMetrics::new(32, 32, 320.0, 320.0);
+    let mask = MaskAsset::new(MaskId::new(), "constant", MaskSource::Constant(0.6));
+    let mut stack = LayerStack::new();
+    stack.push(Layer::new(
+        "base",
+        LayerKind::SculptBase(patterned_sculpt(32, 32)),
+    ));
+    let mut strokes = Layer::new(
+        "strokes",
+        LayerKind::SculptStrokes(supported_stroke_set(0.15)),
+    );
+    strokes.common.blend = BlendMode::Add;
+    strokes.common.opacity = 0.7;
+    let mut mask_ref = MaskRef::new(mask.id);
+    mask_ref.strength = 0.8;
+    strokes.common.masks.push(mask_ref);
+    stack.push(strokes);
+
+    let cpu = cpu_oracle(&stack, std::slice::from_ref(&mask), metrics);
+    let gpu = gpu_eval(&stack, std::slice::from_ref(&mask), metrics);
+    assert_field_parity("authoring.sculpt-strokes-blended", &gpu, &cpu, SCULPT_STROKES_PREVIEW);
+}
+
+#[test]
+fn sculpt_strokes_fall_back_when_a_downstream_layer_consumes_aux() {
+    // A Flatten stroke (reduction kind) keeps the layer on the CPU resume, and so
+    // does a per-sample stroke sitting under an aux consumer. Both must report a
+    // CPU-resume boundary at the stroke layer rather than compiling fully GPU.
+    let gpu = terra_test_gpu::headless_required();
+    let metrics = HeightfieldMetrics::new(24, 24, 240.0, 240.0);
+
+    let mut flatten_stack = LayerStack::new();
+    flatten_stack.push(Layer::new(
+        "base",
+        LayerKind::SculptBase(patterned_sculpt(24, 24)),
+    ));
+    flatten_stack.push(Layer::new(
+        "flatten",
+        LayerKind::SculptStrokes(SculptStrokeParams {
+            strokes: vec![SculptStroke {
+                kind: SculptStrokeKind::Flatten,
+                points: vec![pt(0.5, 0.5, 1.0)],
+                radius_m: 80.0,
+                strength: 4.0,
+                target_height: 0.0,
+                falloff: 1.5,
+            }],
+            reconcile: 0.15,
+        }),
+    ));
+
+    let mut consumer_stack = LayerStack::new();
+    consumer_stack.push(Layer::new(
+        "base",
+        LayerKind::SculptBase(patterned_sculpt(24, 24)),
+    ));
+    consumer_stack.push(Layer::new(
+        "strokes",
+        LayerKind::SculptStrokes(supported_stroke_set(0.15)),
+    ));
+    consumer_stack.push(Layer::new(
+        "evolve",
+        LayerKind::LandscapeEvolution(LandscapeEvolutionParams::default()),
+    ));
+
+    for (name, stack, resume) in [
+        ("flatten", flatten_stack, 1usize),
+        ("aux-consumer", consumer_stack, 1usize),
+    ] {
+        let mut engine = GpuTerrainEngine::new(&gpu.device, metrics.width);
+        engine.mark_all_dirty(&stack);
+        let result = engine
+            .evaluate(
+                &gpu.device,
+                &gpu.queue,
+                &stack,
+                &[],
+                metrics,
+                QUALITY,
+                false,
+                None,
+            )
+            .expect("gpu eval");
+        assert!(!result.fully_gpu, "{name} must not be fully GPU");
+        assert_eq!(result.resume_cpu_from, Some(resume), "{name}");
+    }
 }
 
 #[test]

@@ -51,6 +51,11 @@ pub const VALUE_NOISE_PREVIEW: ParityTolerance = ParityTolerance::new(17.0, 2.3e
 /// Effect-filter modes retained on GPU after the support audit.
 pub const SMOOTH_FILTER_PREVIEW: ParityTolerance = ParityTolerance::new(1.8, 3.0e-2);
 pub const INFLATE_FILTER_PREVIEW: ParityTolerance = ParityTolerance::new(2.7, 2.8e-2);
+/// SculptStrokes preview: untouched texels are bit-exact copies; stamped texels
+/// diverge only by transcendental edges (`sqrt` vs `hypot`, `pow` vs `powf`). The
+/// bit-exact `hash_noise` port keeps Noise strokes in the same budget. Measured
+/// worst case is ~6.5e-5 m over a 12-kind stroke set; this holds portable headroom.
+pub const SCULPT_STROKES_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-3, 1.0e-5);
 
 /// Canonical documentation table. A unit test keeps the checked-in fidelity
 /// document synchronized with these executable contracts.
@@ -58,6 +63,7 @@ pub const FIDELITY_MATRIX_MARKDOWN: &str = "\
 | Contract | Supported configuration | Max abs (m) | Normalized RMSE |\n\
 | --- | --- | ---: | ---: |\n\
 | `exact-height` | Flat, Ramp, SculptBase, exact blends, hybrid checkpoint | 0.001 | 0.00001 |\n\
+| `authoring.sculpt-strokes` | Per-sample stroke kinds + distance stamps, supported blend/mask | 0.001 | 0.00001 |\n\
 | `mask.simple` | One Constant, Height, or Slope Multiply entry without asset operations | 0.001 | 0.0001 |\n\
 | `noise.value` | Value noise with a 32-bit seed | 17.0 | 0.23 |\n\
 | `filter.blur` | Default outer composite; radius/iteration fixture | 2.1 | 0.0055 |\n\

@@ -552,6 +552,88 @@ impl LayerKind {
         }
     }
 
+    /// Whether this operator's evaluation reads one of the auxiliary fields that a
+    /// [`LayerKind::SculptStrokes`] layer publishes: `SCULPT_PROTECTION`,
+    /// `UPLIFT_RATE`, `HARDNESS`, `SEDIMENT_THICKNESS`, or `EDIT_REGION`.
+    ///
+    /// The GPU sculpt-stroke preview kernel (#113) is a *height* preview only — it
+    /// does not reproduce these aux maps. So a `SculptStrokes` layer may only run on
+    /// the GPU preview path when no enabled downstream layer consumes its aux;
+    /// otherwise that downstream layer's preview would read stale/absent aux and
+    /// silently diverge from the authoritative CPU eval. `compile_gpu_graph` uses
+    /// this to keep such stacks on the CPU resume, mirroring the reason `Coastal` /
+    /// `Materials` stay off the GPU today.
+    ///
+    /// Exhaustive by construction (no wildcard): a new `LayerKind` that reads sculpt
+    /// aux must opt in here, or its preview could diverge unnoticed. The truth is the
+    /// processor arms in `crate::eval::processors`: an arm reading `aux_maps.hardness`
+    /// (directly or via `bake_layer_hardness`/`resolve_hardness`), `UPLIFT_RATE`,
+    /// `SCULPT_PROTECTION`, `SEDIMENT_THICKNESS`, or `EDIT_REGION` is a consumer.
+    pub fn consumes_sculpt_aux(&self) -> bool {
+        match self {
+            // Read sculpt aux directly in their processor arm.
+            LayerKind::LandscapeEvolution(_)  // uplift_rate, sculpt_protection, hardness
+            | LayerKind::HydrologyRepair(_)   // edit_region, hardness, sculpt_protection
+            | LayerKind::GeomorphicDetail(_)  // hardness, sculpt_protection
+            | LayerKind::EcosystemFeedback(_) // hardness, sediment_thickness
+            // Resolve hardness through `bake_layer_hardness` -> `resolve_hardness`,
+            // which returns `aux_maps.hardness` when the source does not override it;
+            // several also read `sediment_thickness` for layered materials.
+            | LayerKind::ThermalErosion(_)
+            | LayerKind::HydraulicErosion(_)
+            | LayerKind::DebrisFlow(_)
+            | LayerKind::StreamPowerErosion(_)
+            | LayerKind::MultiScaleAmplify(_)
+            // Guide mask may select `MaskSource::Hardness` / a named sculpt aux.
+            | LayerKind::RiverCarve(_)
+            // Root-cohesion boost reads `aux_maps.hardness`.
+            | LayerKind::Vegetation(_) => true,
+
+            // Height-only / generator / authoring / filter kinds that never read a
+            // sculpt aux key. `Materials` and `Biomes` read `wetness` / `sediment`
+            // (not the sculpt `sediment_thickness`), so they are not consumers here.
+            LayerKind::Flat(_)
+            | LayerKind::Ramp(_)
+            | LayerKind::NoiseValue(_)
+            | LayerKind::NoisePerlin(_)
+            | LayerKind::NoiseOpenSimplex(_)
+            | LayerKind::NoiseWorley(_)
+            | LayerKind::Fbm(_)
+            | LayerKind::Ridged(_)
+            | LayerKind::DomainWarp(_)
+            | LayerKind::Terrace(_)
+            | LayerKind::Plateau(_)
+            | LayerKind::Mesa(_)
+            | LayerKind::Island(_)
+            | LayerKind::Mountains(_)
+            | LayerKind::Volcano(_)
+            | LayerKind::Uplift(_)
+            | LayerKind::Dunes(_)
+            | LayerKind::Canyons(_)
+            | LayerKind::VoronoiRegions(_)
+            | LayerKind::ImportHeightmap(_)
+            | LayerKind::ProceduralShape(_)
+            | LayerKind::Stamp2d(_)
+            | LayerKind::Stamp3d(_)
+            | LayerKind::PolygonHeight(_)
+            | LayerKind::SculptBase(_)
+            | LayerKind::SculptStrokes(_)
+            | LayerKind::TerrainConstraints(_)
+            | LayerKind::GradientReconstruct(_)
+            | LayerKind::Path(_)
+            | LayerKind::RiverNetwork(_)
+            | LayerKind::SandSimulation(_)
+            | LayerKind::FluidSimulation(_)
+            | LayerKind::Blur(_)
+            | LayerKind::Coastal(_)
+            | LayerKind::EffectFilter(_)
+            | LayerKind::Materials(_)
+            | LayerKind::Biomes(_)
+            | LayerKind::OverhangStamp(_)
+            | LayerKind::LocalSdf(_) => false,
+        }
+    }
+
     /// Phase 11 Rule 3 — scale ownership for this operator family.
     ///
     /// Micro / MultiScale operators must not replace the macro silhouette.
@@ -778,6 +860,52 @@ mod tests {
             LayerKind::EffectFilter(strata).intrinsic_reach(),
             Reach::Full
         );
+    }
+
+    #[test]
+    fn sculpt_aux_consumers_are_declared_and_pure_kinds_are_not() {
+        // Downstream kinds that read a sculpt-published aux (uplift / protection /
+        // hardness / sediment_thickness / edit_region) — directly or through
+        // `bake_layer_hardness` -> `resolve_hardness`. A GPU sculpt-stroke preview
+        // above any of these must resume on the CPU (#113).
+        for kind in [
+            LayerKind::LandscapeEvolution(Default::default()),
+            LayerKind::HydrologyRepair(Default::default()),
+            LayerKind::GeomorphicDetail(Default::default()),
+            LayerKind::EcosystemFeedback(Default::default()),
+            LayerKind::ThermalErosion(Default::default()),
+            LayerKind::HydraulicErosion(Default::default()),
+            LayerKind::DebrisFlow(Default::default()),
+            LayerKind::StreamPowerErosion(Default::default()),
+            LayerKind::MultiScaleAmplify(Default::default()),
+            LayerKind::RiverCarve(Default::default()),
+            LayerKind::Vegetation(Default::default()),
+        ] {
+            assert!(
+                kind.consumes_sculpt_aux(),
+                "{kind:?} reads a sculpt aux and must be declared a consumer"
+            );
+        }
+        // Generators, filters, and the authoring kinds themselves never read a
+        // sculpt aux, so a sculpt preview does not diverge across them. `Biomes`
+        // reads `sediment`/`wetness`, not the sculpt `sediment_thickness`.
+        for kind in [
+            LayerKind::Flat(Default::default()),
+            LayerKind::NoiseValue(Default::default()),
+            LayerKind::Blur(Default::default()),
+            LayerKind::Terrace(Default::default()),
+            LayerKind::EffectFilter(Default::default()),
+            LayerKind::SculptBase(Default::default()),
+            LayerKind::SculptStrokes(Default::default()),
+            LayerKind::TerrainConstraints(Default::default()),
+            LayerKind::Materials(Default::default()),
+            LayerKind::Biomes(Default::default()),
+        ] {
+            assert!(
+                !kind.consumes_sculpt_aux(),
+                "{kind:?} does not read a sculpt aux and must not gate the preview"
+            );
+        }
     }
 
     #[test]

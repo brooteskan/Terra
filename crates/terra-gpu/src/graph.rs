@@ -7,7 +7,8 @@
 //! re-derives kernels mid-walk, so planning has a single authority.
 
 use terra_core::layer::{
-    BlendMode, EffectFilterKind, IslandArchetype, Layer, LayerKind, LayerStack, TransportModel,
+    BlendMode, EffectFilterKind, IslandArchetype, Layer, LayerKind, LayerStack, SculptStrokeKind,
+    TransportModel,
 };
 use terra_core::mask::{MaskAsset, MaskCombine, MaskSource};
 
@@ -26,6 +27,7 @@ pub enum GpuKernel {
     Noise,
     Shape,
     Sculpt,
+    SculptStrokes,
     Blur,
     EffectFilter,
     Terrace,
@@ -41,6 +43,7 @@ impl GpuKernel {
             (Self::Fill, LayerKind::Flat(_))
                 | (Self::Ramp, LayerKind::Ramp(_))
                 | (Self::Sculpt, LayerKind::SculptBase(_))
+                | (Self::SculptStrokes, LayerKind::SculptStrokes(_))
                 | (
                     Self::Noise,
                     LayerKind::NoiseValue(_)
@@ -165,6 +168,25 @@ fn seed_supported(seed: u64) -> bool {
     seed <= u64::from(u32::MAX)
 }
 
+/// Whether a single sculpt-stroke kind is a pure per-sample map of the current
+/// height (plus the distance-to-polyline SDF), which the GPU stamp kernel can
+/// reproduce. The excluded kinds read a neighborhood average of the base input
+/// (`Smooth`, `Pinch`, `Coastline`) or a per-stroke footprint-mean reduction
+/// (`Flatten`); those stay on the CPU resume (#113). The aux-only kinds
+/// (`Uplift` / `Hardness` / `Sediment` / `Protect` / `EncourageErosion`) are
+/// supported because their height contribution is a per-sample function even
+/// though the GPU preview drops the aux they would publish — the aux gate in
+/// `compile_gpu_graph` handles any downstream consumer.
+fn stroke_kind_gpu_supported(kind: SculptStrokeKind) -> bool {
+    !matches!(
+        kind,
+        SculptStrokeKind::Smooth
+            | SculptStrokeKind::Pinch
+            | SculptStrokeKind::Coastline
+            | SculptStrokeKind::Flatten
+    )
+}
+
 fn thermal_config_supported(p: &terra_core::layer::ThermalErosionParams) -> bool {
     !p.layered_materials
         && p.weathering_rate == 0.0
@@ -207,6 +229,21 @@ fn gpu_plan_for_layer(layer: &Layer, mask_assets: &[MaskAsset]) -> Option<GpuLay
         SculptBase(_) if gpu_blend_mode(layer.common.blend).is_some() => {
             (GpuKernel::Sculpt, GpuDirtyPolicy::Local, 0)
         }
+        // Height preview for the per-sample stroke kinds. The reconcile pass reads a
+        // 3x3 of the stamped result, so a non-zero reconcile reaches one texel past
+        // the stamp footprint (matching `SculptStrokes` intrinsic reach). The aux
+        // this layer would publish is dropped here; `compile_gpu_graph` demotes the
+        // plan when a downstream layer consumes it.
+        SculptStrokes(p)
+            if gpu_blend_mode(layer.common.blend).is_some()
+                && p.strokes
+                    .iter()
+                    .all(|stroke| stroke_kind_gpu_supported(stroke.kind)) =>
+        {
+            let halo = u32::from(p.reconcile > 0.0);
+            (GpuKernel::SculptStrokes, GpuDirtyPolicy::Local, halo)
+        }
+        SculptStrokes(_) => return None,
         NoiseValue(p) if seed_supported(p.seed) && gpu_blend_mode(layer.common.blend).is_some() => {
             (GpuKernel::Noise, GpuDirtyPolicy::Local, 2)
         }
@@ -275,19 +312,41 @@ pub fn layer_gpu_supported(layer: &Layer, mask_assets: &[MaskAsset]) -> bool {
 /// so the engine's speculative suffix walk keeps them live on the GPU.
 pub fn compile_gpu_graph(stack: &LayerStack, mask_assets: &[MaskAsset]) -> GpuComputeGraph {
     let layers: Vec<&Layer> = stack.flatten_layers();
-    let mut plans = Vec::with_capacity(layers.len());
-    let mut cpu_from = None;
-    for (flat_index, layer) in layers.iter().enumerate() {
-        if !layer.common.enabled {
-            plans.push(None);
+    let mut plans: Vec<Option<GpuLayerPlan>> = layers
+        .iter()
+        .map(|layer| {
+            layer
+                .common
+                .enabled
+                .then(|| gpu_plan_for_layer(layer, mask_assets))
+                .flatten()
+        })
+        .collect();
+
+    // A `SculptStrokes` GPU plan is a height-only preview; it does not reproduce the
+    // aux maps the CPU eval publishes (protection / uplift / hardness / sediment /
+    // edit-region). If any *enabled* later layer consumes that aux, previewing the
+    // stroke on the GPU would let the downstream result silently diverge from the
+    // authoritative CPU eval, so demote the plan to force a CPU resume at the stroke
+    // layer — the same reason `Coastal` / `Materials` stay off the GPU today (#113).
+    for i in 0..layers.len() {
+        if plans[i].is_none() || !matches!(layers[i].kind, LayerKind::SculptStrokes(_)) {
             continue;
         }
-        let plan = gpu_plan_for_layer(layer, mask_assets);
-        if plan.is_none() && cpu_from.is_none() {
-            cpu_from = Some(flat_index);
+        let downstream_consumer = layers[i + 1..]
+            .iter()
+            .any(|l| l.common.enabled && l.kind.consumes_sculpt_aux());
+        if downstream_consumer {
+            plans[i] = None;
         }
-        plans.push(plan);
     }
+
+    // First enabled layer with no executable plan is the CPU-resume boundary.
+    let cpu_from = layers
+        .iter()
+        .zip(&plans)
+        .position(|(layer, plan)| layer.common.enabled && plan.is_none());
+
     GpuComputeGraph { plans, cpu_from }
 }
 
@@ -312,9 +371,10 @@ mod tests {
     use std::collections::HashMap;
     use terra_core::layer::{
         BiomesParams, BlurParams, CoastalParams, DomainWarpParams, DuneParams, EffectFilterKind,
-        EffectFilterParams, FbmParams, FlatParams, FractalNoiseType, HydraulicErosionParams, Layer,
-        LayerKind, LayerStack, LayerTypeRegistry, MaterialsParams, MountainParams, NoiseParams,
-        PlateauParams, RiverCarveParams, TerraceParams, ThermalErosionParams, VegetationParams,
+        EffectFilterParams, FbmParams, FlatParams, FractalNoiseType, HydraulicErosionParams,
+        LandscapeEvolutionParams, Layer, LayerKind, LayerStack, LayerTypeRegistry, MaterialsParams,
+        MountainParams, NoiseParams, PlateauParams, RiverCarveParams, SculptStroke, SculptStrokeKind,
+        SculptStrokeParams, TerraceParams, ThermalErosionParams, VegetationParams,
     };
     use terra_core::mask::{
         bake_distribution, bake_mask_assets, DistributionEntry, MaskId, MaskOp, MaskRef,
@@ -390,6 +450,9 @@ mod tests {
             "noise",
             LayerKind::NoiseValue(NoiseParams::default()),
         ));
+        // SculptStrokes: GPU localizes it (Local), CPU is Local too — never more
+        // permissive.
+        candidates.push(strokes_layer(SculptStrokeKind::Raise, 0.15));
 
         let mut saw_full_field = false;
         for layer in &candidates {
@@ -559,6 +622,137 @@ mod tests {
                 assert!(plan.kernel.matches_layer_kind(&layer.kind));
             }
         }
+    }
+
+    fn strokes_layer(kind: SculptStrokeKind, reconcile: f32) -> Layer {
+        Layer::new(
+            "strokes",
+            LayerKind::SculptStrokes(SculptStrokeParams {
+                strokes: vec![SculptStroke {
+                    kind,
+                    ..SculptStroke::default()
+                }],
+                reconcile,
+            }),
+        )
+    }
+
+    #[test]
+    fn sculpt_strokes_per_sample_kinds_compile_to_a_local_stamp_plan() {
+        // Per-sample kinds preview on the GPU; a non-zero reconcile carries a
+        // one-texel halo (the 3x3 relax), and reconcile == 0 carries none.
+        for (kind, reconcile, halo) in [
+            (SculptStrokeKind::Raise, 0.15, 1),
+            (SculptStrokeKind::Lower, 0.0, 0),
+            (SculptStrokeKind::Ridge, 0.2, 1),
+            (SculptStrokeKind::Valley, 0.2, 1),
+            (SculptStrokeKind::Inflate, 0.2, 1),
+            (SculptStrokeKind::Terrace, 0.2, 1),
+            (SculptStrokeKind::Noise, 0.2, 1),
+            (SculptStrokeKind::HeightStamp, 0.0, 0),
+            (SculptStrokeKind::PlateauStamp, 0.2, 1),
+            (SculptStrokeKind::CraterStamp, 0.2, 1),
+            (SculptStrokeKind::MountainStamp, 0.2, 1),
+            (SculptStrokeKind::Uplift, 0.2, 1),
+        ] {
+            let layer = strokes_layer(kind, reconcile);
+            let plan = gpu_plan_for_layer(&layer, &[])
+                .unwrap_or_else(|| panic!("{kind:?} should compile to a GPU plan"));
+            assert_eq!(plan.kernel, GpuKernel::SculptStrokes, "{kind:?}");
+            assert!(plan.kernel.matches_layer_kind(&layer.kind), "{kind:?}");
+            assert_eq!(plan.dirty_policy, GpuDirtyPolicy::Local, "{kind:?}");
+            assert_eq!(plan.halo_texels, halo, "{kind:?}");
+            assert!(layer_gpu_supported(&layer, &[]), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn sculpt_strokes_neighborhood_and_reduction_kinds_fall_back_to_cpu() {
+        // Smooth / Pinch / Coastline read a neighborhood of the base; Flatten needs
+        // a footprint-mean reduction. These stay on the CPU resume.
+        for kind in [
+            SculptStrokeKind::Smooth,
+            SculptStrokeKind::Pinch,
+            SculptStrokeKind::Coastline,
+            SculptStrokeKind::Flatten,
+        ] {
+            let layer = strokes_layer(kind, 0.15);
+            assert!(gpu_plan_for_layer(&layer, &[]).is_none(), "{kind:?}");
+            assert!(!layer_gpu_supported(&layer, &[]), "{kind:?}");
+            assert_eq!(single_layer_graph(layer).cpu_from, Some(0), "{kind:?}");
+        }
+
+        // A single unsupported stroke poisons the whole layer: strokes compose in
+        // order, so the layer cannot be split across the GPU/CPU boundary.
+        let mixed = Layer::new(
+            "mixed",
+            LayerKind::SculptStrokes(SculptStrokeParams {
+                strokes: vec![
+                    SculptStroke {
+                        kind: SculptStrokeKind::Raise,
+                        ..SculptStroke::default()
+                    },
+                    SculptStroke {
+                        kind: SculptStrokeKind::Flatten,
+                        ..SculptStroke::default()
+                    },
+                ],
+                reconcile: 0.15,
+            }),
+        );
+        assert!(!layer_gpu_supported(&mixed, &[]));
+    }
+
+    #[test]
+    fn sculpt_strokes_require_a_supported_blend() {
+        let mut layer = strokes_layer(SculptStrokeKind::Raise, 0.15);
+        layer.common.blend = BlendMode::SmoothMaximum;
+        assert!(gpu_blend_mode(layer.common.blend).is_none());
+        assert!(!layer_gpu_supported(&layer, &[]));
+        assert_eq!(single_layer_graph(layer).cpu_from, Some(0));
+    }
+
+    #[test]
+    fn sculpt_strokes_are_demoted_when_a_downstream_layer_consumes_their_aux() {
+        // Raise stroke (GPU-capable) followed by a consumer of the aux it cannot
+        // reproduce on the GPU: the stroke plan is demoted so the preview resumes on
+        // the CPU at the stroke layer, not silently diverging past it.
+        let mut stack = LayerStack::new();
+        stack.push(Layer::new("base", LayerKind::Flat(FlatParams::default())));
+        stack.push(strokes_layer(SculptStrokeKind::Raise, 0.15));
+        stack.push(Layer::new(
+            "evolve",
+            LayerKind::LandscapeEvolution(LandscapeEvolutionParams::default()),
+        ));
+        let graph = compile_gpu_graph(&stack, &[]);
+        assert!(graph.plans[0].is_some(), "base flat stays on GPU");
+        assert!(graph.plans[1].is_none(), "stroke layer demoted by consumer");
+        assert_eq!(graph.cpu_from, Some(1));
+
+        // A disabled consumer does not run, so it must not demote the preview.
+        let mut with_disabled = LayerStack::new();
+        with_disabled.push(strokes_layer(SculptStrokeKind::Raise, 0.15));
+        let mut disabled_consumer = Layer::new(
+            "evolve",
+            LayerKind::LandscapeEvolution(LandscapeEvolutionParams::default()),
+        );
+        disabled_consumer.common.enabled = false;
+        with_disabled.push(disabled_consumer);
+        let graph = compile_gpu_graph(&with_disabled, &[]);
+        assert!(graph.plans[0].is_some(), "no enabled consumer downstream");
+        assert_eq!(graph.cpu_from, None);
+    }
+
+    #[test]
+    fn sculpt_strokes_stay_on_gpu_above_a_non_consuming_filter() {
+        // Raise stroke then a Blur (does not read sculpt aux): fully GPU, live.
+        let mut stack = LayerStack::new();
+        stack.push(Layer::new("base", LayerKind::Flat(FlatParams::default())));
+        stack.push(strokes_layer(SculptStrokeKind::Raise, 0.15));
+        stack.push(Layer::new("blur", LayerKind::Blur(BlurParams::default())));
+        let graph = compile_gpu_graph(&stack, &[]);
+        assert!(graph.fully_gpu(), "cpu_from={:?}", graph.cpu_from);
+        assert!(graph.plans.iter().all(|p| p.is_some()));
     }
 
     #[test]

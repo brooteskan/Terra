@@ -22,7 +22,7 @@ use terra_core::fields::FieldId;
 use terra_core::heightfield::{Heightfield, HeightfieldMetrics, TileId};
 use terra_core::layer::{
     BlendMode, EffectFilterParams, FractalNoiseType, Layer, LayerId, LayerKind, LayerStack,
-    NoiseParams, SculptParams,
+    NoiseParams, SculptParams, SculptStrokeKind, SculptStrokeParams,
 };
 use terra_core::mask::{MaskAsset, MaskSource};
 use terra_core::tiling::{SampleRect, TileScheduler};
@@ -145,6 +145,161 @@ struct CopyU {
     height: u32,
     _p0: f32,
     _p1: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct SculptStrokesU {
+    width: u32,
+    height: u32,
+    world_x: f32,
+    world_z: f32,
+    stroke_count: u32,
+    _p0: u32,
+    _p1: u32,
+    _p2: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct SculptReconcileU {
+    width: u32,
+    height: u32,
+    reconcile: f32,
+    _p0: f32,
+}
+
+/// One stroke's GPU header. Layout mirrors `StrokeHeader` in
+/// `shaders/sculpt_strokes.wgsl` (48 bytes, 8-byte aligned for the trailing
+/// `vec2<f32>` bbox fields); `points` are uploaded separately as `vec4<f32>`.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct StrokeHeaderGpu {
+    kind: u32,
+    first_point: u32,
+    point_count: u32,
+    _pad0: u32,
+    radius_m: f32,
+    strength: f32,
+    target_height: f32,
+    falloff: f32,
+    bbox_min: [f32; 2],
+    bbox_max: [f32; 2],
+}
+
+/// Alias-collapsed kind id shared with `shaders/sculpt_strokes.wgsl`. Only kinds
+/// the planner admits (per-sample maps) are ever uploaded; the neighborhood /
+/// reduction kinds keep the whole layer on the CPU resume.
+fn stroke_kind_gpu_id(kind: SculptStrokeKind) -> u32 {
+    match kind {
+        SculptStrokeKind::Raise => 0,
+        SculptStrokeKind::Lower => 1,
+        SculptStrokeKind::Ridge | SculptStrokeKind::MountainStamp => 2,
+        SculptStrokeKind::Valley | SculptStrokeKind::ValleyStamp | SculptStrokeKind::RiverPath => 3,
+        SculptStrokeKind::Terrace => 4,
+        SculptStrokeKind::Roughness | SculptStrokeKind::Noise => 5,
+        SculptStrokeKind::Inflate => 6,
+        SculptStrokeKind::PlateauStamp => 7,
+        SculptStrokeKind::CraterStamp => 8,
+        SculptStrokeKind::HeightStamp => 9,
+        SculptStrokeKind::Erode | SculptStrokeKind::EncourageErosion => 10,
+        // Uplift / Hardness / Sediment / Protect contribute only aux on the CPU;
+        // their height is unchanged, but they still mark the edit region.
+        SculptStrokeKind::Uplift
+        | SculptStrokeKind::Hardness
+        | SculptStrokeKind::Sediment
+        | SculptStrokeKind::Protect => 11,
+        // Not admitted by the planner; never reaches the GPU. Map to the aux no-op
+        // so a stray upload cannot corrupt height.
+        SculptStrokeKind::Smooth
+        | SculptStrokeKind::Pinch
+        | SculptStrokeKind::Coastline
+        | SculptStrokeKind::Flatten => 11,
+    }
+}
+
+/// Flatten a stroke set into GPU headers + a shared `vec4` point pool. Each
+/// header carries a world-space footprint (point bbox padded by `radius_m`) so
+/// the stamp kernel can cull texts outside the brush; correctness still comes
+/// from the per-texel weight test. Both vectors are kept non-empty so the storage
+/// bindings are valid even for an empty stroke set (`stroke_count` gates reads).
+fn build_stroke_buffers(
+    p: &SculptStrokeParams,
+    m: &HeightfieldMetrics,
+) -> (Vec<StrokeHeaderGpu>, Vec<[f32; 4]>) {
+    let sx = m.world_size_x;
+    let sz = m.world_size_z;
+    let mut headers = Vec::with_capacity(p.strokes.len());
+    let mut points: Vec<[f32; 4]> = Vec::new();
+    for stroke in &p.strokes {
+        let first_point = points.len() as u32;
+        let (mut min_x, mut min_z) = (f32::INFINITY, f32::INFINITY);
+        let (mut max_x, mut max_z) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+        for pt in &stroke.points {
+            let wx = pt.u * sx;
+            let wz = pt.v * sz;
+            min_x = min_x.min(wx);
+            max_x = max_x.max(wx);
+            min_z = min_z.min(wz);
+            max_z = max_z.max(wz);
+            points.push([pt.u, pt.v, pt.pressure, 0.0]);
+        }
+        let r = stroke.radius_m;
+        // A stroke with no points has no footprint: an inverted bbox (min > max)
+        // culls every texel, exactly as the CPU produces no contribution.
+        let (bbox_min, bbox_max) = if stroke.points.is_empty() {
+            ([1.0, 1.0], [-1.0, -1.0])
+        } else {
+            ([min_x - r, min_z - r], [max_x + r, max_z + r])
+        };
+        headers.push(StrokeHeaderGpu {
+            kind: stroke_kind_gpu_id(stroke.kind),
+            first_point,
+            point_count: stroke.points.len() as u32,
+            _pad0: 0,
+            radius_m: stroke.radius_m,
+            strength: stroke.strength,
+            target_height: stroke.target_height,
+            falloff: stroke.falloff,
+            bbox_min,
+            bbox_max,
+        });
+    }
+    if headers.is_empty() {
+        // Placeholder so the storage buffer is bindable; never read (count == 0).
+        headers.push(StrokeHeaderGpu {
+            kind: 11,
+            first_point: 0,
+            point_count: 0,
+            _pad0: 0,
+            radius_m: 0.0,
+            strength: 0.0,
+            target_height: 0.0,
+            falloff: 0.0,
+            bbox_min: [1.0, 1.0],
+            bbox_max: [-1.0, -1.0],
+        });
+    }
+    if points.is_empty() {
+        points.push([0.0, 0.0, 0.0, 0.0]);
+    }
+    (headers, points)
+}
+
+fn make_storage_buffer(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label: &str,
+    bytes: &[u8],
+) -> wgpu::Buffer {
+    let buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: (bytes.len() as u64).max(16),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&buf, 0, bytes);
+    buf
 }
 
 #[repr(C)]
@@ -415,6 +570,19 @@ fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
+fn storage_read_buffer_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: true },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
+}
+
 /// Ring of small uniform buffers so many dispatches can share one submit.
 struct UniformPool {
     buffers: Vec<wgpu::Buffer>,
@@ -536,6 +704,8 @@ pub struct GpuTerrainEngine {
     river_carve: Pipe,
     effect_filter: Pipe,
     mask_bake: Pipe,
+    sculpt_strokes: Pipe,
+    sculpt_strokes_reconcile: Pipe,
     uniform_pool: UniformPool,
     ping: HeightTex,
     pong: HeightTex,
@@ -552,6 +722,10 @@ pub struct GpuTerrainEngine {
     /// Loose sediment thickness for layered erodibility (meters).
     loose_sediment: HeightTex,
     outflow: RgbaTex,
+    /// SculptStrokes preview scratch: stamped height and per-texel brush coverage,
+    /// written by the stamp pass and read by the reconcile pass (#113).
+    sculpt_stamp: HeightTex,
+    sculpt_edited: HeightTex,
     layer_cache: HashMap<LayerId, HeightTex>,
     /// Pre-blend generator output, keyed by layer id.
     layer_contrib: HashMap<LayerId, HeightTex>,
@@ -764,6 +938,39 @@ impl GpuTerrainEngine {
             include_str!("shaders/mask_bake.wgsl"),
             mask_bake_bgl,
         );
+        let sculpt_strokes_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("sculpt-strokes-bgl"),
+            entries: &[
+                uniform_entry(0),
+                tex_read_entry(1),
+                storage_read_buffer_entry(2),
+                storage_read_buffer_entry(3),
+                storage_write_entry(4),
+                storage_write_entry(5),
+            ],
+        });
+        let sculpt_strokes_reconcile_bgl =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("sculpt-strokes-reconcile-bgl"),
+                entries: &[
+                    uniform_entry(0),
+                    tex_read_entry(1),
+                    tex_read_entry(2),
+                    storage_write_entry(3),
+                ],
+            });
+        let sculpt_strokes = make_pipe(
+            device,
+            "sculpt-strokes",
+            include_str!("shaders/sculpt_strokes.wgsl"),
+            sculpt_strokes_bgl,
+        );
+        let sculpt_strokes_reconcile = make_pipe(
+            device,
+            "sculpt-strokes-reconcile",
+            include_str!("shaders/sculpt_strokes_reconcile.wgsl"),
+            sculpt_strokes_reconcile_bgl,
+        );
         let ping = HeightTex::new(device, "ping", w, w);
         let pong = HeightTex::new(device, "pong", w, w);
         let layer_tex = HeightTex::new(device, "layer", w, w);
@@ -777,6 +984,8 @@ impl GpuTerrainEngine {
         let rainfall = HeightTex::new(device, "rainfall", w, w);
         let loose_sediment = HeightTex::new(device, "loose-sediment", w, w);
         let outflow = RgbaTex::new(device, "hydraulic-outflow", w, w);
+        let sculpt_stamp = HeightTex::new(device, "sculpt-stamp", w, w);
+        let sculpt_edited = HeightTex::new(device, "sculpt-edited", w, w);
 
         Self {
             fill,
@@ -795,6 +1004,8 @@ impl GpuTerrainEngine {
             river_carve,
             effect_filter,
             mask_bake,
+            sculpt_strokes,
+            sculpt_strokes_reconcile,
             uniform_pool: UniformPool::new(device, 64),
             ping,
             pong,
@@ -809,6 +1020,8 @@ impl GpuTerrainEngine {
             rainfall,
             loose_sediment,
             outflow,
+            sculpt_stamp,
+            sculpt_edited,
             layer_cache: HashMap::new(),
             layer_contrib: HashMap::new(),
             dirty: HashSet::new(),
@@ -1104,6 +1317,8 @@ impl GpuTerrainEngine {
         self.rainfall = HeightTex::new(device, "rainfall", w, h);
         self.loose_sediment = HeightTex::new(device, "loose-sediment", w, h);
         self.outflow = RgbaTex::new(device, "hydraulic-outflow", w, h);
+        self.sculpt_stamp = HeightTex::new(device, "sculpt-stamp", w, h);
+        self.sculpt_edited = HeightTex::new(device, "sculpt-edited", w, h);
         self.layer_cache.clear();
         self.layer_contrib.clear();
         self.dirty.clear();
@@ -2240,6 +2455,133 @@ impl GpuTerrainEngine {
         );
     }
 
+    /// Stamp the stroke set into `sculpt_stamp`/`sculpt_edited`, then relax into
+    /// `layer_tex` (the layer contribution the standard blend consumes). Full-field
+    /// like every other layer's contribution — `layer_tex` is shared scratch, so it
+    /// must be valid everywhere the full-field blend reads it (#113).
+    fn run_sculpt_strokes(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        p: &SculptStrokeParams,
+    ) {
+        let (headers, points) = build_stroke_buffers(p, &self.metrics);
+        let header_buf = make_storage_buffer(
+            device,
+            queue,
+            "sculpt-stroke-headers",
+            bytemuck::cast_slice(&headers),
+        );
+        let point_buf = make_storage_buffer(
+            device,
+            queue,
+            "sculpt-stroke-points",
+            bytemuck::cast_slice(&points),
+        );
+
+        // All `&mut self` (uniform-pool) writes happen before any texture-view
+        // borrow, matching `blend_into_current`.
+        let stamp_u = SculptStrokesU {
+            width: self.metrics.width,
+            height: self.metrics.height,
+            world_x: self.metrics.world_size_x,
+            world_z: self.metrics.world_size_z,
+            stroke_count: p.strokes.len() as u32,
+            _p0: 0,
+            _p1: 0,
+            _p2: 0,
+        };
+        let stamp_u_buf = self.write_uniform(device, queue, &stamp_u);
+        let recon_u = SculptReconcileU {
+            width: self.metrics.width,
+            height: self.metrics.height,
+            reconcile: p.reconcile,
+            _p0: 0.0,
+        };
+        let recon_u_buf = self.write_uniform(device, queue, &recon_u);
+
+        let gx = self.metrics.width.div_ceil(8);
+        let gy = self.metrics.height.div_ceil(8);
+        let src_view = if self.current == 0 {
+            &self.ping.view
+        } else {
+            &self.pong.view
+        };
+
+        let stamp_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("sculpt-strokes-bg"),
+            layout: &self.sculpt_strokes.bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: stamp_u_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(src_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: header_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: point_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(&self.sculpt_stamp.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(&self.sculpt_edited.view),
+                },
+            ],
+        });
+        let recon_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("sculpt-strokes-reconcile-bg"),
+            layout: &self.sculpt_strokes_reconcile.bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: recon_u_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&self.sculpt_stamp.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&self.sculpt_edited.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&self.layer_tex.view),
+                },
+            ],
+        });
+
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("sculpt-strokes-stamp"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.sculpt_strokes.pipeline);
+            pass.set_bind_group(0, &stamp_bg, &[]);
+            pass.dispatch_workgroups(gx, gy, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("sculpt-strokes-reconcile"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.sculpt_strokes_reconcile.pipeline);
+            pass.set_bind_group(0, &recon_bg, &[]);
+            pass.dispatch_workgroups(gx, gy, 1);
+        }
+    }
+
     fn cache_current(
         &mut self,
         device: &wgpu::Device,
@@ -2319,6 +2661,33 @@ impl GpuTerrainEngine {
                 // `layer_tex` was filled by `upload_sculpt_to_layer` just before this call.
                 let (lo, hi) = p.sample_range();
                 self.expand_range(lo, hi);
+                self.blend_into_current(
+                    device,
+                    queue,
+                    encoder,
+                    layer.common.opacity,
+                    layer.common.blend,
+                )?;
+            }
+            (GpuKernel::SculptStrokes, LayerKind::SculptStrokes(p)) => {
+                // Stamp every stroke, then reconcile into `layer_tex`; the standard
+                // blend below reproduces the CPU composite for the supported blends.
+                self.run_sculpt_strokes(device, queue, encoder, p);
+                // Presentation range: fold in only the *absolute* stamp targets, like
+                // every other kernel expands with stable values. The additive kinds
+                // are relative to the (already-ranged) input, so widening by their
+                // magnitude here would be relative to the accumulating range and
+                // compound across incremental dabs — sinking the render's slab base
+                // (`min_h - f(span)`) a little further on every drag step. Their exact
+                // extent is left to the async CPU refine; height itself is unaffected.
+                for stroke in &p.strokes {
+                    if matches!(
+                        stroke.kind,
+                        SculptStrokeKind::HeightStamp | SculptStrokeKind::PlateauStamp
+                    ) {
+                        self.expand_range(stroke.target_height, stroke.target_height);
+                    }
+                }
                 self.blend_into_current(
                     device,
                     queue,
@@ -4311,6 +4680,176 @@ mod smoke_tests {
         assert_eq!(
             engine.executed_kernels, planned,
             "executor must consume the compiled plan, not re-plan or ignore it"
+        );
+    }
+
+    fn raise_strokes(u: f32, v: f32, strength: f32) -> SculptStrokeParams {
+        SculptStrokeParams {
+            strokes: vec![terra_core::layer::SculptStroke {
+                kind: SculptStrokeKind::Raise,
+                points: vec![terra_core::layer::SculptPoint {
+                    u,
+                    v,
+                    pressure: 1.0,
+                }],
+                radius_m: 60.0,
+                strength,
+                target_height: 0.0,
+                falloff: 1.5,
+            }],
+            reconcile: 0.15,
+        }
+    }
+
+    #[test]
+    fn sculpt_strokes_kernel_is_executed_from_the_plan() {
+        let Some(gpu) = terra_test_gpu::headless() else {
+            return;
+        };
+        let metrics = HeightfieldMetrics::new(32, 32, 320.0, 320.0);
+        let mut stack = LayerStack::new();
+        let base = Layer::new("base", LayerKind::Flat(FlatParams { height: 5.0 }));
+        let base_id = base.id();
+        stack.push(base);
+        stack.push(Layer::new(
+            "strokes",
+            LayerKind::SculptStrokes(raise_strokes(0.5, 0.5, 10.0)),
+        ));
+
+        let mut engine = GpuTerrainEngine::new(&gpu.device, metrics.width);
+        engine.mark_dirty(base_id);
+        engine
+            .evaluate(
+                &gpu.device,
+                &gpu.queue,
+                &stack,
+                &[],
+                metrics,
+                PreviewQuality::Draft,
+                false,
+                None,
+            )
+            .expect("fully-GPU stroke evaluation");
+
+        let planned: Vec<GpuKernel> = engine
+            .last_graph
+            .plans
+            .iter()
+            .flatten()
+            .map(|plan| plan.kernel)
+            .collect();
+        assert_eq!(planned, vec![GpuKernel::Fill, GpuKernel::SculptStrokes]);
+        assert_eq!(engine.executed_kernels, planned);
+    }
+
+    /// Two `SculptStrokes` layers in one evaluate walk share the stamp/edited/layer
+    /// scratch textures. The second must read the first layer's composited result
+    /// (not a clobbered scratch), so the whole field must still match the CPU, which
+    /// applies the layers in the same order.
+    #[test]
+    fn stacked_sculpt_stroke_layers_apply_in_order_and_match_cpu() {
+        let Some(gpu) = terra_test_gpu::headless() else {
+            return;
+        };
+        let metrics = HeightfieldMetrics::new(40, 40, 400.0, 400.0);
+        let mut stack = LayerStack::new();
+        stack.push(Layer::new(
+            "base",
+            LayerKind::SculptBase(SculptParams::filled(40, 12.0)),
+        ));
+        stack.push(Layer::new(
+            "s1",
+            LayerKind::SculptStrokes(raise_strokes(0.45, 0.5, 10.0)),
+        ));
+        stack.push(Layer::new(
+            "s2",
+            LayerKind::SculptStrokes(raise_strokes(0.55, 0.5, 6.0)),
+        ));
+
+        let mut engine = GpuTerrainEngine::new(&gpu.device, metrics.width);
+        engine.mark_all_dirty(&stack);
+        let gpu_h = engine
+            .evaluate(
+                &gpu.device,
+                &gpu.queue,
+                &stack,
+                &[],
+                metrics,
+                PreviewQuality::Draft,
+                true,
+                None,
+            )
+            .expect("stacked stroke evaluation")
+            .cpu
+            .expect("gpu readback");
+
+        let cpu = cpu_oracle(&stack, metrics);
+        crate::parity::assert_field_parity(
+            "authoring.sculpt-strokes-stacked",
+            &gpu_h,
+            &cpu,
+            crate::parity::SCULPT_STROKES_PREVIEW,
+        );
+    }
+
+    /// A SculptStrokes layer sits above the base, so a stroke dab is an incremental
+    /// eval that seeds `approx_range` from cache rather than resetting it. Additive
+    /// strokes must not widen that carried range, or it drifts on every drag step and
+    /// the renderer's slab base (`min_h - f(max_h - min_h)`) visibly sinks. Repeated
+    /// identical dabs must leave the presentation range fixed.
+    #[test]
+    fn incremental_sculpt_stroke_dabs_do_not_drift_the_presentation_range() {
+        let Some(gpu) = terra_test_gpu::headless() else {
+            return;
+        };
+        let metrics = HeightfieldMetrics::new(48, 48, 480.0, 480.0);
+        let mut stack = LayerStack::new();
+        stack.push(Layer::new(
+            "base",
+            LayerKind::SculptBase(SculptParams::filled(48, 30.0)),
+        ));
+        let strokes_layer = Layer::new(
+            "strokes",
+            LayerKind::SculptStrokes(raise_strokes(0.5, 0.5, 12.0)),
+        );
+        let strokes_id = strokes_layer.id();
+        stack.push(strokes_layer);
+
+        let mut engine = GpuTerrainEngine::new(&gpu.device, metrics.width);
+        engine.mark_all_dirty(&stack);
+        engine
+            .evaluate(
+                &gpu.device,
+                &gpu.queue,
+                &stack,
+                &[],
+                metrics,
+                PreviewQuality::Draft,
+                false,
+                None,
+            )
+            .expect("full stroke evaluation");
+        let range_after_full = engine.approx_range;
+
+        for _ in 0..6 {
+            engine.set_dirty_rect(Some((16, 16, 16, 16)));
+            engine.mark_dirty(strokes_id);
+            engine
+                .evaluate(
+                    &gpu.device,
+                    &gpu.queue,
+                    &stack,
+                    &[],
+                    metrics,
+                    PreviewQuality::Draft,
+                    false,
+                    None,
+                )
+                .expect("incremental stroke dab");
+        }
+        assert_eq!(
+            engine.approx_range, range_after_full,
+            "incremental stroke dabs drifted the presentation range"
         );
     }
 
