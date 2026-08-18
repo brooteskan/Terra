@@ -32,15 +32,40 @@ pub enum IoError {
     Metrics(#[from] terra_core::heightfield::MetricsError),
 }
 
+/// Why a background export failed.
+///
+/// Cancellation is not represented here: a cancelled export resolves to idle
+/// with no result (the `BuildJob::result` stays `None`).
+#[derive(Debug, Error)]
+pub enum ExportError {
+    #[error(transparent)]
+    Eval(#[from] terra_core::eval::EvalError),
+    #[error(transparent)]
+    Package(#[from] IoError),
+    #[error("panicked: {0}")]
+    Panicked(String),
+}
+
+/// Why a background project save or load failed.
+#[derive(Debug, Error)]
+pub enum ProjectIoError {
+    #[error(transparent)]
+    Fs(#[from] std::io::Error),
+    #[error(transparent)]
+    Document(#[from] serde_json::Error),
+    #[error(transparent)]
+    Job(#[from] terra_jobs::JobError),
+}
+
 pub struct BuildJob {
     pub progress: f32,
     pub done: bool,
-    pub result: Option<Result<ExportResult, String>>,
+    pub result: Option<Result<ExportResult, ExportError>>,
 }
 
 /// Non-blocking export worker.
 pub struct BackgroundExporter {
-    handle: Option<JobHandle<Result<ExportResult, String>>>,
+    handle: Option<JobHandle<Result<ExportResult, ExportError>>>,
     pub job: BuildJob,
 }
 
@@ -72,9 +97,9 @@ impl BackgroundExporter {
                         out_dir,
                         ..ExportRequest::default()
                     };
-                    export_package(&hf, &eval_ctx, &req).map_err(|e| e.to_string())
+                    export_package(&hf, &eval_ctx, &req).map_err(ExportError::from)
                 }
-                Err(e) => Err(e.to_string()),
+                Err(e) => Err(e.into()),
             }
         });
     }
@@ -85,7 +110,7 @@ impl BackgroundExporter {
     /// arbitrary bodies (a panicking one, a spin-until-cancelled one).
     fn start_job<F>(&mut self, f: F)
     where
-        F: FnOnce(&JobCtx) -> Result<ExportResult, String> + Send + 'static,
+        F: FnOnce(&JobCtx) -> Result<ExportResult, ExportError> + Send + 'static,
     {
         // A superseded job should stop burning CPU rather than run on detached.
         if let Some(handle) = self.handle.take() {
@@ -120,7 +145,7 @@ impl BackgroundExporter {
                 // stuck progress bar); surface it as a failed job instead.
                 self.job.progress = 1.0;
                 self.job.done = true;
-                self.job.result = Some(Err(format!("panicked: {message}")));
+                self.job.result = Some(Err(ExportError::Panicked(message)));
             }
             Err(JobError::Cancelled) => {
                 // A cancelled export returns to idle: no Done result, no stuck
@@ -220,7 +245,7 @@ pub enum ProjectIoResult {
     },
     Failed {
         path: PathBuf,
-        error: String,
+        error: ProjectIoError,
     },
 }
 
@@ -266,7 +291,7 @@ impl BackgroundProjectIo {
                 Err(e) => {
                     return ProjectIoResult::Failed {
                         path,
-                        error: e.to_string(),
+                        error: e.into(),
                     }
                 }
             };
@@ -274,7 +299,7 @@ impl BackgroundProjectIo {
                 Ok(()) => ProjectIoResult::Saved { path },
                 Err(e) => ProjectIoResult::Failed {
                     path,
-                    error: e.to_string(),
+                    error: e.into(),
                 },
             }
         }));
@@ -291,7 +316,7 @@ impl BackgroundProjectIo {
                 Err(e) => {
                     return ProjectIoResult::Failed {
                         path,
-                        error: e.to_string(),
+                        error: e.into(),
                     }
                 }
             };
@@ -302,7 +327,7 @@ impl BackgroundProjectIo {
                 },
                 Err(e) => ProjectIoResult::Failed {
                     path,
-                    error: e.to_string(),
+                    error: e.into(),
                 },
             }
         }));
@@ -322,15 +347,11 @@ impl BackgroundProjectIo {
         let path = self.pending_path.take().unwrap_or_default();
         self.result = Some(match outcome {
             Ok(result) => result,
-            Err(JobError::Panicked(message)) => ProjectIoResult::Failed {
-                path,
-                error: format!("job panicked: {message}"),
-            },
             // No cancel surface is exposed for project IO; map defensively so an
             // impossible state surfaces loudly rather than vanishing.
-            Err(JobError::Cancelled) => ProjectIoResult::Failed {
+            Err(e) => ProjectIoResult::Failed {
                 path,
-                error: "job cancelled".to_string(),
+                error: e.into(),
             },
         });
     }
@@ -452,10 +473,15 @@ mod worker_tests {
             exporter.job.done && exporter.job.result.is_some()
         });
         match exporter.job.result.take() {
-            Some(Err(message)) => assert!(
-                message.contains("boom in export"),
-                "the panic message should surface, got: {message}"
-            ),
+            Some(Err(ExportError::Panicked(message))) => {
+                assert!(
+                    message.contains("boom in export"),
+                    "the panic message should surface, got: {message}"
+                );
+                let display = format!("{}", ExportError::Panicked(message));
+                assert!(display.starts_with("panicked:"), "Display format: {display}");
+            }
+            Some(Err(other)) => panic!("expected Panicked, got: {other}"),
             Some(Ok(_)) => panic!("expected a failed export, got a successful result"),
             None => panic!("expected a failed export result, got none"),
         }
@@ -469,7 +495,9 @@ mod worker_tests {
             while !ctx.token().is_cancelled() {
                 std::thread::yield_now();
             }
-            Err("value produced after cancel — must be discarded".to_string())
+            Err(ExportError::Panicked(
+                "value produced after cancel — must be discarded".into(),
+            ))
         });
         exporter.cancel();
         wait_until(|| {
@@ -493,7 +521,11 @@ mod worker_tests {
         match io.result.take() {
             Some(ProjectIoResult::Failed { path, error }) => {
                 assert_eq!(path, PathBuf::from("project.terra"));
-                assert!(error.contains("io boom"), "got: {error}");
+                assert!(
+                    matches!(error, ProjectIoError::Job(JobError::Panicked(_))),
+                    "expected a Job(Panicked) error, got: {error}"
+                );
+                assert!(error.to_string().contains("io boom"), "got: {error}");
             }
             other => panic!("expected a Failed result, got {other:?}"),
         }
@@ -542,7 +574,7 @@ mod worker_tests {
         let (gate_tx, gate_rx) = mpsc::channel::<()>();
         exporter.start_job(move |_ctx| {
             gate_rx.recv().expect("await release");
-            Err("done".to_string())
+            Err(ExportError::Panicked("done".into()))
         });
         let busy = exporter.pump();
         assert!(busy.busy, "export in flight");
@@ -568,7 +600,9 @@ mod worker_tests {
             while !ctx.token().is_cancelled() {
                 std::thread::yield_now();
             }
-            Err("produced after cancel — must be discarded".to_string())
+            Err(ExportError::Panicked(
+                "produced after cancel — must be discarded".into(),
+            ))
         });
         assert!(exporter.pump().busy, "busy until cancelled");
 
@@ -607,5 +641,130 @@ mod worker_tests {
             io.result.take(),
             Some(ProjectIoResult::Saved { .. })
         ));
+    }
+
+    // ---- Typed-error boundary tests (#76) ----
+
+    #[test]
+    fn load_malformed_json_crosses_worker_as_document_error() {
+        let path = std::env::temp_dir().join(format!(
+            "terra-io-bad-json-{}.terra",
+            std::process::id()
+        ));
+        std::fs::write(&path, "{ not json").expect("write fixture");
+
+        let mut io = BackgroundProjectIo::new();
+        io.start_load(path.clone());
+        wait_until(|| {
+            io.poll();
+            !io.is_busy() && io.result.is_some()
+        });
+        match io.result.take() {
+            Some(ProjectIoResult::Failed { error, .. }) => {
+                assert!(
+                    matches!(error, ProjectIoError::Document(_)),
+                    "malformed JSON must surface as Document, got: {error}"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_missing_file_crosses_worker_as_fs_error() {
+        let path = std::env::temp_dir().join(format!(
+            "terra-io-missing-{}-nonexistent.terra",
+            std::process::id()
+        ));
+        assert!(!path.exists(), "fixture must not exist");
+
+        let mut io = BackgroundProjectIo::new();
+        io.start_load(path);
+        wait_until(|| {
+            io.poll();
+            !io.is_busy() && io.result.is_some()
+        });
+        match io.result.take() {
+            Some(ProjectIoResult::Failed { error, .. }) => {
+                match &error {
+                    ProjectIoError::Fs(e) => {
+                        assert_eq!(e.kind(), std::io::ErrorKind::NotFound);
+                    }
+                    _ => panic!("expected Fs(NotFound), got: {error}"),
+                }
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn save_into_missing_directory_crosses_worker_as_fs_error() {
+        let path = std::env::temp_dir().join(format!(
+            "terra-io-nodir-{}/deep/project.terra",
+            std::process::id()
+        ));
+        assert!(!path.parent().unwrap().exists(), "parent must not exist");
+
+        let doc = TerrainDocument::new_default();
+        let mut io = BackgroundProjectIo::new();
+        io.start_save(doc, path);
+        wait_until(|| {
+            io.poll();
+            !io.is_busy() && io.result.is_some()
+        });
+        match io.result.take() {
+            Some(ProjectIoResult::Failed { error, .. }) => {
+                assert!(
+                    matches!(error, ProjectIoError::Fs(_)),
+                    "write into missing dir must surface as Fs, got: {error}"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn export_eval_failure_crosses_worker_typed() {
+        let mut doc = flat_doc();
+        doc.export_resolution = 0;
+
+        let mut exporter = BackgroundExporter::new();
+        exporter.start(doc, std::env::temp_dir());
+        wait_until(|| {
+            exporter.poll();
+            exporter.job.done && exporter.job.result.is_some()
+        });
+        match exporter.job.result.take() {
+            Some(Err(ExportError::Eval(terra_core::eval::EvalError::InvalidMetrics(_)))) => {}
+            other => panic!(
+                "expected Eval(InvalidMetrics), got: {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn export_package_failure_crosses_worker_typed() {
+        let doc = flat_doc();
+        // Point out_dir at a regular file so create_dir_all fails.
+        let blocker = std::env::temp_dir().join(format!(
+            "terra-io-export-blocker-{}",
+            std::process::id()
+        ));
+        std::fs::write(&blocker, b"block").expect("write blocker");
+
+        let mut exporter = BackgroundExporter::new();
+        exporter.start(doc, blocker.clone());
+        wait_until(|| {
+            exporter.poll();
+            exporter.job.done && exporter.job.result.is_some()
+        });
+        match exporter.job.result.take() {
+            Some(Err(ExportError::Package(IoError::Io(_)))) => {}
+            other => panic!(
+                "expected Package(Io(_)), got: {other:?}"
+            ),
+        }
+        let _ = std::fs::remove_file(&blocker);
     }
 }

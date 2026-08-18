@@ -78,6 +78,7 @@ impl TerraApp {
             }
             ProjectIoResult::Failed { path, error } => {
                 self.pending_enter_after_save = None;
+                log::error!("{} failed: {error}", path.display());
                 self.ui_state.status = format!("{} failed: {error}", path.display());
                 if let Some(w) = &self.window {
                     w.request_redraw();

@@ -456,6 +456,7 @@ impl ApplicationHandler for TerraApp {
                     self.ui_state.status = format!("Exported {}", res.height_path.display());
                 }
                 Err(err) => {
+                    log::error!("export failed: {err}");
                     self.ui_state.status = format!("Export failed: {err}");
                 }
             }

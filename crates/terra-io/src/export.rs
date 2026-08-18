@@ -44,6 +44,7 @@ impl Default for ExportRequest {
     }
 }
 
+#[derive(Debug)]
 pub struct ExportResult {
     pub height_path: PathBuf,
     pub height_metadata_path: PathBuf,
