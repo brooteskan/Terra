@@ -901,11 +901,58 @@ fn apply_stroke_sample(
     }
 }
 
-/// Stamp + reconcile core shared by the whole-field [`apply_sculpt_strokes`] and
-/// the region-scoped [`apply_sculpt_strokes_scoped`] entries, so the two cannot
-/// drift. `rect` is an inclusive sample rectangle `(i0, i1, j0, j1)` that bounds
-/// the reconcile pass; each stroke additionally stamps only the intersection of
-/// `rect` with its own padded footprint ([`stroke_footprint_rect`]).
+/// The mutable accumulation state of a stroke stamp: the running height plus the
+/// five per-texel aux channels, *before* the final reconcile pass. A prefix
+/// checkpoint (#123) is exactly a snapshot of this after stamping the first `k`
+/// list positions; resuming a stamp clones one of these and stamps the rest.
+#[derive(Clone)]
+struct SculptStampState {
+    out: Heightfield,
+    protect: Vec<f32>,
+    uplift: Vec<f32>,
+    hardness: Vec<f32>,
+    sediment: Vec<f32>,
+    edited: Vec<f32>,
+}
+
+impl SculptStampState {
+    /// Seed from the layer input: `out = input`, every aux channel zeroed — the
+    /// state before any stroke has been stamped (the `k == 0` checkpoint).
+    fn seed(input: &Heightfield) -> Self {
+        let m = input.metrics;
+        let n = (m.width * m.height) as usize;
+        Self {
+            out: input.clone(),
+            protect: vec![0.0; n],
+            uplift: vec![0.0; n],
+            hardness: vec![0.0; n],
+            sediment: vec![0.0; n],
+            edited: vec![0.0; n],
+        }
+    }
+
+    /// Resident bytes of the six buffers (height interior + halos + five dense aux
+    /// channels), for the prefix store's memory budget.
+    fn resident_bytes(&self) -> usize {
+        let aux = self.protect.len()
+            + self.uplift.len()
+            + self.hardness.len()
+            + self.sediment.len()
+            + self.edited.len();
+        self.out.resident_bytes() + aux * std::mem::size_of::<f32>()
+    }
+}
+
+/// Stamp each of `strokes` into `state`, culled to its padded footprint ∩ `rect`.
+/// Shared by the whole-field [`apply_sculpt_strokes`], the region-scoped
+/// [`apply_sculpt_strokes_scoped`], and the prefix-resumed apply (#123), so none
+/// of them can drift. `base` is the layer input — invariant across strokes.
+///
+/// **Resuming is bit-identical.** Every list position's write is a pure function
+/// of the running `state` and `base`, applied strictly in order, so stamping
+/// `[a..b)` into a state and then `[b..c)` yields exactly the buffers that
+/// stamping `[a..c)` in one pass would — which is what lets a checkpoint after `k`
+/// strokes seed a stamp of `[k..]`.
 ///
 /// **The per-stroke footprint cull is semantics-preserving.** `smoothstep_weight`
 /// is exactly zero at `distance >= radius`, so every texel outside a stroke's
@@ -917,103 +964,127 @@ fn apply_stroke_sample(
 /// Smooth/Pinch/Coastline 3×3 and Flatten's footprint-mean scan read `base` (the
 /// layer input, invariant across strokes) or, for the mean, an `out` that prior
 /// strokes have fully stamped over that footprint — never a texel this cull could
-/// have left stale. Stroke chaining is preserved: outside a stroke's footprint the
-/// pre-#122 full-field stamp was already a no-op, so `out` after each stroke is
-/// bit-identical to visiting every texel.
+/// have left stale.
+fn stamp_strokes(
+    state: &mut SculptStampState,
+    base: &Heightfield,
+    strokes: &[SculptStroke],
+    rect: (u32, u32, u32, u32),
+) {
+    let m = base.metrics;
+    // A degenerate (0-size) field has no samples, and the inclusive `rect` a
+    // caller derives from `saturating_sub(1)` would name a phantom (0,0); guard
+    // the loops so the caller falls through to the (empty) aux fields.
+    if m.width == 0 || m.height == 0 {
+        return;
+    }
+    let (r_i0, r_i1, r_j0, r_j1) = rect;
+    for stroke in strokes {
+        if !stroke.enabled {
+            continue;
+        }
+        // Cull to the stroke's padded footprint ∩ rect. A stroke with no
+        // footprint (empty points) or whose footprint misses the rect
+        // contributes nothing inside it — exactly what the full-field weight
+        // test would find (`w == 0` at every such texel).
+        let Some((si0, si1, sj0, sj1)) = stroke_footprint_rect(stroke, &m) else {
+            continue;
+        };
+        let (i0, i1) = (si0.max(r_i0), si1.min(r_i1));
+        let (j0, j1) = (sj0.max(r_j0), sj1.min(r_j1));
+        if i0 > i1 || j0 > j1 {
+            continue;
+        }
+        let flatten_target = flatten_target_for(stroke, &state.out, &m);
+        for j in j0..=j1 {
+            for i in i0..=i1 {
+                let x = m.world_x(i);
+                let z = m.world_z(j);
+                let (distance, pressure) =
+                    distance_to_polyline(x, z, &stroke.points, m.world_size_x, m.world_size_z);
+                let w = smoothstep_weight(distance, stroke.radius_m, stroke.falloff) * pressure;
+                if w <= 0.0 {
+                    continue;
+                }
+                let idx = (j * m.width + i) as usize;
+                state.edited[idx] = state.edited[idx].max(w);
+                let h = state.out.get(i, j);
+                let next = apply_stroke_sample(
+                    stroke,
+                    base,
+                    i,
+                    j,
+                    h,
+                    distance,
+                    w,
+                    flatten_target,
+                    &mut state.protect[idx],
+                    &mut state.uplift[idx],
+                    &mut state.hardness[idx],
+                    &mut state.sediment[idx],
+                );
+                state.out.set(i, j, next);
+            }
+        }
+    }
+}
+
+/// Reconcile `state` over `rect` and package the height + five aux fields. Borrows
+/// `state` (cloning `out` once for the reconciled result) so the pre-reconcile
+/// state survives as a reusable prefix checkpoint (#123).
 ///
 /// The reconcile pass stays bounded to the *whole* `rect` (not per-stroke): where
 /// `edited == 0` it computes `src + (avg - src) * 0.0`, which normalizes `-0.0` to
 /// `+0.0`. Bounding it to stroke footprints would leave `-0.0` behind — a real bit
 /// difference. It is a single O(rect) pass, independent of stroke count, so it is
-/// not what the cull targets.
+/// never checkpointed: it always reruns on the final (possibly resumed) state.
+fn finish_stamp(
+    state: &SculptStampState,
+    reconcile: f32,
+    rect: (u32, u32, u32, u32),
+) -> AuthoringResult {
+    let m = state.out.metrics;
+    let mut out = state.out.clone();
+    if m.width > 0 && m.height > 0 && reconcile > 0.0 {
+        let (r_i0, r_i1, r_j0, r_j1) = rect;
+        // Read the pre-reconcile state, write the fresh copy: identical to the
+        // legacy `let src = out.clone()` because the two are bit-equal at entry.
+        let src = &state.out;
+        for j in r_j0..=r_j1 {
+            for i in r_i0..=r_i1 {
+                let idx = (j * m.width + i) as usize;
+                let a = reconcile.clamp(0.0, 1.0) * state.edited[idx] * 0.35;
+                out.set(
+                    i,
+                    j,
+                    src.get(i, j) + (neighborhood_average(src, i, j) - src.get(i, j)) * a,
+                );
+            }
+        }
+    }
+    AuthoringResult::new(out)
+        .field(keys::SCULPT_PROTECTION, MaskField::from_raw(m, &state.protect))
+        .field(keys::UPLIFT_RATE, MaskField::from_raw(m, &state.uplift))
+        .field(keys::HARDNESS, MaskField::from_raw(m, &state.hardness))
+        .field(keys::SEDIMENT_THICKNESS, MaskField::from_raw(m, &state.sediment))
+        .field(keys::EDIT_REGION, MaskField::from_raw(m, &state.edited))
+}
+
+/// Stamp + reconcile core shared by the whole-field [`apply_sculpt_strokes`] and
+/// the region-scoped [`apply_sculpt_strokes_scoped`] entries. `rect` is an
+/// inclusive sample rectangle `(i0, i1, j0, j1)` that bounds the reconcile pass;
+/// each stroke additionally stamps only the intersection of `rect` with its own
+/// padded footprint. Composition of [`stamp_strokes`] over the whole stroke list
+/// and [`finish_stamp`]; see those for the cull and resume invariants.
 fn apply_strokes_in_rect(
     input: &Heightfield,
     p: &SculptStrokeParams,
     rect: (u32, u32, u32, u32),
 ) -> AuthoringResult {
-    let m = input.metrics;
-    let (r_i0, r_i1, r_j0, r_j1) = rect;
-    let mut out = input.clone();
-    let n = (m.width * m.height) as usize;
-    let mut protect: Vec<f32> = vec![0.0; n];
-    let mut uplift: Vec<f32> = vec![0.0; n];
-    let mut hardness: Vec<f32> = vec![0.0; n];
-    let mut sediment: Vec<f32> = vec![0.0; n];
-    let mut edited: Vec<f32> = vec![0.0; n];
     let base = input.clone();
-    // A degenerate (0-size) field has no samples, and the inclusive `rect` a
-    // caller derives from `saturating_sub(1)` would name a phantom (0,0); guard
-    // the loops and fall through to the (empty) aux fields.
-    if m.width > 0 && m.height > 0 {
-        for stroke in &p.strokes {
-            if !stroke.enabled {
-                continue;
-            }
-            // Cull to the stroke's padded footprint ∩ rect. A stroke with no
-            // footprint (empty points) or whose footprint misses the rect
-            // contributes nothing inside it — exactly what the full-field weight
-            // test would find (`w == 0` at every such texel).
-            let Some((si0, si1, sj0, sj1)) = stroke_footprint_rect(stroke, &m) else {
-                continue;
-            };
-            let (i0, i1) = (si0.max(r_i0), si1.min(r_i1));
-            let (j0, j1) = (sj0.max(r_j0), sj1.min(r_j1));
-            if i0 > i1 || j0 > j1 {
-                continue;
-            }
-            let flatten_target = flatten_target_for(stroke, &out, &m);
-            for j in j0..=j1 {
-                for i in i0..=i1 {
-                    let x = m.world_x(i);
-                    let z = m.world_z(j);
-                    let (distance, pressure) =
-                        distance_to_polyline(x, z, &stroke.points, m.world_size_x, m.world_size_z);
-                    let w = smoothstep_weight(distance, stroke.radius_m, stroke.falloff) * pressure;
-                    if w <= 0.0 {
-                        continue;
-                    }
-                    let idx = (j * m.width + i) as usize;
-                    edited[idx] = edited[idx].max(w);
-                    let h = out.get(i, j);
-                    let next = apply_stroke_sample(
-                        stroke,
-                        &base,
-                        i,
-                        j,
-                        h,
-                        distance,
-                        w,
-                        flatten_target,
-                        &mut protect[idx],
-                        &mut uplift[idx],
-                        &mut hardness[idx],
-                        &mut sediment[idx],
-                    );
-                    out.set(i, j, next);
-                }
-            }
-        }
-        if p.reconcile > 0.0 {
-            let src = out.clone();
-            for j in r_j0..=r_j1 {
-                for i in r_i0..=r_i1 {
-                    let idx = (j * m.width + i) as usize;
-                    let a = p.reconcile.clamp(0.0, 1.0) * edited[idx] * 0.35;
-                    out.set(
-                        i,
-                        j,
-                        src.get(i, j) + (neighborhood_average(&src, i, j) - src.get(i, j)) * a,
-                    );
-                }
-            }
-        }
-    }
-    AuthoringResult::new(out)
-        .field(keys::SCULPT_PROTECTION, MaskField::from_raw(m, &protect))
-        .field(keys::UPLIFT_RATE, MaskField::from_raw(m, &uplift))
-        .field(keys::HARDNESS, MaskField::from_raw(m, &hardness))
-        .field(keys::SEDIMENT_THICKNESS, MaskField::from_raw(m, &sediment))
-        .field(keys::EDIT_REGION, MaskField::from_raw(m, &edited))
+    let mut state = SculptStampState::seed(input);
+    stamp_strokes(&mut state, &base, &p.strokes, rect);
+    finish_stamp(&state, p.reconcile, rect)
 }
 
 /// Apply every enabled stroke over the whole field, then reconcile.
@@ -1117,6 +1188,355 @@ pub fn apply_sculpt_strokes_scoped(
     // stamped by prior strokes first, so its footprint mean (and thus every scope
     // sample) matches the whole-field result exactly.
     apply_strokes_in_rect(input, p, (i0, i1, j0, j1))
+}
+
+// ---------------------------------------------------------------------------
+// Prefix-checkpoint cache (#123)
+//
+// `SculptStrokes` is one opaque layer holding N strokes; the evaluator's layer
+// cache is all-or-nothing across it, so editing one stroke re-stamps the whole
+// set from the layer input every eval. When the strokes are few but large (each
+// footprint 10–40 % of the field), that stamp — O(Σ stroke_footprint × points) —
+// dominates a Full rebuild even though the #122 bbox cull and #110/#121 tile
+// scoping are already in play (large footprints defeat both).
+//
+// The stamp of the first `k` list positions is a pure, strictly-sequential
+// function of the layer input and `strokes[..k]`. Caching a snapshot of the
+// pre-reconcile [`SculptStampState`] after position `k` (a *prefix checkpoint*)
+// lets a later edit resume from the deepest checkpoint whose prefix still matches
+// and stamp only the changed suffix. The dominant interactive case — appending a
+// stroke — resumes from the previous tail and stamps exactly one stroke, turning
+// O(Σ all strokes) into O(one stroke's footprint).
+// ---------------------------------------------------------------------------
+
+/// One prefix checkpoint: the pre-reconcile stamp state after the first `k` list
+/// positions of a stroke list have been stamped whole-field.
+#[derive(Clone)]
+struct SculptCheckpoint {
+    k: usize,
+    state: SculptStampState,
+}
+
+/// Per-layer prefix-checkpoint entry for a `SculptStrokes` layer (#123). Owned by
+/// the evaluator across edits; validated against the incoming layer input on every
+/// reuse so it can never return a stale result.
+///
+/// `base` is the layer input the checkpoints were stamped from. It does double
+/// duty: the immutable `base` argument the stamp reads (Smooth/Pinch/Coastline
+/// 3×3, Flatten mean) *and* the validity anchor — an incoming input that is not
+/// bit-identical (or a metrics change) discards the entry. Storing it therefore
+/// costs no memory the resume did not already need.
+pub struct SculptPrefixEntry {
+    base: Heightfield,
+    strokes: Vec<SculptStroke>,
+    /// Ascending-`k` checkpoints. The tail (`k == strokes.len()`) is always
+    /// present; pre-tail (`k == n-1`) and one divergence checkpoint are kept
+    /// best-effort under the store's memory budget.
+    checkpoints: Vec<SculptCheckpoint>,
+}
+
+impl SculptPrefixEntry {
+    /// Reusable only when stamped from a bit-identical input at identical metrics.
+    /// Uses `to_bits` so `-0.0`/`+0.0` and any NaN pattern compare exactly — the
+    /// strict side, which at worst forces an unnecessary cold rebuild, never a
+    /// wrong resume.
+    fn matches_input(&self, input: &Heightfield) -> bool {
+        if self.base.metrics != input.metrics {
+            return false;
+        }
+        self.base
+            .tiles()
+            .iter()
+            .zip(input.tiles())
+            .all(|(a, b)| {
+                a.data().len() == b.data().len()
+                    && a.data()
+                        .iter()
+                        .zip(b.data())
+                        .all(|(p, q)| p.to_bits() == q.to_bits())
+            })
+    }
+
+    /// The deepest stored checkpoint at `k <= limit`, or `None` if only the seed
+    /// (`k == 0`) applies.
+    fn checkpoint_at_most(&self, limit: usize) -> Option<&SculptCheckpoint> {
+        self.checkpoints
+            .iter()
+            .filter(|c| c.k <= limit)
+            .max_by_key(|c| c.k)
+    }
+
+    /// Total resident bytes of the anchor input plus every checkpoint's six
+    /// buffers — the figure the store's budget sums.
+    pub fn resident_bytes(&self) -> usize {
+        self.base.resident_bytes()
+            + self
+                .checkpoints
+                .iter()
+                .map(|c| c.state.resident_bytes())
+                .sum::<usize>()
+    }
+
+    /// Drop every checkpoint but the tail (highest `k`) under memory pressure. The
+    /// tail is what keeps the next append O(one stroke), so it is never evicted.
+    pub fn drop_non_tail(&mut self) {
+        if let Some(max_k) = self.checkpoints.iter().map(|c| c.k).max() {
+            self.checkpoints.retain(|c| c.k == max_k);
+        }
+    }
+
+    /// Number of stored checkpoints (observability / tests).
+    pub fn checkpoint_count(&self) -> usize {
+        self.checkpoints.len()
+    }
+}
+
+/// Outcome of a cached apply, for telemetry and tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SculptApplyStats {
+    /// Checkpoint `k` the stamp resumed from (`0` = cold, seeded from the input).
+    pub resumed_from: usize,
+    /// List positions stamped this call (`stroke_count - resumed_from`). `0` is a
+    /// no-op re-eval (only the `reconcile` slider or nothing changed).
+    pub restamped: usize,
+    /// Total enabled+disabled list positions (`strokes.len()`).
+    pub stroke_count: usize,
+}
+
+/// Longest prefix over which two stroke lists are elementwise equal. Positions
+/// count disabled strokes too, so toggling `enabled` diverges at that position.
+/// A NaN param makes even identical-looking strokes compare unequal, so the match
+/// stops early and the stamp resumes shallower — never reusing a mismatched
+/// prefix.
+fn matching_prefix_len(a: &[SculptStroke], b: &[SculptStroke]) -> usize {
+    let mut k = 0;
+    while k < a.len() && k < b.len() && a[k] == b[k] {
+        k += 1;
+    }
+    k
+}
+
+/// Whole-field apply that resumes from a prefix checkpoint (#123) and rebuilds the
+/// entry in place.
+///
+/// Validates `entry` against `input`, resumes the stamp from the deepest checkpoint
+/// whose prefix still matches `p.strokes`, stamps the changed suffix, and stores a
+/// refreshed entry retaining the tail plus (best-effort) pre-tail and one
+/// divergence checkpoint. Output is bit-identical to [`apply_sculpt_strokes`] for
+/// the same params — the checkpoint only replays a stamp the sequential loop would
+/// have produced anyway.
+///
+/// **Panic-safe by construction.** The prior entry is `take`n up front, so `*entry`
+/// is `None` for the whole body; a panic mid-stamp simply leaves it `None` and the
+/// next eval runs cold, never trusting half-updated buffers.
+pub fn apply_sculpt_strokes_cached(
+    input: &Heightfield,
+    p: &SculptStrokeParams,
+    entry: &mut Option<SculptPrefixEntry>,
+) -> (AuthoringResult, SculptApplyStats) {
+    let m = input.metrics;
+    let rect = (0, m.width.saturating_sub(1), 0, m.height.saturating_sub(1));
+    let n = p.strokes.len();
+
+    // No strokes: nothing to checkpoint. Drop any entry and apply directly.
+    if n == 0 {
+        *entry = None;
+        return (
+            apply_strokes_in_rect(input, p, rect),
+            SculptApplyStats {
+                resumed_from: 0,
+                restamped: 0,
+                stroke_count: 0,
+            },
+        );
+    }
+
+    // Take the prior entry (panic-safety, see doc); keep it only if still valid.
+    let prior = entry.take().filter(|e| e.matches_input(input));
+
+    // Own the base buffer once: the validated prior base (no clone) or a fresh
+    // clone of the input.
+    let (base, prior_strokes, mut prior_cps) = match prior {
+        Some(e) => (e.base, e.strokes, e.checkpoints),
+        None => (input.clone(), Vec::new(), Vec::new()),
+    };
+
+    // Any prior checkpoint at `k <= match_k` stamped an identical prefix.
+    let match_k = matching_prefix_len(&prior_strokes, &p.strokes);
+    prior_cps.retain(|cp| cp.k <= match_k);
+    prior_cps.sort_by_key(|cp| cp.k);
+
+    // Resume from the deepest still-valid checkpoint (cloning its state into the
+    // working buffers), or a cold seed.
+    let resume_k = prior_cps.last().map(|cp| cp.k).unwrap_or(0);
+    let mut state = match prior_cps.last() {
+        Some(cp) => cp.state.clone(),
+        None => SculptStampState::seed(input),
+    };
+
+    // Retention points besides the always-kept tail (`k == n`):
+    //   * pre-tail (`k == n-1`): a drag growing the last stroke resumes here.
+    //   * divergence (`k == match_k`): re-editing the first changed stroke resumes
+    //     here — only when a strict interior point (`0 < match_k < n-1`); a no-op
+    //     (`match_k == n`) or a last-stroke edit fold into tail / pre-tail.
+    let pre_tail_k = if n >= 2 { Some(n - 1) } else { None };
+    let divergence_k = if match_k > 0 && match_k + 1 < n {
+        Some(match_k)
+    } else {
+        None
+    };
+    let is_wanted = |k: usize| Some(k) == pre_tail_k || Some(k) == divergence_k;
+
+    // Carry still-valid prior checkpoints at a wanted `k` forward by move (no
+    // clone). The hot path lands here: append/drag resume from `k == n-1`, exactly
+    // `pre_tail_k`, so the old tail/pre-tail is reused rather than re-snapshotted.
+    let mut new_cps: Vec<SculptCheckpoint> = Vec::new();
+    for cp in prior_cps.drain(..) {
+        if cp.k > 0 && cp.k < n && is_wanted(cp.k) {
+            new_cps.push(cp);
+        }
+    }
+
+    // Stamp the changed suffix one position at a time, snapshotting fresh
+    // checkpoints at wanted interior `k`s not already held.
+    for k in resume_k..n {
+        stamp_strokes(&mut state, &base, std::slice::from_ref(&p.strokes[k]), rect);
+        let running = k + 1;
+        if running < n && is_wanted(running) && !new_cps.iter().any(|c| c.k == running) {
+            new_cps.push(SculptCheckpoint {
+                k: running,
+                state: state.clone(),
+            });
+        }
+    }
+
+    let result = finish_stamp(&state, p.reconcile, rect);
+    // Tail (`k == n`): move the final state in, no clone.
+    new_cps.push(SculptCheckpoint { k: n, state });
+    new_cps.sort_by_key(|c| c.k);
+
+    let stats = SculptApplyStats {
+        resumed_from: resume_k,
+        restamped: n - resume_k,
+        stroke_count: n,
+    };
+    *entry = Some(SculptPrefixEntry {
+        base,
+        strokes: p.strokes.clone(),
+        checkpoints: new_cps,
+    });
+    (result, stats)
+}
+
+/// Overlay the inclusive sample `rect` of `src`'s six buffers onto `dst`. Seeds a
+/// scoped stamp's working rectangle from a whole-field prefix checkpoint (#123);
+/// outside `rect`, `dst` keeps its seed (the layer input, zeroed aux) so the
+/// reconcile pass reads the same one-past-`rect` neighbour an unresumed scoped
+/// stamp would.
+fn overlay_state_rect(
+    dst: &mut SculptStampState,
+    src: &SculptStampState,
+    rect: (u32, u32, u32, u32),
+) {
+    let m = dst.out.metrics;
+    if m.width == 0 || m.height == 0 {
+        return;
+    }
+    let (i0, i1, j0, j1) = rect;
+    for j in j0..=j1 {
+        for i in i0..=i1 {
+            let idx = (j * m.width + i) as usize;
+            dst.out.set(i, j, src.out.get(i, j));
+            dst.protect[idx] = src.protect[idx];
+            dst.uplift[idx] = src.uplift[idx];
+            dst.hardness[idx] = src.hardness[idx];
+            dst.sediment[idx] = src.sediment[idx];
+            dst.edited[idx] = src.edited[idx];
+        }
+    }
+}
+
+/// Whether any enabled stroke in `strokes` has a padded footprint intersecting
+/// `rect` — i.e. the prefix actually contributes inside the scoped rectangle, so
+/// seeding from its checkpoint is worthwhile rather than a pointless copy.
+fn prefix_reaches_rect(
+    strokes: &[SculptStroke],
+    m: &HeightfieldMetrics,
+    rect: (u32, u32, u32, u32),
+) -> bool {
+    let (i0, i1, j0, j1) = rect;
+    strokes.iter().any(|s| {
+        s.enabled
+            && stroke_footprint_rect(s, m)
+                .is_some_and(|(a, b, c, d)| a <= i1 && b >= i0 && c <= j1 && d >= j0)
+    })
+}
+
+/// Region-scoped apply that resumes from a whole-field prefix checkpoint (#123).
+///
+/// Resolves the same working rectangle `S` as [`apply_sculpt_strokes_scoped`] via
+/// the stroke-footprint fixpoint, then — when a base-identical `entry` offers a
+/// prefix checkpoint whose strokes reach `S` — seeds the `S` region of the stamp
+/// from that checkpoint and stamps only the changed suffix over `S`. Falls back to
+/// the unresumed scoped stamp otherwise.
+///
+/// **Bit-identical to [`apply_sculpt_strokes_scoped`] over `S`.** The fixpoint
+/// guarantees every stroke intersecting `S` has its *whole* footprint inside `S`,
+/// so the whole-field prefix state restricted to `S` equals the scoped prefix
+/// stamp over `S` (identical strokes, identical Flatten means over footprints
+/// `⊆ S`). Seeding `S` from the checkpoint and continuing the sequential stamp
+/// therefore replays exactly what an unresumed scoped stamp of `[0..]` would.
+pub fn apply_sculpt_strokes_scoped_resumed(
+    input: &Heightfield,
+    p: &SculptStrokeParams,
+    scope: &[TileId],
+    entry: Option<&SculptPrefixEntry>,
+) -> AuthoringResult {
+    let m = input.metrics;
+    let Some((mut i0, mut i1, mut j0, mut j1)) = scope_rect_dilated(input, scope) else {
+        return AuthoringResult::new(input.clone());
+    };
+    // Fixpoint: absorb the full footprint of every stroke intersecting S (same as
+    // the unresumed scoped apply).
+    loop {
+        let mut grew = false;
+        for stroke in &p.strokes {
+            if !stroke.enabled {
+                continue;
+            }
+            let Some((si0, si1, sj0, sj1)) = stroke_footprint_rect(stroke, &m) else {
+                continue;
+            };
+            if si0 <= i1 && si1 >= i0 && sj0 <= j1 && sj1 >= j0 {
+                let grown = (i0.min(si0), i1.max(si1), j0.min(sj0), j1.max(sj1));
+                if grown != (i0, i1, j0, j1) {
+                    (i0, i1, j0, j1) = grown;
+                    grew = true;
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    let rect = (i0, i1, j0, j1);
+
+    // Resume from a valid whole-field checkpoint when its prefix actually reaches
+    // S; otherwise stamp the whole list over S as before.
+    if let Some(e) = entry {
+        if e.matches_input(input) {
+            let k0limit = matching_prefix_len(&e.strokes, &p.strokes);
+            if let Some(cp) = e.checkpoint_at_most(k0limit) {
+                if cp.k > 0 && prefix_reaches_rect(&p.strokes[..cp.k], &m, rect) {
+                    let mut state = SculptStampState::seed(input);
+                    overlay_state_rect(&mut state, &cp.state, rect);
+                    stamp_strokes(&mut state, &e.base, &p.strokes[cp.k..], rect);
+                    return finish_stamp(&state, p.reconcile, rect);
+                }
+            }
+        }
+    }
+    apply_strokes_in_rect(input, p, rect)
 }
 
 pub fn apply_constraints(input: &Heightfield, p: &TerrainConstraintParams) -> AuthoringResult {
@@ -2295,5 +2715,186 @@ mod tests {
             let want0 = apply_sculpt_strokes_unculled(&h, &p0);
             assert_result_bit_identical(&got0, &want0, m, "edge-cases-no-reconcile");
         }
+    }
+
+    // --- #123 prefix-checkpoint cache -------------------------------------
+
+    /// Run a cached apply of `p` resuming from `entry`, assert it is bit-identical
+    /// to a fresh whole-field apply (the spec, itself pinned to the unculled
+    /// oracle), and return the observed stats. Rebuilds `entry`.
+    fn cached_step(
+        input: &Heightfield,
+        p: &SculptStrokeParams,
+        entry: &mut Option<SculptPrefixEntry>,
+        m: HeightfieldMetrics,
+        label: &str,
+    ) -> SculptApplyStats {
+        let (got, stats) = apply_sculpt_strokes_cached(input, p, entry);
+        let want = apply_sculpt_strokes(input, p);
+        assert_result_bit_identical(&got, &want, m, label);
+        stats
+    }
+
+    /// The whole contract: an edit sequence through the cached apply stays
+    /// bit-identical to the whole-field apply at every step, across both grids —
+    /// cold build, no-op, reconcile-only, append, drag, early edit, mid edit,
+    /// delete, and disable, including the Flatten that couples across strokes.
+    #[test]
+    fn cached_apply_matches_whole_field_across_edit_sequence() {
+        for m in parity_metrics() {
+            let h = fp_field(m);
+            let mut p = SculptStrokeParams {
+                strokes: vec![
+                    mk_stroke(SculptStrokeKind::Raise, 0.3, 0.4, 120.0),
+                    mk_stroke(SculptStrokeKind::Smooth, 0.5, 0.5, 90.0),
+                    // A Flatten straddling the priors: its footprint mean must be
+                    // recomputed from the resumed running field, not a stale one.
+                    mk_stroke(SculptStrokeKind::Flatten, 0.5, 0.5, 220.0),
+                    mk_stroke(SculptStrokeKind::Uplift, 0.45, 0.5, 80.0),
+                ],
+                reconcile: 0.2,
+            };
+            let mut entry: Option<SculptPrefixEntry> = None;
+
+            let s = cached_step(&h, &p, &mut entry, m, "cold");
+            assert_eq!(s.resumed_from, 0, "cold resumes from the seed");
+            assert_eq!(s.restamped, 4, "cold stamps every stroke");
+            assert!(entry.is_some(), "cold apply leaves an entry");
+
+            let s = cached_step(&h, &p, &mut entry, m, "noop");
+            assert_eq!(s.restamped, 0, "identical params restamp nothing");
+
+            // Reconcile is post-checkpoint: changing it reuses the tail, stamps 0.
+            p.reconcile = 0.35;
+            let s = cached_step(&h, &p, &mut entry, m, "reconcile-only");
+            assert_eq!(s.restamped, 0, "reconcile change reuses the tail checkpoint");
+            p.reconcile = 0.2;
+            cached_step(&h, &p, &mut entry, m, "reconcile-restore");
+
+            // Append: resume from the previous tail, stamp exactly one stroke.
+            p.strokes.push(mk_stroke(SculptStrokeKind::Ridge, 0.7, 0.3, 100.0));
+            let s = cached_step(&h, &p, &mut entry, m, "append");
+            assert_eq!(s.restamped, 1, "append restamps one stroke");
+            assert_eq!(s.resumed_from, p.strokes.len() - 1);
+
+            // Drag: grow the last stroke's polyline — resume from pre-tail, stamp 1.
+            p.strokes.last_mut().unwrap().points.push(spt(0.72, 0.32));
+            let s = cached_step(&h, &p, &mut entry, m, "drag");
+            assert_eq!(s.restamped, 1, "drag on the last stroke restamps one stroke");
+
+            // Edit stroke 0: correct, and (no k<=0 checkpoint but the seed) resumes
+            // cold — the early-edit case the acceptance calls out for correctness.
+            p.strokes[0].strength = 20.0;
+            let s = cached_step(&h, &p, &mut entry, m, "edit-early");
+            assert_eq!(s.resumed_from, 0, "editing stroke 0 resumes from the seed");
+
+            // Mid-list delete then disable: trim-diff isolates the change; both stay
+            // bit-identical to a whole-field rebuild.
+            p.strokes.remove(1);
+            cached_step(&h, &p, &mut entry, m, "delete-mid");
+            p.strokes[0].enabled = false;
+            cached_step(&h, &p, &mut entry, m, "toggle-disable");
+        }
+    }
+
+    /// A repeated edit to the same interior stroke resumes from a divergence
+    /// checkpoint the first such edit leaves behind — the second pays only the
+    /// suffix, not the whole prefix.
+    #[test]
+    fn repeated_interior_edit_resumes_from_divergence_checkpoint() {
+        let m = parity_metrics()[0];
+        let h = fp_field(m);
+        let mut p = SculptStrokeParams {
+            strokes: (0..5)
+                .map(|k| mk_stroke(SculptStrokeKind::Raise, 0.15 + 0.15 * k as f32, 0.5, 90.0))
+                .collect(),
+            reconcile: 0.2,
+        };
+        let mut entry: Option<SculptPrefixEntry> = None;
+        cached_step(&h, &p, &mut entry, m, "cold");
+
+        // First edit to stroke 1: no checkpoint at k<=1 yet, so it resumes cold —
+        // but this apply records a divergence checkpoint at k=1.
+        p.strokes[1].strength = 20.0;
+        let s1 = cached_step(&h, &p, &mut entry, m, "interior-edit-1");
+        assert_eq!(s1.resumed_from, 0, "first interior edit resumes cold");
+
+        // Second edit to the same stroke: resume from the k=1 divergence checkpoint.
+        p.strokes[1].strength = 25.0;
+        let s2 = cached_step(&h, &p, &mut entry, m, "interior-edit-2");
+        assert_eq!(
+            s2.resumed_from, 1,
+            "repeated interior edit resumes from the divergence checkpoint"
+        );
+        assert_eq!(s2.restamped, 4, "and stamps only the suffix");
+    }
+
+    /// A changed layer input (same metrics, different heights) or a metrics change
+    /// invalidates the entry: the apply falls back to a cold rebuild and is still
+    /// bit-identical to the whole-field apply on the new input.
+    #[test]
+    fn changed_input_or_metrics_invalidates_the_entry() {
+        let m = parity_metrics()[0];
+        let h1 = fp_field(m);
+        let p = SculptStrokeParams {
+            strokes: vec![
+                mk_stroke(SculptStrokeKind::Raise, 0.3, 0.4, 120.0),
+                mk_stroke(SculptStrokeKind::Flatten, 0.5, 0.5, 160.0),
+            ],
+            reconcile: 0.2,
+        };
+        let mut entry: Option<SculptPrefixEntry> = None;
+        cached_step(&h1, &p, &mut entry, m, "warm-on-h1");
+
+        // Different heights at identical metrics: the base bit-compare rejects it.
+        let mut h2 = h1.clone();
+        h2.set(m.width / 2, m.height / 2, h1.get(m.width / 2, m.height / 2) + 5.0);
+        let s = cached_step(&h2, &p, &mut entry, m, "changed-input");
+        assert_eq!(s.resumed_from, 0, "a changed input forces a cold rebuild");
+
+        // A metrics change (different resolution) also invalidates.
+        let m2 = parity_metrics()[1];
+        let h3 = fp_field(m2);
+        let s = cached_step(&h3, &p, &mut entry, m2, "changed-metrics");
+        assert_eq!(s.resumed_from, 0, "a metrics change forces a cold rebuild");
+    }
+
+    /// A NaN stroke param never compares equal to itself, so the match stops early
+    /// and the apply degrades to cold — never reusing a mismatched prefix — while
+    /// staying bit-identical (NaN bits included) to the whole-field apply.
+    #[test]
+    fn nan_param_degrades_to_cold_never_wrong() {
+        let m = parity_metrics()[0];
+        let h = fp_field(m);
+        let mut p = SculptStrokeParams {
+            strokes: vec![
+                mk_stroke(SculptStrokeKind::Raise, 0.3, 0.4, 120.0),
+                mk_stroke(SculptStrokeKind::Raise, 0.6, 0.5, 120.0),
+            ],
+            reconcile: 0.2,
+        };
+        let mut entry: Option<SculptPrefixEntry> = None;
+        cached_step(&h, &p, &mut entry, m, "warm");
+        p.strokes[0].strength = f32::NAN;
+        // Re-eval with the NaN twice: both stay bit-identical and never resume past
+        // the NaN stroke.
+        let s = cached_step(&h, &p, &mut entry, m, "nan-1");
+        assert_eq!(s.resumed_from, 0, "the NaN stroke at index 0 blocks any resume");
+        cached_step(&h, &p, &mut entry, m, "nan-2");
+    }
+
+    /// An empty stroke list keeps no entry and still matches the whole-field apply.
+    #[test]
+    fn empty_stroke_list_keeps_no_entry() {
+        let m = parity_metrics()[0];
+        let h = fp_field(m);
+        let p = SculptStrokeParams {
+            strokes: Vec::new(),
+            reconcile: 0.2,
+        };
+        let mut entry: Option<SculptPrefixEntry> = None;
+        let s = cached_step(&h, &p, &mut entry, m, "empty");
+        assert_eq!(s.stroke_count, 0);
+        assert!(entry.is_none(), "an empty list stores no checkpoint");
     }
 }

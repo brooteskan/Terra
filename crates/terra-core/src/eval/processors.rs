@@ -25,6 +25,18 @@ pub struct ProcessorRegistry {
     // No state: built-in kinds are dispatched by the match in `evaluate`.
 }
 
+/// The five per-texel aux channels a `SculptStrokes` apply publishes (max-merged
+/// over any lower layer that wrote the same key). Single source of truth shared by
+/// the stateless registry arm, the prefix-cached whole-field path, and the scoped
+/// re-merge (#123) so the three cannot drift.
+pub(crate) const SCULPT_STROKE_AUX_KEYS: [&str; 5] = [
+    keys::SCULPT_PROTECTION,
+    keys::UPLIFT_RATE,
+    keys::HARDNESS,
+    keys::SEDIMENT_THICKNESS,
+    keys::EDIT_REGION,
+];
+
 impl ProcessorRegistry {
     pub fn builtin() -> Self {
         Self {}
@@ -48,18 +60,11 @@ impl ProcessorRegistry {
         match &layer.kind {
             LayerKind::SculptBase(p) => Ok(generators::sculpt_base(ctx.metrics, p)),
             LayerKind::SculptStrokes(p) => {
+                // Stateless whole-field apply. The evaluator normally intercepts
+                // this kind with the prefix-cached path (#123); this arm is the
+                // fallback for any other caller and the cold-cache reference.
                 let result = authoring::apply_sculpt_strokes(input, p);
-                Ok(publish_authoring_merge(
-                    ctx,
-                    result,
-                    &[
-                        keys::SCULPT_PROTECTION,
-                        keys::UPLIFT_RATE,
-                        keys::HARDNESS,
-                        keys::SEDIMENT_THICKNESS,
-                        keys::EDIT_REGION,
-                    ],
-                ))
+                Ok(publish_authoring_merge(ctx, result, &SCULPT_STROKE_AUX_KEYS))
             }
             LayerKind::TerrainConstraints(p) => {
                 let result = authoring::apply_constraints(input, p);
@@ -830,7 +835,7 @@ fn publish_authoring(ctx: &mut EvalContext, result: authoring::AuthoringResult) 
     ctx.ensure_derived_fields(&result.height);
     result.height
 }
-fn publish_authoring_merge(
+pub(crate) fn publish_authoring_merge(
     ctx: &mut EvalContext,
     mut result: authoring::AuthoringResult,
     merge_keys: &[&'static str],

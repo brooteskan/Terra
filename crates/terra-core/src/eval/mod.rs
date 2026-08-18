@@ -93,6 +93,12 @@ pub struct LayerEvalTiming {
     /// expanded dirty set the scoped recompute actually touched. The recompute
     /// counter the phase-2 equivalence oracle asserts against.
     pub tiles_recomputed: Option<u32>,
+    /// Stroke list positions re-stamped when this was a prefix-cached
+    /// `SculptStrokes` whole-field apply (#123). `None` for every other layer /
+    /// path; `Some(0)` a no-op re-eval; `Some(1)` the hot append/drag case;
+    /// `Some(n)` a cold or deep-prefix rebuild. The prefix-cache counter the #123
+    /// acceptance asserts against.
+    pub strokes_restamped: Option<u32>,
 }
 
 pub struct EvalContext {
@@ -125,6 +131,10 @@ pub struct EvalContext {
     /// via [`StackEvaluator::mark_dirty_from_region`] (phase 4, from the request's
     /// `dirty_region`), so `initial_scope` stays a test-only seam.
     pub initial_scope: Option<Vec<TileId>>,
+    /// One-shot stash for the prefix-cached `SculptStrokes` apply (#123): the
+    /// re-stamped position count, set during that layer's generate and drained by
+    /// the next `record_*_timing` into [`LayerEvalTiming::strokes_restamped`].
+    pub(crate) pending_strokes_restamped: Option<u32>,
 }
 
 impl EvalContext {
@@ -142,6 +152,7 @@ impl EvalContext {
             cancel: CancelToken::never(),
             layer_timings: Vec::new(),
             initial_scope: None,
+            pending_strokes_restamped: None,
         }
     }
 
@@ -211,9 +222,101 @@ impl EvalContext {
     }
 }
 
+/// Global resident-byte budget for the `SculptStrokes` prefix-checkpoint store
+/// (#123). At Full 4096² one checkpoint is ~402 MB (height + five aux) and the
+/// anchor input ~67 MB, so 1 GiB holds base + tail + pre-tail for one large stroke
+/// layer (append and drag stay fast) and trims the optional divergence checkpoint
+/// under pressure. At ≤2048² every retained checkpoint fits comfortably.
+const SCULPT_PREFIX_BUDGET_BYTES: usize = 1024 * 1024 * 1024;
+
+/// Per-layer prefix-checkpoint store for `SculptStrokes` (#123). Whole-field
+/// applies populate it (one entry per layer, keyed by [`LayerId`]); scoped applies
+/// read it without writing. Bounded by [`SCULPT_PREFIX_BUDGET_BYTES`].
+struct SculptPrefixStore {
+    entries: HashMap<LayerId, crate::authoring::SculptPrefixEntry>,
+    budget_bytes: usize,
+}
+
+impl SculptPrefixStore {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            budget_bytes: SCULPT_PREFIX_BUDGET_BYTES,
+        }
+    }
+
+    /// Remove and return the entry for `id` so a cached apply can consume + rebuild
+    /// it; the caller re-inserts via [`Self::put`] on success.
+    fn take(&mut self, id: LayerId) -> Option<crate::authoring::SculptPrefixEntry> {
+        self.entries.remove(&id)
+    }
+
+    /// Read-only lookup for the scoped resume path (never mutates the store).
+    fn get(&self, id: LayerId) -> Option<&crate::authoring::SculptPrefixEntry> {
+        self.entries.get(&id)
+    }
+
+    /// Store a rebuilt entry and trim the store back to budget, protecting this
+    /// entry's tail.
+    fn put(&mut self, id: LayerId, entry: crate::authoring::SculptPrefixEntry) {
+        self.entries.insert(id, entry);
+        self.enforce_budget(id);
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    /// Drop entries for layers no longer in the stack (deleted layers).
+    fn retain_layers(&mut self, live: &HashSet<LayerId>) {
+        self.entries.retain(|id, _| live.contains(id));
+    }
+
+    fn total_bytes(&self) -> usize {
+        self.entries.values().map(|e| e.resident_bytes()).sum()
+    }
+
+    /// Trim to [`Self::budget_bytes`], always preserving `keep`'s tail checkpoint
+    /// (the O(1)-append seed). In order: drop other entries' non-tail checkpoints,
+    /// then evict other entries whole, then drop `keep`'s own non-tail checkpoints.
+    fn enforce_budget(&mut self, keep: LayerId) {
+        if self.total_bytes() <= self.budget_bytes {
+            return;
+        }
+        for (id, entry) in self.entries.iter_mut() {
+            if *id != keep {
+                entry.drop_non_tail();
+            }
+        }
+        if self.total_bytes() <= self.budget_bytes {
+            return;
+        }
+        let others: Vec<LayerId> = self
+            .entries
+            .keys()
+            .copied()
+            .filter(|id| *id != keep)
+            .collect();
+        for id in others {
+            if self.total_bytes() <= self.budget_bytes {
+                break;
+            }
+            self.entries.remove(&id);
+        }
+        if self.total_bytes() > self.budget_bytes {
+            if let Some(entry) = self.entries.get_mut(&keep) {
+                entry.drop_non_tail();
+            }
+        }
+    }
+}
+
 pub struct StackEvaluator {
     pub registry: ProcessorRegistry,
     pub cache: LayerCache,
+    /// Prefix-checkpoint cache for `SculptStrokes` layers (#123). Survives across
+    /// edits so an interactive stroke resumes an earlier stamp.
+    sculpt_prefix: SculptPrefixStore,
 }
 
 impl Default for StackEvaluator {
@@ -227,6 +330,7 @@ impl StackEvaluator {
         Self {
             registry: ProcessorRegistry::builtin(),
             cache: LayerCache::new(),
+            sculpt_prefix: SculptPrefixStore::new(),
         }
     }
 
@@ -314,6 +418,7 @@ impl StackEvaluator {
     /// Discard every layer cache entry (project switch / hard reset).
     pub fn clear_project_caches(&mut self) {
         self.cache.clear();
+        self.sculpt_prefix.clear();
     }
 
     /// Full rebuild (Phase 1 path) — tree walk so scoped groups compose correctly.
@@ -324,6 +429,9 @@ impl StackEvaluator {
     ) -> Result<Heightfield, EvalError> {
         profiling::scope!("rebuild_all");
         self.cache.clear();
+        // A cold rebuild re-stamps from scratch; the whole-field SculptStrokes arm
+        // repopulates the prefix store as it goes.
+        self.sculpt_prefix.clear();
         let seed = Heightfield::zeros(ctx.metrics);
         self.evaluate_nodes(&stack.nodes, ctx, &seed)
     }
@@ -347,6 +455,10 @@ impl StackEvaluator {
         if layers.is_empty() {
             return Ok(Heightfield::zeros(ctx.metrics));
         }
+
+        // Release prefix checkpoints for layers that no longer exist (deletes).
+        let live_ids: HashSet<LayerId> = layers.iter().map(|l| l.id()).collect();
+        self.sculpt_prefix.retain_layers(&live_ids);
 
         let metrics = ctx.metrics;
         let first_dirty = layers.iter().position(|l| {
@@ -704,7 +816,15 @@ impl StackEvaluator {
 
         let scaled_layer = layer_with_world_scale(layer, ctx.level_steps.world_scale);
         let mut bound_layer = apply_param_bindings(ctx, &scaled_layer);
-        let generated = self.registry.evaluate(ctx, input, &bound_layer)?;
+        // SculptStrokes takes the prefix-cached whole-field path (#123): an edit
+        // resumes an earlier stamp instead of re-stamping the whole stroke set.
+        // Every other kind dispatches through the stateless registry as before.
+        let generated = match &bound_layer.kind {
+            crate::layer::LayerKind::SculptStrokes(p) => {
+                self.eval_sculpt_strokes_cached(ctx, input, p, layer.id())?
+            }
+            _ => self.registry.evaluate(ctx, input, &bound_layer)?,
+        };
         // Avoid unused-mut warning if future passes mutate further.
         let _ = &mut bound_layer;
         let mask = effective_layer_mask(ctx, &layer.common.masks, input);
@@ -731,6 +851,32 @@ impl StackEvaluator {
         publish_layer_outputs(ctx, layer, &out);
         record_layer_timing(ctx, layer, timing_started, LayerEvalStatus::Computed);
         Ok(out)
+    }
+
+    /// Whole-field `SculptStrokes` generate via the prefix-checkpoint cache (#123).
+    ///
+    /// Consumes the layer's stored entry, resumes the stamp from the deepest
+    /// matching prefix, rebuilds + re-stores the entry, and publishes the five aux
+    /// channels exactly as the stateless registry arm does. Stashes the re-stamped
+    /// position count for this layer's timing record.
+    fn eval_sculpt_strokes_cached(
+        &mut self,
+        ctx: &mut EvalContext,
+        input: &Heightfield,
+        p: &crate::authoring::SculptStrokeParams,
+        layer_id: LayerId,
+    ) -> Result<Heightfield, EvalError> {
+        let mut slot = self.sculpt_prefix.take(layer_id);
+        let (result, stats) = crate::authoring::apply_sculpt_strokes_cached(input, p, &mut slot);
+        if let Some(entry) = slot {
+            self.sculpt_prefix.put(layer_id, entry);
+        }
+        ctx.pending_strokes_restamped = Some(stats.restamped as u32);
+        Ok(processors::publish_authoring_merge(
+            ctx,
+            result,
+            &processors::SCULPT_STROKE_AUX_KEYS,
+        ))
     }
 
     /// Tile-scoped recompute of one layer (#100 phase 2), panic-contained exactly
@@ -1049,16 +1195,18 @@ impl StackEvaluator {
         layer_id: LayerId,
         scope: &[TileId],
     ) -> Result<Heightfield, EvalError> {
-        use crate::field_data::keys;
         let metrics = ctx.metrics;
-        let result = crate::authoring::apply_sculpt_strokes_scoped(input, p, scope);
-        let aux_keys = [
-            keys::SCULPT_PROTECTION,
-            keys::UPLIFT_RATE,
-            keys::HARDNESS,
-            keys::SEDIMENT_THICKNESS,
-            keys::EDIT_REGION,
-        ];
+        // Resume the scoped stamp from a whole-field prefix checkpoint when one is
+        // available (#123): seed the working rect from the checkpoint and stamp
+        // only the changed suffix over it. Read-only store access — scoped runs
+        // never store (a result restricted to `S` is not a whole-field checkpoint).
+        let result = crate::authoring::apply_sculpt_strokes_scoped_resumed(
+            input,
+            p,
+            scope,
+            self.sculpt_prefix.get(layer_id),
+        );
+        let aux_keys = processors::SCULPT_STROKE_AUX_KEYS;
         let n = (metrics.width * metrics.height) as usize;
         for key in aux_keys {
             // Aux entering from below (a lower layer that also wrote this key),
@@ -1169,6 +1317,7 @@ fn record_layer_timing(
     started: Instant,
     status: LayerEvalStatus,
 ) {
+    let strokes_restamped = ctx.pending_strokes_restamped.take();
     ctx.layer_timings.push(LayerEvalTiming {
         layer: layer.id(),
         layer_name: layer.common.name.clone(),
@@ -1176,12 +1325,14 @@ fn record_layer_timing(
         elapsed_us: started.elapsed().as_micros() as u64,
         status,
         tiles_recomputed: None,
+        strokes_restamped,
     });
 }
 
 /// Timing for a layer that ran tile-scoped, tagged with the size of the tile set
 /// it recomputed (the phase-2 recompute counter).
 fn record_scoped_layer_timing(ctx: &mut EvalContext, layer: &Layer, started: Instant, tiles: u32) {
+    let strokes_restamped = ctx.pending_strokes_restamped.take();
     ctx.layer_timings.push(LayerEvalTiming {
         layer: layer.id(),
         layer_name: layer.common.name.clone(),
@@ -1189,10 +1340,12 @@ fn record_scoped_layer_timing(ctx: &mut EvalContext, layer: &Layer, started: Ins
         elapsed_us: started.elapsed().as_micros() as u64,
         status: LayerEvalStatus::Computed,
         tiles_recomputed: Some(tiles),
+        strokes_restamped,
     });
 }
 
 fn record_reused_layer(ctx: &mut EvalContext, layer: &Layer) {
+    let strokes_restamped = ctx.pending_strokes_restamped.take();
     ctx.layer_timings.push(LayerEvalTiming {
         layer: layer.id(),
         layer_name: layer.common.name.clone(),
@@ -1200,6 +1353,7 @@ fn record_reused_layer(ctx: &mut EvalContext, layer: &Layer) {
         elapsed_us: 0,
         status: LayerEvalStatus::CacheHit,
         tiles_recomputed: None,
+        strokes_restamped,
     });
 }
 
@@ -2137,6 +2291,159 @@ mod tests {
         assert!(
             !eval.cache.is_dirty(layer_b),
             "sibling layer cache should stay clean"
+        );
+    }
+
+    // --- #123 prefix-checkpoint cache -------------------------------------
+
+    /// The evaluator surfaces the prefix cache end to end: after a warm whole-field
+    /// build, appending a stroke and rebuilding whole-field restamps exactly one
+    /// stroke (reported in `strokes_restamped`) and stays bit-identical to a cold
+    /// rebuild of the appended stack.
+    #[test]
+    fn appended_stroke_restamps_one_and_matches_cold_rebuild() {
+        use crate::authoring::{SculptPoint, SculptStroke, SculptStrokeKind, SculptStrokeParams};
+        use crate::layer::{Layer, SculptParams};
+
+        let m = HeightfieldMetrics::new(96, 96, 1500.0, 1500.0);
+        let mut sculpt = SculptParams::filled(96, 0.0);
+        for j in 0..96 {
+            for i in 0..96 {
+                sculpt.samples[(j * 96 + i) as usize] = 20.0 + i as f32 * 0.1 + j as f32 * 0.05;
+            }
+        }
+        let stroke = |u, v| SculptStroke {
+            kind: SculptStrokeKind::Raise,
+            points: vec![SculptPoint { u, v, pressure: 1.0 }],
+            radius_m: 200.0,
+            strength: 6.0,
+            target_height: 0.0,
+            falloff: 1.5,
+            enabled: true,
+        };
+        let start = SculptStrokeParams {
+            strokes: vec![stroke(0.3, 0.4), stroke(0.5, 0.5), stroke(0.7, 0.6)],
+            reconcile: 0.15,
+        };
+        let mut stack = LayerStack::new();
+        stack.push(Layer::new("Sculpt", LayerKind::SculptBase(sculpt)));
+        let strokes_layer = Layer::new("Strokes", LayerKind::SculptStrokes(start));
+        let strokes_id = strokes_layer.id();
+        stack.push(strokes_layer);
+
+        // Warm whole-field build populates the prefix store.
+        let mut eval = StackEvaluator::new();
+        eval.mark_all_dirty(&stack);
+        let mut ctx = EvalContext::new(m);
+        eval.rebuild_incremental(&stack, &mut ctx).expect("warm build");
+
+        // Append a stroke to the same layer, then rebuild whole-field again.
+        if let Some(l) = stack.find_mut(strokes_id) {
+            if let LayerKind::SculptStrokes(p) = &mut l.kind {
+                p.strokes.push(stroke(0.4, 0.7));
+            }
+        }
+        eval.mark_all_dirty(&stack);
+        let mut ctx2 = EvalContext::new(m);
+        let warm_out = eval
+            .rebuild_incremental(&stack, &mut ctx2)
+            .expect("append rebuild");
+
+        let timing = ctx2
+            .layer_timings
+            .iter()
+            .find(|t| t.layer == strokes_id)
+            .expect("sculpt layer timing");
+        assert_eq!(
+            timing.strokes_restamped,
+            Some(1),
+            "append restamps exactly one stroke via the prefix cache"
+        );
+
+        // Cold control on the appended stack.
+        let mut cold = StackEvaluator::new();
+        cold.mark_all_dirty(&stack);
+        let mut cctx = EvalContext::new(m);
+        let cold_out = cold
+            .rebuild_incremental(&stack, &mut cctx)
+            .expect("cold rebuild");
+
+        for j in 0..m.height {
+            for i in 0..m.width {
+                assert_eq!(
+                    warm_out.get(i, j).to_bits(),
+                    cold_out.get(i, j).to_bits(),
+                    "prefix-resumed append diverged from the cold rebuild at ({i},{j})"
+                );
+            }
+        }
+    }
+
+    /// The store honours its byte budget: inserting a second entry when only one
+    /// fits evicts the untouched entry while preserving the just-touched entry's
+    /// tail checkpoint (the O(1)-append seed).
+    #[test]
+    fn sculpt_prefix_store_evicts_untouched_but_keeps_touched_tail() {
+        use crate::authoring::{
+            apply_sculpt_strokes_cached, SculptPoint, SculptStroke, SculptStrokeKind,
+            SculptStrokeParams,
+        };
+
+        let m = HeightfieldMetrics::new(64, 64, 1000.0, 1000.0);
+        let h = Heightfield::zeros(m);
+        let p = SculptStrokeParams {
+            strokes: (0..4)
+                .map(|k| SculptStroke {
+                    kind: SculptStrokeKind::Raise,
+                    points: vec![SculptPoint {
+                        u: 0.2 + 0.15 * k as f32,
+                        v: 0.5,
+                        pressure: 1.0,
+                    }],
+                    radius_m: 120.0,
+                    strength: 5.0,
+                    target_height: 0.0,
+                    falloff: 1.5,
+                    enabled: true,
+                })
+                .collect(),
+            reconcile: 0.2,
+        };
+        let build = || {
+            let mut e = None;
+            apply_sculpt_strokes_cached(&h, &p, &mut e);
+            e.expect("cached apply leaves an entry")
+        };
+        let e1 = build();
+        let e2 = build();
+        let per = e1.resident_bytes();
+        assert!(
+            e1.checkpoint_count() >= 2,
+            "a multi-stroke cold apply keeps pre-tail + tail"
+        );
+
+        let id1 = LayerId::new();
+        let id2 = LayerId::new();
+        // A budget admitting a single entry: inserting the second evicts the first.
+        let mut store = SculptPrefixStore {
+            entries: HashMap::new(),
+            budget_bytes: per,
+        };
+        store.entries.insert(id1, e1);
+        store.put(id2, e2);
+
+        assert!(
+            store.total_bytes() <= store.budget_bytes,
+            "store trimmed back to budget"
+        );
+        assert!(store.get(id2).is_some(), "the just-touched entry survives");
+        assert!(
+            store.get(id2).unwrap().checkpoint_count() >= 1,
+            "the touched entry keeps its tail"
+        );
+        assert!(
+            store.get(id1).is_none(),
+            "the untouched entry is evicted under pressure"
         );
     }
 }

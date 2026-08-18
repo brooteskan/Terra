@@ -247,6 +247,15 @@ impl Heightfield {
         &mut self.tiles
     }
 
+    /// Resident sample bytes across all tiles (interior + halo `f32`s). Excludes
+    /// the fixed per-tile/-field struct overhead; used to size in-memory caches.
+    pub fn resident_bytes(&self) -> usize {
+        self.tiles
+            .iter()
+            .map(|t| std::mem::size_of_val(t.data()))
+            .sum()
+    }
+
     fn tile_index(&self, id: TileId) -> Option<usize> {
         if id.tx >= self.metrics.tiles_x() || id.tz >= self.metrics.tiles_z() {
             return None;
