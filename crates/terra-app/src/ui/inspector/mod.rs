@@ -1242,6 +1242,8 @@ fn draw_tool_inspector(ui: &mut GuiContext<'_>, doc: &TerrainDocument, ui_state:
     } else {
         slider_f32(ui, "Strength (m)", &mut ui_state.sculpt_strength, 0.5, 40.0);
     }
+    // Brush edge hardness → stroke falloff (0 soft/broad … 1 hard/pointed).
+    slider_f32(ui, "Falloff", &mut ui_state.brush_falloff, 0.0, 1.0);
     if let Some(base) = doc
         .stack
         .flatten_layers()

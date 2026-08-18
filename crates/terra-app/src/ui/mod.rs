@@ -692,6 +692,15 @@ impl UiState {
         }
     }
 
+    /// Map the brush edge-hardness [`Self::brush_falloff`] (0 soft … 1 hard) onto a
+    /// sculpt stroke's falloff exponent (`smoothstep_weight(..).powf(falloff)`):
+    /// a low exponent spreads the brush broadly, a high one draws it to a point.
+    /// The 0.5 default lands near the historical 1.5 so existing strokes read the same.
+    pub fn sculpt_falloff_exponent(&self) -> f32 {
+        let hardness = self.brush_falloff.clamp(0.0, 1.0);
+        0.4 + 5.0 * hardness * hardness
+    }
+
     /// Remember and arm an editor tool. Sculpt brushes update [`Self::last_sculpt_tool`].
     pub fn set_editor_tool(&mut self, tool: EditorTool) {
         if tool.is_sculpt() {

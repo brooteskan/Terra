@@ -263,6 +263,7 @@ pub(crate) fn try_apply(
             stroke_kind,
             target_height,
         } => {
+            let falloff = app.ui_state.sculpt_falloff_exponent();
             if let Some(target) = app.session.document.stack.find_mut(layer) {
                 let continuing = app.last_paint_uv.is_some();
                 let world_radius = radius
@@ -280,6 +281,17 @@ pub(crate) fn try_apply(
                         target_height,
                         continuing,
                     );
+                    // Brush strength / edge-falloff apply to the stroke being painted.
+                    // `stamp_stroke` sets these only when it creates a new stroke, so a
+                    // continuing drag would freeze them at the first dab's values —
+                    // refresh the active stroke each dab so the sliders stay live.
+                    // Falloff has no other UI path onto the stroke, so this is what
+                    // makes the Falloff control affect sculpt strokes at all.
+                    if let Some(last) = params.strokes.last_mut() {
+                        last.strength = strength;
+                        last.falloff = falloff;
+                        last.target_height = target_height;
+                    }
                     ctx.dirty_from = Some(layer);
                     app.session.document.selected = Some(layer);
                     app.ui_state.shape_session_layer = Some(layer);
@@ -495,5 +507,62 @@ mod tests {
             !app.worker_mark_all_dirty,
             "a bounded sculpt edit must not escalate to whole-field"
         );
+    }
+
+    /// The brush strength and edge-falloff must land on the painted stroke: falloff
+    /// has no other UI path onto the stroke IR, and strength must stay live across a
+    /// continuing drag (not freeze at the first dab). Regression for the "falloff /
+    /// strength don't affect raise strokes" report.
+    #[test]
+    fn brush_strength_and_falloff_reach_the_painted_stroke() {
+        use terra_core::layer::LayerKind;
+
+        let mut app = TerraApp::default();
+        let layer = create_shape_layer("Shape");
+        let id = layer.id();
+        app.session.document.stack = LayerStack::new();
+        app.session.document.stack.push(layer);
+        app.session.document.selected = Some(id);
+        app.last_paint_uv = None;
+
+        // Soft brush, first dab: creates the stroke.
+        app.ui_state.brush_falloff = 0.2;
+        let soft_falloff = app.ui_state.sculpt_falloff_exponent();
+        app.apply_actions(vec![PanelAction::PaintSculptStamp {
+            layer: id,
+            u: 0.5,
+            v: 0.5,
+            radius: 0.05,
+            strength: 7.0,
+            stroke_kind: SculptStrokeKind::Raise,
+            target_height: 0.0,
+        }]);
+        let stroke = |app: &TerraApp| match &app.session.document.stack.find(id).unwrap().kind {
+            LayerKind::SculptStrokes(p) => p.strokes.last().unwrap().clone(),
+            other => panic!("expected SculptStrokes, got {other:?}"),
+        };
+        let first = stroke(&app);
+        assert_eq!(first.strength, 7.0);
+        assert!((first.falloff - soft_falloff).abs() < 1e-6);
+
+        // Continue the same drag with a harder brush and higher strength: the active
+        // stroke must pick up both, not stay frozen at the first dab's values.
+        app.last_paint_uv = Some((0.5, 0.5));
+        app.ui_state.brush_falloff = 0.9;
+        let hard_falloff = app.ui_state.sculpt_falloff_exponent();
+        assert!(hard_falloff > soft_falloff, "harder brush => larger exponent");
+        app.apply_actions(vec![PanelAction::PaintSculptStamp {
+            layer: id,
+            u: 0.52,
+            v: 0.5,
+            radius: 0.05,
+            strength: 30.0,
+            stroke_kind: SculptStrokeKind::Raise,
+            target_height: 0.0,
+        }]);
+        let updated = stroke(&app);
+        assert_eq!(updated.points.len(), 2, "same stroke, appended point");
+        assert_eq!(updated.strength, 30.0, "strength stays live mid-drag");
+        assert!((updated.falloff - hard_falloff).abs() < 1e-6, "falloff stays live");
     }
 }
