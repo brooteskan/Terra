@@ -857,10 +857,10 @@ mod tests {
             LayerKind::SculptStrokes(Default::default()).intrinsic_reach(),
             Reach::Localized { halo_samples: 1 }
         );
-        // Grows to two when a base-neighborhood stroke (Smooth or Pinch) feeds a
-        // non-zero reconcile: the base 3x3 shifts the stamped field, then reconcile
-        // re-reads it. Without reconcile such a stroke stays at the one-sample floor
-        // (its own base read).
+        // Grows to two when a base-neighborhood stroke (Smooth, Pinch, or Coastline)
+        // feeds a non-zero reconcile: the base 3x3 shifts the stamped field, then
+        // reconcile re-reads it. Without reconcile such a stroke stays at the one-sample
+        // floor (its own base read).
         use crate::authoring::{SculptStroke, SculptStrokeKind, SculptStrokeParams};
         let base_neighborhood_strokes = |kind, reconcile| {
             LayerKind::SculptStrokes(SculptStrokeParams {
@@ -871,7 +871,11 @@ mod tests {
                 reconcile,
             })
         };
-        for kind in [SculptStrokeKind::Smooth, SculptStrokeKind::Pinch] {
+        for kind in [
+            SculptStrokeKind::Smooth,
+            SculptStrokeKind::Pinch,
+            SculptStrokeKind::Coastline,
+        ] {
             assert_eq!(
                 base_neighborhood_strokes(kind, 0.15).intrinsic_reach(),
                 Reach::Localized { halo_samples: 2 },

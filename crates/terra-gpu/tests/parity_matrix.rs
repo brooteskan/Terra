@@ -287,8 +287,8 @@ fn pt(u: f32, v: f32, pressure: f32) -> SculptPoint {
 }
 
 /// Stroke set exercising every GPU-supported kind (per-sample maps + distance
-/// stamps + an alias + an aux-only kind + the base-neighborhood Smooth and Pinch),
-/// with multi-point polylines, varied pressure, and a single-point stroke.
+/// stamps + an alias + an aux-only kind + the base-neighborhood Smooth, Pinch, and
+/// Coastline), with multi-point polylines, varied pressure, and a single-point stroke.
 fn supported_stroke_set(reconcile: f32) -> SculptStrokeParams {
     let stroke = |kind, points, radius_m, strength, target_height| SculptStroke {
         kind,
@@ -366,6 +366,21 @@ fn supported_stroke_set(reconcile: f32) -> SculptStrokeParams {
                 vec![pt(0.6, 0.95, 1.0), pt(0.4, 0.75, 1.0)],
                 60.0,
                 5.0,
+                0.0,
+            ),
+            // Coastline lowers the sample by `abs(strength * w) * 0.25`, blends it 0.55
+            // toward the clamped 3x3 mean of `src`, then gates the whole thing by `w`
+            // (`h * (1 - w)` at the falloff edge). Unlike Smooth/Pinch it uses *both*
+            // weights — `s = strength * w` in the lowering term and `w` in the gate — so
+            // it catches an s-vs-w swap as well as a running-vs-`src` average. Routed
+            // across the CraterStamp bowl (0.65, 0.55), where the running height sits
+            // well below `base`, and out to the (0.95, 0.45) right border — a clamped
+            // edge neither Smooth (top-left) nor Pinch (bottom) visits.
+            stroke(
+                SculptStrokeKind::Coastline,
+                vec![pt(0.95, 0.45, 1.0), pt(0.65, 0.55, 1.0)],
+                60.0,
+                6.0,
                 0.0,
             ),
         ],
