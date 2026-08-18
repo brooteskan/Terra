@@ -79,6 +79,20 @@ impl SculptStrokeKind {
             Self::HeightStamp => "Height Stamp",
         }
     }
+
+    /// Mode byte for the legacy foundation raster (`SculptParams::stamp_circle`:
+    /// 0 raise, 1 lower, 2 smooth, 3 flatten). `None` = the foundation path
+    /// cannot represent this brush; route it to a Shape (`SculptStrokes`) layer,
+    /// which implements every kind.
+    pub fn foundation_mode(self) -> Option<u8> {
+        match self {
+            Self::Raise => Some(0),
+            Self::Lower | Self::Erode => Some(1),
+            Self::Smooth | Self::Pinch => Some(2),
+            Self::Flatten => Some(3),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]

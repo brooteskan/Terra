@@ -197,9 +197,13 @@ pub fn resolve_shape_target(
         {
             return ShapeTargetDecision::UseExisting(id);
         }
+        // The Foundation only keeps a stroke it can actually represent on the
+        // legacy raster path. Brushes it can't (Terrace, Inflate, stamps, …)
+        // fall through to a Shape Layer instead of silently becoming Raise (#97).
         if stack
             .find(id)
             .is_some_and(|l| matches!(l.kind, LayerKind::SculptBase(_)))
+            && tool.stroke_kind().foundation_mode().is_some()
         {
             return ShapeTargetDecision::UseExisting(id);
         }
@@ -381,6 +385,73 @@ mod tests {
             ShapeTargetDecision::UseExisting(id),
             "selecting a Shape Layer must keep strokes on that layer"
         );
+    }
+
+    fn base_stack() -> (LayerStack, LayerId) {
+        let mut stack = LayerStack::new();
+        let layer = Layer::new(
+            "Base",
+            LayerKind::SculptBase(crate::layer::SculptParams::filled(8, 0.0)),
+        );
+        let id = layer.id();
+        stack.push(layer);
+        (stack, id)
+    }
+
+    #[test]
+    fn foundation_keeps_supported_brush() {
+        // A brush the legacy foundation raster implements stays on the Base layer.
+        let (stack, id) = base_stack();
+        let d = resolve_shape_target(
+            &stack,
+            Some(id),
+            ShapeEditMode::NewLayerPerSession,
+            None,
+            ShapeTool::Lower,
+        );
+        assert_eq!(d, ShapeTargetDecision::UseExisting(id));
+    }
+
+    #[test]
+    fn foundation_redirects_unsupported_brush_to_new_shape_layer() {
+        // Terrace / Inflate / stamps aren't representable on the foundation raster;
+        // rather than silently raising, the stroke retargets to a Shape Layer (#97).
+        let (stack, base) = base_stack();
+        for tool in [
+            ShapeTool::Terrace,
+            ShapeTool::Inflate,
+            ShapeTool::MountainStamp,
+        ] {
+            let d = resolve_shape_target(
+                &stack,
+                Some(base),
+                ShapeEditMode::NewLayerPerSession,
+                None,
+                tool,
+            );
+            match d {
+                ShapeTargetDecision::CreateNew { tool: got, .. } => assert_eq!(got, tool),
+                other => panic!("{tool:?} must create a Shape Layer, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn foundation_redirect_prefers_live_session_shape_layer() {
+        // With a Shape session layer live, an unsupported foundation brush appends
+        // there instead of spawning yet another layer.
+        let (mut stack, base) = base_stack();
+        let shape = create_shape_layer("Terraces");
+        let shape_id = shape.id();
+        stack.push(shape);
+        let d = resolve_shape_target(
+            &stack,
+            Some(base),
+            ShapeEditMode::NewLayerPerSession,
+            Some(shape_id),
+            ShapeTool::Terrace,
+        );
+        assert_eq!(d, ShapeTargetDecision::UseExisting(shape_id));
     }
 
     #[test]

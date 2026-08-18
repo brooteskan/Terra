@@ -354,17 +354,19 @@ pub(crate) fn try_apply(
                     app.session.document.selected = Some(layer);
                 } else if let terra_core::layer::LayerKind::SculptBase(params) = &mut target.kind {
                     // Legacy foundation path â€” prefer Shape history for new strokes.
-                    let mode = match stroke_kind {
-                        terra_core::authoring::SculptStrokeKind::Lower
-                        | terra_core::authoring::SculptStrokeKind::Erode => 1u8,
-                        terra_core::authoring::SculptStrokeKind::Smooth
-                        | terra_core::authoring::SculptStrokeKind::Pinch => 2u8,
-                        terra_core::authoring::SculptStrokeKind::Flatten => 3u8,
-                        _ => 0u8,
-                    };
-                    params.stamp_circle(u, v, radius, strength, mode);
-                    ctx.dirty_from = Some(layer);
-                    app.session.document.selected = Some(layer);
+                    // `resolve_shape_target` redirects unsupported brushes to a Shape
+                    // Layer before they reach here; if a programmatic caller lands one
+                    // anyway, refuse rather than silently raising the terrain (#97).
+                    if let Some(mode) = stroke_kind.foundation_mode() {
+                        params.stamp_circle(u, v, radius, strength, mode);
+                        ctx.dirty_from = Some(layer);
+                        app.session.document.selected = Some(layer);
+                    } else {
+                        app.ui_state.status = format!(
+                            "{} isn't supported on the Foundation layer — use a Shape Layer",
+                            stroke_kind.label()
+                        );
+                    }
                 }
             }
             if ctx.dirty_from == Some(layer) {
@@ -564,5 +566,75 @@ mod tests {
         assert_eq!(updated.points.len(), 2, "same stroke, appended point");
         assert_eq!(updated.strength, 30.0, "strength stays live mid-drag");
         assert!((updated.falloff - hard_falloff).abs() < 1e-6, "falloff stays live");
+    }
+
+    /// #97 regression: a brush the legacy foundation raster can't represent
+    /// (Terrace here) must never silently raise the terrain. Before the fix it
+    /// fell through the mode `match` to `_ => 0` (Raise) and edited the heights.
+    #[test]
+    fn unsupported_foundation_brush_does_not_silently_raise() {
+        use terra_core::layer::{Layer, LayerKind, SculptParams};
+
+        let mut app = TerraApp::default();
+        let base = Layer::new("Base", LayerKind::SculptBase(SculptParams::filled(64, 20.0)));
+        let id = base.id();
+        app.session.document.stack = LayerStack::new();
+        app.session.document.stack.push(base);
+        app.session.document.selected = Some(id);
+
+        let samples = |app: &TerraApp| match &app.session.document.stack.find(id).unwrap().kind {
+            LayerKind::SculptBase(p) => p.samples.clone(),
+            other => panic!("expected SculptBase, got {other:?}"),
+        };
+        let before = samples(&app);
+
+        // Reset dirty tracking so the refusal can be shown to invalidate nothing.
+        app.worker_mark_all_dirty = false;
+        app.worker_dirty_from = None;
+        app.worker_dirty_region = None;
+        app.last_paint_uv = None;
+
+        // Terrace has no foundation mode — it must be refused, not raised.
+        app.apply_actions(vec![PanelAction::PaintSculptStamp {
+            layer: id,
+            u: 0.5,
+            v: 0.5,
+            radius: 0.2,
+            strength: 30.0,
+            stroke_kind: SculptStrokeKind::Terrace,
+            target_height: 0.0,
+        }]);
+
+        assert_eq!(
+            samples(&app),
+            before,
+            "an unsupported foundation brush must not modify heights"
+        );
+        assert!(
+            app.worker_dirty_region.is_none() && app.worker_dirty_from.is_none(),
+            "a refused stroke invalidates nothing"
+        );
+        assert!(!app.worker_mark_all_dirty);
+        assert!(
+            app.ui_state.status.contains("Terrace") && app.ui_state.status.contains("Foundation"),
+            "the artist must be told why the brush did nothing: {:?}",
+            app.ui_state.status
+        );
+
+        // Positive control: a supported brush (Lower) still edits the foundation.
+        app.apply_actions(vec![PanelAction::PaintSculptStamp {
+            layer: id,
+            u: 0.5,
+            v: 0.5,
+            radius: 0.2,
+            strength: 30.0,
+            stroke_kind: SculptStrokeKind::Lower,
+            target_height: 0.0,
+        }]);
+        assert!(
+            samples(&app).iter().any(|&s| s < 20.0),
+            "Lower is supported on the foundation and must lower heights"
+        );
+        assert_eq!(app.session.document.selected, Some(id));
     }
 }
