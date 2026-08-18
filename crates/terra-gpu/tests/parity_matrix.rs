@@ -298,6 +298,7 @@ fn supported_stroke_set(reconcile: f32) -> SculptStrokeParams {
         strength,
         target_height,
         falloff: 1.5,
+        enabled: true,
     };
     SculptStrokeParams {
         strokes: vec![
@@ -507,6 +508,7 @@ fn sculpt_strokes_fall_back_when_a_downstream_layer_consumes_aux() {
                 strength: 4.0,
                 target_height: 0.0,
                 falloff: 1.5,
+                enabled: true,
             }],
             reconcile: 0.15,
         }),

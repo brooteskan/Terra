@@ -151,7 +151,7 @@ const MODULE_DEPENDENCIES: &[(&str, &[&str])] = &[
     ),
     (
         "command",
-        &["layer", "mask", "operation_placement", "raster"],
+        &["authoring", "layer", "mask", "operation_placement", "raster"],
     ),
     (
         "contextual_create",

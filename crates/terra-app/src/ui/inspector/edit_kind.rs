@@ -54,10 +54,22 @@ pub(crate) fn edit_kind(
             changed |= slider_f32(ui, "Fill height", &mut p.fill_height, -100.0, 500.0);
         }
         LayerKind::SculptStrokes(p) => {
-            label(
-                ui,
-                &format!("{} editable semantic stroke(s)", p.strokes.len()),
-            );
+            let disabled = p.strokes.iter().filter(|s| !s.enabled).count();
+            let count_label = if disabled > 0 {
+                format!(
+                    "{} stroke{} \u{00b7} {} disabled",
+                    p.strokes.len(),
+                    if p.strokes.len() == 1 { "" } else { "s" },
+                    disabled,
+                )
+            } else {
+                format!(
+                    "{} stroke{}",
+                    p.strokes.len(),
+                    if p.strokes.len() == 1 { "" } else { "s" },
+                )
+            };
+            label(ui, &count_label);
             changed |= slider_f32(ui, "Reconcile", &mut p.reconcile, 0.0, 1.0);
             if advanced {
                 label(

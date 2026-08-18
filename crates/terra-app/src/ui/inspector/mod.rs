@@ -905,6 +905,49 @@ pub fn draw_inspector_gui(
             {
                 changed = true;
             }
+            if let Some((sel_layer, sel_idx)) = ui_state.selected_stroke {
+                if sel_layer == id {
+                    if let LayerKind::SculptStrokes(p) = &mut kind {
+                        if let Some(stroke) = p.strokes.get_mut(sel_idx) {
+                            section_header(ui, "SELECTED STROKE");
+                            label_dim(
+                                ui,
+                                &format!(
+                                    "{} \u{00b7} {} point{}",
+                                    stroke.kind.label(),
+                                    stroke.points.len(),
+                                    if stroke.points.len() == 1 { "" } else { "s" },
+                                ),
+                            );
+                            changed |= slider_f32(
+                                ui,
+                                "Strength",
+                                &mut stroke.strength,
+                                0.0,
+                                100.0,
+                            );
+                            changed |= slider_f32(
+                                ui,
+                                "Radius",
+                                &mut stroke.radius_m,
+                                1.0,
+                                500.0,
+                            );
+                            changed |=
+                                slider_f32(ui, "Falloff", &mut stroke.falloff, 0.1, 5.0);
+                            changed |= slider_f32(
+                                ui,
+                                "Target Height",
+                                &mut stroke.target_height,
+                                -500.0,
+                                2000.0,
+                            );
+                            changed |=
+                                checkbox(ui, "Enabled", &mut stroke.enabled);
+                        }
+                    }
+                }
+            }
             if changed {
                 actions.push(PanelAction::SetKind { id, kind });
             }

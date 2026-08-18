@@ -24,6 +24,7 @@ pub const TERRAIN_SCOPE_KEY: u64 = 0;
 const CONCEPT_BASE: u128 = 0x0000_0000_5445_5252_C0C3_0000_0000_0000;
 const ADVANCED_BASE: u128 = 0x0000_0000_5445_5252_AD70_0000_0000_0000;
 const MASK_STACK_BASE: u128 = 0x0000_0000_5445_5252_4D53_4B31_0000_0000;
+const STROKE_ROW_BASE: u128 = 0x0000_0000_5445_5252_5354_524B_0000_0000;
 
 /// High-level artist concept folders (presentation only).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -164,6 +165,12 @@ pub fn advanced_placement_id(biome_id: LayerId) -> LayerId {
 
 pub fn mask_stack_row_id(biome_id: LayerId) -> LayerId {
     LayerId::from_u128(MASK_STACK_BASE ^ (biome_id.0.as_u128() & 0xFFFF_FFFF_FFFF_FFFF))
+}
+
+pub fn stroke_row_id(layer_id: LayerId, index: usize) -> LayerId {
+    LayerId::from_u128(
+        STROKE_ROW_BASE ^ (layer_id.0.as_u128() & 0xFFFF_FFFF_FFFF_FFFF) ^ ((index as u128) << 64),
+    )
 }
 
 /// Biome summary line: coverage · enabled · priority · health.

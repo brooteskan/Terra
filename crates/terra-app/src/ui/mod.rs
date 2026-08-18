@@ -282,6 +282,8 @@ pub struct UiState {
     pub outdated_layer_ids: Vec<terra_core::layer::LayerId>,
     /// Cap 1 soft incomplete-project diagnostic for the dock (non-blocking).
     pub soft_project_diag: Option<String>,
+    /// Selected sub-stroke within a SculptStrokes layer (parent layer, vec index).
+    pub selected_stroke: Option<(terra_core::layer::LayerId, usize)>,
 }
 
 /// Presentation-only environment lighting for the 3D viewport.

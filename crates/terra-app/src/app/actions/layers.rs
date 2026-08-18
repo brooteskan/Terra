@@ -148,6 +148,65 @@ pub(crate) fn try_apply(
         }
         PanelAction::Select(id) => {
             app.session.document.selected = Some(id);
+            app.ui_state.selected_stroke = None;
+        }
+        PanelAction::SelectStroke { layer, index } => {
+            app.session.document.selected = Some(layer);
+            app.ui_state.selected_stroke = Some((layer, index));
+            if let Some(l) = app.session.document.stack.find(layer) {
+                if matches!(l.kind, LayerKind::SculptStrokes(_)) {
+                    app.ui_state.shape_session_layer = Some(layer);
+                    app.ui_state.shape_edit_mode =
+                        terra_core::shape_history::ShapeEditMode::ContinueSelected;
+                }
+            }
+        }
+        PanelAction::SetStrokeEnabled {
+            layer,
+            index,
+            enabled,
+        } => {
+            let previous = app
+                .session
+                .document
+                .stack
+                .find(layer)
+                .and_then(|l| {
+                    if let LayerKind::SculptStrokes(p) = &l.kind {
+                        p.strokes.get(index).map(|s| s.enabled)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(true);
+            let cmd = EditorCommand::SetStrokeEnabled {
+                id: layer,
+                index,
+                enabled,
+                previous,
+            };
+            apply(&cmd, &mut app.session.document.stack);
+            app.session.history.push_executed(cmd);
+            ctx.dirty_from = Some(layer);
+            ctx.doc_mutated = true;
+        }
+        PanelAction::DeleteStroke { layer, index } => {
+            if let Some(l) = app.session.document.stack.find(layer) {
+                if let LayerKind::SculptStrokes(p) = &l.kind {
+                    if let Some(stroke) = p.strokes.get(index).cloned() {
+                        let cmd = EditorCommand::RemoveStroke {
+                            id: layer,
+                            index,
+                            stroke,
+                        };
+                        apply(&cmd, &mut app.session.document.stack);
+                        app.session.history.push_executed(cmd);
+                        app.ui_state.selected_stroke = None;
+                        ctx.dirty_from = Some(layer);
+                        ctx.doc_mutated = true;
+                    }
+                }
+            }
         }
         PanelAction::SetEnabled { id, enabled } => {
             let previous = app

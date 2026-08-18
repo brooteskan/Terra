@@ -62,6 +62,19 @@ pub enum PanelAction {
         id: LayerId,
         enabled: bool,
     },
+    SelectStroke {
+        layer: LayerId,
+        index: usize,
+    },
+    SetStrokeEnabled {
+        layer: LayerId,
+        index: usize,
+        enabled: bool,
+    },
+    DeleteStroke {
+        layer: LayerId,
+        index: usize,
+    },
     SetOpacity {
         id: LayerId,
         opacity: f32,

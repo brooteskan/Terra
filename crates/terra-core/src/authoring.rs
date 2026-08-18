@@ -50,6 +50,37 @@ pub enum SculptStrokeKind {
     HeightStamp,
 }
 
+impl SculptStrokeKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Raise => "Raise",
+            Self::Lower => "Lower",
+            Self::Smooth => "Smooth",
+            Self::Flatten => "Flatten",
+            Self::Ridge => "Ridge",
+            Self::Valley => "Valley",
+            Self::Terrace => "Terrace",
+            Self::Roughness => "Roughness",
+            Self::Uplift => "Uplift",
+            Self::Hardness => "Hardness",
+            Self::Sediment => "Sediment",
+            Self::Protect => "Protect",
+            Self::EncourageErosion => "Encourage Erosion",
+            Self::Pinch => "Pinch",
+            Self::Inflate => "Inflate",
+            Self::Erode => "Erode",
+            Self::Noise => "Noise",
+            Self::MountainStamp => "Mountain Stamp",
+            Self::ValleyStamp => "Valley Stamp",
+            Self::PlateauStamp => "Plateau Stamp",
+            Self::CraterStamp => "Crater Stamp",
+            Self::Coastline => "Coastline",
+            Self::RiverPath => "River Path",
+            Self::HeightStamp => "Height Stamp",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct SculptPoint {
     pub u: f32,
@@ -81,6 +112,8 @@ pub struct SculptStroke {
     pub target_height: f32,
     #[serde(default = "sculpt_falloff")]
     pub falloff: f32,
+    #[serde(default = "enabled_default")]
+    pub enabled: bool,
 }
 
 fn one() -> f32 {
@@ -95,6 +128,9 @@ fn sculpt_strength() -> f32 {
 fn sculpt_falloff() -> f32 {
     1.5
 }
+fn enabled_default() -> bool {
+    true
+}
 
 impl Default for SculptStroke {
     fn default() -> Self {
@@ -105,6 +141,7 @@ impl Default for SculptStroke {
             strength: sculpt_strength(),
             target_height: 0.0,
             falloff: sculpt_falloff(),
+            enabled: true,
         }
     }
 }
@@ -691,6 +728,9 @@ pub fn apply_sculpt_strokes(input: &Heightfield, p: &SculptStrokeParams) -> Auth
     let mut edited: Vec<f32> = vec![0.0; n];
     let base = input.clone();
     for stroke in &p.strokes {
+        if !stroke.enabled {
+            continue;
+        }
         let flatten_target = flatten_target_for(stroke, &out, &m);
         for j in 0..m.height {
             for i in 0..m.width {
@@ -799,6 +839,9 @@ pub fn apply_sculpt_strokes_scoped(
     loop {
         let mut grew = false;
         for stroke in &p.strokes {
+            if !stroke.enabled {
+                continue;
+            }
             let Some((si0, si1, sj0, sj1)) = stroke_footprint_rect(stroke, &m) else {
                 continue;
             };
@@ -825,6 +868,9 @@ pub fn apply_sculpt_strokes_scoped(
     let mut edited: Vec<f32> = vec![0.0; n];
     let base = input.clone();
     for stroke in &p.strokes {
+        if !stroke.enabled {
+            continue;
+        }
         // Skip strokes whose footprint does not reach S (no effect inside it).
         match stroke_footprint_rect(stroke, &m) {
             Some((si0, si1, sj0, sj1)) if si0 <= i1 && si1 >= i0 && sj0 <= j1 && sj1 >= j0 => {}
@@ -1224,6 +1270,7 @@ mod tests {
                 strength: 4.0,
                 target_height: 1_000_000.0, // absurd — must be ignored by Flatten
                 falloff: 1.5,
+                enabled: true,
             }],
             ..SculptStrokeParams::default()
         };
@@ -1251,6 +1298,7 @@ mod tests {
             strength: 4.0,
             target_height: 0.0,
             falloff: 1.5,
+            enabled: true,
         };
         let once = apply_sculpt_strokes(
             &h,
@@ -1334,6 +1382,7 @@ mod tests {
                     strength: 8.0,
                     target_height: 0.0,
                     falloff: 1.5,
+                    enabled: true,
                 },
                 SculptStroke {
                     kind: SculptStrokeKind::Smooth,
@@ -1342,6 +1391,7 @@ mod tests {
                     strength: 5.0,
                     target_height: 0.0,
                     falloff: 1.2,
+                    enabled: true,
                 },
                 SculptStroke {
                     kind: SculptStrokeKind::Flatten,
@@ -1350,6 +1400,7 @@ mod tests {
                     strength: 4.0,
                     target_height: 0.0,
                     falloff: 1.5,
+                    enabled: true,
                 },
                 SculptStroke {
                     kind: SculptStrokeKind::Uplift,
@@ -1358,6 +1409,7 @@ mod tests {
                     strength: 3.0,
                     target_height: 0.0,
                     falloff: 1.5,
+                    enabled: true,
                 },
             ],
             reconcile: 0.2,

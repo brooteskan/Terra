@@ -1,5 +1,6 @@
 //! Command-based undo/redo, including bounded snapshots for explicitly resized owned rasters.
 
+use crate::authoring::SculptStroke;
 use crate::layer::{
     BlendMode, GridDimensions, Layer, LayerGroup, LayerId, LayerKind, LayerStack, SculptParams,
     StackNode,
@@ -128,6 +129,17 @@ pub enum EditorCommand {
     ResizeRasterSource {
         target: OwnedRasterTarget,
         stored: StoredRaster,
+    },
+    SetStrokeEnabled {
+        id: LayerId,
+        index: usize,
+        enabled: bool,
+        previous: bool,
+    },
+    RemoveStroke {
+        id: LayerId,
+        index: usize,
+        stroke: SculptStroke,
     },
 }
 
@@ -436,6 +448,15 @@ impl EditorCommand {
             Self::Annotate { label } => label.clone(),
             Self::SetOperationPlacement { .. } => "Changed Apply Where".into(),
             Self::ResizeRasterSource { .. } => "Resized Source Resolution".into(),
+            Self::SetStrokeEnabled { enabled, .. } => if *enabled {
+                "Enabled Stroke"
+            } else {
+                "Disabled Stroke"
+            }
+            .into(),
+            Self::RemoveStroke { stroke, .. } => {
+                format!("Deleted {} Stroke", stroke.kind.label())
+            }
         }
     }
 }
@@ -542,6 +563,29 @@ pub fn apply(cmd: &EditorCommand, stack: &mut LayerStack) -> Option<LayerId> {
             Some(*id)
         }
         EditorCommand::ResizeRasterSource { .. } => None,
+        EditorCommand::SetStrokeEnabled {
+            id, index, enabled, ..
+        } => {
+            if let Some(l) = stack.find_mut(*id) {
+                if let LayerKind::SculptStrokes(p) = &mut l.kind {
+                    if let Some(s) = p.strokes.get_mut(*index) {
+                        s.enabled = *enabled;
+                    }
+                }
+            }
+            Some(*id)
+        }
+        EditorCommand::RemoveStroke { id, index, .. } => {
+            if let Some(l) = stack.find_mut(*id) {
+                if let LayerKind::SculptStrokes(p) = &mut l.kind {
+                    let i = (*index).min(p.strokes.len().saturating_sub(1));
+                    if i < p.strokes.len() {
+                        p.strokes.remove(i);
+                    }
+                }
+            }
+            Some(*id)
+        }
     }
 }
 
@@ -670,6 +714,29 @@ fn invert(cmd: &EditorCommand, stack: &mut LayerStack) -> Option<LayerId> {
             Some(*id)
         }
         EditorCommand::ResizeRasterSource { .. } => None,
+        EditorCommand::SetStrokeEnabled {
+            id, index, previous, ..
+        } => {
+            if let Some(l) = stack.find_mut(*id) {
+                if let LayerKind::SculptStrokes(p) = &mut l.kind {
+                    if let Some(s) = p.strokes.get_mut(*index) {
+                        s.enabled = *previous;
+                    }
+                }
+            }
+            Some(*id)
+        }
+        EditorCommand::RemoveStroke {
+            id, index, stroke, ..
+        } => {
+            if let Some(l) = stack.find_mut(*id) {
+                if let LayerKind::SculptStrokes(p) = &mut l.kind {
+                    let i = (*index).min(p.strokes.len());
+                    p.strokes.insert(i, stroke.clone());
+                }
+            }
+            Some(*id)
+        }
     }
 }
 

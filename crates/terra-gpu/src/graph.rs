@@ -245,15 +245,17 @@ fn gpu_plan_for_layer(layer: &Layer, mask_assets: &[MaskAsset]) -> Option<GpuLay
             if gpu_blend_mode(layer.common.blend).is_some()
                 && p.strokes
                     .iter()
+                    .filter(|s| s.enabled)
                     .all(|stroke| stroke_kind_gpu_supported(stroke.kind)) =>
         {
             let reads_base_neighborhood = p.strokes.iter().any(|stroke| {
-                matches!(
-                    stroke.kind,
-                    SculptStrokeKind::Smooth
-                        | SculptStrokeKind::Pinch
-                        | SculptStrokeKind::Coastline
-                )
+                stroke.enabled
+                    && matches!(
+                        stroke.kind,
+                        SculptStrokeKind::Smooth
+                            | SculptStrokeKind::Pinch
+                            | SculptStrokeKind::Coastline
+                    )
             });
             let halo = u32::from(reads_base_neighborhood) + u32::from(p.reconcile > 0.0);
             (GpuKernel::SculptStrokes, GpuDirtyPolicy::Local, halo)

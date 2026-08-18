@@ -494,12 +494,13 @@ impl LayerKind {
                     + u32::from(
                         p.reconcile > 0.0
                             && p.strokes.iter().any(|s| {
-                                matches!(
-                                    s.kind,
-                                    crate::authoring::SculptStrokeKind::Smooth
-                                        | crate::authoring::SculptStrokeKind::Pinch
-                                        | crate::authoring::SculptStrokeKind::Coastline
-                                )
+                                s.enabled
+                                    && matches!(
+                                        s.kind,
+                                        crate::authoring::SculptStrokeKind::Smooth
+                                            | crate::authoring::SculptStrokeKind::Pinch
+                                            | crate::authoring::SculptStrokeKind::Coastline
+                                    )
                             }),
                     ),
             },

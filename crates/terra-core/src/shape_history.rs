@@ -304,7 +304,9 @@ pub fn stamp_stroke(
     };
     let append = continuing
         && params.strokes.last().is_some_and(|last| {
-            last.kind == kind && (last.radius_m - radius_m).abs() <= radius_m.max(1.0) * 0.05
+            last.enabled
+                && last.kind == kind
+                && (last.radius_m - radius_m).abs() <= radius_m.max(1.0) * 0.05
         });
     if append {
         params.strokes.last_mut().unwrap().points.push(point);
@@ -316,6 +318,7 @@ pub fn stamp_stroke(
             strength,
             target_height,
             falloff: 1.5,
+            enabled: true,
         });
     }
 }

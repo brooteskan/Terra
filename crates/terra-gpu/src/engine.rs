@@ -22,7 +22,7 @@ use terra_core::fields::FieldId;
 use terra_core::heightfield::{Heightfield, HeightfieldMetrics, TileId};
 use terra_core::layer::{
     BlendMode, EffectFilterParams, FractalNoiseType, Layer, LayerId, LayerKind, LayerStack,
-    NoiseParams, SculptParams, SculptStrokeKind, SculptStrokeParams,
+    NoiseParams, SculptParams, SculptStroke, SculptStrokeKind, SculptStrokeParams,
 };
 use terra_core::mask::{MaskAsset, MaskSource};
 use terra_core::tiling::{SampleRect, TileScheduler};
@@ -259,14 +259,14 @@ fn stroke_kind_gpu_id(kind: SculptStrokeKind) -> u32 {
 /// from the per-texel weight test. Both vectors are kept non-empty so the storage
 /// bindings are valid even for an empty stroke set (`stroke_count` gates reads).
 fn build_stroke_buffers(
-    p: &SculptStrokeParams,
+    strokes: &[&SculptStroke],
     m: &HeightfieldMetrics,
 ) -> (Vec<StrokeHeaderGpu>, Vec<[f32; 4]>) {
     let sx = m.world_size_x;
     let sz = m.world_size_z;
-    let mut headers = Vec::with_capacity(p.strokes.len());
+    let mut headers = Vec::with_capacity(strokes.len());
     let mut points: Vec<[f32; 4]> = Vec::new();
-    for stroke in &p.strokes {
+    for stroke in strokes {
         let first_point = points.len() as u32;
         let (mut min_x, mut min_z) = (f32::INFINITY, f32::INFINITY);
         let (mut max_x, mut max_z) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
@@ -2585,7 +2585,9 @@ impl GpuTerrainEngine {
         encoder: &mut wgpu::CommandEncoder,
         p: &SculptStrokeParams,
     ) {
-        let (headers, points) = build_stroke_buffers(p, &self.metrics);
+        let strokes: Vec<&SculptStroke> =
+            p.strokes.iter().filter(|s| s.enabled).collect();
+        let (headers, points) = build_stroke_buffers(&strokes, &self.metrics);
         let header_buf = make_storage_buffer(
             device,
             queue,
@@ -2603,7 +2605,7 @@ impl GpuTerrainEngine {
         let height = self.metrics.height;
         let world_x = self.metrics.world_size_x;
         let world_z = self.metrics.world_size_z;
-        let n = p.strokes.len() as u32;
+        let n = strokes.len() as u32;
         let gx = width.div_ceil(8);
         let gy = height.div_ceil(8);
         let num_partials = gx * gy;
@@ -2664,7 +2666,7 @@ impl GpuTerrainEngine {
         let mut ops: Vec<Op> = Vec::new();
         let mut cur = RunSlot::Src;
         let mut prev = 0u32;
-        for (idx, stroke) in p.strokes.iter().enumerate() {
+        for (idx, stroke) in strokes.iter().enumerate() {
             if !matches!(stroke.kind, SculptStrokeKind::Flatten) {
                 continue;
             }
@@ -3064,10 +3066,12 @@ impl GpuTerrainEngine {
                 // already in range and it settles `h` toward that mean, so it cannot
                 // exceed the current extent — and its `target_height` is ignored (#117).
                 for stroke in &p.strokes {
-                    if matches!(
-                        stroke.kind,
-                        SculptStrokeKind::HeightStamp | SculptStrokeKind::PlateauStamp
-                    ) {
+                    if stroke.enabled
+                        && matches!(
+                            stroke.kind,
+                            SculptStrokeKind::HeightStamp | SculptStrokeKind::PlateauStamp
+                        )
+                    {
                         self.expand_range(stroke.target_height, stroke.target_height);
                     }
                 }
@@ -5079,6 +5083,7 @@ mod smoke_tests {
                 strength,
                 target_height: 0.0,
                 falloff: 1.5,
+                enabled: true,
             }],
             reconcile: 0.15,
         }
