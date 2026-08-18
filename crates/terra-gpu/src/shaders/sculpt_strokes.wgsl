@@ -1,11 +1,13 @@
-// Interactive SculptStrokes preview — stamp pass (#113).
+// Interactive SculptStrokes preview — stamp pass (#113, #114).
 //
-// One dispatch stamps every supported per-sample stroke into `stamp_out`, chaining
-// strokes at each texel exactly as the CPU `apply_sculpt_strokes` does (stroke k+1
-// reads the height stroke k already wrote). `edited_out` receives the max brush
-// weight touching the texel, which the reconcile pass consumes. The neighborhood
-// and reduction kinds (Smooth / Pinch / Coastline / Flatten) never reach the GPU —
-// the planner keeps any layer containing one on the CPU resume.
+// One dispatch stamps every supported stroke into `stamp_out`, chaining strokes at
+// each texel exactly as the CPU `apply_sculpt_strokes` does (stroke k+1 reads the
+// height stroke k already wrote). `edited_out` receives the max brush weight
+// touching the texel, which the reconcile pass consumes. Most supported kinds are
+// per-sample maps of the running height; Smooth (#114) additionally reads a clamped
+// 3x3 of `src` — the layer input (`base` on the CPU), not the running stamp. The
+// remaining neighborhood and reduction kinds (Pinch / Coastline / Flatten) never
+// reach the GPU — the planner keeps any layer containing one on the CPU resume.
 
 struct Uniforms {
     width: u32,
@@ -32,6 +34,7 @@ const KIND_CRATER_STAMP: u32 = 8u;
 const KIND_HEIGHT_STAMP: u32 = 9u;
 const KIND_ERODE: u32 = 10u;
 const KIND_AUX_NOOP: u32 = 11u;
+const KIND_SMOOTH: u32 = 12u;
 
 struct StrokeHeader {
     kind: u32,
@@ -162,6 +165,22 @@ fn round_away(x: f32) -> f32 {
     return sign(x) * floor(abs(x) + 0.5);
 }
 
+// Clamped 3x3 mean of `src` (the layer input) at (px, py) — the GPU port of the CPU
+// `neighborhood_average(base, ..)`. Same dj-outer/di-inner walk and /9 divide so the
+// summation order matches. Reads the *input*, never the running stamp, so strokes
+// chaining off `h` do not perturb it.
+fn base_neighborhood_average(px: i32, py: i32) -> f32 {
+    var sum = 0.0;
+    for (var dj = -1; dj <= 1; dj = dj + 1) {
+        for (var di = -1; di <= 1; di = di + 1) {
+            let ii = clamp(px + di, 0, i32(u.width) - 1);
+            let jj = clamp(py + dj, 0, i32(u.height) - 1);
+            sum = sum + textureLoad(src, vec2<i32>(ii, jj), 0).r;
+        }
+    }
+    return sum / 9.0;
+}
+
 fn apply_kind(header: StrokeHeader, h: f32, dist: f32, w: f32, px: i32, py: i32) -> f32 {
     let s = header.strength * w;
     let r = max(header.radius_m, 1.0);
@@ -209,6 +228,9 @@ fn apply_kind(header: StrokeHeader, h: f32, dist: f32, w: f32, px: i32, py: i32)
         }
         case 10u: {                                                 // ERODE / EncourageErosion
             return h - abs(s) * 0.35;
+        }
+        case 12u: {                                                 // SMOOTH — pull toward 3x3 mean of `src`
+            return h + (base_neighborhood_average(px, py) - h) * w;  // weight is `w`, not `s`
         }
         default: { return h; }                                      // AUX_NOOP
     }

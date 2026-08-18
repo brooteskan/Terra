@@ -464,10 +464,12 @@ impl LayerKind {
     ///
     /// Resolves the coarse [`Self::spatial_dependency`] bucket into an actual
     /// halo where one is honestly known: `Blur` and the bounded `EffectFilter`
-    /// kernels carry `radius * iterations`; `SculptStrokes` reaches one sample
-    /// past its footprint for the reconcile pass. Every other non-`Local` kind
-    /// returns [`Reach::Full`] here — the localizable cases are exactly the
-    /// explicit arms, so nothing globally-coupled leaks through as a finite halo.
+    /// kernels carry `radius * iterations`; `SculptStrokes` reaches one sample past
+    /// its footprint for the reconcile 3x3, and a second sample when a
+    /// base-neighborhood stroke (Smooth / Pinch / Coastline) feeds that reconcile.
+    /// Every other non-`Local` kind returns [`Reach::Full`] here — the localizable
+    /// cases are exactly the explicit arms, so nothing globally-coupled leaks
+    /// through as a finite halo.
     pub fn intrinsic_reach(&self) -> Reach {
         match self {
             LayerKind::EffectFilter(p) => match p.kind.spatial_dependency() {
@@ -480,7 +482,25 @@ impl LayerKind {
             LayerKind::Blur(p) => Reach::Localized {
                 halo_samples: p.radius.saturating_mul(p.iterations.max(1)),
             },
-            LayerKind::SculptStrokes(_) => Reach::Localized { halo_samples: 1 },
+            LayerKind::SculptStrokes(p) => Reach::Localized {
+                // Floor of 1 for the reconcile 3x3 (also covers a base-neighborhood
+                // stroke's own stamp read). Reach is 2 only when such a stroke feeds a
+                // non-zero reconcile: the base 3x3 shifts the stamped field one texel,
+                // then reconcile re-reads that at 3x3. Keeps the CPU oracle in
+                // agreement with the GPU plan halo for Smooth (#114).
+                halo_samples: 1
+                    + u32::from(
+                        p.reconcile > 0.0
+                            && p.strokes.iter().any(|s| {
+                                matches!(
+                                    s.kind,
+                                    crate::authoring::SculptStrokeKind::Smooth
+                                        | crate::authoring::SculptStrokeKind::Pinch
+                                        | crate::authoring::SculptStrokeKind::Coastline
+                                )
+                            }),
+                    ),
+            },
             other => match other.spatial_dependency() {
                 DirtyClass::Local => Reach::LOCAL,
                 DirtyClass::Expanding | DirtyClass::BasinDependent => Reach::Full,
@@ -831,9 +851,32 @@ mod tests {
             LayerKind::VoronoiRegions(Default::default()).intrinsic_reach(),
             Reach::LOCAL
         );
-        // SculptStrokes: one-sample reconcile halo.
+        // SculptStrokes: one-sample reconcile-halo floor for the default (empty,
+        // reconcile 0.15) params.
         assert_eq!(
             LayerKind::SculptStrokes(Default::default()).intrinsic_reach(),
+            Reach::Localized { halo_samples: 1 }
+        );
+        // Grows to two when a base-neighborhood stroke (Smooth) feeds a non-zero
+        // reconcile: the base 3x3 shifts the stamped field, then reconcile re-reads it.
+        use crate::authoring::{SculptStroke, SculptStrokeKind, SculptStrokeParams};
+        let smooth_strokes = |reconcile| {
+            LayerKind::SculptStrokes(SculptStrokeParams {
+                strokes: vec![SculptStroke {
+                    kind: SculptStrokeKind::Smooth,
+                    ..SculptStroke::default()
+                }],
+                reconcile,
+            })
+        };
+        assert_eq!(
+            smooth_strokes(0.15).intrinsic_reach(),
+            Reach::Localized { halo_samples: 2 }
+        );
+        // Without reconcile a Smooth stroke stays at the one-sample floor (its own
+        // base read).
+        assert_eq!(
+            smooth_strokes(0.0).intrinsic_reach(),
             Reach::Localized { halo_samples: 1 }
         );
         // Basin-coupled kind: whole field.

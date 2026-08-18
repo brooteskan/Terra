@@ -287,8 +287,8 @@ fn pt(u: f32, v: f32, pressure: f32) -> SculptPoint {
 }
 
 /// Stroke set exercising every GPU-supported kind (per-sample maps + distance
-/// stamps + an alias + an aux-only kind), with multi-point polylines, varied
-/// pressure, and a single-point stroke.
+/// stamps + an alias + an aux-only kind + the base-neighborhood Smooth), with
+/// multi-point polylines, varied pressure, and a single-point stroke.
 fn supported_stroke_set(reconcile: f32) -> SculptStrokeParams {
     let stroke = |kind, points, radius_m, strength, target_height| SculptStroke {
         kind,
@@ -343,6 +343,18 @@ fn supported_stroke_set(reconcile: f32) -> SculptStrokeParams {
             // Alias of Ridge; aux-only kind exercises the reconcile edit weight.
             stroke(SculptStrokeKind::MountainStamp, vec![pt(0.15, 0.5, 1.0)], 45.0, 7.0, 0.0),
             stroke(SculptStrokeKind::Uplift, vec![pt(0.5, 0.15, 1.0)], 50.0, 3.0, 0.0),
+            // Smooth pulls each sample toward the 3x3 mean of the *layer input*.
+            // Placed last and routed across the Raise footprint (0.3, 0.35) so a GPU
+            // that wrongly averaged the running (raised) height instead of `base`
+            // would diverge here; the (0.05, 0.05) endpoint drives the brush onto the
+            // border texels, exercising the clamped-edge taps.
+            stroke(
+                SculptStrokeKind::Smooth,
+                vec![pt(0.05, 0.05, 1.0), pt(0.3, 0.35, 1.0)],
+                60.0,
+                5.0,
+                0.0,
+            ),
         ],
         reconcile,
     }

@@ -168,22 +168,20 @@ fn seed_supported(seed: u64) -> bool {
     seed <= u64::from(u32::MAX)
 }
 
-/// Whether a single sculpt-stroke kind is a pure per-sample map of the current
-/// height (plus the distance-to-polyline SDF), which the GPU stamp kernel can
-/// reproduce. The excluded kinds read a neighborhood average of the base input
-/// (`Smooth`, `Pinch`, `Coastline`) or a per-stroke footprint-mean reduction
-/// (`Flatten`); those stay on the CPU resume (#113). The aux-only kinds
-/// (`Uplift` / `Hardness` / `Sediment` / `Protect` / `EncourageErosion`) are
-/// supported because their height contribution is a per-sample function even
-/// though the GPU preview drops the aux they would publish — the aux gate in
-/// `compile_gpu_graph` handles any downstream consumer.
+/// Whether the GPU stamp kernel can reproduce a single sculpt-stroke kind. Most
+/// supported kinds are pure per-sample maps of the running height (plus the
+/// distance-to-polyline SDF); `Smooth` additionally reads a clamped 3x3 of the layer
+/// input (`src`), which the kernel samples directly (#114). The excluded kinds read a
+/// neighborhood average of the base input (`Pinch`, `Coastline`) or a per-stroke
+/// footprint-mean reduction (`Flatten`); those stay on the CPU resume (#113). The
+/// aux-only kinds (`Uplift` / `Hardness` / `Sediment` / `Protect` /
+/// `EncourageErosion`) are supported because their height contribution is a
+/// per-sample function even though the GPU preview drops the aux they would publish —
+/// the aux gate in `compile_gpu_graph` handles any downstream consumer.
 fn stroke_kind_gpu_supported(kind: SculptStrokeKind) -> bool {
     !matches!(
         kind,
-        SculptStrokeKind::Smooth
-            | SculptStrokeKind::Pinch
-            | SculptStrokeKind::Coastline
-            | SculptStrokeKind::Flatten
+        SculptStrokeKind::Pinch | SculptStrokeKind::Coastline | SculptStrokeKind::Flatten
     )
 }
 
@@ -229,18 +227,24 @@ fn gpu_plan_for_layer(layer: &Layer, mask_assets: &[MaskAsset]) -> Option<GpuLay
         SculptBase(_) if gpu_blend_mode(layer.common.blend).is_some() => {
             (GpuKernel::Sculpt, GpuDirtyPolicy::Local, 0)
         }
-        // Height preview for the per-sample stroke kinds. The reconcile pass reads a
-        // 3x3 of the stamped result, so a non-zero reconcile reaches one texel past
-        // the stamp footprint (matching `SculptStrokes` intrinsic reach). The aux
-        // this layer would publish is dropped here; `compile_gpu_graph` demotes the
-        // plan when a downstream layer consumes it.
+        // Height preview for the supported stroke kinds. A Smooth stroke reads a 3x3
+        // of the layer input, so an upstream edit reaches one texel further through
+        // the stamp; a non-zero reconcile reads a 3x3 of the stamped result and adds
+        // its own texel. The two compose (Smooth's base read feeds reconcile's stamped
+        // read), so the plan halo is their sum — kept in agreement with the CPU
+        // `SculptStrokes` intrinsic reach. The aux this layer would publish is dropped
+        // here; `compile_gpu_graph` demotes the plan when a downstream layer consumes it.
         SculptStrokes(p)
             if gpu_blend_mode(layer.common.blend).is_some()
                 && p.strokes
                     .iter()
                     .all(|stroke| stroke_kind_gpu_supported(stroke.kind)) =>
         {
-            let halo = u32::from(p.reconcile > 0.0);
+            let reads_base_neighborhood = p
+                .strokes
+                .iter()
+                .any(|stroke| matches!(stroke.kind, SculptStrokeKind::Smooth));
+            let halo = u32::from(reads_base_neighborhood) + u32::from(p.reconcile > 0.0);
             (GpuKernel::SculptStrokes, GpuDirtyPolicy::Local, halo)
         }
         SculptStrokes(_) => return None,
@@ -638,9 +642,12 @@ mod tests {
     }
 
     #[test]
-    fn sculpt_strokes_per_sample_kinds_compile_to_a_local_stamp_plan() {
-        // Per-sample kinds preview on the GPU; a non-zero reconcile carries a
-        // one-texel halo (the 3x3 relax), and reconcile == 0 carries none.
+    fn sculpt_strokes_supported_kinds_compile_to_a_local_stamp_plan() {
+        // Supported kinds preview on the GPU. The plan halo is the base-neighborhood
+        // read (Smooth reads a 3x3 of the layer input: +1) plus the reconcile 3x3
+        // relax (non-zero reconcile: +1). Per-sample kinds have no base read, so they
+        // carry only the reconcile texel (1) or none (0); Smooth carries both (2) or
+        // its lone base read (1).
         for (kind, reconcile, halo) in [
             (SculptStrokeKind::Raise, 0.15, 1),
             (SculptStrokeKind::Lower, 0.0, 0),
@@ -654,6 +661,8 @@ mod tests {
             (SculptStrokeKind::CraterStamp, 0.2, 1),
             (SculptStrokeKind::MountainStamp, 0.2, 1),
             (SculptStrokeKind::Uplift, 0.2, 1),
+            (SculptStrokeKind::Smooth, 0.2, 2),
+            (SculptStrokeKind::Smooth, 0.0, 1),
         ] {
             let layer = strokes_layer(kind, reconcile);
             let plan = gpu_plan_for_layer(&layer, &[])
@@ -668,10 +677,11 @@ mod tests {
 
     #[test]
     fn sculpt_strokes_neighborhood_and_reduction_kinds_fall_back_to_cpu() {
-        // Smooth / Pinch / Coastline read a neighborhood of the base; Flatten needs
-        // a footprint-mean reduction. These stay on the CPU resume.
+        // Pinch / Coastline read a neighborhood of the base with a non-linear weight
+        // the stamp kernel does not yet reproduce; Flatten needs a footprint-mean
+        // reduction. These stay on the CPU resume. (Smooth, the linear base-3x3 pull,
+        // is GPU-supported as of #114.)
         for kind in [
-            SculptStrokeKind::Smooth,
             SculptStrokeKind::Pinch,
             SculptStrokeKind::Coastline,
             SculptStrokeKind::Flatten,

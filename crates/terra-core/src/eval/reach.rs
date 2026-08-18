@@ -299,6 +299,24 @@ mod tests {
     }
 
     #[test]
+    fn smooth_stroke_with_reconcile_reaches_two_samples() {
+        // A Smooth stroke reads a 3x3 of the layer input; with reconcile on, the
+        // stamped result is re-read at 3x3, so the effective reach is two samples.
+        use crate::authoring::{SculptStroke, SculptStrokeKind, SculptStrokeParams};
+        let l = layer(LayerKind::SculptStrokes(SculptStrokeParams {
+            strokes: vec![SculptStroke {
+                kind: SculptStrokeKind::Smooth,
+                ..SculptStroke::default()
+            }],
+            reconcile: 0.15,
+        }));
+        assert_eq!(
+            effective_reach(&l, &[]),
+            Reach::Localized { halo_samples: 2 }
+        );
+    }
+
+    #[test]
     fn slope_mask_contributes_one_sample_halo() {
         let mut l = layer(LayerKind::VoronoiRegions(Default::default()));
         l.common.masks = Distribution {

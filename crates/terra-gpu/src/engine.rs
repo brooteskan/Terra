@@ -209,12 +209,12 @@ fn stroke_kind_gpu_id(kind: SculptStrokeKind) -> u32 {
         | SculptStrokeKind::Hardness
         | SculptStrokeKind::Sediment
         | SculptStrokeKind::Protect => 11,
+        // Smooth pulls each sample toward the clamped 3x3 mean of the layer input
+        // (`src`); the stamp kernel reads that neighborhood directly (#114).
+        SculptStrokeKind::Smooth => 12,
         // Not admitted by the planner; never reaches the GPU. Map to the aux no-op
         // so a stray upload cannot corrupt height.
-        SculptStrokeKind::Smooth
-        | SculptStrokeKind::Pinch
-        | SculptStrokeKind::Coastline
-        | SculptStrokeKind::Flatten => 11,
+        SculptStrokeKind::Pinch | SculptStrokeKind::Coastline | SculptStrokeKind::Flatten => 11,
     }
 }
 
