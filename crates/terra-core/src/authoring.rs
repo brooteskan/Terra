@@ -610,8 +610,15 @@ pub fn stroke_footprint_uv(stroke: &SculptStroke, m: &HeightfieldMetrics) -> Opt
     if stroke.points.is_empty() {
         return None;
     }
-    let ru = stroke.radius_m / m.world_size_x.max(1e-3);
-    let rv = stroke.radius_m / m.world_size_z.max(1e-3);
+    // `smoothstep_weight` clamps the radius to `1e-4` internally, so its support is
+    // `distance < radius.max(1e-4)`. Pad by the same clamped radius: a zero or
+    // negative `radius_m` (reachable via a hand-edited project file) would
+    // otherwise shrink or invert this box below the actual support and let the
+    // culled stamp skip a texel the weight test would still hit. No-op for every
+    // real stroke (`radius_m` is metres, far above `1e-4`).
+    let radius = stroke.radius_m.max(1e-4);
+    let ru = radius / m.world_size_x.max(1e-3);
+    let rv = radius / m.world_size_z.max(1e-3);
     let (mut u0, mut u1, mut v0, mut v1) = (1.0f32, 0.0f32, 1.0f32, 0.0f32);
     for pt in &stroke.points {
         u0 = u0.min(pt.u);
@@ -894,8 +901,38 @@ fn apply_stroke_sample(
     }
 }
 
-pub fn apply_sculpt_strokes(input: &Heightfield, p: &SculptStrokeParams) -> AuthoringResult {
+/// Stamp + reconcile core shared by the whole-field [`apply_sculpt_strokes`] and
+/// the region-scoped [`apply_sculpt_strokes_scoped`] entries, so the two cannot
+/// drift. `rect` is an inclusive sample rectangle `(i0, i1, j0, j1)` that bounds
+/// the reconcile pass; each stroke additionally stamps only the intersection of
+/// `rect` with its own padded footprint ([`stroke_footprint_rect`]).
+///
+/// **The per-stroke footprint cull is semantics-preserving.** `smoothstep_weight`
+/// is exactly zero at `distance >= radius`, so every texel outside a stroke's
+/// padded bbox has `w == 0` — no height write, no `edited`/aux max-merge. Skipping
+/// them changes nothing. This is the same bbox the GPU stamp kernel early-outs on
+/// (`StrokeHeader.bbox`), so the two backends cull identically.
+///
+/// **Reads may reach one texel past a stroke's rect, and that is fine.** The
+/// Smooth/Pinch/Coastline 3×3 and Flatten's footprint-mean scan read `base` (the
+/// layer input, invariant across strokes) or, for the mean, an `out` that prior
+/// strokes have fully stamped over that footprint — never a texel this cull could
+/// have left stale. Stroke chaining is preserved: outside a stroke's footprint the
+/// pre-#122 full-field stamp was already a no-op, so `out` after each stroke is
+/// bit-identical to visiting every texel.
+///
+/// The reconcile pass stays bounded to the *whole* `rect` (not per-stroke): where
+/// `edited == 0` it computes `src + (avg - src) * 0.0`, which normalizes `-0.0` to
+/// `+0.0`. Bounding it to stroke footprints would leave `-0.0` behind — a real bit
+/// difference. It is a single O(rect) pass, independent of stroke count, so it is
+/// not what the cull targets.
+fn apply_strokes_in_rect(
+    input: &Heightfield,
+    p: &SculptStrokeParams,
+    rect: (u32, u32, u32, u32),
+) -> AuthoringResult {
     let m = input.metrics;
+    let (r_i0, r_i1, r_j0, r_j1) = rect;
     let mut out = input.clone();
     let n = (m.width * m.height) as usize;
     let mut protect: Vec<f32> = vec![0.0; n];
@@ -904,53 +941,70 @@ pub fn apply_sculpt_strokes(input: &Heightfield, p: &SculptStrokeParams) -> Auth
     let mut sediment: Vec<f32> = vec![0.0; n];
     let mut edited: Vec<f32> = vec![0.0; n];
     let base = input.clone();
-    for stroke in &p.strokes {
-        if !stroke.enabled {
-            continue;
-        }
-        let flatten_target = flatten_target_for(stroke, &out, &m);
-        for j in 0..m.height {
-            for i in 0..m.width {
-                let x = m.world_x(i);
-                let z = m.world_z(j);
-                let (distance, pressure) =
-                    distance_to_polyline(x, z, &stroke.points, m.world_size_x, m.world_size_z);
-                let w = smoothstep_weight(distance, stroke.radius_m, stroke.falloff) * pressure;
-                if w <= 0.0 {
-                    continue;
+    // A degenerate (0-size) field has no samples, and the inclusive `rect` a
+    // caller derives from `saturating_sub(1)` would name a phantom (0,0); guard
+    // the loops and fall through to the (empty) aux fields.
+    if m.width > 0 && m.height > 0 {
+        for stroke in &p.strokes {
+            if !stroke.enabled {
+                continue;
+            }
+            // Cull to the stroke's padded footprint ∩ rect. A stroke with no
+            // footprint (empty points) or whose footprint misses the rect
+            // contributes nothing inside it — exactly what the full-field weight
+            // test would find (`w == 0` at every such texel).
+            let Some((si0, si1, sj0, sj1)) = stroke_footprint_rect(stroke, &m) else {
+                continue;
+            };
+            let (i0, i1) = (si0.max(r_i0), si1.min(r_i1));
+            let (j0, j1) = (sj0.max(r_j0), sj1.min(r_j1));
+            if i0 > i1 || j0 > j1 {
+                continue;
+            }
+            let flatten_target = flatten_target_for(stroke, &out, &m);
+            for j in j0..=j1 {
+                for i in i0..=i1 {
+                    let x = m.world_x(i);
+                    let z = m.world_z(j);
+                    let (distance, pressure) =
+                        distance_to_polyline(x, z, &stroke.points, m.world_size_x, m.world_size_z);
+                    let w = smoothstep_weight(distance, stroke.radius_m, stroke.falloff) * pressure;
+                    if w <= 0.0 {
+                        continue;
+                    }
+                    let idx = (j * m.width + i) as usize;
+                    edited[idx] = edited[idx].max(w);
+                    let h = out.get(i, j);
+                    let next = apply_stroke_sample(
+                        stroke,
+                        &base,
+                        i,
+                        j,
+                        h,
+                        distance,
+                        w,
+                        flatten_target,
+                        &mut protect[idx],
+                        &mut uplift[idx],
+                        &mut hardness[idx],
+                        &mut sediment[idx],
+                    );
+                    out.set(i, j, next);
                 }
-                let idx = (j * m.width + i) as usize;
-                edited[idx] = edited[idx].max(w);
-                let h = out.get(i, j);
-                let next = apply_stroke_sample(
-                    stroke,
-                    &base,
-                    i,
-                    j,
-                    h,
-                    distance,
-                    w,
-                    flatten_target,
-                    &mut protect[idx],
-                    &mut uplift[idx],
-                    &mut hardness[idx],
-                    &mut sediment[idx],
-                );
-                out.set(i, j, next);
             }
         }
-    }
-    if p.reconcile > 0.0 {
-        let src = out.clone();
-        for j in 0..m.height {
-            for i in 0..m.width {
-                let idx = (j * m.width + i) as usize;
-                let a = p.reconcile.clamp(0.0, 1.0) * edited[idx] * 0.35;
-                out.set(
-                    i,
-                    j,
-                    src.get(i, j) + (neighborhood_average(&src, i, j) - src.get(i, j)) * a,
-                );
+        if p.reconcile > 0.0 {
+            let src = out.clone();
+            for j in r_j0..=r_j1 {
+                for i in r_i0..=r_i1 {
+                    let idx = (j * m.width + i) as usize;
+                    let a = p.reconcile.clamp(0.0, 1.0) * edited[idx] * 0.35;
+                    out.set(
+                        i,
+                        j,
+                        src.get(i, j) + (neighborhood_average(&src, i, j) - src.get(i, j)) * a,
+                    );
+                }
             }
         }
     }
@@ -960,6 +1014,26 @@ pub fn apply_sculpt_strokes(input: &Heightfield, p: &SculptStrokeParams) -> Auth
         .field(keys::HARDNESS, MaskField::from_raw(m, &hardness))
         .field(keys::SEDIMENT_THICKNESS, MaskField::from_raw(m, &sediment))
         .field(keys::EDIT_REGION, MaskField::from_raw(m, &edited))
+}
+
+/// Apply every enabled stroke over the whole field, then reconcile.
+///
+/// Each stroke's stamp is culled to its padded bounding box — the same region the
+/// GPU kernel's `StrokeHeader.bbox` bounds — so the pass costs ~O(Σ stroke
+/// footprints) plus an irreducible O(field) floor (two clones, the reconcile pass,
+/// five aux fields), not O(strokes × field). The output is bit-identical to an
+/// unculled full-field stamp: every skipped texel has weight exactly zero.
+///
+/// This whole-field entry runs on project load, `mark_all_layers_dirty`, and
+/// quality/resolution changes over a cold cache. Per-stroke edits instead take the
+/// scoped path ([`apply_sculpt_strokes_scoped`], #110/#121).
+pub fn apply_sculpt_strokes(input: &Heightfield, p: &SculptStrokeParams) -> AuthoringResult {
+    let m = input.metrics;
+    apply_strokes_in_rect(
+        input,
+        p,
+        (0, m.width.saturating_sub(1), 0, m.height.saturating_sub(1)),
+    )
 }
 
 /// The scope-tile interiors dilated one sample and clamped to the field, as an
@@ -1036,75 +1110,13 @@ pub fn apply_sculpt_strokes_scoped(
         }
     }
 
-    let mut out = input.clone();
-    let n = (m.width * m.height) as usize;
-    let mut protect: Vec<f32> = vec![0.0; n];
-    let mut uplift: Vec<f32> = vec![0.0; n];
-    let mut hardness: Vec<f32> = vec![0.0; n];
-    let mut sediment: Vec<f32> = vec![0.0; n];
-    let mut edited: Vec<f32> = vec![0.0; n];
-    let base = input.clone();
-    for stroke in &p.strokes {
-        if !stroke.enabled {
-            continue;
-        }
-        // Skip strokes whose footprint does not reach S (no effect inside it).
-        match stroke_footprint_rect(stroke, &m) {
-            Some((si0, si1, sj0, sj1)) if si0 <= i1 && si1 >= i0 && sj0 <= j1 && sj1 >= j0 => {}
-            _ => continue,
-        }
-        let flatten_target = flatten_target_for(stroke, &out, &m);
-        for j in j0..=j1 {
-            for i in i0..=i1 {
-                let x = m.world_x(i);
-                let z = m.world_z(j);
-                let (distance, pressure) =
-                    distance_to_polyline(x, z, &stroke.points, m.world_size_x, m.world_size_z);
-                let w = smoothstep_weight(distance, stroke.radius_m, stroke.falloff) * pressure;
-                if w <= 0.0 {
-                    continue;
-                }
-                let idx = (j * m.width + i) as usize;
-                edited[idx] = edited[idx].max(w);
-                let h = out.get(i, j);
-                let next = apply_stroke_sample(
-                    stroke,
-                    &base,
-                    i,
-                    j,
-                    h,
-                    distance,
-                    w,
-                    flatten_target,
-                    &mut protect[idx],
-                    &mut uplift[idx],
-                    &mut hardness[idx],
-                    &mut sediment[idx],
-                );
-                out.set(i, j, next);
-            }
-        }
-    }
-    if p.reconcile > 0.0 {
-        let src = out.clone();
-        for j in j0..=j1 {
-            for i in i0..=i1 {
-                let idx = (j * m.width + i) as usize;
-                let a = p.reconcile.clamp(0.0, 1.0) * edited[idx] * 0.35;
-                out.set(
-                    i,
-                    j,
-                    src.get(i, j) + (neighborhood_average(&src, i, j) - src.get(i, j)) * a,
-                );
-            }
-        }
-    }
-    AuthoringResult::new(out)
-        .field(keys::SCULPT_PROTECTION, MaskField::from_raw(m, &protect))
-        .field(keys::UPLIFT_RATE, MaskField::from_raw(m, &uplift))
-        .field(keys::HARDNESS, MaskField::from_raw(m, &hardness))
-        .field(keys::SEDIMENT_THICKNESS, MaskField::from_raw(m, &sediment))
-        .field(keys::EDIT_REGION, MaskField::from_raw(m, &edited))
+    // Stamp + reconcile the resolved working rectangle `S`. The shared core culls
+    // each stroke to its own footprint ∩ `S` and skips strokes that miss it — the
+    // same skip this function ran inline before #122 unified the two entries. The
+    // fixpoint above guarantees every Flatten reaching `S` has its whole footprint
+    // stamped by prior strokes first, so its footprint mean (and thus every scope
+    // sample) matches the whole-field result exactly.
+    apply_strokes_in_rect(input, p, (i0, i1, j0, j1))
 }
 
 pub fn apply_constraints(input: &Heightfield, p: &TerrainConstraintParams) -> AuthoringResult {
@@ -1957,5 +1969,331 @@ mod tests {
         assert_edit_contained(m, &h, &prev, &edited(&|s| { s.remove(1); }), "delete-smooth@1");
         assert_edit_contained(m, &h, &prev, &edited(&|s| s[2].target_height = 40.0), "flatten-target@2");
         assert_edit_contained(m, &h, &prev, &edited(&|s| s[2].strength += 3.0), "flatten-strength@2");
+    }
+
+    // ---- #122: whole-field bbox cull is bit-identical to an unculled stamp ----
+
+    fn spt(u: f32, v: f32) -> SculptPoint {
+        SculptPoint {
+            u,
+            v,
+            pressure: 1.0,
+        }
+    }
+
+    /// The exact pre-#122 whole-field stamp: loops the entire field for every
+    /// enabled stroke with no bbox cull. It shares `flatten_target_for`,
+    /// `apply_stroke_sample`, `smoothstep_weight`, `distance_to_polyline`, and the
+    /// reconcile pass with production, so it differs from `apply_sculpt_strokes`
+    /// *only* in loop bounds — which is precisely what #122 changed. The parity
+    /// tests below pin the two bit-for-bit.
+    fn apply_sculpt_strokes_unculled(
+        input: &Heightfield,
+        p: &SculptStrokeParams,
+    ) -> AuthoringResult {
+        let m = input.metrics;
+        let mut out = input.clone();
+        let n = (m.width * m.height) as usize;
+        let mut protect: Vec<f32> = vec![0.0; n];
+        let mut uplift: Vec<f32> = vec![0.0; n];
+        let mut hardness: Vec<f32> = vec![0.0; n];
+        let mut sediment: Vec<f32> = vec![0.0; n];
+        let mut edited: Vec<f32> = vec![0.0; n];
+        let base = input.clone();
+        for stroke in &p.strokes {
+            if !stroke.enabled {
+                continue;
+            }
+            let flatten_target = flatten_target_for(stroke, &out, &m);
+            for j in 0..m.height {
+                for i in 0..m.width {
+                    let x = m.world_x(i);
+                    let z = m.world_z(j);
+                    let (distance, pressure) =
+                        distance_to_polyline(x, z, &stroke.points, m.world_size_x, m.world_size_z);
+                    let w = smoothstep_weight(distance, stroke.radius_m, stroke.falloff) * pressure;
+                    if w <= 0.0 {
+                        continue;
+                    }
+                    let idx = (j * m.width + i) as usize;
+                    edited[idx] = edited[idx].max(w);
+                    let h = out.get(i, j);
+                    let next = apply_stroke_sample(
+                        stroke,
+                        &base,
+                        i,
+                        j,
+                        h,
+                        distance,
+                        w,
+                        flatten_target,
+                        &mut protect[idx],
+                        &mut uplift[idx],
+                        &mut hardness[idx],
+                        &mut sediment[idx],
+                    );
+                    out.set(i, j, next);
+                }
+            }
+        }
+        if p.reconcile > 0.0 {
+            let src = out.clone();
+            for j in 0..m.height {
+                for i in 0..m.width {
+                    let idx = (j * m.width + i) as usize;
+                    let a = p.reconcile.clamp(0.0, 1.0) * edited[idx] * 0.35;
+                    out.set(
+                        i,
+                        j,
+                        src.get(i, j) + (neighborhood_average(&src, i, j) - src.get(i, j)) * a,
+                    );
+                }
+            }
+        }
+        AuthoringResult::new(out)
+            .field(keys::SCULPT_PROTECTION, MaskField::from_raw(m, &protect))
+            .field(keys::UPLIFT_RATE, MaskField::from_raw(m, &uplift))
+            .field(keys::HARDNESS, MaskField::from_raw(m, &hardness))
+            .field(keys::SEDIMENT_THICKNESS, MaskField::from_raw(m, &sediment))
+            .field(keys::EDIT_REGION, MaskField::from_raw(m, &edited))
+    }
+
+    fn assert_result_bit_identical(
+        got: &AuthoringResult,
+        want: &AuthoringResult,
+        m: HeightfieldMetrics,
+        label: &str,
+    ) {
+        let aux_keys = [
+            keys::SCULPT_PROTECTION,
+            keys::UPLIFT_RATE,
+            keys::HARDNESS,
+            keys::SEDIMENT_THICKNESS,
+            keys::EDIT_REGION,
+        ];
+        for j in 0..m.height {
+            for i in 0..m.width {
+                assert_eq!(
+                    got.height.get(i, j).to_bits(),
+                    want.height.get(i, j).to_bits(),
+                    "{label}: height mismatch at ({i},{j})"
+                );
+                for key in aux_keys {
+                    let g = got.fields.get(key).expect("got aux").get(i, j);
+                    let w = want.fields.get(key).expect("want aux").get(i, j);
+                    assert_eq!(
+                        g.to_bits(),
+                        w.to_bits(),
+                        "{label}: aux {key} mismatch at ({i},{j})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// UV that lands exactly on the cell center of sample `(i, j)`:
+    /// `world_x(i) = (i + 0.5) * dx` and a UV point maps to `u * world_size_x`, so
+    /// `u = (i + 0.5) / width`. Placing a degenerate-radius point here forces a
+    /// full-weight stamp on exactly that texel.
+    fn cell_center_uv(m: HeightfieldMetrics, i: u32, j: u32) -> (f32, f32) {
+        (
+            (i as f32 + 0.5) / m.width as f32,
+            (j as f32 + 0.5) / m.height as f32,
+        )
+    }
+
+    fn all_kinds() -> Vec<SculptStrokeKind> {
+        use SculptStrokeKind::*;
+        vec![
+            Raise,
+            Lower,
+            Smooth,
+            Flatten,
+            HeightStamp,
+            Ridge,
+            MountainStamp,
+            Valley,
+            ValleyStamp,
+            RiverPath,
+            Terrace,
+            Roughness,
+            Noise,
+            Uplift,
+            Hardness,
+            Sediment,
+            Protect,
+            EncourageErosion,
+            Erode,
+            Pinch,
+            Inflate,
+            PlateauStamp,
+            CraterStamp,
+            Coastline,
+        ]
+    }
+
+    fn parity_metrics() -> [HeightfieldMetrics; 2] {
+        [
+            // Square world.
+            HeightfieldMetrics {
+                width: 64,
+                height: 64,
+                world_size_x: 1000.0,
+                world_size_z: 1000.0,
+                tile_size: 16,
+                halo: 2,
+            },
+            // Non-square samples AND non-square world, to exercise the anisotropic
+            // (`radius_m / world_size_{x,z}`) pad on both axes.
+            HeightfieldMetrics {
+                width: 96,
+                height: 64,
+                world_size_x: 1200.0,
+                world_size_z: 500.0,
+                tile_size: 16,
+                halo: 2,
+            },
+        ]
+    }
+
+    #[test]
+    fn whole_field_cull_matches_unculled_across_all_kinds() {
+        // One stroke of every kind, chained in list order, on square + non-square
+        // grids. A deterministic LCG scatters positions/radii (no `rand` dep); a
+        // few kinds get a two-point polyline so multi-segment distance is covered.
+        for m in parity_metrics() {
+            let h = fp_field(m);
+            let mut lcg = 0x1234_5678u32;
+            let mut next = || {
+                lcg = lcg.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (lcg >> 8) as f32 / (1u32 << 24) as f32
+            };
+            let mut strokes = Vec::new();
+            for kind in all_kinds() {
+                let u = 0.1 + next() * 0.8;
+                let v = 0.1 + next() * 0.8;
+                let radius = 60.0 + next() * 120.0;
+                let points = if matches!(
+                    kind,
+                    SculptStrokeKind::RiverPath
+                        | SculptStrokeKind::Valley
+                        | SculptStrokeKind::ValleyStamp
+                ) {
+                    vec![
+                        spt(u, v),
+                        spt((u + 0.15).min(0.98), (v + 0.1).min(0.98)),
+                    ]
+                } else {
+                    vec![spt(u, v)]
+                };
+                strokes.push(SculptStroke {
+                    kind,
+                    points,
+                    radius_m: radius,
+                    strength: 6.0,
+                    target_height: 12.0,
+                    falloff: 1.5,
+                    enabled: true,
+                });
+            }
+            let p = SculptStrokeParams {
+                strokes,
+                reconcile: 0.2,
+            };
+            let got = apply_sculpt_strokes(&h, &p);
+            let want = apply_sculpt_strokes_unculled(&h, &p);
+            assert_result_bit_identical(&got, &want, m, "all-kinds");
+        }
+    }
+
+    #[test]
+    fn whole_field_cull_matches_unculled_on_edge_cases() {
+        // Flatten chaining, border-clipped strokes, degenerate radii, an empty
+        // stroke, and a disabled stroke — the cases the cull is most likely to get
+        // wrong. Bit-identity to the unculled reference is the whole contract.
+        for m in parity_metrics() {
+            let h = fp_field(m);
+            let (zu, zv) = cell_center_uv(m, m.width / 3, m.height / 2);
+            let (nu, nv) = cell_center_uv(m, (2 * m.width) / 3, m.height / 4);
+            let strokes = vec![
+                // Raise + Smooth, then a large Flatten straddling both: its footprint
+                // mean must be measured over an `out` the priors fully stamped.
+                mk_stroke(SculptStrokeKind::Raise, 0.5, 0.5, 120.0),
+                mk_stroke(SculptStrokeKind::Smooth, 0.55, 0.5, 90.0),
+                SculptStroke {
+                    kind: SculptStrokeKind::Flatten,
+                    points: vec![spt(0.5, 0.5)],
+                    radius_m: 400.0,
+                    strength: 4.0,
+                    target_height: 0.0,
+                    falloff: 1.5,
+                    enabled: true,
+                },
+                // Clipped by each border (footprint clamps to the field edge).
+                mk_stroke(SculptStrokeKind::Ridge, 0.01, 0.5, 100.0),
+                mk_stroke(SculptStrokeKind::Valley, 0.99, 0.5, 100.0),
+                mk_stroke(SculptStrokeKind::Raise, 0.5, 0.01, 80.0),
+                mk_stroke(SculptStrokeKind::Lower, 0.5, 0.99, 80.0),
+                // Coastline reads a 3×3 of `base`; place it so its rect abuts the
+                // Raise/Smooth footprints (reads cross a rect boundary).
+                mk_stroke(SculptStrokeKind::Coastline, 0.68, 0.5, 60.0),
+                // Zero and negative radius at exact cell centers: support is a single
+                // texel; locks the `radius_m.max(1e-4)` pad hardening.
+                SculptStroke {
+                    kind: SculptStrokeKind::Raise,
+                    points: vec![spt(zu, zv)],
+                    radius_m: 0.0,
+                    strength: 6.0,
+                    target_height: 0.0,
+                    falloff: 1.5,
+                    enabled: true,
+                },
+                SculptStroke {
+                    kind: SculptStrokeKind::Raise,
+                    points: vec![spt(nu, nv)],
+                    radius_m: -50.0,
+                    strength: 6.0,
+                    target_height: 0.0,
+                    falloff: 1.5,
+                    enabled: true,
+                },
+                // Enabled but empty (no footprint): contributes nothing.
+                SculptStroke {
+                    kind: SculptStrokeKind::Raise,
+                    points: vec![],
+                    radius_m: 100.0,
+                    strength: 5.0,
+                    target_height: 0.0,
+                    falloff: 1.5,
+                    enabled: true,
+                },
+                // Disabled: skipped by both paths.
+                SculptStroke {
+                    kind: SculptStrokeKind::Lower,
+                    points: vec![spt(0.3, 0.3)],
+                    radius_m: 150.0,
+                    strength: 9.0,
+                    target_height: 0.0,
+                    falloff: 1.5,
+                    enabled: false,
+                },
+            ];
+            let p = SculptStrokeParams {
+                strokes,
+                reconcile: 0.2,
+            };
+            let got = apply_sculpt_strokes(&h, &p);
+            let want = apply_sculpt_strokes_unculled(&h, &p);
+            assert_result_bit_identical(&got, &want, m, "edge-cases");
+
+            // Reconcile disabled: exercises the no-reconcile branch too.
+            let p0 = SculptStrokeParams {
+                reconcile: 0.0,
+                ..p.clone()
+            };
+            let got0 = apply_sculpt_strokes(&h, &p0);
+            let want0 = apply_sculpt_strokes_unculled(&h, &p0);
+            assert_result_bit_identical(&got0, &want0, m, "edge-cases-no-reconcile");
+        }
     }
 }
