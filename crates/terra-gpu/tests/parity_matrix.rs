@@ -287,8 +287,8 @@ fn pt(u: f32, v: f32, pressure: f32) -> SculptPoint {
 }
 
 /// Stroke set exercising every GPU-supported kind (per-sample maps + distance
-/// stamps + an alias + an aux-only kind + the base-neighborhood Smooth), with
-/// multi-point polylines, varied pressure, and a single-point stroke.
+/// stamps + an alias + an aux-only kind + the base-neighborhood Smooth and Pinch),
+/// with multi-point polylines, varied pressure, and a single-point stroke.
 fn supported_stroke_set(reconcile: f32) -> SculptStrokeParams {
     let stroke = |kind, points, radius_m, strength, target_height| SculptStroke {
         kind,
@@ -351,6 +351,19 @@ fn supported_stroke_set(reconcile: f32) -> SculptStrokeParams {
             stroke(
                 SculptStrokeKind::Smooth,
                 vec![pt(0.05, 0.05, 1.0), pt(0.3, 0.35, 1.0)],
+                60.0,
+                5.0,
+                0.0,
+            ),
+            // Pinch is Smooth's base-3x3 pull at a 1.25 overdrive. Routed across the
+            // Ridge crest (0.4, 0.75), where the running height sits well above `base`,
+            // so a GPU that averaged the running (ridged) height instead of `src`, or
+            // dropped the 1.25 gain, diverges by metres there — far beyond tolerance.
+            // The (0.6, 0.95) endpoint drives the brush onto the bottom border for the
+            // clamped-edge taps, an edge the Smooth stroke does not visit.
+            stroke(
+                SculptStrokeKind::Pinch,
+                vec![pt(0.6, 0.95, 1.0), pt(0.4, 0.75, 1.0)],
                 60.0,
                 5.0,
                 0.0,

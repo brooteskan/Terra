@@ -857,28 +857,32 @@ mod tests {
             LayerKind::SculptStrokes(Default::default()).intrinsic_reach(),
             Reach::Localized { halo_samples: 1 }
         );
-        // Grows to two when a base-neighborhood stroke (Smooth) feeds a non-zero
-        // reconcile: the base 3x3 shifts the stamped field, then reconcile re-reads it.
+        // Grows to two when a base-neighborhood stroke (Smooth or Pinch) feeds a
+        // non-zero reconcile: the base 3x3 shifts the stamped field, then reconcile
+        // re-reads it. Without reconcile such a stroke stays at the one-sample floor
+        // (its own base read).
         use crate::authoring::{SculptStroke, SculptStrokeKind, SculptStrokeParams};
-        let smooth_strokes = |reconcile| {
+        let base_neighborhood_strokes = |kind, reconcile| {
             LayerKind::SculptStrokes(SculptStrokeParams {
                 strokes: vec![SculptStroke {
-                    kind: SculptStrokeKind::Smooth,
+                    kind,
                     ..SculptStroke::default()
                 }],
                 reconcile,
             })
         };
-        assert_eq!(
-            smooth_strokes(0.15).intrinsic_reach(),
-            Reach::Localized { halo_samples: 2 }
-        );
-        // Without reconcile a Smooth stroke stays at the one-sample floor (its own
-        // base read).
-        assert_eq!(
-            smooth_strokes(0.0).intrinsic_reach(),
-            Reach::Localized { halo_samples: 1 }
-        );
+        for kind in [SculptStrokeKind::Smooth, SculptStrokeKind::Pinch] {
+            assert_eq!(
+                base_neighborhood_strokes(kind, 0.15).intrinsic_reach(),
+                Reach::Localized { halo_samples: 2 },
+                "{kind:?}"
+            );
+            assert_eq!(
+                base_neighborhood_strokes(kind, 0.0).intrinsic_reach(),
+                Reach::Localized { halo_samples: 1 },
+                "{kind:?}"
+            );
+        }
         // Basin-coupled kind: whole field.
         assert_eq!(
             LayerKind::ThermalErosion(Default::default()).intrinsic_reach(),

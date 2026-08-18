@@ -1,13 +1,14 @@
-// Interactive SculptStrokes preview — stamp pass (#113, #114).
+// Interactive SculptStrokes preview — stamp pass (#113, #114, #115).
 //
 // One dispatch stamps every supported stroke into `stamp_out`, chaining strokes at
 // each texel exactly as the CPU `apply_sculpt_strokes` does (stroke k+1 reads the
 // height stroke k already wrote). `edited_out` receives the max brush weight
 // touching the texel, which the reconcile pass consumes. Most supported kinds are
-// per-sample maps of the running height; Smooth (#114) additionally reads a clamped
-// 3x3 of `src` — the layer input (`base` on the CPU), not the running stamp. The
-// remaining neighborhood and reduction kinds (Pinch / Coastline / Flatten) never
-// reach the GPU — the planner keeps any layer containing one on the CPU resume.
+// per-sample maps of the running height; Smooth (#114) and Pinch (#115) additionally
+// read a clamped 3x3 of `src` — the layer input (`base` on the CPU), not the running
+// stamp — with Pinch applying Smooth's pull at a 1.25 overdrive. The remaining
+// neighborhood and reduction kinds (Coastline / Flatten) never reach the GPU — the
+// planner keeps any layer containing one on the CPU resume.
 
 struct Uniforms {
     width: u32,
@@ -35,6 +36,7 @@ const KIND_HEIGHT_STAMP: u32 = 9u;
 const KIND_ERODE: u32 = 10u;
 const KIND_AUX_NOOP: u32 = 11u;
 const KIND_SMOOTH: u32 = 12u;
+const KIND_PINCH: u32 = 13u;
 
 struct StrokeHeader {
     kind: u32,
@@ -231,6 +233,9 @@ fn apply_kind(header: StrokeHeader, h: f32, dist: f32, w: f32, px: i32, py: i32)
         }
         case 12u: {                                                 // SMOOTH — pull toward 3x3 mean of `src`
             return h + (base_neighborhood_average(px, py) - h) * w;  // weight is `w`, not `s`
+        }
+        case 13u: {                                                 // PINCH — Smooth's pull at a 1.25 overdrive
+            return h + (base_neighborhood_average(px, py) - h) * w * 1.25;  // weight is `w`, not `s`
         }
         default: { return h; }                                      // AUX_NOOP
     }

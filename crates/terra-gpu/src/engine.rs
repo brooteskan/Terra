@@ -188,8 +188,9 @@ struct StrokeHeaderGpu {
 }
 
 /// Alias-collapsed kind id shared with `shaders/sculpt_strokes.wgsl`. Only kinds
-/// the planner admits (per-sample maps) are ever uploaded; the neighborhood /
-/// reduction kinds keep the whole layer on the CPU resume.
+/// the planner admits are ever uploaded — the per-sample maps plus the base-3x3
+/// Smooth/Pinch; the remaining neighborhood / reduction kinds keep the whole layer
+/// on the CPU resume.
 fn stroke_kind_gpu_id(kind: SculptStrokeKind) -> u32 {
     match kind {
         SculptStrokeKind::Raise => 0,
@@ -210,11 +211,13 @@ fn stroke_kind_gpu_id(kind: SculptStrokeKind) -> u32 {
         | SculptStrokeKind::Sediment
         | SculptStrokeKind::Protect => 11,
         // Smooth pulls each sample toward the clamped 3x3 mean of the layer input
-        // (`src`); the stamp kernel reads that neighborhood directly (#114).
+        // (`src`); Pinch applies the same pull at a 1.25 overdrive. The stamp kernel
+        // reads that neighborhood directly (#114, #115).
         SculptStrokeKind::Smooth => 12,
+        SculptStrokeKind::Pinch => 13,
         // Not admitted by the planner; never reaches the GPU. Map to the aux no-op
         // so a stray upload cannot corrupt height.
-        SculptStrokeKind::Pinch | SculptStrokeKind::Coastline | SculptStrokeKind::Flatten => 11,
+        SculptStrokeKind::Coastline | SculptStrokeKind::Flatten => 11,
     }
 }
 
