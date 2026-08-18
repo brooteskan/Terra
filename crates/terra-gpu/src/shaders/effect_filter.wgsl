@@ -152,22 +152,30 @@ fn apply_filter(i: i32, j: i32, h: f32) -> f32 {
                 out_h = mix(u.sea_level, h, t * t * (3.0 - 2.0 * t));
             }
         }
-        case 4u: { // Denoise — bilateral-ish
+        case 4u: { // Denoise — edge-preserving bilateral. Mirrors the CPU
+            // `filter_kernels::bilateral` with the sigma derivation from
+            // `generators::effect_filter`'s Denoise arm: sigma_space = 0.55 * radius
+            // (floored at 0.25, the kernel's own clamp), sigma_range = amount in
+            // metres (floored at 0.5, the Denoise arm's `amount.max(0.5)`). The range
+            // weight underflows to ~0 across a large depth step, so the shelf->basin
+            // discontinuity is preserved. CPU remains the export oracle.
             let center = h;
+            let ss = max(0.55 * f32(r), 0.25);
+            let sr = max(u.amount, 0.5);
             var sum = 0.0;
             var wsum = 0.0;
-            let sigma = max(f32(r) * 0.5, 1.0);
             for (var dj = -r; dj <= r; dj++) {
                 for (var di = -r; di <= r; di++) {
                     let v = sample_h(i + di, j + dj);
-                    let spatial = exp(-f32(di * di + dj * dj) / (2.0 * sigma * sigma));
-                    let range = exp(-abs(v - center) * abs(v - center) / (2.0 * 4.0));
-                    let w = spatial * range;
-                    sum += v * w;
-                    wsum += w;
+                    let ws = exp(-f32(di * di + dj * dj) / (2.0 * ss * ss));
+                    let d = v - center;
+                    let wr = exp(-(d * d) / (2.0 * sr * sr));
+                    let wt = ws * wr;
+                    sum += v * wt;
+                    wsum += wt;
                 }
             }
-            out_h = sum / max(wsum, 1e-4);
+            out_h = sum / max(wsum, 1e-5);
         }
         case 5u: { // Inflate
             out_h = h + u.amount * u.strength;

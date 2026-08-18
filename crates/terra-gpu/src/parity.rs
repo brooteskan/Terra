@@ -51,6 +51,18 @@ pub const VALUE_NOISE_PREVIEW: ParityTolerance = ParityTolerance::new(17.0, 2.3e
 /// Effect-filter modes retained on GPU after the support audit.
 pub const SMOOTH_FILTER_PREVIEW: ParityTolerance = ParityTolerance::new(1.8, 3.0e-2);
 pub const INFLATE_FILTER_PREVIEW: ParityTolerance = ParityTolerance::new(2.7, 2.8e-2);
+/// Denoise (bilateral) preview (#119). The GPU kernel mirrors the CPU
+/// `filter_kernels::bilateral` term-for-term, so the residual is the same class
+/// as Smooth: the exp() range/spatial weights diverge only at transcendental
+/// edges, and at Draft quality the shared effect-filter dispatch mixes `strength`
+/// and floors the pass count per pass while the CPU mixes once at the end (so an
+/// authored `iterations: 1` runs two GPU passes against one CPU pass). Across the
+/// depth discontinuity the range weight underflows to 0 on both backends, so the
+/// deep basin is preserved bit-for-bit; the budget is set by the small-fixture
+/// worst texel where the Draft 2-vs-1-pass fold difference lives. Measured worst
+/// case is ~1.5 m / 0.030 on the patterned fixture (the shelf/basin fixture, whose
+/// passes align at 2, stays well under); this holds portable headroom.
+pub const DENOISE_FILTER_PREVIEW: ParityTolerance = ParityTolerance::new(2.2, 3.8e-2);
 /// SculptStrokes preview: untouched texels are bit-exact copies; stamped texels
 /// diverge only by transcendental edges (`sqrt` vs `hypot`, `pow` vs `powf`). The
 /// bit-exact `hash_noise` port keeps Noise strokes in the same budget; the base-3x3
@@ -77,6 +89,7 @@ pub const FIDELITY_MATRIX_MARKDOWN: &str = "\
 | `filter.blur` | Default outer composite; radius/iteration fixture | 2.1 | 0.0055 |\n\
 | `effect.smooth` | Smooth, default outer composite | 1.8 | 0.03 |\n\
 | `effect.inflate` | Inflate, default outer composite | 2.7 | 0.028 |\n\
+| `effect.denoise` | Denoise (bilateral), default outer composite | 2.2 | 0.038 |\n\
 | `filter.terrace` | Default outer composite | 8.5 | 0.10 |\n\
 | `simulation.thermal` | Non-layered, constant hardness, no weathering extension | 3.2 | 0.05 |\n\
 | `simulation.hydraulic` | Base transport, no sources, particles, layers, or post-effects | 3.0 | 0.03 |\n\

@@ -280,9 +280,16 @@ fn gpu_plan_for_layer(layer: &Layer, mask_assets: &[MaskAsset]) -> Option<GpuLay
             GpuDirtyPolicy::Local,
             p.radius.clamp(1, BLUR_MAX_RADIUS),
         ),
+        // Denoise (bilateral) joins Smooth/Inflate on the ratcheted GPU path: its
+        // wgsl mode-4 kernel now mirrors the CPU bilateral (parity-guarded incl. the
+        // shipped reef Shelf Flatten config), and it carries the same
+        // radius-sized halo as Smooth. This keeps the Tropical Island reef biome
+        // preview off the whole-stack CPU fallback (#119).
         EffectFilter(p)
-            if matches!(p.kind, EffectFilterKind::Smooth | EffectFilterKind::Inflate)
-                && inplace_composite_supported(layer) =>
+            if matches!(
+                p.kind,
+                EffectFilterKind::Smooth | EffectFilterKind::Inflate | EffectFilterKind::Denoise
+            ) && inplace_composite_supported(layer) =>
         {
             (
                 GpuKernel::EffectFilter,
@@ -633,7 +640,10 @@ mod tests {
                     ..EffectFilterParams::default()
                 }),
             );
-            let supported = matches!(kind, EffectFilterKind::Smooth | EffectFilterKind::Inflate);
+            let supported = matches!(
+                kind,
+                EffectFilterKind::Smooth | EffectFilterKind::Inflate | EffectFilterKind::Denoise
+            );
             let plan = gpu_plan_for_layer(&layer, &[]);
             assert_eq!(plan.is_some(), supported, "{}", kind.label());
             if let Some(plan) = plan {

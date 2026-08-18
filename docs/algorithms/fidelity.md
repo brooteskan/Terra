@@ -23,6 +23,7 @@ Errors compare complete GPU and CPU height fields. Normalized RMSE uses the maxi
 | `filter.blur` | Default outer composite; radius/iteration fixture | 2.1 | 0.0055 |
 | `effect.smooth` | Smooth, default outer composite | 1.8 | 0.03 |
 | `effect.inflate` | Inflate, default outer composite | 2.7 | 0.028 |
+| `effect.denoise` | Denoise (bilateral), default outer composite | 2.2 | 0.038 |
 | `filter.terrace` | Default outer composite | 8.5 | 0.10 |
 | `simulation.thermal` | Non-layered, constant hardness, no weathering extension | 3.2 | 0.05 |
 | `simulation.hydraulic` | Base transport, no sources, particles, layers, or post-effects | 3.0 | 0.03 |

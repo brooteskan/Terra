@@ -10,9 +10,9 @@ use terra_core::layer::{
 };
 use terra_core::mask::{bake_mask_assets, MaskAsset, MaskId, MaskRef, MaskSource};
 use terra_gpu::parity::{
-    assert_field_parity, BLUR_PREVIEW, EXACT_HEIGHT, HYDRAULIC_PREVIEW, INFLATE_FILTER_PREVIEW,
-    SCULPT_STROKES_PREVIEW, SIMPLE_MASK, SMOOTH_FILTER_PREVIEW, TERRACE_PREVIEW, THERMAL_PREVIEW,
-    VALUE_NOISE_PREVIEW, VOLCANIC_ISLAND_PREVIEW,
+    assert_field_parity, BLUR_PREVIEW, DENOISE_FILTER_PREVIEW, EXACT_HEIGHT, HYDRAULIC_PREVIEW,
+    INFLATE_FILTER_PREVIEW, SCULPT_STROKES_PREVIEW, SIMPLE_MASK, SMOOTH_FILTER_PREVIEW,
+    TERRACE_PREVIEW, THERMAL_PREVIEW, VALUE_NOISE_PREVIEW, VOLCANIC_ISLAND_PREVIEW,
 };
 use terra_gpu::GpuTerrainEngine;
 
@@ -219,6 +219,16 @@ fn gpu_required_noise_and_effect_filter_approximations_are_bounded() {
             },
             INFLATE_FILTER_PREVIEW,
         ),
+        (
+            "effect.denoise",
+            EffectFilterParams {
+                kind: EffectFilterKind::Denoise,
+                iterations: 1,
+                radius: 2,
+                ..EffectFilterParams::default()
+            },
+            DENOISE_FILTER_PREVIEW,
+        ),
     ] {
         let mut stack = LayerStack::new();
         stack.push(Layer::new(
@@ -230,6 +240,103 @@ fn gpu_required_noise_and_effect_filter_approximations_are_bounded() {
         let gpu = gpu_eval(&stack, &[], metrics);
         assert_field_parity(name, &gpu, &cpu, tolerance);
     }
+}
+
+/// Pull the shipped "Shelf Flatten" params straight out of the Tropical Island
+/// palette so this GPU test tracks whatever config actually ships — mirroring the
+/// CPU-side helper in `terra-core/tests/shelf_flatten_bathymetry.rs`. Fails loudly
+/// if the layer is renamed or is no longer an EffectFilter.
+fn shipped_shelf_flatten() -> EffectFilterParams {
+    let lib = terra_core::BiomeLibrary::tropical_island_palette();
+    for def in &lib.definitions {
+        for (name, kind) in &def.terrain_layers {
+            if name == "Shelf Flatten" {
+                match kind {
+                    LayerKind::EffectFilter(p) => return p.clone(),
+                    _ => panic!("'Shelf Flatten' is no longer an EffectFilter layer"),
+                }
+            }
+        }
+    }
+    panic!("Tropical Island palette no longer has a 'Shelf Flatten' terrain layer");
+}
+
+#[test]
+fn gpu_required_denoise_preserves_shelf_basin_discontinuity() {
+    // #119: the shipped reef "Shelf Flatten" (Denoise/bilateral) must now preview on
+    // the GPU without bleeding the shallow shelf into the adjacent deep basin — the
+    // divergence class #95 hardened the CPU export against, guarded here in preview
+    // too. The fixture mirrors terra-core's shelf_flatten_bathymetry: a rippled
+    // ~-7 m shelf abutting a flat ~-218 m basin across a ~211 m step, filtered at the
+    // config pulled live from the shipped palette.
+    const RES: u32 = 64;
+    const SHELF_LAST_COL: u32 = 31;
+    const SHELF_DEPTH: f32 = -7.0;
+    const BASIN_DEPTH: f32 = -218.0;
+    const RIPPLE: f32 = 2.0;
+
+    let metrics = HeightfieldMetrics::new(RES, RES, RES as f32 * 10.0, RES as f32 * 10.0);
+    let samples: Vec<f32> = (0..RES)
+        .flat_map(|j| {
+            (0..RES).map(move |i| {
+                if i <= SHELF_LAST_COL {
+                    // Deterministic +/-2 m checkerboard: real high-frequency detail
+                    // for the denoise to attenuate on the shelf itself.
+                    let ripple = if (i + j) % 2 == 0 { RIPPLE } else { -RIPPLE };
+                    SHELF_DEPTH + ripple
+                } else {
+                    BASIN_DEPTH
+                }
+            })
+        })
+        .collect();
+
+    let params = shipped_shelf_flatten();
+    // Premise guard: the shipped layer is the bilateral Denoise this test exercises.
+    assert_eq!(params.kind, EffectFilterKind::Denoise);
+
+    let mut stack = LayerStack::new();
+    stack.push(Layer::new(
+        "base",
+        LayerKind::SculptBase(SculptParams {
+            width: RES,
+            height: RES,
+            samples,
+            fill_height: 0.0,
+        }),
+    ));
+    stack.push(Layer::new("Shelf Flatten", LayerKind::EffectFilter(params)));
+
+    let cpu = cpu_oracle(&stack, &[], metrics);
+    // gpu_eval asserts fully_gpu: the stack compiles a GPU plan with no CPU fallback
+    // from the Denoise layer (acceptance criterion 1).
+    let gpu = gpu_eval(&stack, &[], metrics);
+    assert_field_parity(
+        "effect.denoise.shelf-basin",
+        &gpu,
+        &cpu,
+        DENOISE_FILTER_PREVIEW,
+    );
+
+    // Headline, asserted directly on the GPU output so it survives even if the parity
+    // tolerance is later loosened: every basin cell stays within 5 m of the true
+    // basin depth — the same bound terra-core's CPU shelf test uses. A box blur lifts
+    // the first basin columns by tens of metres; the edge-aware bilateral must not.
+    let mut worst = 0.0f32;
+    let mut worst_at = (0u32, 0u32);
+    for j in 0..RES {
+        for i in (SHELF_LAST_COL + 1)..RES {
+            let dev = (gpu.get(i, j) - BASIN_DEPTH).abs();
+            if dev > worst {
+                worst = dev;
+                worst_at = (i, j);
+            }
+        }
+    }
+    assert!(
+        worst <= 5.0,
+        "GPU Denoise bled the shelf into the basin: {worst:.1} m at {worst_at:?}"
+    );
 }
 
 #[test]

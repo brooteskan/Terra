@@ -51,7 +51,10 @@ fn every_effect_filter_variant_has_an_explicit_executable_plan() {
             }),
         );
         let graph = graph_for(layer);
-        let supported = matches!(kind, EffectFilterKind::Smooth | EffectFilterKind::Inflate);
+        let supported = matches!(
+            kind,
+            EffectFilterKind::Smooth | EffectFilterKind::Inflate | EffectFilterKind::Denoise
+        );
         assert_eq!(graph.fully_gpu(), supported, "{}", kind.label());
         if supported {
             let plan = graph.plans[0].expect("supported filter retains a plan");
