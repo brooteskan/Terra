@@ -17,7 +17,7 @@ Errors compare complete GPU and CPU height fields. Normalized RMSE uses the maxi
 | Contract | Supported configuration | Max abs (m) | Normalized RMSE |
 | --- | --- | ---: | ---: |
 | `exact-height` | Flat, Ramp, SculptBase, exact blends, hybrid checkpoint | 0.001 | 0.00001 |
-| `authoring.sculpt-strokes` | Per-sample stroke kinds, Smooth/Pinch/Coastline, and distance stamps, supported blend/mask | 0.001 | 0.00001 |
+| `authoring.sculpt-strokes` | Per-sample stroke kinds, Smooth/Pinch/Coastline, Flatten, and distance stamps, supported blend/mask | 0.001 | 0.00001 |
 | `mask.simple` | One Constant, Height, or Slope Multiply entry without asset operations | 0.001 | 0.0001 |
 | `noise.value` | Value noise with a 32-bit seed | 17.0 | 0.23 |
 | `filter.blur` | Default outer composite; radius/iteration fixture | 2.1 | 0.0055 |
@@ -37,6 +37,6 @@ Errors compare complete GPU and CPU height fields. Normalized RMSE uses the maxi
 - Perlin, fBm, ridged, domain-warp, dunes, mountains, canyons, mesa, volcano, uplift, plateau, non-volcanic island archetypes, RiverCarve, and unratcheted EffectFilter variants fall back to CPU. They may return only after gaining a named full-field contract.
 - Seeds with non-zero upper 32 bits fall back instead of being truncated.
 - Layered/source-driven/multilevel thermal and particle/layered/source-driven hydraulic configurations fall back to CPU.
-- SculptStrokes previews the per-sample stroke kinds (Raise/Lower/Ridge/Valley/Inflate/Terrace/Noise, the distance stamps, and the aux-only kinds) plus Smooth, Pinch, and Coastline, whose base-3x3 pull the stamp kernel reads directly from the layer input (Pinch at a 1.25 overdrive; Coastline a lower-and-blend toward that mean under a weight gate); only Flatten stays on CPU. It is a height-only preview — the CPU eval remains authoritative for the protection/uplift/hardness/sediment/edit-region aux, so a stroke layer resumes on CPU whenever an enabled downstream layer consumes that aux.
+- SculptStrokes previews the per-sample stroke kinds (Raise/Lower/Ridge/Valley/Inflate/Terrace/Noise, the distance stamps, and the aux-only kinds) plus Smooth, Pinch, and Coastline, whose base-3x3 pull the stamp kernel reads directly from the layer input (Pinch at a 1.25 overdrive; Coastline a lower-and-blend toward that mean under a weight gate), and Flatten, whose footprint mean a reduce/resolve pair measures against the running field before the stamp path applies it (the stroke run is segmented at each Flatten). Every stroke kind now previews on the GPU. It is a height-only preview — the CPU eval remains authoritative for the protection/uplift/hardness/sediment/edit-region aux, so a stroke layer resumes on CPU whenever an enabled downstream layer consumes that aux.
 - Materials/biomes are ID masks + procedural viewport palette, not a PBR asset library.
 - Clipmaps are nested full grids (no skirts/morphing yet).

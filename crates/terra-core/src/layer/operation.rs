@@ -487,7 +487,9 @@ impl LayerKind {
                 // stroke's own stamp read). Reach is 2 only when such a stroke feeds a
                 // non-zero reconcile: the base 3x3 shifts the stamped field one texel,
                 // then reconcile re-reads that at 3x3. Keeps the CPU oracle in
-                // agreement with the GPU plan halo for Smooth (#114).
+                // agreement with the GPU plan halo for Smooth (#114). Flatten stays
+                // tile-scoped too — its footprint fixpoint (#110) keeps a self-edit
+                // recompute bit-exact without escalating the layer's reach.
                 halo_samples: 1
                     + u32::from(
                         p.reconcile > 0.0
@@ -887,6 +889,13 @@ mod tests {
                 "{kind:?}"
             );
         }
+        // Flatten stays tile-scoped (its #110 footprint fixpoint keeps a self-edit
+        // recompute bit-exact), so it does not escalate the layer's reach: a lone
+        // Flatten sits at the one-sample reconcile floor like any per-sample stroke.
+        assert_eq!(
+            base_neighborhood_strokes(SculptStrokeKind::Flatten, 0.15).intrinsic_reach(),
+            Reach::Localized { halo_samples: 1 },
+        );
         // Basin-coupled kind: whole field.
         assert_eq!(
             LayerKind::ThermalErosion(Default::default()).intrinsic_reach(),

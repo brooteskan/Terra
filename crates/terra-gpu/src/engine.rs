@@ -154,10 +154,39 @@ struct SculptStrokesU {
     height: u32,
     world_x: f32,
     world_z: f32,
-    stroke_count: u32,
+    /// Contiguous stroke range this dispatch stamps: `[stroke_lo, stroke_hi)`.
+    /// The edited pass shares the layout with `lo = 0`, `hi = stroke_count`.
+    stroke_lo: u32,
+    stroke_hi: u32,
+    _p1: u32,
+    _p2: u32,
+}
+
+/// Reduce pass uniform: measures one Flatten stroke's footprint mean. `stroke_index`
+/// selects the header; workgroups address their partial slot via `num_workgroups`.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct SculptReduceU {
+    width: u32,
+    height: u32,
+    world_x: f32,
+    world_z: f32,
+    stroke_index: u32,
     _p0: u32,
     _p1: u32,
     _p2: u32,
+}
+
+/// Resolve pass uniform: folds the reduce partials into `targets[target_index]`,
+/// falling back to `fallback` (the stroke's `target_height`) when the footprint
+/// carried no weight — the exact CPU `flatten_target_for` degenerate branch.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct SculptResolveU {
+    num_partials: u32,
+    target_index: u32,
+    fallback: f32,
+    _p0: f32,
 }
 
 #[repr(C)]
@@ -188,9 +217,9 @@ struct StrokeHeaderGpu {
 }
 
 /// Alias-collapsed kind id shared with `shaders/sculpt_strokes.wgsl`. Only kinds
-/// the planner admits are ever uploaded — the per-sample maps plus the base-3x3
-/// Smooth/Pinch/Coastline; the remaining reduction kind keeps the whole layer on
-/// the CPU resume.
+/// the planner admits are ever uploaded — the per-sample maps, the base-3x3
+/// Smooth/Pinch/Coastline, and the footprint-mean Flatten (#117), whose per-stroke
+/// target the reduce/resolve passes precompute into the `targets` buffer.
 fn stroke_kind_gpu_id(kind: SculptStrokeKind) -> u32 {
     match kind {
         SculptStrokeKind::Raise => 0,
@@ -217,9 +246,10 @@ fn stroke_kind_gpu_id(kind: SculptStrokeKind) -> u32 {
         SculptStrokeKind::Smooth => 12,
         SculptStrokeKind::Pinch => 13,
         SculptStrokeKind::Coastline => 14,
-        // Not admitted by the planner; never reaches the GPU. Map to the aux no-op
-        // so a stray upload cannot corrupt height.
-        SculptStrokeKind::Flatten => 11,
+        // Flatten settles toward the brush-weighted mean of the running field over
+        // its footprint; the reduce/resolve passes compute that scalar per stroke
+        // into `targets`, and the stamp arm applies `h + (target - h) * w` (#117).
+        SculptStrokeKind::Flatten => 15,
     }
 }
 
@@ -588,6 +618,19 @@ fn storage_read_buffer_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
+fn storage_rw_buffer_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: false },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
+}
+
 /// Ring of small uniform buffers so many dispatches can share one submit.
 struct UniformPool {
     buffers: Vec<wgpu::Buffer>,
@@ -710,6 +753,9 @@ pub struct GpuTerrainEngine {
     effect_filter: Pipe,
     mask_bake: Pipe,
     sculpt_strokes: Pipe,
+    sculpt_strokes_edited: Pipe,
+    sculpt_strokes_flatten_reduce: Pipe,
+    sculpt_strokes_flatten_resolve: Pipe,
     sculpt_strokes_reconcile: Pipe,
     uniform_pool: UniformPool,
     ping: HeightTex,
@@ -727,9 +773,12 @@ pub struct GpuTerrainEngine {
     /// Loose sediment thickness for layered erodibility (meters).
     loose_sediment: HeightTex,
     outflow: RgbaTex,
-    /// SculptStrokes preview scratch: stamped height and per-texel brush coverage,
-    /// written by the stamp pass and read by the reconcile pass (#113).
+    /// SculptStrokes preview scratch: the running stamped height (`sculpt_stamp` and
+    /// the ping-pong partner `sculpt_stamp_b`) and the per-texel brush coverage
+    /// (`sculpt_edited`), read by the reconcile pass (#113, #117). The Flatten
+    /// segmentation (#117) chains stamp segments between the two height buffers.
     sculpt_stamp: HeightTex,
+    sculpt_stamp_b: HeightTex,
     sculpt_edited: HeightTex,
     layer_cache: HashMap<LayerId, HeightTex>,
     /// Pre-blend generator output, keyed by layer id.
@@ -947,13 +996,44 @@ impl GpuTerrainEngine {
             label: Some("sculpt-strokes-bgl"),
             entries: &[
                 uniform_entry(0),
-                tex_read_entry(1),
-                storage_read_buffer_entry(2),
-                storage_read_buffer_entry(3),
-                storage_write_entry(4),
-                storage_write_entry(5),
+                tex_read_entry(1),            // src_original (base neighborhood)
+                tex_read_entry(2),            // running_in (chained height)
+                storage_read_buffer_entry(3), // headers
+                storage_read_buffer_entry(4), // points
+                storage_read_buffer_entry(5), // targets (Flatten footprint means)
+                storage_write_entry(6),       // stamp_out
             ],
         });
+        let sculpt_strokes_edited_bgl =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("sculpt-strokes-edited-bgl"),
+                entries: &[
+                    uniform_entry(0),
+                    storage_read_buffer_entry(1), // headers
+                    storage_read_buffer_entry(2), // points
+                    storage_write_entry(3),       // edited_out
+                ],
+            });
+        let sculpt_strokes_flatten_reduce_bgl =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("sculpt-strokes-flatten-reduce-bgl"),
+                entries: &[
+                    uniform_entry(0),
+                    tex_read_entry(1),            // running field entering the stroke
+                    storage_read_buffer_entry(2), // headers
+                    storage_read_buffer_entry(3), // points
+                    storage_rw_buffer_entry(4),   // partials
+                ],
+            });
+        let sculpt_strokes_flatten_resolve_bgl =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("sculpt-strokes-flatten-resolve-bgl"),
+                entries: &[
+                    uniform_entry(0),
+                    storage_read_buffer_entry(1), // partials
+                    storage_rw_buffer_entry(2),   // targets
+                ],
+            });
         let sculpt_strokes_reconcile_bgl =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("sculpt-strokes-reconcile-bgl"),
@@ -969,6 +1049,24 @@ impl GpuTerrainEngine {
             "sculpt-strokes",
             include_str!("shaders/sculpt_strokes.wgsl"),
             sculpt_strokes_bgl,
+        );
+        let sculpt_strokes_edited = make_pipe(
+            device,
+            "sculpt-strokes-edited",
+            include_str!("shaders/sculpt_strokes_edited.wgsl"),
+            sculpt_strokes_edited_bgl,
+        );
+        let sculpt_strokes_flatten_reduce = make_pipe(
+            device,
+            "sculpt-strokes-flatten-reduce",
+            include_str!("shaders/sculpt_strokes_flatten_reduce.wgsl"),
+            sculpt_strokes_flatten_reduce_bgl,
+        );
+        let sculpt_strokes_flatten_resolve = make_pipe(
+            device,
+            "sculpt-strokes-flatten-resolve",
+            include_str!("shaders/sculpt_strokes_flatten_resolve.wgsl"),
+            sculpt_strokes_flatten_resolve_bgl,
         );
         let sculpt_strokes_reconcile = make_pipe(
             device,
@@ -990,6 +1088,7 @@ impl GpuTerrainEngine {
         let loose_sediment = HeightTex::new(device, "loose-sediment", w, w);
         let outflow = RgbaTex::new(device, "hydraulic-outflow", w, w);
         let sculpt_stamp = HeightTex::new(device, "sculpt-stamp", w, w);
+        let sculpt_stamp_b = HeightTex::new(device, "sculpt-stamp-b", w, w);
         let sculpt_edited = HeightTex::new(device, "sculpt-edited", w, w);
 
         Self {
@@ -1010,6 +1109,9 @@ impl GpuTerrainEngine {
             effect_filter,
             mask_bake,
             sculpt_strokes,
+            sculpt_strokes_edited,
+            sculpt_strokes_flatten_reduce,
+            sculpt_strokes_flatten_resolve,
             sculpt_strokes_reconcile,
             uniform_pool: UniformPool::new(device, 64),
             ping,
@@ -1026,6 +1128,7 @@ impl GpuTerrainEngine {
             loose_sediment,
             outflow,
             sculpt_stamp,
+            sculpt_stamp_b,
             sculpt_edited,
             layer_cache: HashMap::new(),
             layer_contrib: HashMap::new(),
@@ -1323,6 +1426,7 @@ impl GpuTerrainEngine {
         self.loose_sediment = HeightTex::new(device, "loose-sediment", w, h);
         self.outflow = RgbaTex::new(device, "hydraulic-outflow", w, h);
         self.sculpt_stamp = HeightTex::new(device, "sculpt-stamp", w, h);
+        self.sculpt_stamp_b = HeightTex::new(device, "sculpt-stamp-b", w, h);
         self.sculpt_edited = HeightTex::new(device, "sculpt-edited", w, h);
         self.layer_cache.clear();
         self.layer_contrib.clear();
@@ -2460,10 +2564,20 @@ impl GpuTerrainEngine {
         );
     }
 
-    /// Stamp the stroke set into `sculpt_stamp`/`sculpt_edited`, then relax into
-    /// `layer_tex` (the layer contribution the standard blend consumes). Full-field
-    /// like every other layer's contribution — `layer_tex` is shared scratch, so it
-    /// must be valid everywhere the full-field blend reads it (#113).
+    /// Stamp the stroke set into the running height, measure each Flatten target,
+    /// then relax into `layer_tex` (the layer contribution the standard blend
+    /// consumes). Full-field like every other layer's contribution — `layer_tex` is
+    /// shared scratch, so it must be valid everywhere the full-field blend reads it
+    /// (#113).
+    ///
+    /// Most kinds stamp in a single pass over the whole set. Flatten (#117) splits
+    /// the set: each Flatten's target is the brush-weighted mean of the *running*
+    /// field over its footprint, so the stroke run is cut before every Flatten, the
+    /// prior segment is stamped into a ping-pong height buffer, and a reduce/resolve
+    /// pair measures that buffer into `targets[f]` before the Flatten (in the next
+    /// segment) reads it. With no Flatten present this degenerates to one stamp of
+    /// `[0, n)` reading the layer input — the pre-#117 path. `edited` is order- and
+    /// target-independent, so a single pass computes it over the whole set.
     fn run_sculpt_strokes(
         &mut self,
         device: &wgpu::Device,
@@ -2485,65 +2599,336 @@ impl GpuTerrainEngine {
             bytemuck::cast_slice(&points),
         );
 
+        let width = self.metrics.width;
+        let height = self.metrics.height;
+        let world_x = self.metrics.world_size_x;
+        let world_z = self.metrics.world_size_z;
+        let n = p.strokes.len() as u32;
+        let gx = width.div_ceil(8);
+        let gy = height.div_ceil(8);
+        let num_partials = gx * gy;
+
+        // Flatten footprint means, indexed by global stroke id; `partials` is the
+        // reduce pass's per-workgroup scratch. Both are written by the GPU, so they
+        // only need a valid (zeroed) backing until then.
+        let targets_buf = make_storage_buffer(
+            device,
+            queue,
+            "sculpt-stroke-flatten-targets",
+            bytemuck::cast_slice(&vec![0f32; n.max(1) as usize]),
+        );
+        let partials_buf = make_storage_buffer(
+            device,
+            queue,
+            "sculpt-stroke-flatten-partials",
+            bytemuck::cast_slice(&vec![[0f32; 2]; num_partials.max(1) as usize]),
+        );
+
+        // The running field lives in one of three textures: the layer input (`Src`,
+        // ping/pong) or the two ping-pong scratch buffers. `Src` is never written.
+        #[derive(Clone, Copy)]
+        enum RunSlot {
+            Src,
+            A,
+            B,
+        }
+        fn flip(s: RunSlot) -> RunSlot {
+            match s {
+                RunSlot::Src | RunSlot::B => RunSlot::A,
+                RunSlot::A => RunSlot::B,
+            }
+        }
+        #[derive(Clone, Copy)]
+        struct StampOp {
+            lo: u32,
+            hi: u32,
+            in_slot: RunSlot,
+            out_slot: RunSlot,
+        }
+        #[derive(Clone, Copy)]
+        struct ReduceOp {
+            stroke_index: u32,
+            field: RunSlot,
+            target_index: u32,
+            fallback: f32,
+        }
+        #[derive(Clone, Copy)]
+        enum Op {
+            Stamp(StampOp),
+            Reduce(ReduceOp),
+        }
+
+        // Cut the run before each Flatten. `cur` is the field entering the next
+        // segment; a Flatten's reduce measures it, and the segment that finally
+        // applies the Flatten reads `targets[f]` the resolve just wrote.
+        let mut ops: Vec<Op> = Vec::new();
+        let mut cur = RunSlot::Src;
+        let mut prev = 0u32;
+        for (idx, stroke) in p.strokes.iter().enumerate() {
+            if !matches!(stroke.kind, SculptStrokeKind::Flatten) {
+                continue;
+            }
+            let f = idx as u32;
+            if f > prev {
+                let out = flip(cur);
+                ops.push(Op::Stamp(StampOp {
+                    lo: prev,
+                    hi: f,
+                    in_slot: cur,
+                    out_slot: out,
+                }));
+                cur = out;
+            }
+            ops.push(Op::Reduce(ReduceOp {
+                stroke_index: f,
+                field: cur,
+                target_index: f,
+                fallback: stroke.target_height,
+            }));
+            prev = f;
+        }
+        if n > prev {
+            let out = flip(cur);
+            ops.push(Op::Stamp(StampOp {
+                lo: prev,
+                hi: n,
+                in_slot: cur,
+                out_slot: out,
+            }));
+            cur = out;
+        }
+        let final_slot = cur;
+
         // All `&mut self` (uniform-pool) writes happen before any texture-view
-        // borrow, matching `blend_into_current`.
-        let stamp_u = SculptStrokesU {
-            width: self.metrics.width,
-            height: self.metrics.height,
-            world_x: self.metrics.world_size_x,
-            world_z: self.metrics.world_size_z,
-            stroke_count: p.strokes.len() as u32,
-            _p0: 0,
+        // borrow, matching `blend_into_current`; the ops carry their slots so the
+        // dispatch phase needs no further planning.
+        enum PassU {
+            Stamp(wgpu::Buffer),
+            Reduce {
+                reduce: wgpu::Buffer,
+                resolve: wgpu::Buffer,
+            },
+        }
+        let mut pass_us: Vec<PassU> = Vec::with_capacity(ops.len());
+        for op in &ops {
+            match *op {
+                Op::Stamp(s) => {
+                    let u = SculptStrokesU {
+                        width,
+                        height,
+                        world_x,
+                        world_z,
+                        stroke_lo: s.lo,
+                        stroke_hi: s.hi,
+                        _p1: 0,
+                        _p2: 0,
+                    };
+                    pass_us.push(PassU::Stamp(self.write_uniform(device, queue, &u)));
+                }
+                Op::Reduce(r) => {
+                    let ru = SculptReduceU {
+                        width,
+                        height,
+                        world_x,
+                        world_z,
+                        stroke_index: r.stroke_index,
+                        _p0: 0,
+                        _p1: 0,
+                        _p2: 0,
+                    };
+                    let sv = SculptResolveU {
+                        num_partials,
+                        target_index: r.target_index,
+                        fallback: r.fallback,
+                        _p0: 0.0,
+                    };
+                    let reduce = self.write_uniform(device, queue, &ru);
+                    let resolve = self.write_uniform(device, queue, &sv);
+                    pass_us.push(PassU::Reduce { reduce, resolve });
+                }
+            }
+        }
+        let edited_u = SculptStrokesU {
+            width,
+            height,
+            world_x,
+            world_z,
+            stroke_lo: 0,
+            stroke_hi: n,
             _p1: 0,
             _p2: 0,
         };
-        let stamp_u_buf = self.write_uniform(device, queue, &stamp_u);
+        let edited_u_buf = self.write_uniform(device, queue, &edited_u);
         let recon_u = SculptReconcileU {
-            width: self.metrics.width,
-            height: self.metrics.height,
+            width,
+            height,
             reconcile: p.reconcile,
             _p0: 0.0,
         };
         let recon_u_buf = self.write_uniform(device, queue, &recon_u);
 
-        let gx = self.metrics.width.div_ceil(8);
-        let gy = self.metrics.height.div_ceil(8);
+        // Immutable view borrows only, from here down.
         let src_view = if self.current == 0 {
             &self.ping.view
         } else {
             &self.pong.view
         };
+        let stamp_a = &self.sculpt_stamp.view;
+        let stamp_b = &self.sculpt_stamp_b.view;
+        let slot_view = |slot: RunSlot| match slot {
+            RunSlot::Src => src_view,
+            RunSlot::A => stamp_a,
+            RunSlot::B => stamp_b,
+        };
 
-        let stamp_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("sculpt-strokes-bg"),
-            layout: &self.sculpt_strokes.bgl,
+        // Edited coverage: one order-independent pass over the whole set.
+        let edited_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("sculpt-strokes-edited-bg"),
+            layout: &self.sculpt_strokes_edited.bgl,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: stamp_u_buf.as_entire_binding(),
+                    resource: edited_u_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(src_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
                     resource: header_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 3,
+                    binding: 2,
                     resource: point_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::TextureView(&self.sculpt_stamp.view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
+                    binding: 3,
                     resource: wgpu::BindingResource::TextureView(&self.sculpt_edited.view),
                 },
             ],
         });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("sculpt-strokes-edited"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.sculpt_strokes_edited.pipeline);
+            pass.set_bind_group(0, &edited_bg, &[]);
+            pass.dispatch_workgroups(gx, gy, 1);
+        }
+
+        // Segmented stamp + Flatten reductions, in execution order.
+        for (op, pu) in ops.iter().zip(pass_us.iter()) {
+            match (op, pu) {
+                (Op::Stamp(s), PassU::Stamp(u_buf)) => {
+                    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("sculpt-strokes-bg"),
+                        layout: &self.sculpt_strokes.bgl,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: u_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::TextureView(src_view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: wgpu::BindingResource::TextureView(slot_view(s.in_slot)),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 3,
+                                resource: header_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 4,
+                                resource: point_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 5,
+                                resource: targets_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 6,
+                                resource: wgpu::BindingResource::TextureView(slot_view(s.out_slot)),
+                            },
+                        ],
+                    });
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("sculpt-strokes-stamp"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(&self.sculpt_strokes.pipeline);
+                    pass.set_bind_group(0, &bg, &[]);
+                    pass.dispatch_workgroups(gx, gy, 1);
+                }
+                (Op::Reduce(r), PassU::Reduce { reduce, resolve }) => {
+                    let reduce_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("sculpt-strokes-flatten-reduce-bg"),
+                        layout: &self.sculpt_strokes_flatten_reduce.bgl,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: reduce.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::TextureView(slot_view(r.field)),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: header_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 3,
+                                resource: point_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 4,
+                                resource: partials_buf.as_entire_binding(),
+                            },
+                        ],
+                    });
+                    let resolve_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("sculpt-strokes-flatten-resolve-bg"),
+                        layout: &self.sculpt_strokes_flatten_resolve.bgl,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: resolve.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: partials_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: targets_buf.as_entire_binding(),
+                            },
+                        ],
+                    });
+                    {
+                        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: Some("sculpt-strokes-flatten-reduce"),
+                            timestamp_writes: None,
+                        });
+                        pass.set_pipeline(&self.sculpt_strokes_flatten_reduce.pipeline);
+                        pass.set_bind_group(0, &reduce_bg, &[]);
+                        pass.dispatch_workgroups(gx, gy, 1);
+                    }
+                    {
+                        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: Some("sculpt-strokes-flatten-resolve"),
+                            timestamp_writes: None,
+                        });
+                        pass.set_pipeline(&self.sculpt_strokes_flatten_resolve.pipeline);
+                        pass.set_bind_group(0, &resolve_bg, &[]);
+                        pass.dispatch_workgroups(1, 1, 1);
+                    }
+                }
+                _ => unreachable!("ops and pass uniforms are built in lockstep"),
+            }
+        }
+
+        // Reconcile the final running field into the layer contribution.
         let recon_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("sculpt-strokes-reconcile-bg"),
             layout: &self.sculpt_strokes_reconcile.bgl,
@@ -2554,7 +2939,7 @@ impl GpuTerrainEngine {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&self.sculpt_stamp.view),
+                    resource: wgpu::BindingResource::TextureView(slot_view(final_slot)),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
@@ -2566,16 +2951,6 @@ impl GpuTerrainEngine {
                 },
             ],
         });
-
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("sculpt-strokes-stamp"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.sculpt_strokes.pipeline);
-            pass.set_bind_group(0, &stamp_bg, &[]);
-            pass.dispatch_workgroups(gx, gy, 1);
-        }
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("sculpt-strokes-reconcile"),
@@ -2685,6 +3060,9 @@ impl GpuTerrainEngine {
                 // compound across incremental dabs — sinking the render's slab base
                 // (`min_h - f(span)`) a little further on every drag step. Their exact
                 // extent is left to the async CPU refine; height itself is unaffected.
+                // Flatten is deliberately absent: its target is a mean of heights
+                // already in range and it settles `h` toward that mean, so it cannot
+                // exceed the current extent — and its `target_height` is ignored (#117).
                 for stroke in &p.strokes {
                     if matches!(
                         stroke.kind,

@@ -168,19 +168,23 @@ fn seed_supported(seed: u64) -> bool {
     seed <= u64::from(u32::MAX)
 }
 
-/// Whether the GPU stamp kernel can reproduce a single sculpt-stroke kind. Most
+/// Whether the GPU stamp path can reproduce a single sculpt-stroke kind. Most
 /// supported kinds are pure per-sample maps of the running height (plus the
 /// distance-to-polyline SDF); `Smooth`, `Pinch`, and `Coastline` additionally read a
 /// clamped 3x3 of the layer input (`src`), which the kernel samples directly — `Pinch`
 /// is `Smooth`'s pull at a 1.25 overdrive, `Coastline` a lower-and-blend toward that
-/// mean under a weight gate (#114, #115, #116). The excluded kind needs a per-stroke
-/// footprint-mean reduction (`Flatten`); it stays on the CPU resume (#113). The
-/// aux-only kinds (`Uplift` / `Hardness` / `Sediment` / `Protect` /
-/// `EncourageErosion`) are supported because their height contribution is a
-/// per-sample function even though the GPU preview drops the aux they would publish —
-/// the aux gate in `compile_gpu_graph` handles any downstream consumer.
-fn stroke_kind_gpu_supported(kind: SculptStrokeKind) -> bool {
-    !matches!(kind, SculptStrokeKind::Flatten)
+/// mean under a weight gate (#114, #115, #116). `Flatten` needs a per-stroke
+/// footprint-mean reduction over the running field; the reduce/resolve passes now
+/// precompute that scalar and the stamp path segments the run around it, so it too
+/// previews on the GPU (#117). The aux-only kinds (`Uplift` / `Hardness` /
+/// `Sediment` / `Protect` / `EncourageErosion`) are supported because their height
+/// contribution is a per-sample function even though the GPU preview drops the aux
+/// they would publish — the aux gate in `compile_gpu_graph` handles any downstream
+/// consumer. Every kind is now GPU-previewable; the hook is retained so a future
+/// kind the stamp path cannot reproduce can be excluded here (and localised in the
+/// CPU oracle to match).
+fn stroke_kind_gpu_supported(_kind: SculptStrokeKind) -> bool {
+    true
 }
 
 fn thermal_config_supported(p: &terra_core::layer::ThermalErosionParams) -> bool {
@@ -230,8 +234,12 @@ fn gpu_plan_for_layer(layer: &Layer, mask_assets: &[MaskAsset]) -> Option<GpuLay
         // further through the stamp; a non-zero reconcile reads a 3x3 of the stamped
         // result and adds its own texel. The two compose (the base read feeds
         // reconcile's stamped read), so the plan halo is their sum — kept in agreement
-        // with the CPU `SculptStrokes` intrinsic reach. The aux this layer would publish
-        // is dropped here; `compile_gpu_graph` demotes the plan when a downstream layer
+        // with the CPU `SculptStrokes` intrinsic reach. Flatten adds no per-texel
+        // neighbourhood read (its footprint mean is a precomputed scalar), so it does
+        // not widen the stamp halo. Flatten stays tile-scoped like the CPU (its #110
+        // footprint fixpoint keeps a self-edit recompute bit-exact), so it takes the
+        // same `Local` policy — not `FullField`. The aux this layer would publish is
+        // dropped here; `compile_gpu_graph` demotes the plan when a downstream layer
         // consumes it.
         SculptStrokes(p)
             if gpu_blend_mode(layer.common.blend).is_some()
@@ -458,8 +466,10 @@ mod tests {
             LayerKind::NoiseValue(NoiseParams::default()),
         ));
         // SculptStrokes: GPU localizes it (Local), CPU is Local too — never more
-        // permissive.
+        // permissive. This holds for Flatten as well: it stays tile-scoped (Local) on
+        // both sides via its #110 footprint fixpoint.
         candidates.push(strokes_layer(SculptStrokeKind::Raise, 0.15));
+        candidates.push(strokes_layer(SculptStrokeKind::Flatten, 0.15));
 
         let mut saw_full_field = false;
         for layer in &candidates {
@@ -670,6 +680,10 @@ mod tests {
             (SculptStrokeKind::Pinch, 0.0, 1),
             (SculptStrokeKind::Coastline, 0.2, 2),
             (SculptStrokeKind::Coastline, 0.0, 1),
+            // Flatten's footprint mean is a precomputed scalar (no base 3x3), so it
+            // carries only the reconcile texel (1) or none (0) — #117.
+            (SculptStrokeKind::Flatten, 0.2, 1),
+            (SculptStrokeKind::Flatten, 0.0, 0),
         ] {
             let layer = strokes_layer(kind, reconcile);
             let plan = gpu_plan_for_layer(&layer, &[])
@@ -683,18 +697,25 @@ mod tests {
     }
 
     #[test]
-    fn sculpt_strokes_reduction_kind_falls_back_to_cpu() {
-        // Flatten needs a per-stroke footprint-mean reduction the stamp kernel does not
-        // reproduce, so it stays on the CPU resume. (The base-3x3 pulls Smooth, Pinch,
-        // and Coastline are GPU-supported as of #114, #115, and #116.)
+    fn sculpt_strokes_reduction_kind_previews_on_gpu() {
+        // Flatten's per-stroke footprint-mean reduction now runs on the GPU: the
+        // reduce/resolve passes precompute each target and the stamp path segments
+        // the run around it (#117). A Flatten layer compiles fully GPU, and it
+        // composes with per-sample kinds in one plan (the stroke set no longer has to
+        // split across the GPU/CPU boundary at a Flatten).
         let kind = SculptStrokeKind::Flatten;
         let layer = strokes_layer(kind, 0.15);
-        assert!(gpu_plan_for_layer(&layer, &[]).is_none(), "{kind:?}");
-        assert!(!layer_gpu_supported(&layer, &[]), "{kind:?}");
-        assert_eq!(single_layer_graph(layer).cpu_from, Some(0), "{kind:?}");
+        let plan = gpu_plan_for_layer(&layer, &[])
+            .unwrap_or_else(|| panic!("{kind:?} should compile to a GPU plan"));
+        assert_eq!(plan.kernel, GpuKernel::SculptStrokes, "{kind:?}");
+        // Flatten stays tile-scoped like the CPU (its #110 footprint fixpoint keeps a
+        // self-edit recompute bit-exact), so it takes the same Local policy.
+        assert_eq!(plan.dirty_policy, GpuDirtyPolicy::Local, "{kind:?}");
+        assert!(layer_gpu_supported(&layer, &[]), "{kind:?}");
+        assert_eq!(single_layer_graph(layer).cpu_from, None, "{kind:?}");
 
-        // A single unsupported stroke poisons the whole layer: strokes compose in
-        // order, so the layer cannot be split across the GPU/CPU boundary.
+        // Flatten interleaved with a per-sample kind still compiles: the segmentation
+        // measures the Flatten against the running field the Raise already wrote.
         let mixed = Layer::new(
             "mixed",
             LayerKind::SculptStrokes(SculptStrokeParams {
@@ -711,7 +732,7 @@ mod tests {
                 reconcile: 0.15,
             }),
         );
-        assert!(!layer_gpu_supported(&mixed, &[]));
+        assert!(layer_gpu_supported(&mixed, &[]));
     }
 
     #[test]

@@ -1,23 +1,26 @@
-// Interactive SculptStrokes preview — stamp pass (#113, #114, #115, #116).
+// Interactive SculptStrokes preview — stamp pass (#113, #114, #115, #116, #117).
 //
-// One dispatch stamps every supported stroke into `stamp_out`, chaining strokes at
-// each texel exactly as the CPU `apply_sculpt_strokes` does (stroke k+1 reads the
-// height stroke k already wrote). `edited_out` receives the max brush weight
-// touching the texel, which the reconcile pass consumes. Most supported kinds are
-// per-sample maps of the running height; Smooth (#114), Pinch (#115), and Coastline
-// (#116) additionally read a clamped 3x3 of `src` — the layer input (`base` on the
-// CPU), not the running stamp. Pinch is Smooth's pull at a 1.25 overdrive; Coastline
-// lowers the sample and blends it toward that mean under a weight gate. The remaining
-// reduction kind (Flatten) never reaches the GPU — the planner keeps any layer
-// containing one on the CPU resume.
+// One dispatch stamps a contiguous stroke range [stroke_lo, stroke_hi) into
+// `stamp_out`, chaining strokes at each texel exactly as the CPU
+// `apply_sculpt_strokes` does (stroke k+1 reads the height stroke k already wrote).
+// `h` initialises from `running_in` — the field entering this segment — while
+// Smooth (#114), Pinch (#115), and Coastline (#116) read a clamped 3x3 of
+// `src_original`, the layer input (`base` on the CPU), which is invariant across
+// segments. For the whole-set common case the two inputs are the same texture and
+// the range is [0, stroke_count); Flatten (#117) splits the set so its per-stroke
+// footprint-mean target (precomputed into `targets` by the reduce/resolve passes)
+// is measured against the running field before it. Pinch is Smooth's pull at a 1.25
+// overdrive; Coastline lowers the sample and blends it toward that mean under a
+// weight gate. The max brush weight per texel is produced by the separate edited
+// pass (order-independent), not here.
 
 struct Uniforms {
     width: u32,
     height: u32,
     world_x: f32,   // world_size_x (metres)
     world_z: f32,   // world_size_z (metres)
-    stroke_count: u32,
-    _p0: u32,
+    stroke_lo: u32, // first stroke in this segment (inclusive)
+    stroke_hi: u32, // one past the last stroke in this segment
     _p1: u32,
     _p2: u32,
 };
@@ -39,6 +42,7 @@ const KIND_AUX_NOOP: u32 = 11u;
 const KIND_SMOOTH: u32 = 12u;
 const KIND_PINCH: u32 = 13u;
 const KIND_COASTLINE: u32 = 14u;
+const KIND_FLATTEN: u32 = 15u;
 
 struct StrokeHeader {
     kind: u32,
@@ -54,11 +58,17 @@ struct StrokeHeader {
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
-@group(0) @binding(1) var src: texture_2d<f32>;
-@group(0) @binding(2) var<storage, read> headers: array<StrokeHeader>;
-@group(0) @binding(3) var<storage, read> points: array<vec4<f32>>;
-@group(0) @binding(4) var stamp_out: texture_storage_2d<r32float, write>;
-@group(0) @binding(5) var edited_out: texture_storage_2d<r32float, write>;
+// The layer input (`base` on the CPU): the clamped 3x3 read by Smooth/Pinch/Coastline.
+// Invariant across segments — never the running stamp.
+@group(0) @binding(1) var src_original: texture_2d<f32>;
+// The running field entering this segment; `h` initialises from it and chains.
+@group(0) @binding(2) var running_in: texture_2d<f32>;
+@group(0) @binding(3) var<storage, read> headers: array<StrokeHeader>;
+@group(0) @binding(4) var<storage, read> points: array<vec4<f32>>;
+// Per-stroke Flatten footprint means, indexed by global stroke id (written by the
+// reduce/resolve passes). Read only by the Flatten arm; ignored by every other kind.
+@group(0) @binding(5) var<storage, read> targets: array<f32>;
+@group(0) @binding(6) var stamp_out: texture_storage_2d<r32float, write>;
 
 // --- 64-bit unsigned emulation for a bit-exact `hash_noise` port -------------
 // vec2<u32> holds (lo, hi). Grid coordinates are non-negative, so the u32 -> u64
@@ -179,13 +189,13 @@ fn base_neighborhood_average(px: i32, py: i32) -> f32 {
         for (var di = -1; di <= 1; di = di + 1) {
             let ii = clamp(px + di, 0, i32(u.width) - 1);
             let jj = clamp(py + dj, 0, i32(u.height) - 1);
-            sum = sum + textureLoad(src, vec2<i32>(ii, jj), 0).r;
+            sum = sum + textureLoad(src_original, vec2<i32>(ii, jj), 0).r;
         }
     }
     return sum / 9.0;
 }
 
-fn apply_kind(header: StrokeHeader, h: f32, dist: f32, w: f32, px: i32, py: i32) -> f32 {
+fn apply_kind(header: StrokeHeader, h: f32, dist: f32, w: f32, px: i32, py: i32, flatten_target: f32) -> f32 {
     let s = header.strength * w;
     let r = max(header.radius_m, 1.0);
     switch (header.kind) {
@@ -244,6 +254,9 @@ fn apply_kind(header: StrokeHeader, h: f32, dist: f32, w: f32, px: i32, py: i32)
             let lowered = h - abs(s) * 0.25;                         // uses `s` (strength*w), unlike Smooth/Pinch
             return (lowered + (avg - lowered) * 0.55) * w + h * (1.0 - w);
         }
+        case 15u: {                                                 // FLATTEN — settle toward the footprint mean
+            return h + (flatten_target - h) * w;                    // target = weighted mean of the running field
+        }
         default: { return h; }                                      // AUX_NOOP
     }
 }
@@ -257,9 +270,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let wx = (f32(gid.x) + 0.5) * dx;
     let wz = (f32(gid.y) + 0.5) * dz;
 
-    var h = textureLoad(src, p, 0).r;
-    var edited = 0.0;
-    for (var si = 0u; si < u.stroke_count; si = si + 1u) {
+    var h = textureLoad(running_in, p, 0).r;
+    for (var si = u.stroke_lo; si < u.stroke_hi; si = si + 1u) {
         let header = headers[si];
         if (wx < header.bbox_min.x || wx > header.bbox_max.x
             || wz < header.bbox_min.y || wz > header.bbox_max.y) {
@@ -271,10 +283,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         if (weight <= 0.0) {
             continue;
         }
-        edited = max(edited, weight);
-        h = apply_kind(header, h, dist, weight, p.x, p.y);
+        h = apply_kind(header, h, dist, weight, p.x, p.y, targets[si]);
     }
 
     textureStore(stamp_out, p, vec4<f32>(h, 0.0, 0.0, 0.0));
-    textureStore(edited_out, p, vec4<f32>(edited, 0.0, 0.0, 0.0));
 }

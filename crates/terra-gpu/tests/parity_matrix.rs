@@ -288,7 +288,8 @@ fn pt(u: f32, v: f32, pressure: f32) -> SculptPoint {
 
 /// Stroke set exercising every GPU-supported kind (per-sample maps + distance
 /// stamps + an alias + an aux-only kind + the base-neighborhood Smooth, Pinch, and
-/// Coastline), with multi-point polylines, varied pressure, and a single-point stroke.
+/// Coastline + the footprint-mean Flatten), with multi-point polylines, varied
+/// pressure, and a single-point stroke.
 fn supported_stroke_set(reconcile: f32) -> SculptStrokeParams {
     let stroke = |kind, points, radius_m, strength, target_height| SculptStroke {
         kind,
@@ -383,6 +384,43 @@ fn supported_stroke_set(reconcile: f32) -> SculptStrokeParams {
                 6.0,
                 0.0,
             ),
+            // Flatten settles the footprint toward the brush-weighted mean of the
+            // *running* field — the height every prior stroke has already written,
+            // not the layer input. Routed across the CraterStamp bowl (0.65, 0.5,
+            // running well below base) and the Ridge crest (0.4, 0.75, running well
+            // above base): the running mean there differs from the base mean by
+            // metres, so a GPU that reduced over `src` instead of the running stamp,
+            // or skipped the reduction, diverges far beyond tolerance. `target_height`
+            // is deliberately absurd (900) — Flatten ignores it whenever the footprint
+            // carries weight, and it must never leak into the presentation range.
+            stroke(
+                SculptStrokeKind::Flatten,
+                vec![pt(0.4, 0.75, 1.0), pt(0.65, 0.5, 1.0)],
+                70.0,
+                4.0,
+                900.0,
+            ),
+            // A per-sample stroke *after* the first Flatten: exercises the stamp
+            // segment that runs once the reduction has settled its target, and its
+            // footprint overlaps the flattened band so stroke ordering is observable.
+            stroke(
+                SculptStrokeKind::Lower,
+                vec![pt(0.5, 0.6, 1.0)],
+                45.0,
+                5.0,
+                0.0,
+            ),
+            // A second Flatten forces multi-segment sequencing: its footprint mean is
+            // measured against a running field that already carries the first Flatten
+            // *and* the Lower above, so a GPU that reused a stale reduction or reduced
+            // against the wrong segment diverges. Spanning (0.5, 0.55) sits over both.
+            stroke(
+                SculptStrokeKind::Flatten,
+                vec![pt(0.45, 0.55, 1.0), pt(0.6, 0.5, 0.8)],
+                60.0,
+                4.0,
+                900.0,
+            ),
         ],
         reconcile,
     }
@@ -446,9 +484,11 @@ fn gpu_required_sculpt_strokes_match_cpu_under_add_blend_and_mask() {
 
 #[test]
 fn sculpt_strokes_fall_back_when_a_downstream_layer_consumes_aux() {
-    // A Flatten stroke (reduction kind) keeps the layer on the CPU resume, and so
-    // does a per-sample stroke sitting under an aux consumer. Both must report a
-    // CPU-resume boundary at the stroke layer rather than compiling fully GPU.
+    // A stroke layer sitting under a layer that consumes its per-texel aux must
+    // report a CPU-resume boundary at the stroke layer rather than compiling fully
+    // GPU (the GPU preview drops that aux). This holds for a Flatten stroke as much
+    // as for the per-sample kinds — Flatten previews on the GPU (#117), but the aux
+    // gate still demotes it when a downstream layer reads what the preview dropped.
     let gpu = terra_test_gpu::headless_required();
     let metrics = HeightfieldMetrics::new(24, 24, 240.0, 240.0);
 
@@ -470,6 +510,10 @@ fn sculpt_strokes_fall_back_when_a_downstream_layer_consumes_aux() {
             }],
             reconcile: 0.15,
         }),
+    ));
+    flatten_stack.push(Layer::new(
+        "evolve",
+        LayerKind::LandscapeEvolution(LandscapeEvolutionParams::default()),
     ));
 
     let mut consumer_stack = LayerStack::new();
