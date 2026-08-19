@@ -180,14 +180,25 @@ impl TerraApp {
                 | crate::ui::EditorTool::Hardness
                 | crate::ui::EditorTool::Sediment
         ) {
-            let Some(layer_id) = self.ensure_shape_authoring_layer() else {
-                return;
-            };
             use terra_core::authoring::SculptStrokeKind;
             let stroke_kind = match self.ui_state.editor_tool {
                 crate::ui::EditorTool::Protect => SculptStrokeKind::Protect,
                 crate::ui::EditorTool::Hardness => SculptStrokeKind::Hardness,
                 _ => SculptStrokeKind::Sediment,
+            };
+            let selected_target = self.session.document.selected.filter(|&id| {
+                self.session.document.stack.find(id).is_some_and(|layer| {
+                    terra_core::layer::brush_support(&layer.kind, stroke_kind)
+                        != terra_core::layer::EditSupport::Unsupported
+                })
+            });
+            let layer_id = if let Some(id) = selected_target {
+                id
+            } else {
+                let Some(id) = self.ensure_shape_authoring_layer() else {
+                    return;
+                };
+                id
             };
             self.ui_state.ensure_sculpt_defaults();
             self.sculpt_stroke_active = true;

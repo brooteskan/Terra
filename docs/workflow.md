@@ -80,6 +80,7 @@ Workspaces on the TOOLS rail change tools, hierarchy emphasis, and overlays. The
 ## Shape tools vs Shape Layers vs Shape objects
 
 - **Brushes / editor tools** — raise, lower, smooth, flatten, terrace, stamps, paths, mask/biome paint, etc., usually targeting Base or a sculpt/shape layer.
+- Sculpt brush cards are contextual: brushes unsupported by the selected layer are dimmed and cannot be armed. Select a Foundation, Shape Strokes, or Terrain Constraints layer to expose the brushes that can edit its stored content.
 - **Shape Layers** — stack entries that generate or stamp height (procedural, stamps, polygon, path, heightmap import, sculpt strokes, …).
 - **Shape objects** — world-design primitives (coastline, ridge, valley, river, plateau, …) that compile into authoring constraints.
 

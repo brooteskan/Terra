@@ -270,7 +270,23 @@ pub(crate) fn try_apply(
                     * 0.5
                     * (app.session.document.metrics.world_size_x
                         + app.session.document.metrics.world_size_z);
-                if let terra_core::layer::LayerKind::SculptStrokes(params) = &mut target.kind {
+                let support = terra_core::layer::brush_support(&target.kind, stroke_kind);
+                if support == terra_core::layer::EditSupport::Unsupported {
+                    app.ui_state.status =
+                        if matches!(target.kind, terra_core::layer::LayerKind::SculptBase(_)) {
+                            format!(
+                                "{} isn't supported on the Foundation layer — use a Shape Layer",
+                                stroke_kind.label()
+                            )
+                        } else {
+                            format!(
+                                "{} isn't supported on layer \"{}\"",
+                                stroke_kind.label(),
+                                target.common.name
+                            )
+                        };
+                } else if let terra_core::layer::LayerKind::SculptStrokes(params) = &mut target.kind
+                {
                     terra_core::shape_history::stamp_stroke(
                         params,
                         stroke_kind,
@@ -301,29 +317,9 @@ pub(crate) fn try_apply(
                     use terra_core::layer::{
                         SculptPoint, TerrainConstraint, TerrainConstraintKind,
                     };
-                    let constraint_kind = match stroke_kind {
-                        terra_core::authoring::SculptStrokeKind::Ridge
-                        | terra_core::authoring::SculptStrokeKind::MountainStamp => {
-                            TerrainConstraintKind::Ridge
-                        }
-                        terra_core::authoring::SculptStrokeKind::Valley
-                        | terra_core::authoring::SculptStrokeKind::ValleyStamp => {
-                            TerrainConstraintKind::Valley
-                        }
-                        terra_core::authoring::SculptStrokeKind::RiverPath => {
-                            TerrainConstraintKind::River
-                        }
-                        terra_core::authoring::SculptStrokeKind::Coastline => {
-                            TerrainConstraintKind::Coastline
-                        }
-                        terra_core::authoring::SculptStrokeKind::Protect => {
-                            TerrainConstraintKind::Protect
-                        }
-                        terra_core::authoring::SculptStrokeKind::PlateauStamp => {
-                            TerrainConstraintKind::Plateau
-                        }
-                        _ => TerrainConstraintKind::Roughness,
-                    };
+                    let constraint_kind = stroke_kind.terrain_constraint_kind().expect(
+                        "brush_support admitted a constraint brush without a constraint kind",
+                    );
                     let point = SculptPoint {
                         u,
                         v,
@@ -552,7 +548,10 @@ mod tests {
         app.last_paint_uv = Some((0.5, 0.5));
         app.ui_state.brush_falloff = 0.9;
         let hard_falloff = app.ui_state.sculpt_falloff_exponent();
-        assert!(hard_falloff > soft_falloff, "harder brush => larger exponent");
+        assert!(
+            hard_falloff > soft_falloff,
+            "harder brush => larger exponent"
+        );
         app.apply_actions(vec![PanelAction::PaintSculptStamp {
             layer: id,
             u: 0.52,
@@ -565,7 +564,10 @@ mod tests {
         let updated = stroke(&app);
         assert_eq!(updated.points.len(), 2, "same stroke, appended point");
         assert_eq!(updated.strength, 30.0, "strength stays live mid-drag");
-        assert!((updated.falloff - hard_falloff).abs() < 1e-6, "falloff stays live");
+        assert!(
+            (updated.falloff - hard_falloff).abs() < 1e-6,
+            "falloff stays live"
+        );
     }
 
     /// #97 regression: a brush the legacy foundation raster can't represent
@@ -576,7 +578,10 @@ mod tests {
         use terra_core::layer::{Layer, LayerKind, SculptParams};
 
         let mut app = TerraApp::default();
-        let base = Layer::new("Base", LayerKind::SculptBase(SculptParams::filled(64, 20.0)));
+        let base = Layer::new(
+            "Base",
+            LayerKind::SculptBase(SculptParams::filled(64, 20.0)),
+        );
         let id = base.id();
         app.session.document.stack = LayerStack::new();
         app.session.document.stack.push(base);
@@ -636,5 +641,82 @@ mod tests {
             "Lower is supported on the foundation and must lower heights"
         );
         assert_eq!(app.session.document.selected, Some(id));
+    }
+
+    #[test]
+    fn approximate_constraint_brush_uses_explicit_roughness_mapping() {
+        use terra_core::layer::{Layer, LayerKind, TerrainConstraintKind, TerrainConstraintParams};
+
+        let mut app = TerraApp::default();
+        let constraints = Layer::new(
+            "Constraints",
+            LayerKind::TerrainConstraints(TerrainConstraintParams::default()),
+        );
+        let id = constraints.id();
+        app.session.document.stack = LayerStack::new();
+        app.session.document.stack.push(constraints);
+        app.session.document.selected = Some(id);
+        app.worker_mark_all_dirty = false;
+        app.worker_dirty_from = None;
+        app.worker_dirty_region = None;
+
+        app.apply_actions(vec![PanelAction::PaintSculptStamp {
+            layer: id,
+            u: 0.5,
+            v: 0.5,
+            radius: 0.05,
+            strength: 0.7,
+            stroke_kind: SculptStrokeKind::Hardness,
+            target_height: 0.0,
+        }]);
+
+        let params = match &app.session.document.stack.find(id).unwrap().kind {
+            LayerKind::TerrainConstraints(params) => params,
+            other => panic!("expected TerrainConstraints, got {other:?}"),
+        };
+        assert_eq!(params.constraints.len(), 1);
+        assert_eq!(params.constraints[0].kind, TerrainConstraintKind::Roughness);
+        assert_eq!(app.worker_dirty_from, Some(id));
+    }
+
+    #[test]
+    fn unsupported_constraint_brush_creates_nothing() {
+        use terra_core::layer::{Layer, LayerKind, TerrainConstraintParams};
+
+        let mut app = TerraApp::default();
+        let constraints = Layer::new(
+            "Constraints",
+            LayerKind::TerrainConstraints(TerrainConstraintParams::default()),
+        );
+        let id = constraints.id();
+        app.session.document.stack = LayerStack::new();
+        app.session.document.stack.push(constraints);
+        app.session.document.selected = Some(id);
+        app.worker_mark_all_dirty = false;
+        app.worker_dirty_from = None;
+        app.worker_dirty_region = None;
+
+        app.apply_actions(vec![PanelAction::PaintSculptStamp {
+            layer: id,
+            u: 0.5,
+            v: 0.5,
+            radius: 0.05,
+            strength: 1.0,
+            stroke_kind: SculptStrokeKind::Raise,
+            target_height: 0.0,
+        }]);
+
+        let params = match &app.session.document.stack.find(id).unwrap().kind {
+            LayerKind::TerrainConstraints(params) => params,
+            other => panic!("expected TerrainConstraints, got {other:?}"),
+        };
+        assert!(params.constraints.is_empty());
+        assert!(app.worker_dirty_region.is_none() && app.worker_dirty_from.is_none());
+        assert!(!app.worker_mark_all_dirty);
+        assert!(
+            app.ui_state.status.contains("Raise") && app.ui_state.status.contains("Constraints"),
+            "unsupported constraint brush should explain its refusal: {:?}",
+            app.ui_state.status
+        );
     }
 }

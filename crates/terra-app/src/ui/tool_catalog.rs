@@ -73,6 +73,13 @@ impl ToolDef {
     pub fn is_sculpt(&self) -> bool {
         matches!(self.action, ToolAction::Sculpt(_))
     }
+
+    pub fn sculpt_stroke_kind(&self) -> Option<terra_core::authoring::SculptStrokeKind> {
+        match self.action {
+            ToolAction::Sculpt(tool) => tool.sculpt_stroke_kind(),
+            _ => None,
+        }
+    }
 }
 
 /// Create a fresh layer from an explicit catalog preset.

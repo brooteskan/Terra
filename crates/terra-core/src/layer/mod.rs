@@ -3,6 +3,7 @@
 mod binding;
 mod blend;
 mod cache_policy;
+mod edit_support;
 mod group_mode;
 mod kinds;
 mod metadata;
@@ -22,6 +23,7 @@ pub use binding::{
 };
 pub use blend::{blend_heights, blend_pair, blend_weights, BlendMode};
 pub use cache_policy::{CachePolicy, CacheState};
+pub use edit_support::{brush_support, EditSupport};
 pub use group_mode::{
     default_preview_color, is_default_preview_color, palette_preview_color, BiomeSection,
     FalloffCurve, GroupEvalMode, GroupInputMode, GroupKind, SelectedGroupInput, StackCategory,

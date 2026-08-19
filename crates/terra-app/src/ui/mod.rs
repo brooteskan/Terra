@@ -1118,6 +1118,41 @@ impl EditorTool {
             )
     }
 
+    /// Exact domain brush represented by this editor tool.
+    ///
+    /// This is used for edit-capability checks; unlike `shape_tool`, it does not
+    /// collapse semantic field tools into similarly shaped history tools.
+    pub fn sculpt_stroke_kind(self) -> Option<terra_core::authoring::SculptStrokeKind> {
+        use terra_core::authoring::SculptStrokeKind;
+        match self {
+            EditorTool::Raise => Some(SculptStrokeKind::Raise),
+            EditorTool::Lower => Some(SculptStrokeKind::Lower),
+            EditorTool::Smooth => Some(SculptStrokeKind::Smooth),
+            EditorTool::Ridge => Some(SculptStrokeKind::Ridge),
+            EditorTool::Valley => Some(SculptStrokeKind::Valley),
+            EditorTool::Roughness => Some(SculptStrokeKind::Roughness),
+            EditorTool::UpliftBrush => Some(SculptStrokeKind::Uplift),
+            EditorTool::Protect => Some(SculptStrokeKind::Protect),
+            EditorTool::Hardness => Some(SculptStrokeKind::Hardness),
+            EditorTool::Sediment => Some(SculptStrokeKind::Sediment),
+            EditorTool::RiverConstraint => Some(SculptStrokeKind::RiverPath),
+            EditorTool::Flatten => Some(SculptStrokeKind::Flatten),
+            EditorTool::Terrace => Some(SculptStrokeKind::Terrace),
+            EditorTool::Pinch => Some(SculptStrokeKind::Pinch),
+            EditorTool::Inflate => Some(SculptStrokeKind::Inflate),
+            EditorTool::ErodeBrush => Some(SculptStrokeKind::Erode),
+            EditorTool::MountainStamp => Some(SculptStrokeKind::MountainStamp),
+            EditorTool::ValleyStamp => Some(SculptStrokeKind::ValleyStamp),
+            EditorTool::PlateauStamp => Some(SculptStrokeKind::PlateauStamp),
+            EditorTool::CraterStamp => Some(SculptStrokeKind::CraterStamp),
+            EditorTool::CoastlineTool => Some(SculptStrokeKind::Coastline),
+            EditorTool::RiverPathTool => Some(SculptStrokeKind::RiverPath),
+            EditorTool::HeightStamp => Some(SculptStrokeKind::HeightStamp),
+            EditorTool::NoiseBrush => Some(SculptStrokeKind::Noise),
+            _ => None,
+        }
+    }
+
     /// Maps to Shape history [`terra_core::shape_history::ShapeTool`] when applicable.
     pub fn shape_tool(self) -> Option<terra_core::shape_history::ShapeTool> {
         use terra_core::shape_history::ShapeTool;

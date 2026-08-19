@@ -93,6 +93,25 @@ impl SculptStrokeKind {
             _ => None,
         }
     }
+
+    /// Constraint primitive used when this brush edits a
+    /// [`TerrainConstraints`](crate::layer::LayerKind::TerrainConstraints) layer.
+    ///
+    /// `Hardness` and `Sediment` intentionally use the existing Roughness
+    /// constraint as an approximate storage path until dedicated constraint kinds
+    /// exist. `None` means the brush cannot edit constraint-layer content.
+    pub fn terrain_constraint_kind(self) -> Option<TerrainConstraintKind> {
+        match self {
+            Self::Ridge | Self::MountainStamp => Some(TerrainConstraintKind::Ridge),
+            Self::Valley | Self::ValleyStamp => Some(TerrainConstraintKind::Valley),
+            Self::RiverPath => Some(TerrainConstraintKind::River),
+            Self::Coastline => Some(TerrainConstraintKind::Coastline),
+            Self::Protect => Some(TerrainConstraintKind::Protect),
+            Self::PlateauStamp => Some(TerrainConstraintKind::Plateau),
+            Self::Hardness | Self::Sediment => Some(TerrainConstraintKind::Roughness),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]

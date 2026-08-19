@@ -5,7 +5,7 @@
 //! manually add a Shape Layer, add a Mask, or paint a Mask separately.
 
 use crate::authoring::{SculptStroke, SculptStrokeKind, SculptStrokeParams};
-use crate::layer::{Layer, LayerId, LayerKind, LayerStack};
+use crate::layer::{brush_support, EditSupport, Layer, LayerId, LayerKind, LayerStack};
 use serde::{Deserialize, Serialize};
 
 /// Whether the next stroke session creates a new Shape Layer or appends to the selection.
@@ -189,39 +189,27 @@ pub fn resolve_shape_target(
     session_layer: Option<LayerId>,
     tool: ShapeTool,
 ) -> ShapeTargetDecision {
-    // Explicit selection always wins — artists expect the selected Shape Layer to receive strokes.
+    let brush = tool.stroke_kind();
+    let supports_brush = |id| {
+        stack
+            .find(id)
+            .is_some_and(|layer| brush_support(&layer.kind, brush) != EditSupport::Unsupported)
+    };
+
+    // Explicit selection wins when it has a genuine edit path for this brush.
     if let Some(id) = selected {
-        if stack
-            .find(id)
-            .is_some_and(|l| matches!(l.kind, LayerKind::SculptStrokes(_)))
-        {
-            return ShapeTargetDecision::UseExisting(id);
-        }
-        // The Foundation only keeps a stroke it can actually represent on the
-        // legacy raster path. Brushes it can't (Terrace, Inflate, stamps, …)
-        // fall through to a Shape Layer instead of silently becoming Raise (#97).
-        if stack
-            .find(id)
-            .is_some_and(|l| matches!(l.kind, LayerKind::SculptBase(_)))
-            && tool.stroke_kind().foundation_mode().is_some()
-        {
+        if supports_brush(id) {
             return ShapeTargetDecision::UseExisting(id);
         }
     }
     if let Some(id) = session_layer {
-        if stack
-            .find(id)
-            .is_some_and(|l| matches!(l.kind, LayerKind::SculptStrokes(_)))
-        {
+        if supports_brush(id) {
             return ShapeTargetDecision::UseExisting(id);
         }
     }
     if mode == ShapeEditMode::ContinueSelected {
         if let Some(id) = selected {
-            if stack
-                .find(id)
-                .is_some_and(|l| matches!(l.kind, LayerKind::SculptStrokes(_)))
-            {
+            if supports_brush(id) {
                 return ShapeTargetDecision::UseExisting(id);
             }
         }
@@ -398,6 +386,17 @@ mod tests {
         (stack, id)
     }
 
+    fn constraints_stack() -> (LayerStack, LayerId) {
+        let mut stack = LayerStack::new();
+        let layer = Layer::new(
+            "Constraints",
+            LayerKind::TerrainConstraints(Default::default()),
+        );
+        let id = layer.id();
+        stack.push(layer);
+        (stack, id)
+    }
+
     #[test]
     fn foundation_keeps_supported_brush() {
         // A brush the legacy foundation raster implements stays on the Base layer.
@@ -410,6 +409,45 @@ mod tests {
             ShapeTool::Lower,
         );
         assert_eq!(d, ShapeTargetDecision::UseExisting(id));
+    }
+
+    #[test]
+    fn foundation_keeps_approximate_brush() {
+        let (stack, id) = base_stack();
+        let d = resolve_shape_target(
+            &stack,
+            Some(id),
+            ShapeEditMode::NewLayerPerSession,
+            None,
+            ShapeTool::Pinch,
+        );
+        assert_eq!(d, ShapeTargetDecision::UseExisting(id));
+    }
+
+    #[test]
+    fn constraints_keep_supported_brush() {
+        let (stack, id) = constraints_stack();
+        let d = resolve_shape_target(
+            &stack,
+            Some(id),
+            ShapeEditMode::NewLayerPerSession,
+            None,
+            ShapeTool::MountainStamp,
+        );
+        assert_eq!(d, ShapeTargetDecision::UseExisting(id));
+    }
+
+    #[test]
+    fn constraints_redirect_unsupported_brush() {
+        let (stack, id) = constraints_stack();
+        let d = resolve_shape_target(
+            &stack,
+            Some(id),
+            ShapeEditMode::NewLayerPerSession,
+            None,
+            ShapeTool::Raise,
+        );
+        assert!(matches!(d, ShapeTargetDecision::CreateNew { .. }));
     }
 
     #[test]
