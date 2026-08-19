@@ -8,7 +8,7 @@ use terra_core::layer::{
     IslandParams, LandscapeEvolutionParams, Layer, LayerKind, LayerStack, MesaParams,
     MountainParams, NoiseParams, PlateauParams, RampParams, RiverCarveParams, SculptParams,
     SculptPoint, SculptStroke, SculptStrokeKind, SculptStrokeParams, TerraceParams,
-    ThermalErosionParams, UpliftParams, VolcanoParams,
+    StreamPowerParams, ThermalErosionParams, UpliftParams, VolcanoParams,
 };
 use terra_core::mask::{bake_mask_assets, MaskAsset, MaskId, MaskRef, MaskSource};
 use terra_gpu::parity::{
@@ -19,7 +19,8 @@ use terra_gpu::parity::{
     FBM_VALUE_PREVIEW, HYDRAULIC_PREVIEW, INFLATE_FILTER_PREVIEW, MESA_PREVIEW, MOUNTAINS_PREVIEW,
     PERLIN_NOISE_PREVIEW, PLATEAU_PREVIEW, RIDGED_PERLIN_PREVIEW, RIDGED_VALUE_PREVIEW,
     RIVER_CARVE_D8_PREVIEW, RIVER_CARVE_DINFINITY_PREVIEW, SCULPT_STROKES_PREVIEW, SIMPLE_MASK,
-    SMOOTH_FILTER_PREVIEW, TERRACE_PREVIEW, THERMAL_PREVIEW, UPLIFT_PREVIEW, VALUE_NOISE_PREVIEW,
+    SMOOTH_FILTER_PREVIEW, STREAM_POWER_D8_PREVIEW, STREAM_POWER_DINFINITY_PREVIEW,
+    TERRACE_PREVIEW, THERMAL_PREVIEW, UPLIFT_PREVIEW, VALUE_NOISE_PREVIEW,
     VOLCANIC_ISLAND_PREVIEW, VOLCANO_PREVIEW,
 };
 use terra_gpu::GpuTerrainEngine;
@@ -708,6 +709,74 @@ fn gpu_required_river_carve_d8_and_dinfinity_previews_are_bounded() {
             ("simulation.river-carve.d8", RIVER_CARVE_D8_PREVIEW)
         };
         assert_field_parity(contract, &gpu, &cpu, tolerance);
+    }
+}
+
+#[test]
+fn gpu_required_stream_power_d8_and_dinfinity_previews_are_bounded() {
+    const RES: u32 = 12;
+    let metrics = HeightfieldMetrics::new(RES, RES, 120.0, 120.0);
+    let center = (RES as f32 - 1.0) * 0.5;
+    let samples: Vec<f32> = (0..RES)
+        .flat_map(|y| {
+            (0..RES).map(move |x| {
+                180.0 - y as f32 * 3.0 + (x as f32 - center).abs() * 1.5 + x as f32 * 0.01
+            })
+        })
+        .collect();
+
+    for use_dinfinity in [false, true] {
+        let mut stack = LayerStack::new();
+        stack.push(Layer::new(
+            "drainage basin",
+            LayerKind::SculptBase(SculptParams {
+                width: RES,
+                height: RES,
+                samples: samples.clone(),
+                fill_height: 0.0,
+            }),
+        ));
+        stack.push(Layer::new(
+            "stream power",
+            LayerKind::StreamPowerErosion(StreamPowerParams {
+                iterations: 3,
+                k: 0.002,
+                m: 0.5,
+                n: 1.0,
+                dt: 0.75,
+                uplift_rate: 0.05,
+                base_level: 100.0,
+                hardness: 0.2,
+                use_dinfinity,
+                ..StreamPowerParams::default()
+            }),
+        ));
+        let cpu = cpu_oracle(&stack, &[], metrics);
+        let gpu = gpu_eval(&stack, &[], metrics);
+        let (contract, tolerance) = if use_dinfinity {
+            (
+                "simulation.stream-power.d-infinity",
+                STREAM_POWER_DINFINITY_PREVIEW,
+            )
+        } else {
+            ("simulation.stream-power.d8", STREAM_POWER_D8_PREVIEW)
+        };
+        assert_field_parity(contract, &gpu, &cpu, tolerance);
+        assert!(
+            gpu.to_dense().iter().all(|height| height.is_finite()),
+            "{contract} produced a non-finite height"
+        );
+        assert!(
+            gpu.to_dense().iter().all(|height| *height >= 100.0),
+            "{contract} crossed the authored base level"
+        );
+        assert!(
+            gpu.to_dense()
+                .iter()
+                .zip(&samples)
+                .any(|(after, before)| after < before),
+            "{contract} must incise at least one texel"
+        );
     }
 }
 

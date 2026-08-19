@@ -4,7 +4,7 @@ use terra_core::layer::{
     BlendMode, CanyonParams, DomainWarpParams, DuneParams, EffectFilterKind, EffectFilterParams,
     FbmParams, FlatParams, FractalNoiseType, IslandParams, Layer, LayerKind, LayerStack,
     LayerTypeRegistry, MesaParams, MountainParams, NoiseParams, PlateauParams, RiverCarveParams,
-    UpliftParams, VolcanoParams,
+    StreamPowerParams, UpliftParams, VolcanoParams,
 };
 use terra_core::mask::MaskSource;
 use terra_gpu::{compile_gpu_graph, layer_gpu_supported, GpuDirtyPolicy, GpuKernel};
@@ -203,6 +203,51 @@ fn river_carve_defaults_and_configuration_boundaries_are_explicit() {
     ];
     for params in unsupported {
         let layer = Layer::new("unsupported river", LayerKind::RiverCarve(params));
+        assert!(!layer_gpu_supported(&layer, &[]));
+        assert_eq!(graph_for(layer).cpu_from, Some(0));
+    }
+}
+
+#[test]
+fn stream_power_defaults_and_configuration_boundaries_are_explicit() {
+    let default = Layer::new(
+        "stream power",
+        LayerKind::StreamPowerErosion(StreamPowerParams::default()),
+    );
+    let graph = graph_for(default);
+    assert!(graph.fully_gpu());
+    let plan = graph.plans[0].expect("StreamPower plan");
+    assert_eq!(plan.kernel, GpuKernel::StreamPower);
+    assert_eq!(plan.dirty_policy, GpuDirtyPolicy::FullField);
+    assert_eq!(plan.halo_texels, 0);
+
+    let unsupported = [
+        StreamPowerParams {
+            hardness_source: MaskSource::Hardness,
+            ..StreamPowerParams::default()
+        },
+        StreamPowerParams {
+            dendritic_seed: 0.2,
+            ..StreamPowerParams::default()
+        },
+        StreamPowerParams {
+            refill_each_iter: true,
+            ..StreamPowerParams::default()
+        },
+        StreamPowerParams {
+            level_count: 1,
+            ..StreamPowerParams::default()
+        },
+        StreamPowerParams {
+            dt: f32::NAN,
+            ..StreamPowerParams::default()
+        },
+    ];
+    for params in unsupported {
+        let layer = Layer::new(
+            "unsupported stream power",
+            LayerKind::StreamPowerErosion(params),
+        );
         assert!(!layer_gpu_supported(&layer, &[]));
         assert_eq!(graph_for(layer).cpu_from, Some(0));
     }

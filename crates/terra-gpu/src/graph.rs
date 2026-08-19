@@ -9,7 +9,8 @@
 use crate::effect_filter::{effect_filter_gpu_spec, EffectFilterGpuScope};
 use terra_core::layer::{
     BlendMode, DuneParams, FractalNoiseType, IslandArchetype, IslandParams, Layer, LayerKind,
-    LayerStack, MountainParams, RiverCarveParams, SculptStrokeKind, TransportModel, UpliftParams,
+    LayerStack, MountainParams, RiverCarveParams, SculptStrokeKind, StreamPowerParams,
+    TransportModel, UpliftParams,
 };
 use terra_core::mask::{MaskAsset, MaskCombine, MaskSource};
 
@@ -41,6 +42,7 @@ pub enum GpuKernel {
     Thermal,
     Hydraulic,
     RiverCarve,
+    StreamPower,
 }
 
 impl GpuKernel {
@@ -76,6 +78,7 @@ impl GpuKernel {
                 | (Self::Thermal, LayerKind::ThermalErosion(_))
                 | (Self::Hydraulic, LayerKind::HydraulicErosion(_))
                 | (Self::RiverCarve, LayerKind::RiverCarve(_))
+                | (Self::StreamPower, LayerKind::StreamPowerErosion(_))
         )
     }
 }
@@ -290,6 +293,33 @@ fn river_carve_config_supported(p: &RiverCarveParams) -> bool {
         && max_bank_radius <= RIVER_CARVE_MAX_RADIUS as f32
 }
 
+/// Height-only stream-power preview. Drainage is the shared bounded iterative
+/// D8 approximation; D-infinity-authored configurations use that approximation
+/// under their own parity contract. Features requiring Priority-Flood, aux-driven
+/// hardness, dendritic preprocessing, or authored multilevel controls stay CPU-only.
+fn stream_power_config_supported(p: &StreamPowerParams) -> bool {
+    p.k.is_finite()
+        && p.k >= 0.0
+        && p.m.is_finite()
+        && p.m >= 0.0
+        && p.n.is_finite()
+        && p.n >= 0.0
+        && p.dt.is_finite()
+        && p.dt >= 0.0
+        && p.uplift_rate.is_finite()
+        && p.base_level.is_finite()
+        && p.hardness.is_finite()
+        && p.dendritic_seed.is_finite()
+        && p.dendritic_seed <= 1.0e-6
+        && p.stream_threshold.is_finite()
+        && !p.refill_each_iter
+        && matches!(p.hardness_source, MaskSource::None)
+        && p.level_count == 0
+        && p.start_level == 0
+        && p.level_step_strength == 1.0
+        && p.level_step_curve.is_empty()
+}
+
 fn gpu_plan_for_layer(layer: &Layer, mask_assets: &[MaskAsset]) -> Option<GpuLayerPlan> {
     use LayerKind::*;
     if !gpu_mask_supported(layer, mask_assets) {
@@ -437,7 +467,14 @@ fn gpu_plan_for_layer(layer: &Layer, mask_assets: &[MaskAsset]) -> Option<GpuLay
         RiverCarve(p) if river_carve_config_supported(p) && inplace_composite_supported(layer) => {
             (GpuKernel::RiverCarve, GpuDirtyPolicy::FullField, 0)
         }
-        ThermalErosion(_) | HydraulicErosion(_) | RiverCarve(_) => return None,
+        StreamPowerErosion(p)
+            if stream_power_config_supported(p) && inplace_composite_supported(layer) =>
+        {
+            (GpuKernel::StreamPower, GpuDirtyPolicy::FullField, 0)
+        }
+        ThermalErosion(_) | HydraulicErosion(_) | RiverCarve(_) | StreamPowerErosion(_) => {
+            return None;
+        }
         // These CPU operations either modify height without a GPU kernel or publish
         // observable auxiliary fields that the GPU preview cannot currently produce.
         Coastal(_) | Materials(_) | Biomes(_) | Vegetation(_) => return None,
@@ -526,7 +563,8 @@ mod tests {
         HydraulicErosionParams, IslandParams, LandscapeEvolutionParams, Layer, LayerKind,
         LayerStack, LayerTypeRegistry, MaterialsParams, MesaParams, MountainParams, NoiseParams,
         PlateauParams, RiverCarveParams, SculptStroke, SculptStrokeKind, SculptStrokeParams,
-        TerraceParams, ThermalErosionParams, UpliftParams, VegetationParams, VolcanoParams,
+        StreamPowerParams, TerraceParams, ThermalErosionParams, UpliftParams, VegetationParams,
+        VolcanoParams,
     };
     use terra_core::mask::{
         bake_distribution, bake_mask_assets, DistributionEntry, MaskId, MaskOp, MaskRef,
@@ -571,6 +609,10 @@ mod tests {
             Layer::new(
                 "river carve",
                 LayerKind::RiverCarve(RiverCarveParams::default()),
+            ),
+            Layer::new(
+                "stream power",
+                LayerKind::StreamPowerErosion(StreamPowerParams::default()),
             ),
         ]
     }
@@ -1084,6 +1126,54 @@ mod tests {
             ),
             &[]
         ));
+    }
+
+    #[test]
+    fn stream_power_support_is_full_field_and_semantics_preserving() {
+        let default = Layer::new(
+            "stream power",
+            LayerKind::StreamPowerErosion(StreamPowerParams::default()),
+        );
+        let plan = gpu_plan_for_layer(&default, &[]).expect("default StreamPower should compile");
+        assert_eq!(plan.kernel, GpuKernel::StreamPower);
+        assert_eq!(plan.dirty_policy, GpuDirtyPolicy::FullField);
+        assert_eq!(plan.halo_texels, 0);
+
+        let sourced_hardness = StreamPowerParams {
+            hardness_source: MaskSource::Hardness,
+            ..StreamPowerParams::default()
+        };
+        let dendritic = StreamPowerParams {
+            dendritic_seed: 0.25,
+            ..StreamPowerParams::default()
+        };
+        let refill = StreamPowerParams {
+            refill_each_iter: true,
+            ..StreamPowerParams::default()
+        };
+        let authored_levels = StreamPowerParams {
+            level_count: 1,
+            ..StreamPowerParams::default()
+        };
+        let invalid_k = StreamPowerParams {
+            k: f32::NAN,
+            ..StreamPowerParams::default()
+        };
+        for (name, params) in [
+            ("sourced hardness", sourced_hardness),
+            ("dendritic seed", dendritic),
+            ("refill each iter", refill),
+            ("authored levels", authored_levels),
+            ("invalid k", invalid_k),
+        ] {
+            let layer = Layer::new(name, LayerKind::StreamPowerErosion(params));
+            assert!(!layer_gpu_supported(&layer, &[]), "{name}");
+            assert_eq!(single_layer_graph(layer).cpu_from, Some(0), "{name}");
+        }
+
+        let mut partial = default;
+        partial.common.opacity = 0.5;
+        assert!(!layer_gpu_supported(&partial, &[]));
     }
 
     #[test]

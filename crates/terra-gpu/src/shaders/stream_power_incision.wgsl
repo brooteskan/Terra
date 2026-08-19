@@ -1,5 +1,5 @@
-// Approximate stream-power incision for Draft/Medium GPU preview.
-// Uses multi-pass D8 accumulation (no Priority-Flood). Full/Export stays CPU oracle.
+// Approximate stream-power incision for the GPU viewport preview.
+// Uses multi-pass D8 accumulation (no Priority-Flood). CPU export stays authoritative.
 
 struct Uniforms {
     width: u32,
@@ -11,9 +11,9 @@ struct Uniforms {
     uplift: f32,
     base_level: f32,
     cell_area: f32,
-    dx: f32,
-    dz: f32,
-    _pad: f32,
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -28,7 +28,8 @@ fn h_at(i: i32, j: i32) -> f32 {
     return textureLoad(height_tex, vec2<i32>(ii, jj), 0).r;
 }
 
-/// Steepest D8 downhill slope (dimensionless rise/run in world units).
+/// Steepest D8 downhill slope in the CPU hydro convention: height drop per
+/// cardinal/diagonal grid step, not per world-space metre.
 fn steepest_slope(i: i32, j: i32) -> f32 {
     let h0 = h_at(i, j);
     var best = 0.0;
@@ -40,7 +41,7 @@ fn steepest_slope(i: i32, j: i32) -> f32 {
             if (ni < 0 || nj < 0 || ni >= i32(u.width) || nj >= i32(u.height)) {
                 continue;
             }
-            let d = max(length(vec2<f32>(f32(di) * u.dx, f32(dj) * u.dz)), 1e-6);
+            let d = select(1.0, 1.41421356, di != 0 && dj != 0);
             let dh = (h0 - h_at(ni, nj)) / d;
             best = max(best, dh);
         }

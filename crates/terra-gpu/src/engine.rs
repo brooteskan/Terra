@@ -16,7 +16,10 @@ use crate::graph::{
 use crate::{readback_f32, GpuError};
 use bytemuck::{Pod, Zeroable};
 use std::collections::{HashMap, HashSet};
-use terra_core::analyze::{apply_transport_model, clamp_timestep_cfl};
+use terra_core::analyze::{
+    apply_transport_model, clamp_timestep_cfl, default_sim_levels, draft_sim_levels,
+    LevelStepSettings,
+};
 use terra_core::eval::PreviewQuality;
 use terra_core::fields::FieldId;
 use terra_core::heightfield::{Heightfield, HeightfieldMetrics, TileId};
@@ -476,6 +479,23 @@ struct RiverCarveU {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
+struct StreamPowerU {
+    width: u32,
+    height: u32,
+    k: f32,
+    m: f32,
+    n: f32,
+    dt: f32,
+    uplift: f32,
+    base_level: f32,
+    cell_area: f32,
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
 struct EffectFilterU {
     width: u32,
     height: u32,
@@ -872,6 +892,7 @@ pub struct GpuTerrainEngine {
     plateau: Pipe,
     river_accum: Pipe,
     river_carve: Pipe,
+    stream_power: Pipe,
     effect_filter_range: Pipe,
     effect_filter: Pipe,
     mask_bake: Pipe,
@@ -918,7 +939,7 @@ pub struct GpuTerrainEngine {
     /// Optional texel-space edit bounds supplied by interactive painting.
     last_dirty_rect: Option<(u32, u32, u32, u32)>,
     last_quality: Option<PreviewQuality>,
-    /// Maximum thermal/hydraulic iterations submitted in one interactive tick.
+    /// Maximum thermal/hydraulic/stream-power iterations submitted in one interactive tick.
     pub max_sim_iters_per_tick: u32,
     /// During local interaction, stop before a full-field-coupled pass and leave
     /// its suffix dirty for the next refinement evaluation.
@@ -1043,6 +1064,16 @@ impl GpuTerrainEngine {
                 storage_write_entry(3),
             ],
         });
+        let stream_power_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("stream-power-bgl"),
+            entries: &[
+                uniform_entry(0),
+                tex_read_entry(1),
+                tex_read_entry(2),
+                tex_read_entry(3),
+                storage_write_entry(4),
+            ],
+        });
 
         let fill = make_pipe(device, "fill", include_str!("shaders/fill.wgsl"), fill_bgl);
         let noise = make_pipe(
@@ -1119,6 +1150,12 @@ impl GpuTerrainEngine {
             "river-carve",
             include_str!("shaders/river_carve.wgsl"),
             river_carve_bgl,
+        );
+        let stream_power = make_pipe(
+            device,
+            "stream-power-incision",
+            include_str!("shaders/stream_power_incision.wgsl"),
+            stream_power_bgl,
         );
         let effect_filter_range_bgl =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1282,6 +1319,7 @@ impl GpuTerrainEngine {
             plateau,
             river_accum,
             river_carve,
+            stream_power,
             effect_filter_range,
             effect_filter,
             mask_bake,
@@ -1342,7 +1380,7 @@ impl GpuTerrainEngine {
         &self.tile_sched.dirty
     }
 
-    /// Cap thermal/hydraulic iterations for the current interactive refinement phase.
+    /// Cap thermal/hydraulic/stream-power iterations for the current interactive refinement phase.
     /// `None` means uncapped (export / full quality).
     pub fn set_simulation_iteration_cap(&mut self, cap: Option<u32>) {
         self.max_sim_iters_per_tick = cap.unwrap_or(u32::MAX);
@@ -1973,31 +2011,32 @@ impl GpuTerrainEngine {
         );
     }
 
-    fn run_river_carve(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        encoder: &mut wgpu::CommandEncoder,
-        p: &terra_core::layer::RiverCarveParams,
-        quality: PreviewQuality,
-    ) {
-        let iters = match quality {
-            PreviewQuality::Draft => 12u32,
+    fn river_accumulation_iters(&self, quality: PreviewQuality) -> u32 {
+        match quality {
+            PreviewQuality::Draft => 12,
             PreviewQuality::Medium => 32,
             PreviewQuality::Full | PreviewQuality::Export => {
                 (self.metrics.width.min(self.metrics.height) / 4).clamp(48, 160)
             }
-        };
+        }
+    }
+
+    /// Run the shared iterative D8 accumulation preview against `height_slot` and
+    /// return the scratch texture containing the final accumulation field.
+    fn run_river_accumulation(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        height_slot: TexSlot,
+        quality: PreviewQuality,
+    ) -> TexSlot {
+        let iters = self.river_accumulation_iters(quality);
 
         // Seed accumulation with unit rainfall.
         self.fill_slot(device, queue, encoder, TexSlot::WaterA, 1.0);
         self.fill_slot(device, queue, encoder, TexSlot::WaterB, 0.0);
 
-        let height_slot = if self.current == 0 {
-            TexSlot::Ping
-        } else {
-            TexSlot::Pong
-        };
         let accum_u = RiverAccumU {
             width: self.metrics.width,
             height: self.metrics.height,
@@ -2051,6 +2090,28 @@ impl GpuTerrainEngine {
             src_a = !src_a;
         }
 
+        if src_a {
+            TexSlot::WaterA
+        } else {
+            TexSlot::WaterB
+        }
+    }
+
+    fn run_river_carve(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        p: &terra_core::layer::RiverCarveParams,
+        quality: PreviewQuality,
+    ) {
+        let height_slot = if self.current == 0 {
+            TexSlot::Ping
+        } else {
+            TexSlot::Pong
+        };
+        let accum_slot = self.run_river_accumulation(device, queue, encoder, height_slot, quality);
+
         let carve_u = RiverCarveU {
             width: self.metrics.width,
             height: self.metrics.height,
@@ -2066,11 +2127,7 @@ impl GpuTerrainEngine {
             _pad: 0,
         };
         let u_buf = self.write_uniform(device, queue, &carve_u);
-        let acc_view = if src_a {
-            &self.water_a.view
-        } else {
-            &self.water_b.view
-        };
+        let acc_view = self.view_of(accum_slot);
         let (src, dst) = if self.current == 0 {
             (&self.ping.view, &self.pong.view)
         } else {
@@ -2113,6 +2170,155 @@ impl GpuTerrainEngine {
         }
         self.swap_current();
         self.expand_range(self.approx_range.0 - p.depth * 2.0, self.approx_range.1);
+    }
+
+    fn run_stream_power(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        p: &terra_core::layer::StreamPowerParams,
+        quality: PreviewQuality,
+    ) {
+        let authored_iters = match quality {
+            PreviewQuality::Draft => p.iterations.clamp(1, 8),
+            PreviewQuality::Medium => p.iterations.clamp(1, 16),
+            PreviewQuality::Full | PreviewQuality::Export => p.iterations.max(1),
+        };
+        // Mirror the CPU processor's default level-step averaging. Non-default
+        // authored level controls are rejected by the planner, and document-level
+        // schedule variants remain part of the configuration-fallback work in #138.
+        let base = match quality {
+            PreviewQuality::Draft => draft_sim_levels(self.metrics.width),
+            PreviewQuality::Medium | PreviewQuality::Full | PreviewQuality::Export => {
+                default_sim_levels(self.metrics.width)
+            }
+        };
+        let levels = LevelStepSettings::default().schedule_for_filter(
+            base,
+            p.level_count,
+            p.start_level,
+            p.level_step_strength,
+            &p.level_step_curve,
+            quality,
+        );
+        let (iter_scale, effect_scale) = if levels.is_empty() {
+            (1.0, 1.0)
+        } else {
+            let count = levels.len() as f32;
+            (
+                levels.iter().map(|level| level.iter_scale).sum::<f32>() / count,
+                levels
+                    .iter()
+                    .map(|level| level.effect_scale)
+                    .sum::<f32>()
+                    / count,
+            )
+        };
+        let iters = ((authored_iters as f32 * iter_scale).round() as u32)
+            .max(1)
+            .min(match quality {
+                PreviewQuality::Draft => self.max_sim_iters_per_tick.max(1),
+                PreviewQuality::Medium | PreviewQuality::Full | PreviewQuality::Export => {
+                    u32::MAX
+                }
+            });
+        let drainage_stride = match quality {
+            PreviewQuality::Draft => p.drainage_reuse_stride.max(2),
+            PreviewQuality::Medium | PreviewQuality::Full | PreviewQuality::Export => {
+                p.drainage_reuse_stride.max(1)
+            }
+        };
+        let cell_area = (self.metrics.dx() * self.metrics.dz()).max(1.0e-6);
+        let uniform = StreamPowerU {
+            width: self.metrics.width,
+            height: self.metrics.height,
+            k: (p.k * effect_scale).max(0.0),
+            m: p.m.max(0.0),
+            n: p.n.max(0.0),
+            dt: p.dt.max(0.0),
+            uplift: p.uplift_rate,
+            base_level: p.base_level,
+            cell_area,
+            _pad0: 0.0,
+            _pad1: 0.0,
+            _pad2: 0.0,
+        };
+
+        self.fill_slot(
+            device,
+            queue,
+            encoder,
+            TexSlot::Hardness,
+            p.hardness.clamp(0.0, 1.0),
+        );
+
+        let mut accum_slot = TexSlot::WaterA;
+        for iter in 0..iters {
+            let height_slot = if self.current == 0 {
+                TexSlot::Ping
+            } else {
+                TexSlot::Pong
+            };
+            if iter == 0 || iter % drainage_stride == 0 {
+                accum_slot =
+                    self.run_river_accumulation(device, queue, encoder, height_slot, quality);
+            }
+
+            let u_buf = self.write_uniform(device, queue, &uniform);
+            let (src, dst) = if self.current == 0 {
+                (&self.ping.view, &self.pong.view)
+            } else {
+                (&self.pong.view, &self.ping.view)
+            };
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("stream-power-bg"),
+                layout: &self.stream_power.bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: u_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(src),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(self.view_of(accum_slot)),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(&self.hardness.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::TextureView(dst),
+                    },
+                ],
+            });
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("stream-power-incision"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.stream_power.pipeline);
+                pass.set_bind_group(0, &bg, &[]);
+                pass.dispatch_workgroups(
+                    self.metrics.width.div_ceil(8),
+                    self.metrics.height.div_ceil(8),
+                    1,
+                );
+            }
+            self.swap_current();
+        }
+
+        let iter_scale = iters as f32;
+        self.expand_range(
+            (self.approx_range.0 - 50.0 * iter_scale + p.uplift_rate * iter_scale)
+                .max(p.base_level),
+            (self.approx_range.1 + p.uplift_rate.max(0.0) * iter_scale).max(p.base_level),
+        );
     }
 
     fn blend_into_current(
@@ -4056,6 +4262,9 @@ impl GpuTerrainEngine {
             (GpuKernel::RiverCarve, LayerKind::RiverCarve(p)) => {
                 self.run_river_carve(device, queue, encoder, p, quality);
             }
+            (GpuKernel::StreamPower, LayerKind::StreamPowerErosion(p)) => {
+                self.run_stream_power(device, queue, encoder, p, quality);
+            }
             (GpuKernel::Blur, LayerKind::Blur(p)) => {
                 let iters = Self::blur_iters(p);
                 for _ in 0..iters {
@@ -4425,8 +4634,8 @@ mod smoke_tests {
     use terra_core::layer::{
         BlendMode, BlurParams, CoastalParams, DomainWarpParams, EffectFilterParams, FbmParams,
         FlatParams, FractalNoiseType, GroupInputMode, IslandParams, Layer, LayerGroup, LayerKind,
-        LayerStack, MaterialsParams, NamedOutputDecl, NoiseParams, SculptParams, StackNode,
-        RiverCarveParams, ThermalErosionParams,
+        LayerStack, MaterialsParams, NamedOutputDecl, NoiseParams, RiverCarveParams, SculptParams,
+        StackNode, StreamPowerParams, ThermalErosionParams,
     };
     use terra_core::mask::{
         bake_mask_assets, DistributionEntry, MaskAsset, MaskCombine, MaskId, MaskOp, MaskRef,
@@ -4534,6 +4743,13 @@ mod smoke_tests {
         disabled_island.common.enabled = false;
         let disabled_layers = [&disabled_island];
         assert!(cpu_resume_prefix_is_height_only(&disabled_layers, 1));
+
+        let stream_power = Layer::new(
+            "Stream Power",
+            LayerKind::StreamPowerErosion(StreamPowerParams::default()),
+        );
+        let stream_power_layers = [&stream_power];
+        assert!(!cpu_resume_prefix_is_height_only(&stream_power_layers, 1));
     }
 
     /// Revert check for #51: a requested CPU checkpoint must stop before the
@@ -5733,6 +5949,95 @@ mod smoke_tests {
         assert_eq!(
             engine.executed_kernels,
             vec![GpuKernel::RiverCarve, GpuKernel::Blur]
+        );
+    }
+
+    /// #129 interaction policy: StreamPower shares the generic FullField deferral
+    /// path, so no obsolete accumulation/incision sequence launches per pointer dab.
+    #[test]
+    fn local_edit_defers_full_field_stream_power_suffix_until_refinement() {
+        let Some(gpu) = terra_test_gpu::headless() else {
+            return;
+        };
+        let metrics = HeightfieldMetrics::new(16, 16, 160.0, 160.0);
+        let mut stack = LayerStack::new();
+        let base = Layer::new(
+            "base",
+            LayerKind::SculptBase(SculptParams::filled(16, 12.0)),
+        );
+        let base_id = base.id();
+        stack.push(base);
+        stack.push(Layer::new(
+            "stream power",
+            LayerKind::StreamPowerErosion(StreamPowerParams {
+                iterations: 1,
+                k: 0.002,
+                base_level: 0.0,
+                ..StreamPowerParams::default()
+            }),
+        ));
+        stack.push(Layer::new("blur", LayerKind::Blur(BlurParams::default())));
+
+        let mut engine = GpuTerrainEngine::new(&gpu.device, metrics.width);
+        engine.mark_all_dirty(&stack);
+        engine
+            .evaluate(
+                &gpu.device,
+                &gpu.queue,
+                &stack,
+                &[],
+                metrics,
+                PreviewQuality::Draft,
+                false,
+                None,
+            )
+            .expect("warm stream-power stack");
+
+        let Some(layer) = stack.find_mut(base_id) else {
+            panic!("base layer disappeared");
+        };
+        let LayerKind::SculptBase(params) = &mut layer.kind else {
+            panic!("base changed kind");
+        };
+        params.samples[8 * 16 + 8] += 3.0;
+        engine.set_dirty_rect(Some((8, 8, 1, 1)));
+        engine.mark_dirty(base_id);
+        engine.set_defer_full_field(true);
+        let interactive = engine
+            .evaluate(
+                &gpu.device,
+                &gpu.queue,
+                &stack,
+                &[],
+                metrics,
+                PreviewQuality::Draft,
+                false,
+                None,
+            )
+            .expect("interactive stream-power prefix");
+        assert!(interactive.full_field_deferred);
+        assert!(!interactive.fully_gpu);
+        assert_eq!(interactive.resume_cpu_from, None);
+        assert_eq!(engine.executed_kernels, vec![GpuKernel::Sculpt]);
+
+        engine.set_defer_full_field(false);
+        let refined = engine
+            .evaluate(
+                &gpu.device,
+                &gpu.queue,
+                &stack,
+                &[],
+                metrics,
+                PreviewQuality::Draft,
+                false,
+                None,
+            )
+            .expect("refined stream-power suffix");
+        assert!(!refined.full_field_deferred);
+        assert!(refined.fully_gpu);
+        assert_eq!(
+            engine.executed_kernels,
+            vec![GpuKernel::StreamPower, GpuKernel::Blur]
         );
     }
 
