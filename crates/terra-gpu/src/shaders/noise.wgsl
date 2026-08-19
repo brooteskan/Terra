@@ -1,5 +1,5 @@
 // Procedural height generation. Mode 0 preserves the shipped portable
-// NoiseValue preview; modes 1-4 mirror the CPU oracle's arithmetic.
+// NoiseValue preview; modes 1-5 mirror the CPU oracle's arithmetic.
 
 struct Uniforms {
     width: u32,
@@ -17,11 +17,11 @@ struct Uniforms {
     remap_min: f32,
     remap_max: f32,
     noise_type: u32, // 0 value, 1 perlin
-    mode: u32,       // 0 legacy value, 1 perlin, 2 fbm, 3 ridged, 4 domain warp
+    mode: u32,       // 0 legacy value, 1 perlin, 2 fbm, 3 ridged, 4 domain warp, 5 VoronoiRegions
     warp_strength: f32,
     warp_frequency: f32,
-    _pad0: f32,
-    _pad1: f32,
+    cell_jitter: f32,
+    height_per_cell: f32,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -216,6 +216,37 @@ fn cpu_domain_warp_height(world: vec2<f32>) -> f32 {
     return cpu_fbm_height(world + vec2<f32>(wx, wz), 1u);
 }
 
+// CPU `worley2` searches the surrounding 3x3 cells and derives each feature
+// coordinate from the same integer hash, including signed-cell bit patterns.
+fn cpu_worley_f1(p: vec2<f32>, seed: u32) -> f32 {
+    let cell = vec2<i32>(floor(p));
+    var f1 = 1.0e30;
+    for (var dz = -1; dz <= 1; dz++) {
+        for (var dx = -1; dx <= 1; dx++) {
+            let candidate = cell + vec2<i32>(dx, dz);
+            let hx = cpu_hash2(candidate.x, candidate.y, seed);
+            let hz = cpu_hash2(candidate.x, candidate.y, seed ^ 0xA5A5A5A5u);
+            let scale = f32(0xffffffffu);
+            let feature = vec2<f32>(
+                f32(candidate.x) + f32(hx) / scale,
+                f32(candidate.y) + f32(hz) / scale,
+            );
+            let delta = p - feature;
+            f1 = min(f1, sqrt(delta.x * delta.x + delta.y * delta.y));
+        }
+    }
+    return f1;
+}
+
+fn cpu_voronoi_regions_height(world: vec2<f32>) -> f32 {
+    let p = (world + vec2<f32>(u.offset_x, u.offset_z)) * u.frequency;
+    let f1 = cpu_worley_f1(p, u.seed);
+    let t = clamp(f1 / 1.2, 0.0, 1.0);
+    let worley = cpu_lerp(u.remap_min, u.remap_max, t) * u.amplitude;
+    let cell = cpu_value_noise(p, u.seed ^ 0xBEEFu);
+    return worley * 0.25 + cell * u.height_per_cell * u.cell_jitter;
+}
+
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= u.width || gid.y >= u.height) { return; }
@@ -231,6 +262,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         case 2u: { height = cpu_fbm_height(world, u.noise_type); }
         case 3u: { height = cpu_ridged_height(world, u.noise_type); }
         case 4u: { height = cpu_domain_warp_height(world); }
+        case 5u: { height = cpu_voronoi_regions_height(world); }
         default: { height = 0.0; }
     }
     textureStore(dst, vec2<i32>(i32(gid.x), i32(gid.y)), vec4<f32>(height, 0.0, 0.0, 0.0));

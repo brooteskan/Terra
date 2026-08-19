@@ -93,6 +93,9 @@ pub const FBM_PERLIN_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-3, 1.0
 pub const RIDGED_VALUE_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-3, 1.0e-5);
 pub const RIDGED_PERLIN_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-3, 1.0e-5);
 pub const DOMAIN_WARP_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-3, 1.0e-5);
+/// VoronoiRegions ports the CPU 3x3 Worley F1 search, value-noise cell term,
+/// remap, and low-32-bit seed contract directly into the noise shader.
+pub const VORONOI_REGIONS_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-3, 1.0e-5);
 /// Effect-filter modes retained on GPU after the support audit.
 pub const SMOOTH_FILTER_PREVIEW: ParityTolerance = ParityTolerance::new(1.8, 3.0e-2);
 pub const INFLATE_FILTER_PREVIEW: ParityTolerance = ParityTolerance::new(2.7, 2.8e-2);
@@ -156,6 +159,7 @@ pub const FIDELITY_MATRIX_MARKDOWN: &str = "\
 | `noise.ridged.value` | Value ridged MF, 1-12 octaves, reproducible 32-bit seed stream | 0.001 | 0.00001 |\n\
 | `noise.ridged.perlin` | Perlin ridged MF, 1-12 octaves, reproducible 32-bit seed stream | 0.001 | 0.00001 |\n\
 | `noise.domain-warp` | Perlin domain warp, 1-12 octaves, reproducible 32-bit seed stream | 0.001 | 0.00001 |\n\
+| `noise.voronoi-regions` | Euclidean Worley F1 plus value-noise cell heights, reproducible 32-bit seed | 0.001 | 0.00001 |\n\
 | `filter.blur` | Authored outer composite; radius/iteration fixture | 2.1 | 0.0055 |\n\
 | `effect.smooth` | Smooth, authored outer composite | 1.8 | 0.03 |\n\
 | `effect.inflate` | Inflate, authored outer composite | 2.7 | 0.028 |\n\

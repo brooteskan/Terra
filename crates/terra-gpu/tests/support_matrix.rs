@@ -7,7 +7,7 @@ use terra_core::layer::{
     MesaParams, MountainParams, MultiScaleAmplifyParams, NoiseParams, ParamBinding, PathNode,
     PathParams, PlateauParams, PolygonHeightMode, PolygonHeightParams, ProceduralGenerator,
     ProceduralShapeParams, RiverCarveParams, Stamp2dParams, Stamp3dParams, StreamPowerParams,
-    UpliftParams, VolcanoParams,
+    UpliftParams, VolcanoParams, VoronoiParams,
 };
 use terra_core::mask::{MaskAsset, MaskId, MaskOp, MaskRef, MaskSource};
 use terra_gpu::{
@@ -578,6 +578,10 @@ fn noise_family_defaults_and_seed_stream_boundaries_are_explicit() {
             "domain warp",
             LayerKind::DomainWarp(DomainWarpParams::default()),
         ),
+        Layer::new(
+            "voronoi regions",
+            LayerKind::VoronoiRegions(VoronoiParams::default()),
+        ),
     ];
     for layer in defaults {
         let graph = graph_for(layer.clone());
@@ -641,6 +645,16 @@ fn noise_family_defaults_and_seed_stream_boundaries_are_explicit() {
             LayerKind::NoisePerlin(NoiseParams {
                 octaves: 13,
                 ..NoiseParams::default()
+            }),
+        ),
+        Layer::new(
+            "voronoi seed overflow",
+            LayerKind::VoronoiRegions(VoronoiParams {
+                base: NoiseParams {
+                    seed: u64::from(u32::MAX) + 1,
+                    ..NoiseParams::default()
+                },
+                ..VoronoiParams::default()
             }),
         ),
     ];

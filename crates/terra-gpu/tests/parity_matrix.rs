@@ -12,6 +12,7 @@ use terra_core::layer::{
     ProceduralGenerator, ProceduralShapeParams, RampParams, RiverCarveParams, SculptParams,
     SculptPoint, SculptStroke, SculptStrokeKind, SculptStrokeParams, Stamp2dParams,
     StreamPowerParams, TerraceParams, ThermalErosionParams, UpliftParams, VolcanoParams,
+    VoronoiParams,
 };
 use terra_core::mask::{bake_mask_assets, MaskAsset, MaskId, MaskRef, MaskSource};
 use terra_gpu::parity::{
@@ -25,7 +26,7 @@ use terra_gpu::parity::{
     RIDGED_VALUE_PREVIEW, RIVER_CARVE_D8_PREVIEW, RIVER_CARVE_DINFINITY_PREVIEW,
     SCULPT_STROKES_PREVIEW, SIMPLE_MASK, SMOOTH_FILTER_PREVIEW, STREAM_POWER_D8_PREVIEW,
     STREAM_POWER_DINFINITY_PREVIEW, TERRACE_PREVIEW, THERMAL_PREVIEW, UPLIFT_PREVIEW,
-    VALUE_NOISE_PREVIEW, VOLCANIC_ISLAND_PREVIEW, VOLCANO_PREVIEW,
+    VALUE_NOISE_PREVIEW, VOLCANIC_ISLAND_PREVIEW, VOLCANO_PREVIEW, VORONOI_REGIONS_PREVIEW,
 };
 use terra_gpu::GpuTerrainEngine;
 
@@ -574,6 +575,15 @@ fn gpu_required_noise_family_previews_are_bounded() {
             }),
             DOMAIN_WARP_PREVIEW,
         ),
+        (
+            "noise.voronoi-regions",
+            LayerKind::VoronoiRegions(VoronoiParams {
+                base: base.clone(),
+                cell_jitter: 0.63,
+                height_per_cell: 37.0,
+            }),
+            VORONOI_REGIONS_PREVIEW,
+        ),
     ];
 
     for (name, kind, tolerance) in cases {
@@ -617,6 +627,41 @@ fn gpu_required_noise_family_previews_are_bounded() {
     assert!(
         warp_effect > 1.0,
         "DomainWarp parameters had no material effect"
+    );
+
+    let voronoi = VoronoiParams {
+        base: NoiseParams {
+            seed: 29,
+            frequency: 0.047,
+            amplitude: 31.0,
+            offset_x: -8.5,
+            offset_z: 5.75,
+            remap_min: -0.35,
+            remap_max: 0.92,
+            ..NoiseParams::default()
+        },
+        cell_jitter: 0.72,
+        height_per_cell: 41.0,
+    };
+    let mut cellular_stack = LayerStack::new();
+    cellular_stack.push(Layer::new(
+        "cellular",
+        LayerKind::VoronoiRegions(voronoi.clone()),
+    ));
+    let mut worley_only_stack = LayerStack::new();
+    worley_only_stack.push(Layer::new(
+        "worley only",
+        LayerKind::VoronoiRegions(VoronoiParams {
+            cell_jitter: 0.0,
+            ..voronoi
+        }),
+    ));
+    let cellular = gpu_eval(&cellular_stack, &[], metrics).to_dense();
+    let worley_only = gpu_eval(&worley_only_stack, &[], metrics).to_dense();
+    let cellular_effect = terra_gpu::parity::max_abs_diff(&cellular, &worley_only);
+    assert!(
+        cellular_effect > 1.0,
+        "VoronoiRegions cell_jitter/height_per_cell term had no material effect"
     );
 }
 

@@ -74,6 +74,7 @@ impl GpuKernel {
                         | LayerKind::Fbm(_)
                         | LayerKind::Ridged(_)
                         | LayerKind::DomainWarp(_)
+                        | LayerKind::VoronoiRegions(_)
                 )
                 | (
                     Self::Shape,
@@ -535,6 +536,7 @@ fn rejected_layer_reason(layer: &Layer) -> GpuFallbackReason {
             !seed_stream_supported(p.base.seed, p.base.octaves, 1013)
                 || !seed_stream_supported(p.base.seed, 2, 1)
         }
+        LayerKind::VoronoiRegions(p) => !seed_supported(p.base.seed),
         LayerKind::Mountains(p) => !mountain_seed_streams_supported(p),
         LayerKind::Dunes(p) => !seed_stream_supported(p.base.seed, p.base.octaves, 1013),
         LayerKind::Canyons(p) => !seed_supported(p.seed),
@@ -571,8 +573,7 @@ fn rejected_layer_reason(layer: &Layer) -> GpuFallbackReason {
         | LayerKind::FluidSimulation(_)
         | LayerKind::RiverNetwork(_)
         | LayerKind::NoiseOpenSimplex(_)
-        | LayerKind::NoiseWorley(_)
-        | LayerKind::VoronoiRegions(_) => GpuFallbackReason::new(
+        | LayerKind::NoiseWorley(_) => GpuFallbackReason::new(
             GpuFallbackCode::UnsupportedLayerKind,
             "layer",
             "layer kind has no admitted GPU preview plan",
@@ -716,6 +717,11 @@ fn gpu_plan_for_layer(
             // a bounded upstream edit still propagates only through same-texel blend.
             (GpuKernel::Noise, GpuDirtyPolicy::Local, 2)
         }
+        VoronoiRegions(p)
+            if seed_supported(p.base.seed) && gpu_blend_mode(layer.common.blend).is_some() =>
+        {
+            (GpuKernel::Noise, GpuDirtyPolicy::Local, 2)
+        }
         Mountains(p)
             if mountain_seed_streams_supported(p)
                 && gpu_blend_mode(layer.common.blend).is_some() =>
@@ -750,8 +756,10 @@ fn gpu_plan_for_layer(
             (GpuKernel::Shape, GpuDirtyPolicy::Local, 2)
         }
         Flat(_) | Ramp(_) | NoiseValue(_) | NoisePerlin(_) | Fbm(_) | Ridged(_) | Mountains(_)
-        | Dunes(_) | Canyons(_) | DomainWarp(_) | SculptBase(_) | Mesa(_) | Volcano(_)
-        | Island(_) | Plateau(_) | Uplift(_) => return Err(rejected_layer_reason(layer)),
+        | Dunes(_) | Canyons(_) | DomainWarp(_) | VoronoiRegions(_) | SculptBase(_) | Mesa(_)
+        | Volcano(_) | Island(_) | Plateau(_) | Uplift(_) => {
+            return Err(rejected_layer_reason(layer));
+        }
         Blur(p) if inplace_composite_supported(layer) => (
             GpuKernel::Blur,
             GpuDirtyPolicy::Local,

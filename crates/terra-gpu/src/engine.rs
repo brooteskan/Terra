@@ -134,7 +134,8 @@ struct NoiseU {
     mode: u32,
     warp_strength: f32,
     warp_frequency: f32,
-    _pad: [f32; 2],
+    cell_jitter: f32,
+    height_per_cell: f32,
 }
 
 #[repr(u32)]
@@ -147,6 +148,7 @@ enum NoiseKernelMode {
     Fbm = 2,
     Ridged = 3,
     DomainWarp = 4,
+    VoronoiRegions = 5,
 }
 
 #[derive(Clone, Copy)]
@@ -155,6 +157,8 @@ struct NoiseDispatch {
     mode: NoiseKernelMode,
     warp_strength: f32,
     warp_frequency: f32,
+    cell_jitter: f32,
+    height_per_cell: f32,
 }
 
 impl NoiseDispatch {
@@ -164,6 +168,8 @@ impl NoiseDispatch {
             mode,
             warp_strength: 0.0,
             warp_frequency: 0.0,
+            cell_jitter: 0.0,
+            height_per_cell: 0.0,
         }
     }
 
@@ -173,6 +179,19 @@ impl NoiseDispatch {
             mode: NoiseKernelMode::DomainWarp,
             warp_strength,
             warp_frequency,
+            cell_jitter: 0.0,
+            height_per_cell: 0.0,
+        }
+    }
+
+    const fn voronoi_regions(cell_jitter: f32, height_per_cell: f32) -> Self {
+        Self {
+            noise_type: 0,
+            mode: NoiseKernelMode::VoronoiRegions,
+            warp_strength: 0.0,
+            warp_frequency: 0.0,
+            cell_jitter,
+            height_per_cell,
         }
     }
 }
@@ -1056,6 +1075,7 @@ fn layer_input_independent(kind: &LayerKind) -> bool {
             | LayerKind::Uplift(_)
             | LayerKind::Island(_)
             | LayerKind::DomainWarp(_)
+            | LayerKind::VoronoiRegions(_)
             | LayerKind::ProceduralShape(_)
             | LayerKind::ImportHeightmap(_)
             | LayerKind::Stamp2d(_)
@@ -2328,7 +2348,8 @@ impl GpuTerrainEngine {
             mode: dispatch.mode as u32,
             warp_strength: dispatch.warp_strength,
             warp_frequency: dispatch.warp_frequency,
-            _pad: [0.0; 2],
+            cell_jitter: dispatch.cell_jitter,
+            height_per_cell: dispatch.height_per_cell,
         };
         let u_buf = self.write_uniform(device, queue, &u);
         let destination = self.view_of(destination);
@@ -6500,6 +6521,29 @@ impl GpuTerrainEngine {
                     layer.common.blend,
                 )?;
             }
+            (GpuKernel::Noise, LayerKind::VoronoiRegions(p)) => {
+                self.gen_noise(
+                    device,
+                    queue,
+                    encoder,
+                    &p.base,
+                    NoiseDispatch::voronoi_regions(p.cell_jitter, p.height_per_cell),
+                );
+                let worley_lo = 0.25 * p.base.amplitude * p.base.remap_min;
+                let worley_hi = 0.25 * p.base.amplitude * p.base.remap_max;
+                let cell_span = (p.height_per_cell * p.cell_jitter).abs();
+                self.expand_range(
+                    worley_lo.min(worley_hi) - cell_span,
+                    worley_lo.max(worley_hi) + cell_span,
+                );
+                self.blend_into_current(
+                    device,
+                    queue,
+                    encoder,
+                    layer.common.opacity,
+                    layer.common.blend,
+                )?;
+            }
             (GpuKernel::Thermal, LayerKind::ThermalErosion(p)) => {
                 let talus = p.talus_angle_deg.to_radians().tan() * self.metrics.dx();
                 let iters = Self::scale_iters(quality, p.iterations).min(match quality {
@@ -7164,6 +7208,7 @@ mod smoke_tests {
         IslandParams, Layer, LayerGroup, LayerKind, LayerStack, MaterialsParams,
         MultiScaleAmplifyParams, NamedOutputDecl, NoiseParams, ParamBinding, RiverCarveParams,
         SculptParams, StackNode, Stamp2dParams, StreamPowerParams, ThermalErosionParams,
+        VoronoiParams,
     };
     use terra_core::mask::{
         bake_mask_assets, DistributionEntry, MaskAsset, MaskCombine, MaskId, MaskOp, MaskRef,
@@ -8364,6 +8409,68 @@ mod smoke_tests {
         }
     }
 
+    fn flatten_strokes(u: f32, v: f32) -> SculptStrokeParams {
+        SculptStrokeParams {
+            strokes: vec![terra_core::layer::SculptStroke {
+                kind: SculptStrokeKind::Flatten,
+                points: vec![terra_core::layer::SculptPoint {
+                    u,
+                    v,
+                    pressure: 1.0,
+                }],
+                radius_m: 60.0,
+                strength: 1.0,
+                target_height: 0.0,
+                falloff: 1.5,
+                enabled: true,
+            }],
+            reconcile: 0.0,
+        }
+    }
+
+    /// #107: the historical #98 Voronoi + Flatten stack now has executable
+    /// kernels for both layers, so a Full app-style evaluation needs no CPU resume.
+    #[test]
+    fn voronoi_flatten_stack_is_fully_gpu_at_full_quality() {
+        let Some(gpu) = terra_test_gpu::headless() else {
+            return;
+        };
+        let metrics = HeightfieldMetrics::new(48, 40, 240.0, 160.0);
+        let mut stack = LayerStack::new();
+        stack.push(Layer::new(
+            "voronoi",
+            LayerKind::VoronoiRegions(VoronoiParams::default()),
+        ));
+        stack.push(Layer::new(
+            "flatten",
+            LayerKind::SculptStrokes(flatten_strokes(0.5, 0.5)),
+        ));
+
+        let mut engine = GpuTerrainEngine::new(&gpu.device, metrics.width);
+        engine.mark_all_dirty(&stack);
+        let result = engine
+            .evaluate(
+                &gpu.device,
+                &gpu.queue,
+                &stack,
+                &[],
+                metrics,
+                PreviewQuality::Full,
+                false,
+                None,
+            )
+            .expect("Full Voronoi + Flatten GPU evaluation");
+
+        assert!(result.fully_gpu);
+        assert_eq!(result.freshness, GpuPreviewFreshness::Current);
+        assert_eq!(result.resume_cpu_from, None);
+        assert_eq!(result.cpu_fallback, None);
+        assert_eq!(
+            engine.executed_kernels,
+            vec![GpuKernel::Noise, GpuKernel::SculptStrokes]
+        );
+    }
+
     #[test]
     fn sculpt_strokes_kernel_is_executed_from_the_plan() {
         let Some(gpu) = terra_test_gpu::headless() else {
@@ -8479,6 +8586,97 @@ mod smoke_tests {
         assert!(stats.used_layer_zero_region);
         assert_eq!(stats.reused_contributions, 1);
         assert!(stats.sculpt_resampled_texels < u64::from(metrics.width * metrics.height));
+    }
+
+    /// #107: VoronoiRegions is input-independent, so an upstream bounded edit
+    /// re-blends its warm contribution without re-running the 3x3 Worley search.
+    #[test]
+    fn warm_cache_base_edit_reuses_voronoi_contribution() {
+        let Some(gpu) = terra_test_gpu::headless() else {
+            return;
+        };
+        let res = 48u32;
+        let metrics = HeightfieldMetrics::new(res, res, 240.0, 240.0);
+        let rect = (20u32, 20u32, 8u32, 8u32);
+        let mut stack = LayerStack::new();
+        let base = Layer::new(
+            "base",
+            LayerKind::SculptBase(SculptParams::filled(res, 5.0)),
+        );
+        let base_id = base.id();
+        stack.push(base);
+        let mut voronoi = Layer::new(
+            "voronoi",
+            LayerKind::VoronoiRegions(VoronoiParams::default()),
+        );
+        voronoi.common.blend = BlendMode::Add;
+        stack.push(voronoi);
+
+        let mut engine = GpuTerrainEngine::new(&gpu.device, metrics.width);
+        engine.mark_all_dirty(&stack);
+        engine
+            .evaluate(
+                &gpu.device,
+                &gpu.queue,
+                &stack,
+                &[],
+                metrics,
+                PreviewQuality::Draft,
+                false,
+                None,
+            )
+            .expect("warm Voronoi contribution cache");
+
+        let LayerKind::SculptBase(params) = &mut stack.find_mut(base_id).expect("base layer").kind
+        else {
+            panic!("base changed kind");
+        };
+        for y in rect.1..rect.1 + rect.3 {
+            for x in rect.0..rect.0 + rect.2 {
+                params.samples[(y * res + x) as usize] += 7.0;
+            }
+        }
+        engine.set_dirty_rect(Some(rect));
+        engine.mark_dirty(base_id);
+        let incremental = engine
+            .evaluate(
+                &gpu.device,
+                &gpu.queue,
+                &stack,
+                &[],
+                metrics,
+                PreviewQuality::Draft,
+                true,
+                None,
+            )
+            .expect("bounded edit with cached Voronoi contribution")
+            .cpu
+            .expect("incremental GPU readback");
+
+        let mut oracle_engine = GpuTerrainEngine::new(&gpu.device, metrics.width);
+        oracle_engine.mark_all_dirty(&stack);
+        let oracle = oracle_engine
+            .evaluate(
+                &gpu.device,
+                &gpu.queue,
+                &stack,
+                &[],
+                metrics,
+                PreviewQuality::Draft,
+                true,
+                None,
+            )
+            .expect("fresh Voronoi GPU oracle")
+            .cpu
+            .expect("oracle GPU readback");
+
+        let error = crate::parity::max_abs_diff(&incremental.to_dense(), &oracle.to_dense());
+        assert!(
+            error <= 1.0e-3,
+            "cached Voronoi contribution drifted by {error}"
+        );
+        assert_eq!(engine.executed_kernels, vec![GpuKernel::Sculpt]);
+        assert_eq!(engine.last_eval_stats().reused_contributions, 1);
     }
 
     /// #136: a warm first-layer SculptBase edit remains bounded through upload,

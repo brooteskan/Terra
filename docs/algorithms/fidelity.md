@@ -30,6 +30,7 @@ Errors compare complete GPU and CPU height fields. Normalized RMSE uses the maxi
 | `noise.ridged.value` | Value ridged MF, 1-12 octaves, reproducible 32-bit seed stream | 0.001 | 0.00001 |
 | `noise.ridged.perlin` | Perlin ridged MF, 1-12 octaves, reproducible 32-bit seed stream | 0.001 | 0.00001 |
 | `noise.domain-warp` | Perlin domain warp, 1-12 octaves, reproducible 32-bit seed stream | 0.001 | 0.00001 |
+| `noise.voronoi-regions` | Euclidean Worley F1 plus value-noise cell heights, reproducible 32-bit seed | 0.001 | 0.00001 |
 | `filter.blur` | Authored outer composite; radius/iteration fixture | 2.1 | 0.0055 |
 | `effect.smooth` | Smooth, authored outer composite | 1.8 | 0.03 |
 | `effect.inflate` | Inflate, authored outer composite | 2.7 | 0.028 |
@@ -67,7 +68,7 @@ Errors compare complete GPU and CPU height fields. Normalized RMSE uses the maxi
 - GPU hydraulic omits full neighbor water/sediment gather (atomic-free preview).
 - GPU value noise is a portable hash approximation, not bit-identical to CPU.
 - Distribution-node programs, missing assets, Noise/Curvature/painted mask sources, and mask blur radii above 16 fall back to CPU with a structured reason code.
-- OpenSimplex/Worley generators, OpenSimplex fBm/ridged configurations, non-default dune transport controls, and the EffectFilter variants not named in the matrix fall back to CPU. They may return only after gaining a named parity contract.
+- The general OpenSimplex and `NoiseWorley` generators, OpenSimplex fBm/ridged configurations, non-default dune transport controls, and the EffectFilter variants not named in the matrix fall back to CPU. `VoronoiRegions` is the parity-covered Worley/value-noise exception. Other variants may return only after gaining a named parity contract.
 - RiverCarve preview uses iterative D8 routing for both authored routing modes and omits guide-mask bias; guided configurations fall back to CPU. D8 is exact-height class on the monotone drainage fixture, while authored D-infinity has its own bounded approximation contract. CPU priority-fill routing and auxiliary flow/accumulation/wetness fields remain authoritative for export and downstream auxiliary consumers.
 - StreamPower preview reuses the iterative D8 accumulation pass for both authored routing modes and applies the CPU grid-relative incision law with constant hardness. Priority-Flood, per-iteration refill, dendritic seeding, source-driven hardness, authored multilevel overrides, and hydrology auxiliary publication remain CPU-only; CPU export is authoritative.
 - MultiScaleAmplify previews the CPU coarse-to-fine schedule with uniform hardness/ridge lock and the bounded thermal, D8 stream-power, and hydraulic kernels. Field-sourced hardness/lock masks, inherited hardness, and downstream consumers of its hardness/erosion/deposition outputs remain CPU-only; CPU export and auxiliary publication are authoritative.

@@ -1,9 +1,11 @@
 //! Regression test for issues #98 / #101.
 //!
 //! A superseding edit must interrupt an in-flight long CPU eval *mid-fill*
-//! instead of waiting it out. The stack is the #98 repro (a GPU-unsupported
-//! `VoronoiRegions` generator plus a Flatten Shape layer); at a resolution where
-//! a Full eval takes seconds, a follow-up job submitted while that eval is still
+//! instead of waiting it out. The stack is the historical #98 repro
+//! (`VoronoiRegions` plus a Flatten Shape layer); although both layers now have
+//! height-preview GPU kernels, the direct CPU worker remains the authoritative
+//! oracle and a representative cancellation stress fixture. At a resolution where
+//! a Full CPU eval takes seconds, a follow-up job submitted while that eval is still
 //! filling must return in a small fraction of the uncancelled time.
 //!
 //! Timing bounds are self-calibrated against this machine's own uncancelled
@@ -23,8 +25,8 @@ use terra_core::layer::{Layer, LayerKind, LayerStack};
 use terra_core::shape_history::{create_shape_layer, stamp_stroke, ShapeTool};
 use terra_core::CancelToken;
 
-/// The #98 repro stack: a Voronoi base (no GPU kernel) plus a Flatten Shape
-/// layer that contributes real per-pixel work.
+/// The historical #98 repro stack: a Voronoi base plus a Flatten Shape layer
+/// that contributes real per-pixel CPU work.
 fn voronoi_flatten_stack() -> LayerStack {
     let mut stack = LayerStack::new();
     stack.push(Layer::new(

@@ -1,14 +1,13 @@
-//! Repro + timing for issue #98: Full CPU eval of a stack that contains a
-//! GPU-unsupported generator (`VoronoiRegions`) plus a Flatten Shape layer.
+//! Historical repro + CPU timing fixture for issue #98: Full CPU eval of a
+//! `VoronoiRegions` generator plus a Flatten Shape layer.
 //!
 //! Usage: `cargo run [--release] --example voronoi_flatten_full_eval -- [max_res]`
 //!
-//! Neither `VoronoiRegions` nor `SculptStrokes` has a GPU kernel, so the
-//! interactive Full refine of this stack cannot stay on the GPU — it resumes on
-//! the CPU. The point of this binary is to establish that that CPU eval is
-//! *finite* and scales O(pixels): it is a long synchronous computation, not an
-//! infinite loop. The reported wall time is what the background eval worker
-//! spends per Full build (and what a mid-layer cancel must be able to interrupt).
+//! Both layers now have height-preview GPU kernels (#107 and #117), so the current
+//! interactive stack stays on the GPU unless a downstream layer consumes sculpt
+//! auxiliary fields. This binary remains the direct CPU-oracle timing fixture: it
+//! establishes that the CPU eval is *finite* and scales O(pixels), and preserves a
+//! representative long fill for cancellation/performance investigations.
 //!
 //! `max_res` (optional) caps the resolution sweep so a debug run stays quick;
 //! the default sweep is 256/512/1024/2048 to match the table in the issue.
