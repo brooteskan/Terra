@@ -181,6 +181,7 @@ impl TerraApp {
                 | crate::ui::EditorTool::Sediment
         ) {
             use terra_core::authoring::SculptStrokeKind;
+            use terra_core::layer::BrushEditable;
             let stroke_kind = match self.ui_state.editor_tool {
                 crate::ui::EditorTool::Protect => SculptStrokeKind::Protect,
                 crate::ui::EditorTool::Hardness => SculptStrokeKind::Hardness,
@@ -188,8 +189,7 @@ impl TerraApp {
             };
             let selected_target = self.session.document.selected.filter(|&id| {
                 self.session.document.stack.find(id).is_some_and(|layer| {
-                    terra_core::layer::brush_support(&layer.kind, stroke_kind)
-                        != terra_core::layer::EditSupport::Unsupported
+                    layer.brush_support(stroke_kind) != terra_core::layer::EditSupport::Unsupported
                 })
             });
             let layer_id = if let Some(id) = selected_target {

@@ -126,7 +126,7 @@ pub enum PanelAction {
         mask_id: MaskId,
         action: MaskEditAction,
     },
-    /// Stamp onto the sculptable Base height buffer.
+    /// Stamp onto a brush-editable layer.
     PaintSculptStamp {
         layer: LayerId,
         u: f32,

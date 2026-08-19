@@ -200,6 +200,46 @@ impl Default for SculptStrokeParams {
     }
 }
 
+impl SculptStrokeParams {
+    /// Append or extend one sampled sculpt stroke.
+    #[allow(clippy::too_many_arguments)]
+    pub fn stamp_stroke(
+        &mut self,
+        kind: SculptStrokeKind,
+        u: f32,
+        v: f32,
+        radius_m: f32,
+        strength: f32,
+        target_height: f32,
+        continuing: bool,
+    ) {
+        let point = SculptPoint {
+            u,
+            v,
+            pressure: 1.0,
+        };
+        let append = continuing
+            && self.strokes.last().is_some_and(|last| {
+                last.enabled
+                    && last.kind == kind
+                    && (last.radius_m - radius_m).abs() <= radius_m.max(1.0) * 0.05
+            });
+        if append {
+            self.strokes.last_mut().unwrap().points.push(point);
+        } else {
+            self.strokes.push(SculptStroke {
+                kind,
+                points: vec![point],
+                radius_m: radius_m.max(1.0),
+                strength,
+                target_height,
+                falloff: 1.5,
+                enabled: true,
+            });
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TerrainConstraintKind {
     Elevation,

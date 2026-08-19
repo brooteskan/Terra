@@ -15,7 +15,7 @@ use crate::ui::workspace::{workspace_definition, WorkspaceId};
 use crate::ui::{EditorTool, UiState};
 use terra_core::authoring::SculptStrokeKind;
 use terra_core::document::TerrainDocument;
-use terra_core::layer::{brush_support, EditSupport};
+use terra_core::layer::{BrushEditable, EditSupport};
 use terra_core::mask::{MaskAsset, MaskId};
 use terra_gui::{Color, DrawList, GuiContext, Icon, Id, Rect};
 
@@ -432,7 +432,7 @@ fn selected_brush_support(
     brush.map(|brush| {
         doc.selected
             .and_then(|id| doc.stack.find(id))
-            .map(|layer| brush_support(&layer.kind, brush))
+            .map(|layer| layer.brush_support(brush))
             .unwrap_or(EditSupport::Unsupported)
     })
 }

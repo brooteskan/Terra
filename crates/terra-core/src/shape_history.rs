@@ -4,8 +4,8 @@
 //! on the terrain stack. Brush coverage lives on the stroke IR — artists never
 //! manually add a Shape Layer, add a Mask, or paint a Mask separately.
 
-use crate::authoring::{SculptStroke, SculptStrokeKind, SculptStrokeParams};
-use crate::layer::{brush_support, EditSupport, Layer, LayerId, LayerKind, LayerStack};
+use crate::authoring::{SculptStrokeKind, SculptStrokeParams};
+use crate::layer::{BrushEditable, EditSupport, Layer, LayerId, LayerKind, LayerStack};
 use serde::{Deserialize, Serialize};
 
 /// Whether the next stroke session creates a new Shape Layer or appends to the selection.
@@ -193,7 +193,7 @@ pub fn resolve_shape_target(
     let supports_brush = |id| {
         stack
             .find(id)
-            .is_some_and(|layer| brush_support(&layer.kind, brush) != EditSupport::Unsupported)
+            .is_some_and(|layer| layer.brush_support(brush) != EditSupport::Unsupported)
     };
 
     // Explicit selection wins when it has a genuine edit path for this brush.
@@ -288,37 +288,21 @@ pub fn stamp_stroke(
     target_height: f32,
     continuing: bool,
 ) {
-    use crate::authoring::SculptPoint;
-    let point = SculptPoint {
+    params.stamp_stroke(
+        kind,
         u,
         v,
-        pressure: 1.0,
-    };
-    let append = continuing
-        && params.strokes.last().is_some_and(|last| {
-            last.enabled
-                && last.kind == kind
-                && (last.radius_m - radius_m).abs() <= radius_m.max(1.0) * 0.05
-        });
-    if append {
-        params.strokes.last_mut().unwrap().points.push(point);
-    } else {
-        params.strokes.push(SculptStroke {
-            kind,
-            points: vec![point],
-            radius_m: radius_m.max(1.0),
-            strength,
-            target_height,
-            falloff: 1.5,
-            enabled: true,
-        });
-    }
+        radius_m,
+        strength,
+        target_height,
+        continuing,
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::authoring::SculptPoint;
+    use crate::authoring::{SculptPoint, SculptStroke};
 
     #[test]
     fn new_session_creates_named_layer_decision() {

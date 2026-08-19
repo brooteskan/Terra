@@ -263,105 +263,49 @@ pub(crate) fn try_apply(
             stroke_kind,
             target_height,
         } => {
+            use terra_core::layer::{BrushDab, BrushEditable, EditSupport};
+
             let falloff = app.ui_state.sculpt_falloff_exponent();
+            let continuing = app.last_paint_uv.is_some();
+            let world_radius = radius
+                * 0.5
+                * (app.session.document.metrics.world_size_x
+                    + app.session.document.metrics.world_size_z);
             if let Some(target) = app.session.document.stack.find_mut(layer) {
-                let continuing = app.last_paint_uv.is_some();
-                let world_radius = radius
-                    * 0.5
-                    * (app.session.document.metrics.world_size_x
-                        + app.session.document.metrics.world_size_z);
-                let support = terra_core::layer::brush_support(&target.kind, stroke_kind);
-                if support == terra_core::layer::EditSupport::Unsupported {
-                    app.ui_state.status =
-                        if matches!(target.kind, terra_core::layer::LayerKind::SculptBase(_)) {
-                            format!(
-                                "{} isn't supported on the Foundation layer — use a Shape Layer",
-                                stroke_kind.label()
-                            )
-                        } else {
-                            format!(
-                                "{} isn't supported on layer \"{}\"",
-                                stroke_kind.label(),
-                                target.common.name
-                            )
-                        };
-                } else if let terra_core::layer::LayerKind::SculptStrokes(params) = &mut target.kind
-                {
-                    terra_core::shape_history::stamp_stroke(
-                        params,
-                        stroke_kind,
-                        u,
-                        v,
-                        world_radius.max(1.0),
-                        strength,
-                        target_height,
-                        continuing,
-                    );
-                    // Brush strength / edge-falloff apply to the stroke being painted.
-                    // `stamp_stroke` sets these only when it creates a new stroke, so a
-                    // continuing drag would freeze them at the first dab's values —
-                    // refresh the active stroke each dab so the sliders stay live.
-                    // Falloff has no other UI path onto the stroke, so this is what
-                    // makes the Falloff control affect sculpt strokes at all.
-                    if let Some(last) = params.strokes.last_mut() {
-                        last.strength = strength;
-                        last.falloff = falloff;
-                        last.target_height = target_height;
-                    }
-                    ctx.dirty_from = Some(layer);
-                    app.session.document.selected = Some(layer);
-                    app.ui_state.shape_session_layer = Some(layer);
-                } else if let terra_core::layer::LayerKind::TerrainConstraints(params) =
-                    &mut target.kind
-                {
-                    use terra_core::layer::{
-                        SculptPoint, TerrainConstraint, TerrainConstraintKind,
-                    };
-                    let constraint_kind = stroke_kind.terrain_constraint_kind().expect(
-                        "brush_support admitted a constraint brush without a constraint kind",
-                    );
-                    let point = SculptPoint {
-                        u,
-                        v,
-                        pressure: 1.0,
-                    };
-                    let append = continuing
-                        && params.constraints.last().is_some_and(|last| {
-                            last.kind == constraint_kind
-                                && (last.width_m - world_radius).abs()
-                                    <= world_radius.max(1.0) * 0.05
-                        });
-                    if append {
-                        params.constraints.last_mut().unwrap().points.push(point);
-                    } else {
-                        params.constraints.push(TerrainConstraint {
-                            kind: constraint_kind,
-                            points: vec![point],
-                            width_m: world_radius.max(1.0),
-                            value: strength,
-                            strength: if matches!(constraint_kind, TerrainConstraintKind::Protect) {
-                                strength.clamp(0.0, 1.0)
-                            } else {
-                                1.0
-                            },
-                        });
-                    }
-                    ctx.dirty_from = Some(layer);
-                    app.session.document.selected = Some(layer);
-                } else if let terra_core::layer::LayerKind::SculptBase(params) = &mut target.kind {
-                    // Legacy foundation path â€” prefer Shape history for new strokes.
-                    // `resolve_shape_target` redirects unsupported brushes to a Shape
-                    // Layer before they reach here; if a programmatic caller lands one
-                    // anyway, refuse rather than silently raising the terrain (#97).
-                    if let Some(mode) = stroke_kind.foundation_mode() {
-                        params.stamp_circle(u, v, radius, strength, mode);
-                        ctx.dirty_from = Some(layer);
-                        app.session.document.selected = Some(layer);
-                    } else {
-                        app.ui_state.status = format!(
+                let support = target.brush_support(stroke_kind);
+                if support == EditSupport::Unsupported {
+                    app.ui_state.status = if target.kind.is_sculpt_base() {
+                        format!(
                             "{} isn't supported on the Foundation layer — use a Shape Layer",
                             stroke_kind.label()
-                        );
+                        )
+                    } else {
+                        format!(
+                            "{} isn't supported on layer \"{}\"",
+                            stroke_kind.label(),
+                            target.common.name
+                        )
+                    };
+                } else {
+                    let is_shape_history =
+                        terra_core::shape_history::is_shape_history_layer(&target.kind);
+                    target.apply_brush(
+                        stroke_kind,
+                        BrushDab {
+                            u,
+                            v,
+                            radius_uv: radius,
+                            radius_m: world_radius,
+                            strength,
+                            target_height,
+                            falloff,
+                            continuing,
+                        },
+                    );
+                    ctx.dirty_from = Some(layer);
+                    app.session.document.selected = Some(layer);
+                    if is_shape_history {
+                        app.ui_state.shape_session_layer = Some(layer);
                     }
                 }
             }
