@@ -6,19 +6,21 @@ use terra_core::layer::{
     BlendMode, BlurParams, CanyonParams, DomainWarpParams, DuneParams, EffectFilterKind,
     EffectFilterParams, FbmParams, FlatParams, FractalNoiseType, HydraulicErosionParams,
     IslandParams, LandscapeEvolutionParams, Layer, LayerKind, LayerStack, MesaParams,
-    MountainParams, NoiseParams, PlateauParams, RampParams, SculptParams, SculptPoint,
-    RiverCarveParams, SculptStroke, SculptStrokeKind, SculptStrokeParams, TerraceParams,
+    MountainParams, NoiseParams, PlateauParams, RampParams, RiverCarveParams, SculptParams,
+    SculptPoint, SculptStroke, SculptStrokeKind, SculptStrokeParams, TerraceParams,
     ThermalErosionParams, UpliftParams, VolcanoParams,
 };
 use terra_core::mask::{bake_mask_assets, MaskAsset, MaskId, MaskRef, MaskSource};
 use terra_gpu::parity::{
-    assert_field_parity, ARCHIPELAGO_PREVIEW, ATOLL_PREVIEW, BLUR_PREVIEW, CANYONS_PREVIEW,
-    DENOISE_FILTER_PREVIEW, DOMAIN_WARP_PREVIEW, DUNES_PREVIEW, EXACT_HEIGHT, FBM_PERLIN_PREVIEW,
+    assert_field_parity, ADD_SET_FILTER_PREVIEW, ARCHIPELAGO_PREVIEW, ATOLL_PREVIEW, BLUR_PREVIEW,
+    CANYONS_PREVIEW, CURVE_FILTER_PREVIEW, CUTOFF_FILTER_PREVIEW, DEFLATE_FILTER_PREVIEW,
+    DENOISE_FILTER_PREVIEW, DOMAIN_WARP_PREVIEW, DUNES_PREVIEW, EFFECT_FILTER_EXACT_PREVIEW,
+    EFFECT_FILTER_SPATIAL_PREVIEW, EFFECT_FILTER_WARP_PREVIEW, EXACT_HEIGHT, FBM_PERLIN_PREVIEW,
     FBM_VALUE_PREVIEW, HYDRAULIC_PREVIEW, INFLATE_FILTER_PREVIEW, MESA_PREVIEW, MOUNTAINS_PREVIEW,
     PERLIN_NOISE_PREVIEW, PLATEAU_PREVIEW, RIDGED_PERLIN_PREVIEW, RIDGED_VALUE_PREVIEW,
     RIVER_CARVE_D8_PREVIEW, RIVER_CARVE_DINFINITY_PREVIEW, SCULPT_STROKES_PREVIEW, SIMPLE_MASK,
-    SMOOTH_FILTER_PREVIEW, TERRACE_PREVIEW, THERMAL_PREVIEW, UPLIFT_PREVIEW,
-    VALUE_NOISE_PREVIEW, VOLCANIC_ISLAND_PREVIEW, VOLCANO_PREVIEW,
+    SMOOTH_FILTER_PREVIEW, TERRACE_PREVIEW, THERMAL_PREVIEW, UPLIFT_PREVIEW, VALUE_NOISE_PREVIEW,
+    VOLCANIC_ISLAND_PREVIEW, VOLCANO_PREVIEW,
 };
 use terra_gpu::GpuTerrainEngine;
 
@@ -234,6 +236,166 @@ fn gpu_required_noise_and_effect_filter_approximations_are_bounded() {
                 ..EffectFilterParams::default()
             },
             DENOISE_FILTER_PREVIEW,
+        ),
+        (
+            "effect.add-set",
+            EffectFilterParams::add_set(),
+            ADD_SET_FILTER_PREVIEW,
+        ),
+        (
+            "effect.add-set.absolute",
+            EffectFilterParams {
+                sea_level: 1.0,
+                amount: 17.25,
+                ..EffectFilterParams::add_set()
+            },
+            ADD_SET_FILTER_PREVIEW,
+        ),
+        (
+            "effect.deflate",
+            EffectFilterParams::deflate(),
+            DEFLATE_FILTER_PREVIEW,
+        ),
+        (
+            "effect.curve",
+            EffectFilterParams::curve(),
+            CURVE_FILTER_PREVIEW,
+        ),
+        (
+            "effect.cutoff",
+            EffectFilterParams::cutoff(),
+            CUTOFF_FILTER_PREVIEW,
+        ),
+        (
+            "effect.terrace-simple",
+            EffectFilterParams::terrace_simple(),
+            EFFECT_FILTER_EXACT_PREVIEW,
+        ),
+        (
+            "effect.shore",
+            EffectFilterParams::shore(),
+            EFFECT_FILTER_EXACT_PREVIEW,
+        ),
+        (
+            "effect.blocks",
+            EffectFilterParams::blocks(),
+            EFFECT_FILTER_EXACT_PREVIEW,
+        ),
+        (
+            "effect.zero-edge",
+            EffectFilterParams::zero_edge(),
+            EFFECT_FILTER_EXACT_PREVIEW,
+        ),
+        (
+            "effect.squeeze",
+            EffectFilterParams::squeeze(),
+            EFFECT_FILTER_EXACT_PREVIEW,
+        ),
+        (
+            "effect.directional-blur",
+            EffectFilterParams::directional_blur(),
+            EFFECT_FILTER_SPATIAL_PREVIEW,
+        ),
+        (
+            "effect.angle-blur",
+            EffectFilterParams::angle_blur(),
+            EFFECT_FILTER_SPATIAL_PREVIEW,
+        ),
+        (
+            "effect.swirl",
+            EffectFilterParams::swirl(),
+            EFFECT_FILTER_WARP_PREVIEW,
+        ),
+        (
+            "effect.crater",
+            EffectFilterParams::crater(),
+            EFFECT_FILTER_SPATIAL_PREVIEW,
+        ),
+        (
+            "effect.distortion",
+            EffectFilterParams::distortion(),
+            EFFECT_FILTER_WARP_PREVIEW,
+        ),
+        (
+            "effect.balloon",
+            EffectFilterParams::balloon(),
+            EFFECT_FILTER_SPATIAL_PREVIEW,
+        ),
+        (
+            "effect.noise-perlin",
+            EffectFilterParams::noise_perlin(),
+            EFFECT_FILTER_EXACT_PREVIEW,
+        ),
+        (
+            "effect.noise-value",
+            EffectFilterParams::noise_value(),
+            EFFECT_FILTER_EXACT_PREVIEW,
+        ),
+        (
+            "effect.noise-white",
+            EffectFilterParams::noise_white(),
+            EFFECT_FILTER_EXACT_PREVIEW,
+        ),
+        (
+            "effect.noise-wave",
+            EffectFilterParams::noise_wave(),
+            EFFECT_FILTER_EXACT_PREVIEW,
+        ),
+        (
+            "effect.scatter-detail",
+            EffectFilterParams::scatter_detail(),
+            EFFECT_FILTER_EXACT_PREVIEW,
+        ),
+        (
+            "effect.spike-removal",
+            EffectFilterParams::spike_removal(),
+            EFFECT_FILTER_SPATIAL_PREVIEW,
+        ),
+        (
+            "effect.noise-billow",
+            EffectFilterParams::noise_billow(),
+            EFFECT_FILTER_EXACT_PREVIEW,
+        ),
+        (
+            "effect.noise-ridged",
+            EffectFilterParams::noise_ridged(),
+            EFFECT_FILTER_EXACT_PREVIEW,
+        ),
+        (
+            "effect.ridged",
+            EffectFilterParams::ridged(),
+            EFFECT_FILTER_EXACT_PREVIEW,
+        ),
+        (
+            "effect.rugged",
+            EffectFilterParams::rugged(),
+            EFFECT_FILTER_EXACT_PREVIEW,
+        ),
+        (
+            "effect.border-blend.absolute",
+            EffectFilterParams {
+                sea_level: 11.0,
+                ..EffectFilterParams::border_blend()
+            },
+            EFFECT_FILTER_EXACT_PREVIEW,
+        ),
+        (
+            "effect.flatten.absolute",
+            EffectFilterParams {
+                sea_level: 11.0,
+                ..EffectFilterParams::flatten_filter()
+            },
+            EFFECT_FILTER_EXACT_PREVIEW,
+        ),
+        (
+            "effect.hexagons",
+            EffectFilterParams::hexagons(),
+            EFFECT_FILTER_EXACT_PREVIEW,
+        ),
+        (
+            "effect.terrace-steep",
+            EffectFilterParams::terrace_steep(),
+            EFFECT_FILTER_SPATIAL_PREVIEW,
         ),
     ] {
         let mut stack = LayerStack::new();

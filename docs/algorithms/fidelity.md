@@ -30,6 +30,13 @@ Errors compare complete GPU and CPU height fields. Normalized RMSE uses the maxi
 | `effect.smooth` | Smooth, default outer composite | 1.8 | 0.03 |
 | `effect.inflate` | Inflate, default outer composite | 2.7 | 0.028 |
 | `effect.denoise` | Denoise (bilateral), default outer composite | 2.2 | 0.038 |
+| `effect.add-set` | Add and Set pointwise remaps, default outer composite | 0.001 | 0.00001 |
+| `effect.deflate` | Amount-limited greyscale erosion, default outer composite | 0.001 | 0.00001 |
+| `effect.curve` | Exact entering-field range reduction, default outer composite | 0.001 | 0.00001 |
+| `effect.cutoff` | Exact entering-field range reduction, default outer composite | 0.001 | 0.00001 |
+| `effect.pointwise-procedural` | TerraceSimple, Shore, Blocks, ZeroEdge, Squeeze, Perlin-family noise, scatter, Hexagons, and authored absolute border/flatten targets | 0.001 | 0.00001 |
+| `effect.spatial` | DirectionalBlur, AngleBlur, Balloon, Crater, TerraceSteep, and radius-one SpikeRemoval | 0.02 | 0.0002 |
+| `effect.warp` | Swirl and Distortion with a reproducible 32-bit seed | 0.05 | 0.001 |
 | `filter.terrace` | Default outer composite | 8.5 | 0.10 |
 | `simulation.thermal` | Non-layered, constant hardness, no weathering extension | 3.2 | 0.05 |
 | `simulation.hydraulic` | Base transport, no sources, particles, layers, or post-effects | 3.0 | 0.03 |
@@ -52,7 +59,7 @@ Errors compare complete GPU and CPU height fields. Normalized RMSE uses the maxi
 - GPU hydraulic omits full neighbor water/sediment gather (atomic-free preview).
 - GPU value noise is a portable hash approximation, not bit-identical to CPU.
 - Multi-entry distributions, non-Multiply combines, mask asset operations, missing assets, and Noise/Curvature mask sources fall back to CPU.
-- OpenSimplex/Worley generators, OpenSimplex fBm/ridged configurations, non-default dune transport controls, and unratcheted EffectFilter variants fall back to CPU. They may return only after gaining a named full-field contract.
+- OpenSimplex/Worley generators, OpenSimplex fBm/ridged configurations, non-default dune transport controls, and the EffectFilter variants not named in the matrix fall back to CPU. They may return only after gaining a named parity contract.
 - RiverCarve preview uses iterative D8 routing for both authored routing modes and omits guide-mask bias; guided configurations fall back to CPU. D8 is exact-height class on the monotone drainage fixture, while authored D-infinity has its own bounded approximation contract. CPU priority-fill routing and auxiliary flow/accumulation/wetness fields remain authoritative for export and downstream auxiliary consumers.
 - Seeds/derived octave streams outside 32 bits and noise configurations above 12 octaves fall back instead of being truncated.
 - Layered/source-driven/multilevel thermal and particle/layered/source-driven hydraulic configurations fall back to CPU.

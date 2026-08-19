@@ -94,6 +94,16 @@ pub const INFLATE_FILTER_PREVIEW: ParityTolerance = ParityTolerance::new(2.7, 2.
 /// case is ~1.5 m / 0.030 on the patterned fixture (the shelf/basin fixture, whose
 /// passes align at 2, stays well under); this holds portable headroom.
 pub const DENOISE_FILTER_PREVIEW: ParityTolerance = ParityTolerance::new(2.2, 3.8e-2);
+/// Pointwise Add/Set and bounded greyscale erosion mirror the CPU formulas.
+pub const ADD_SET_FILTER_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-3, 1.0e-5);
+pub const DEFLATE_FILTER_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-3, 1.0e-5);
+/// Field-range remaps use an exact GPU reduction; residuals are f32 pow ordering.
+pub const CURVE_FILTER_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-3, 1.0e-5);
+pub const CUTOFF_FILTER_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-3, 1.0e-5);
+/// Newly ratcheted pointwise, range-remap, neighbourhood, and procedural filters.
+pub const EFFECT_FILTER_EXACT_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-3, 1.0e-5);
+pub const EFFECT_FILTER_SPATIAL_PREVIEW: ParityTolerance = ParityTolerance::new(2.0e-2, 2.0e-4);
+pub const EFFECT_FILTER_WARP_PREVIEW: ParityTolerance = ParityTolerance::new(5.0e-2, 1.0e-3);
 /// SculptStrokes preview: untouched texels are bit-exact copies; stamped texels
 /// diverge only by transcendental edges (`sqrt` vs `hypot`, `pow` vs `powf`). The
 /// bit-exact `hash_noise` port keeps Noise strokes in the same budget; the base-3x3
@@ -127,6 +137,13 @@ pub const FIDELITY_MATRIX_MARKDOWN: &str = "\
 | `effect.smooth` | Smooth, default outer composite | 1.8 | 0.03 |\n\
 | `effect.inflate` | Inflate, default outer composite | 2.7 | 0.028 |\n\
 | `effect.denoise` | Denoise (bilateral), default outer composite | 2.2 | 0.038 |\n\
+| `effect.add-set` | Add and Set pointwise remaps, default outer composite | 0.001 | 0.00001 |\n\
+| `effect.deflate` | Amount-limited greyscale erosion, default outer composite | 0.001 | 0.00001 |\n\
+| `effect.curve` | Exact entering-field range reduction, default outer composite | 0.001 | 0.00001 |\n\
+| `effect.cutoff` | Exact entering-field range reduction, default outer composite | 0.001 | 0.00001 |\n\
+| `effect.pointwise-procedural` | TerraceSimple, Shore, Blocks, ZeroEdge, Squeeze, Perlin-family noise, scatter, Hexagons, and authored absolute border/flatten targets | 0.001 | 0.00001 |\n\
+| `effect.spatial` | DirectionalBlur, AngleBlur, Balloon, Crater, TerraceSteep, and radius-one SpikeRemoval | 0.02 | 0.0002 |\n\
+| `effect.warp` | Swirl and Distortion with a reproducible 32-bit seed | 0.05 | 0.001 |\n\
 | `filter.terrace` | Default outer composite | 8.5 | 0.10 |\n\
 | `simulation.thermal` | Non-layered, constant hardness, no weathering extension | 3.2 | 0.05 |\n\
 | `simulation.hydraulic` | Base transport, no sources, particles, layers, or post-effects | 3.0 | 0.03 |\n\

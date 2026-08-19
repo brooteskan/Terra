@@ -6,10 +6,10 @@
 //! (`cpu_from`). `GpuTerrainEngine::evaluate` indexes this plan directly and never
 //! re-derives kernels mid-walk, so planning has a single authority.
 
+use crate::effect_filter::{effect_filter_gpu_spec, EffectFilterGpuScope};
 use terra_core::layer::{
-    BlendMode, DuneParams, EffectFilterKind, FractalNoiseType, IslandArchetype, IslandParams,
-    Layer, LayerKind, LayerStack, MountainParams, RiverCarveParams, SculptStrokeKind,
-    TransportModel, UpliftParams,
+    BlendMode, DuneParams, FractalNoiseType, IslandArchetype, IslandParams, Layer, LayerKind,
+    LayerStack, MountainParams, RiverCarveParams, SculptStrokeKind, TransportModel, UpliftParams,
 };
 use terra_core::mask::{MaskAsset, MaskCombine, MaskSource};
 
@@ -410,22 +410,16 @@ fn gpu_plan_for_layer(layer: &Layer, mask_assets: &[MaskAsset]) -> Option<GpuLay
             GpuDirtyPolicy::Local,
             p.radius.clamp(1, BLUR_MAX_RADIUS),
         ),
-        // Denoise (bilateral) joins Smooth/Inflate on the ratcheted GPU path: its
-        // wgsl mode-4 kernel now mirrors the CPU bilateral (parity-guarded incl. the
-        // shipped reef Shelf Flatten config), and it carries the same
-        // radius-sized halo as Smooth. This keeps the Tropical Island reef biome
-        // preview off the whole-stack CPU fallback (#119).
-        EffectFilter(p)
-            if matches!(
-                p.kind,
-                EffectFilterKind::Smooth | EffectFilterKind::Inflate | EffectFilterKind::Denoise
-            ) && inplace_composite_supported(layer) =>
-        {
-            (
-                GpuKernel::EffectFilter,
-                GpuDirtyPolicy::Local,
-                p.radius.clamp(1, EFFECT_FILTER_MAX_RADIUS),
-            )
+        EffectFilter(p) if inplace_composite_supported(layer) => {
+            let spec = effect_filter_gpu_spec(p)?;
+            let (dirty_policy, halo_texels) = match spec.scope {
+                EffectFilterGpuScope::LocalPointwise => (GpuDirtyPolicy::Local, 0),
+                EffectFilterGpuScope::LocalExpanding { halo_per_pass } => {
+                    (GpuDirtyPolicy::Local, halo_per_pass)
+                }
+                EffectFilterGpuScope::FullField => (GpuDirtyPolicy::FullField, 0),
+            };
+            (GpuKernel::EffectFilter, dirty_policy, halo_texels)
         }
         Blur(_) | EffectFilter(_) => return None,
         Terrace(_) if inplace_composite_supported(layer) => {
@@ -803,13 +797,56 @@ mod tests {
             );
             let supported = matches!(
                 kind,
-                EffectFilterKind::Smooth | EffectFilterKind::Inflate | EffectFilterKind::Denoise
+                EffectFilterKind::Smooth
+                    | EffectFilterKind::Inflate
+                    | EffectFilterKind::Denoise
+                    | EffectFilterKind::AddSet
+                    | EffectFilterKind::Deflate
+                    | EffectFilterKind::Curve
+                    | EffectFilterKind::Cutoff
+                    | EffectFilterKind::TerraceSimple
+                    | EffectFilterKind::Shore
+                    | EffectFilterKind::Blocks
+                    | EffectFilterKind::ZeroEdge
+                    | EffectFilterKind::Squeeze
+                    | EffectFilterKind::DirectionalBlur
+                    | EffectFilterKind::AngleBlur
+                    | EffectFilterKind::Swirl
+                    | EffectFilterKind::Crater
+                    | EffectFilterKind::Distortion
+                    | EffectFilterKind::Balloon
+                    | EffectFilterKind::NoisePerlin
+                    | EffectFilterKind::NoiseValue
+                    | EffectFilterKind::NoiseWhite
+                    | EffectFilterKind::NoiseWave
+                    | EffectFilterKind::ScatterDetail
+                    | EffectFilterKind::NoiseBillow
+                    | EffectFilterKind::NoiseRidged
+                    | EffectFilterKind::Ridged
+                    | EffectFilterKind::Rugged
+                    | EffectFilterKind::Hexagons
+                    | EffectFilterKind::TerraceSteep
             );
             let plan = gpu_plan_for_layer(&layer, &[]);
             assert_eq!(plan.is_some(), supported, "{}", kind.label());
             if let Some(plan) = plan {
                 assert_eq!(plan.kernel, GpuKernel::EffectFilter, "{}", kind.label());
                 assert!(plan.kernel.matches_layer_kind(&layer.kind));
+                let expected_policy = match kind {
+                    EffectFilterKind::Curve
+                    | EffectFilterKind::Cutoff
+                    | EffectFilterKind::TerraceSimple
+                    | EffectFilterKind::ZeroEdge
+                    | EffectFilterKind::Squeeze
+                    | EffectFilterKind::Swirl
+                    | EffectFilterKind::Distortion
+                    | EffectFilterKind::Hexagons
+                    | EffectFilterKind::TerraceSteep => {
+                        GpuDirtyPolicy::FullField
+                    }
+                    _ => GpuDirtyPolicy::Local,
+                };
+                assert_eq!(plan.dirty_policy, expected_policy, "{}", kind.label());
             }
         }
     }

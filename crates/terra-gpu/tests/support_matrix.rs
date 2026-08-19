@@ -56,24 +56,131 @@ fn every_effect_filter_variant_has_an_explicit_executable_plan() {
         let graph = graph_for(layer);
         let supported = matches!(
             kind,
-            EffectFilterKind::Smooth | EffectFilterKind::Inflate | EffectFilterKind::Denoise
+            EffectFilterKind::Smooth
+                | EffectFilterKind::Inflate
+                | EffectFilterKind::Denoise
+                | EffectFilterKind::AddSet
+                | EffectFilterKind::Deflate
+                | EffectFilterKind::Curve
+                | EffectFilterKind::Cutoff
+                | EffectFilterKind::TerraceSimple
+                | EffectFilterKind::Shore
+                | EffectFilterKind::Blocks
+                | EffectFilterKind::ZeroEdge
+                | EffectFilterKind::Squeeze
+                | EffectFilterKind::DirectionalBlur
+                | EffectFilterKind::AngleBlur
+                | EffectFilterKind::Swirl
+                | EffectFilterKind::Crater
+                | EffectFilterKind::Distortion
+                | EffectFilterKind::Balloon
+                | EffectFilterKind::NoisePerlin
+                | EffectFilterKind::NoiseValue
+                | EffectFilterKind::NoiseWhite
+                | EffectFilterKind::NoiseWave
+                | EffectFilterKind::ScatterDetail
+                | EffectFilterKind::NoiseBillow
+                | EffectFilterKind::NoiseRidged
+                | EffectFilterKind::Ridged
+                | EffectFilterKind::Rugged
+                | EffectFilterKind::Hexagons
+                | EffectFilterKind::TerraceSteep
         );
         assert_eq!(graph.fully_gpu(), supported, "{}", kind.label());
         if supported {
             let plan = graph.plans[0].expect("supported filter retains a plan");
             assert_eq!(plan.kernel, GpuKernel::EffectFilter);
+            let expected_policy = match kind {
+                EffectFilterKind::Curve
+                | EffectFilterKind::Cutoff
+                | EffectFilterKind::TerraceSimple
+                | EffectFilterKind::ZeroEdge
+                | EffectFilterKind::Squeeze
+                | EffectFilterKind::Swirl
+                | EffectFilterKind::Distortion
+                | EffectFilterKind::Hexagons
+                | EffectFilterKind::TerraceSteep => GpuDirtyPolicy::FullField,
+                _ => GpuDirtyPolicy::Local,
+            };
+            assert_eq!(plan.dirty_policy, expected_policy, "{}", kind.label());
         } else {
             assert_eq!(graph.cpu_from, Some(0));
         }
+    }
+
+    let spike = Layer::new(
+        "spike removal radius one",
+        LayerKind::EffectFilter(EffectFilterParams::spike_removal()),
+    );
+    let graph = graph_for(spike);
+    assert!(graph.fully_gpu());
+    assert_eq!(
+        graph.plans[0].expect("spike plan").dirty_policy,
+        GpuDirtyPolicy::Local
+    );
+
+    let unsupported_spike = Layer::new(
+        "spike removal radius two",
+        LayerKind::EffectFilter(EffectFilterParams {
+            radius: 2,
+            ..EffectFilterParams::spike_removal()
+        }),
+    );
+    assert!(!graph_for(unsupported_spike).fully_gpu());
+
+    let overflowing_noise = Layer::new(
+        "overflowing billow seed stream",
+        LayerKind::EffectFilter(EffectFilterParams {
+            seed: u64::from(u32::MAX) - 100,
+            ..EffectFilterParams::noise_billow()
+        }),
+    );
+    assert!(!graph_for(overflowing_noise).fully_gpu());
+
+    let oversized_radius = Layer::new(
+        "oversized directional radius",
+        LayerKind::EffectFilter(EffectFilterParams {
+            radius: terra_gpu::EFFECT_FILTER_MAX_RADIUS + 1,
+            ..EffectFilterParams::directional_blur()
+        }),
+    );
+    assert!(!graph_for(oversized_radius).fully_gpu());
+
+    let overflowing_warp_seed = Layer::new(
+        "overflowing warp seed",
+        LayerKind::EffectFilter(EffectFilterParams {
+            seed: u64::from(u32::MAX),
+            warp_strength: 1.0,
+            ..EffectFilterParams::noise_wave()
+        }),
+    );
+    assert!(!graph_for(overflowing_warp_seed).fully_gpu());
+
+    for params in [
+        EffectFilterParams {
+            sea_level: 12.0,
+            ..EffectFilterParams::border_blend()
+        },
+        EffectFilterParams {
+            sea_level: 12.0,
+            ..EffectFilterParams::flatten_filter()
+        },
+    ] {
+        let graph = graph_for(Layer::new(
+            "absolute target",
+            LayerKind::EffectFilter(params),
+        ));
+        assert!(graph.fully_gpu());
+        assert_eq!(
+            graph.plans[0].expect("absolute plan").dirty_policy,
+            GpuDirtyPolicy::Local
+        );
     }
 }
 
 #[test]
 fn river_carve_defaults_and_configuration_boundaries_are_explicit() {
-    let default = Layer::new(
-        "river",
-        LayerKind::RiverCarve(RiverCarveParams::default()),
-    );
+    let default = Layer::new("river", LayerKind::RiverCarve(RiverCarveParams::default()));
     let graph = graph_for(default);
     assert!(graph.fully_gpu());
     let plan = graph.plans[0].expect("RiverCarve plan");

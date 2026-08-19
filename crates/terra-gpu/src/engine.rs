@@ -8,7 +8,7 @@
 //! Interactive hard rules (WC): no UI-thread height readback, no mesh rebuild,
 //! prefer fully GPU stacks, never present an incomplete prefix as finished Draft.
 
-use crate::effect_filter::resolve_effect_mode;
+use crate::effect_filter::{effect_filter_gpu_spec, EffectFilterGpuPasses};
 use crate::graph::{
     compile_gpu_graph, expand_dirty_rect, gpu_blend_mode, GpuComputeGraph, GpuDirtyPolicy,
     GpuKernel, BLUR_MAX_RADIUS, EFFECT_FILTER_MAX_RADIUS, RIVER_CARVE_MAX_RADIUS,
@@ -501,10 +501,35 @@ struct EffectFilterU {
     warp_frequency: f32,
     dx: f32,
     invert: f32,
+    flow_threshold: f32,
+    wall_steepness: f32,
+    valley_floor: f32,
+    talus_mix: f32,
+    top_smoothness: f32,
+    riser_sharpness: f32,
+    lacunarity: f32,
+    persistence: f32,
+    octaves: u32,
+    voronoi_feature: u32,
+    tileable: u32,
+    _pad_params: u32,
+    crater_radius: f32,
+    dz: f32,
+    _pad_metric0: f32,
+    _pad_metric1: f32,
     region_x: u32,
     region_y: u32,
     region_w: u32,
     region_h: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct EffectRangeU {
+    width: u32,
+    height: u32,
+    _pad0: u32,
+    _pad1: u32,
 }
 
 #[repr(C)]
@@ -847,6 +872,7 @@ pub struct GpuTerrainEngine {
     plateau: Pipe,
     river_accum: Pipe,
     river_carve: Pipe,
+    effect_filter_range: Pipe,
     effect_filter: Pipe,
     mask_bake: Pipe,
     sculpt_strokes: Pipe,
@@ -877,6 +903,8 @@ pub struct GpuTerrainEngine {
     sculpt_stamp: HeightTex,
     sculpt_stamp_b: HeightTex,
     sculpt_edited: HeightTex,
+    /// Ordered-f32 min/max written by `effect_filter_range` and read by remap kernels.
+    effect_filter_range_buffer: wgpu::Buffer,
     layer_cache: HashMap<LayerId, HeightTex>,
     /// Pre-blend generator output, keyed by layer id.
     layer_contrib: HashMap<LayerId, HeightTex>,
@@ -1092,9 +1120,29 @@ impl GpuTerrainEngine {
             include_str!("shaders/river_carve.wgsl"),
             river_carve_bgl,
         );
+        let effect_filter_range_bgl =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("effect-filter-range-bgl"),
+                entries: &[
+                    uniform_entry(0),
+                    tex_read_entry(1),
+                    storage_rw_buffer_entry(2),
+                ],
+            });
+        let effect_filter_range = make_pipe(
+            device,
+            "effect-filter-range",
+            include_str!("shaders/effect_filter_range.wgsl"),
+            effect_filter_range_bgl,
+        );
         let effect_filter_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("effect-filter-bgl"),
-            entries: &[uniform_entry(0), tex_read_entry(1), storage_write_entry(2)],
+            entries: &[
+                uniform_entry(0),
+                tex_read_entry(1),
+                storage_write_entry(2),
+                storage_read_buffer_entry(3),
+            ],
         });
         let mask_bake_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("mask-bake-bgl"),
@@ -1210,6 +1258,12 @@ impl GpuTerrainEngine {
         let sculpt_stamp = HeightTex::new(device, "sculpt-stamp", w, w);
         let sculpt_stamp_b = HeightTex::new(device, "sculpt-stamp-b", w, w);
         let sculpt_edited = HeightTex::new(device, "sculpt-edited", w, w);
+        let effect_filter_range_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("effect-filter-range"),
+            size: 8,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         Self {
             fill,
@@ -1228,6 +1282,7 @@ impl GpuTerrainEngine {
             plateau,
             river_accum,
             river_carve,
+            effect_filter_range,
             effect_filter,
             mask_bake,
             sculpt_strokes,
@@ -1252,6 +1307,7 @@ impl GpuTerrainEngine {
             sculpt_stamp,
             sculpt_stamp_b,
             sculpt_edited,
+            effect_filter_range_buffer,
             layer_cache: HashMap::new(),
             layer_contrib: HashMap::new(),
             dirty: HashSet::new(),
@@ -2133,7 +2189,12 @@ impl GpuTerrainEngine {
     }
 
     fn effect_filter_iters(quality: PreviewQuality, p: &EffectFilterParams) -> u32 {
-        Self::scale_iters(quality, p.iterations.max(1)).min(8)
+        match effect_filter_gpu_spec(p).map(|spec| spec.passes) {
+            Some(EffectFilterGpuPasses::LegacyQualityScaled) => {
+                Self::scale_iters(quality, p.iterations.max(1)).min(8)
+            }
+            Some(EffectFilterGpuPasses::Once) | None => 1,
+        }
     }
 
     fn blur_iters(p: &terra_core::layer::BlurParams) -> u32 {
@@ -2166,6 +2227,64 @@ impl GpuTerrainEngine {
         }
     }
 
+    fn reduce_effect_filter_range(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+    ) {
+        // Ordered-f32 encodings of +infinity (min initializer) and -infinity
+        // (max initializer). The WGSL transform preserves total numeric ordering
+        // across negative and positive finite terrain heights.
+        let initial = [0xff80_0000u32, 0x007f_ffffu32];
+        queue.write_buffer(
+            &self.effect_filter_range_buffer,
+            0,
+            bytemuck::cast_slice(&initial),
+        );
+        let uniform = EffectRangeU {
+            width: self.metrics.width,
+            height: self.metrics.height,
+            _pad0: 0,
+            _pad1: 0,
+        };
+        let uniform = self.write_uniform(device, queue, &uniform);
+        let src = if self.current == 0 {
+            &self.ping.view
+        } else {
+            &self.pong.view
+        };
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("effect-filter-range-bg"),
+            layout: &self.effect_filter_range.bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(src),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.effect_filter_range_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("effect-filter-range"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.effect_filter_range.pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(
+            self.metrics.width.div_ceil(8),
+            self.metrics.height.div_ceil(8),
+            1,
+        );
+    }
+
     fn run_effect_filter(
         &mut self,
         device: &wgpu::Device,
@@ -2174,8 +2293,13 @@ impl GpuTerrainEngine {
         p: &EffectFilterParams,
         quality: PreviewQuality,
     ) {
-        let mode = resolve_effect_mode(p.kind);
+        let spec = effect_filter_gpu_spec(p)
+            .expect("compiled EffectFilter plan must retain an executable spec");
+        let mode = spec.mode;
         let iters = Self::effect_filter_iters(quality, p);
+        if spec.needs_height_range {
+            self.reduce_effect_filter_range(device, queue, encoder);
+        }
         let (rx, ry, rw, rh, gx, gy) = self.dirty_dispatch_extent();
         for _ in 0..iters {
             let u = EffectFilterU {
@@ -2205,6 +2329,26 @@ impl GpuTerrainEngine {
                 warp_frequency: p.warp_frequency,
                 dx: self.metrics.dx(),
                 invert: if p.invert { 1.0 } else { 0.0 },
+                flow_threshold: p.flow_threshold,
+                wall_steepness: p.wall_steepness,
+                valley_floor: p.valley_floor,
+                talus_mix: p.talus_mix,
+                top_smoothness: p.top_smoothness,
+                riser_sharpness: p.riser_sharpness,
+                lacunarity: p.lacunarity,
+                persistence: p.persistence,
+                octaves: p.octaves,
+                voronoi_feature: match p.voronoi_feature {
+                    terra_core::noise::WorleyFeature::F1 => 0,
+                    terra_core::noise::WorleyFeature::F2 => 1,
+                    terra_core::noise::WorleyFeature::F2MinusF1 => 2,
+                },
+                tileable: u32::from(p.tileable),
+                _pad_params: 0,
+                crater_radius: p.crater_radius,
+                dz: self.metrics.dz(),
+                _pad_metric0: 0.0,
+                _pad_metric1: 0.0,
                 region_x: rx,
                 region_y: ry,
                 region_w: rw,
@@ -2232,6 +2376,10 @@ impl GpuTerrainEngine {
                     wgpu::BindGroupEntry {
                         binding: 2,
                         resource: wgpu::BindingResource::TextureView(dst),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: self.effect_filter_range_buffer.as_entire_binding(),
                     },
                 ],
             });
