@@ -49,6 +49,49 @@ struct NoiseU {
     remap_max: f32,
     noise_type: u32,
     mode: u32,
+    warp_strength: f32,
+    warp_frequency: f32,
+    _pad: [f32; 2],
+}
+
+#[repr(u32)]
+#[derive(Clone, Copy)]
+enum NoiseKernelMode {
+    /// Existing portable value-noise preview. Its output is already public and
+    /// parity-ratcheted, so the new CPU-aligned modes must not rewrite it.
+    LegacyValue = 0,
+    Perlin = 1,
+    Fbm = 2,
+    Ridged = 3,
+    DomainWarp = 4,
+}
+
+#[derive(Clone, Copy)]
+struct NoiseDispatch {
+    noise_type: u32,
+    mode: NoiseKernelMode,
+    warp_strength: f32,
+    warp_frequency: f32,
+}
+
+impl NoiseDispatch {
+    const fn new(noise_type: u32, mode: NoiseKernelMode) -> Self {
+        Self {
+            noise_type,
+            mode,
+            warp_strength: 0.0,
+            warp_frequency: 0.0,
+        }
+    }
+
+    const fn domain_warp(warp_strength: f32, warp_frequency: f32) -> Self {
+        Self {
+            noise_type: 1,
+            mode: NoiseKernelMode::DomainWarp,
+            warp_strength,
+            warp_frequency,
+        }
+    }
 }
 
 #[repr(C)]
@@ -1575,8 +1618,7 @@ impl GpuTerrainEngine {
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         p: &NoiseParams,
-        noise_type: u32,
-        ridged: bool,
+        dispatch: NoiseDispatch,
     ) {
         let u = NoiseU {
             width: self.metrics.width,
@@ -1593,8 +1635,11 @@ impl GpuTerrainEngine {
             offset_z: p.offset_z,
             remap_min: p.remap_min,
             remap_max: p.remap_max,
-            noise_type,
-            mode: if ridged { 1 } else { 0 },
+            noise_type: dispatch.noise_type,
+            mode: dispatch.mode as u32,
+            warp_strength: dispatch.warp_strength,
+            warp_frequency: dispatch.warp_frequency,
+            _pad: [0.0; 2],
         };
         let u_buf = self.write_uniform(device, queue, &u);
         let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -3143,7 +3188,13 @@ impl GpuTerrainEngine {
                 )?;
             }
             (GpuKernel::Noise, LayerKind::NoiseValue(p)) => {
-                self.gen_noise(device, queue, encoder, p, 0, false);
+                self.gen_noise(
+                    device,
+                    queue,
+                    encoder,
+                    p,
+                    NoiseDispatch::new(0, NoiseKernelMode::LegacyValue),
+                );
                 self.expand_range(0.0, p.amplitude);
                 self.blend_into_current(
                     device,
@@ -3154,8 +3205,15 @@ impl GpuTerrainEngine {
                 )?;
             }
             (GpuKernel::Noise, LayerKind::NoisePerlin(p)) => {
-                self.gen_noise(device, queue, encoder, p, 1, false);
-                self.expand_range(0.0, p.amplitude);
+                self.gen_noise(
+                    device,
+                    queue,
+                    encoder,
+                    p,
+                    NoiseDispatch::new(1, NoiseKernelMode::Perlin),
+                );
+                let amplitude = p.amplitude.abs();
+                self.expand_range(-amplitude, amplitude);
                 self.blend_into_current(
                     device,
                     queue,
@@ -3166,8 +3224,15 @@ impl GpuTerrainEngine {
             }
             (GpuKernel::Noise, LayerKind::Fbm(p)) => {
                 let nt = Self::noise_type_u(p.noise).ok_or(GpuError::RequiresCpu)?;
-                self.gen_noise(device, queue, encoder, &p.base, nt, false);
-                self.expand_range(0.0, p.base.amplitude);
+                self.gen_noise(
+                    device,
+                    queue,
+                    encoder,
+                    &p.base,
+                    NoiseDispatch::new(nt, NoiseKernelMode::Fbm),
+                );
+                let amplitude = p.base.amplitude.abs();
+                self.expand_range(-amplitude, amplitude);
                 self.blend_into_current(
                     device,
                     queue,
@@ -3178,8 +3243,14 @@ impl GpuTerrainEngine {
             }
             (GpuKernel::Noise, LayerKind::Ridged(p)) => {
                 let nt = Self::noise_type_u(p.noise).ok_or(GpuError::RequiresCpu)?;
-                self.gen_noise(device, queue, encoder, &p.base, nt, true);
-                self.expand_range(0.0, p.base.amplitude);
+                self.gen_noise(
+                    device,
+                    queue,
+                    encoder,
+                    &p.base,
+                    NoiseDispatch::new(nt, NoiseKernelMode::Ridged),
+                );
+                self.expand_range(p.base.amplitude.min(0.0), p.base.amplitude.max(0.0));
                 self.blend_into_current(
                     device,
                     queue,
@@ -3295,8 +3366,15 @@ impl GpuTerrainEngine {
                 )?;
             }
             (GpuKernel::Noise, LayerKind::DomainWarp(p)) => {
-                self.gen_noise(device, queue, encoder, &p.base, 1, false);
-                self.expand_range(0.0, p.base.amplitude);
+                self.gen_noise(
+                    device,
+                    queue,
+                    encoder,
+                    &p.base,
+                    NoiseDispatch::domain_warp(p.warp_strength, p.warp_frequency),
+                );
+                let amplitude = p.base.amplitude.abs();
+                self.expand_range(-amplitude, amplitude);
                 self.blend_into_current(
                     device,
                     queue,
@@ -3980,9 +4058,9 @@ mod smoke_tests {
     use terra_core::eval::{EvalContext, PreviewQuality, StackEvaluator};
     use terra_core::heightfield::HeightfieldMetrics;
     use terra_core::layer::{
-        BlendMode, BlurParams, CoastalParams, EffectFilterParams, FbmParams, FlatParams,
-        FractalNoiseType, GroupInputMode, IslandParams, Layer, LayerGroup, LayerKind, LayerStack,
-        MaterialsParams, NamedOutputDecl, NoiseParams, SculptParams, StackNode,
+        BlendMode, BlurParams, CoastalParams, DomainWarpParams, EffectFilterParams, FbmParams,
+        FlatParams, FractalNoiseType, GroupInputMode, IslandParams, Layer, LayerGroup, LayerKind,
+        LayerStack, MaterialsParams, NamedOutputDecl, NoiseParams, SculptParams, StackNode,
         ThermalErosionParams,
     };
     use terra_core::mask::{
@@ -5239,6 +5317,95 @@ mod smoke_tests {
             engine.approx_range, range_after_full,
             "incremental stroke dabs drifted the presentation range"
         );
+    }
+
+    /// #125: domain displacement changes only which procedural-noise coordinate is
+    /// generated. It never samples a displaced texel from the entering height, so a
+    /// bounded upstream edit still passes through its Add blend without a
+    /// warp-strength-sized dirty halo.
+    #[test]
+    fn dirty_rect_domain_warp_matches_full_field_evaluation() {
+        let Some(gpu) = terra_test_gpu::headless() else {
+            return;
+        };
+        let res = 64u32;
+        let metrics = HeightfieldMetrics::new(res, res, 192.0, 128.0);
+        let rect = (24u32, 20u32, 12u32, 10u32);
+        let mut stack = LayerStack::new();
+        let base = Layer::new("base", LayerKind::Flat(FlatParams { height: 4.0 }));
+        let base_id = base.id();
+        stack.push(base);
+        let sculpt = Layer::new(
+            "sculpt",
+            LayerKind::SculptBase(SculptParams::filled(res, 20.0)),
+        );
+        let sculpt_id = sculpt.id();
+        stack.push(sculpt);
+        stack.push(Layer::new(
+            "warp",
+            LayerKind::DomainWarp(DomainWarpParams {
+                warp_strength: 35.0,
+                warp_frequency: 0.018,
+                ..DomainWarpParams::default()
+            }),
+        ));
+
+        let mut engine = GpuTerrainEngine::new(&gpu.device, metrics.width);
+        engine.mark_dirty(base_id);
+        engine
+            .evaluate(
+                &gpu.device,
+                &gpu.queue,
+                &stack,
+                &[],
+                metrics,
+                PreviewQuality::Draft,
+                false,
+                None,
+            )
+            .expect("warm domain-warp stack");
+
+        if let LayerKind::SculptBase(params) = &mut stack.flatten_layers_mut()[1].kind {
+            for y in rect.1..rect.1 + rect.3 {
+                for x in rect.0..rect.0 + rect.2 {
+                    params.samples[(y * res + x) as usize] = 65.0;
+                }
+            }
+        }
+        engine.set_dirty_rect(Some(rect));
+        engine.mark_dirty(sculpt_id);
+        let incremental = engine
+            .evaluate(
+                &gpu.device,
+                &gpu.queue,
+                &stack,
+                &[],
+                metrics,
+                PreviewQuality::Draft,
+                true,
+                None,
+            )
+            .expect("incremental domain-warp evaluation")
+            .cpu
+            .expect("incremental readback");
+
+        let mut oracle_engine = GpuTerrainEngine::new(&gpu.device, metrics.width);
+        let oracle = oracle_engine
+            .evaluate(
+                &gpu.device,
+                &gpu.queue,
+                &stack,
+                &[],
+                metrics,
+                PreviewQuality::Draft,
+                true,
+                None,
+            )
+            .expect("full domain-warp evaluation")
+            .cpu
+            .expect("oracle readback");
+        let error = crate::parity::max_abs_diff(&incremental.to_dense(), &oracle.to_dense());
+        assert!(error <= 1.0e-3, "incremental DomainWarp drifted by {error}");
     }
 
     /// B1-D6 / C1-C2 — #90's explicit rect-edge-artifact answer. A flat field with

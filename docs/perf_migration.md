@@ -51,7 +51,7 @@ CPU fallback when stack has unsupported layers / masks
 
 ## Wave C/D GPU-supported layers
 
-`Flat`, `Ramp`, `NoiseValue`, `NoisePerlin`, `Fbm` (Value/Perlin), `Ridged`, `ThermalErosion`, `HydraulicErosion`, `Blur`, `Terrace`
+`Flat`, `Ramp`, `NoiseValue`, `NoisePerlin`, `Fbm` (Value/Perlin), `Ridged` (Value/Perlin), `DomainWarp`, `ThermalErosion`, `HydraulicErosion`, `Blur`, `Terrace`
 
 ## Verification
 

@@ -1,8 +1,8 @@
 use terra_core::eval::{EvalContext, StackEvaluator};
 use terra_core::heightfield::HeightfieldMetrics;
 use terra_core::layer::{
-    BlendMode, EffectFilterKind, EffectFilterParams, FbmParams, FlatParams, FractalNoiseType,
-    Layer, LayerKind, LayerStack, LayerTypeRegistry, NoiseParams,
+    BlendMode, DomainWarpParams, EffectFilterKind, EffectFilterParams, FbmParams, FlatParams,
+    FractalNoiseType, Layer, LayerKind, LayerStack, LayerTypeRegistry, NoiseParams,
 };
 use terra_gpu::{compile_gpu_graph, layer_gpu_supported, GpuKernel};
 
@@ -80,7 +80,8 @@ fn fractal_noise_variants_and_blend_modes_are_explicitly_classified() {
                     ..FbmParams::default()
                 }),
             );
-            assert!(!layer_gpu_supported(&layer, &[]), "{noise:?}");
+            let supported = matches!(noise, FractalNoiseType::Value | FractalNoiseType::Perlin);
+            assert_eq!(layer_gpu_supported(&layer, &[]), supported, "{noise:?}");
         }
     }
 
@@ -103,6 +104,88 @@ fn fractal_noise_variants_and_blend_modes_are_explicitly_classified() {
         let mut layer = Layer::new("blend", LayerKind::Flat(FlatParams { height: 2.0 }));
         layer.common.blend = blend;
         assert_eq!(layer_gpu_supported(&layer, &[]), supported, "{blend:?}");
+    }
+}
+
+#[test]
+fn noise_family_defaults_and_seed_stream_boundaries_are_explicit() {
+    let defaults = [
+        Layer::new("perlin", LayerKind::NoisePerlin(NoiseParams::default())),
+        Layer::new("fbm", LayerKind::Fbm(FbmParams::default())),
+        Layer::new("ridged", LayerKind::Ridged(FbmParams::default())),
+        Layer::new(
+            "domain warp",
+            LayerKind::DomainWarp(DomainWarpParams::default()),
+        ),
+    ];
+    for layer in defaults {
+        let graph = graph_for(layer.clone());
+        assert!(graph.fully_gpu(), "{}", layer.common.name);
+        assert_eq!(graph.plans[0].expect("noise plan").kernel, GpuKernel::Noise);
+    }
+
+    let mut unsupported_blend = Layer::new(
+        "warped height blend",
+        LayerKind::DomainWarp(DomainWarpParams::default()),
+    );
+    unsupported_blend.common.blend = BlendMode::HeightBlend;
+    assert!(!layer_gpu_supported(&unsupported_blend, &[]));
+    assert_eq!(graph_for(unsupported_blend).cpu_from, Some(0));
+
+    let near_limit = u64::from(u32::MAX) - 100;
+    let rejected = [
+        Layer::new(
+            "perlin overflow",
+            LayerKind::NoisePerlin(NoiseParams {
+                seed: near_limit,
+                octaves: 2,
+                ..NoiseParams::default()
+            }),
+        ),
+        Layer::new(
+            "fbm overflow",
+            LayerKind::Fbm(FbmParams {
+                base: NoiseParams {
+                    seed: near_limit,
+                    octaves: 2,
+                    ..NoiseParams::default()
+                },
+                ..FbmParams::default()
+            }),
+        ),
+        Layer::new(
+            "ridged overflow",
+            LayerKind::Ridged(FbmParams {
+                base: NoiseParams {
+                    seed: near_limit,
+                    octaves: 2,
+                    ..NoiseParams::default()
+                },
+                ..FbmParams::default()
+            }),
+        ),
+        Layer::new(
+            "warp overflow",
+            LayerKind::DomainWarp(DomainWarpParams {
+                base: NoiseParams {
+                    seed: u64::from(u32::MAX),
+                    octaves: 1,
+                    ..NoiseParams::default()
+                },
+                ..DomainWarpParams::default()
+            }),
+        ),
+        Layer::new(
+            "too many perlin octaves",
+            LayerKind::NoisePerlin(NoiseParams {
+                octaves: 13,
+                ..NoiseParams::default()
+            }),
+        ),
+    ];
+    for layer in rejected {
+        assert!(!layer_gpu_supported(&layer, &[]), "{}", layer.common.name);
+        assert_eq!(graph_for(layer).cpu_from, Some(0));
     }
 }
 

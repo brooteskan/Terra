@@ -20,6 +20,12 @@ Errors compare complete GPU and CPU height fields. Normalized RMSE uses the maxi
 | `authoring.sculpt-strokes` | Per-sample stroke kinds, Smooth/Pinch/Coastline, Flatten, and distance stamps, supported blend/mask | 0.001 | 0.00001 |
 | `mask.simple` | One Constant, Height, or Slope Multiply entry without asset operations | 0.001 | 0.0001 |
 | `noise.value` | Value noise with a 32-bit seed | 17.0 | 0.23 |
+| `noise.perlin` | Perlin, 1-12 octaves, reproducible 32-bit seed stream | 0.001 | 0.00001 |
+| `noise.fbm.value` | Value fBm, 1-12 octaves, reproducible 32-bit seed stream | 0.001 | 0.00001 |
+| `noise.fbm.perlin` | Perlin fBm, 1-12 octaves, reproducible 32-bit seed stream | 0.001 | 0.00001 |
+| `noise.ridged.value` | Value ridged MF, 1-12 octaves, reproducible 32-bit seed stream | 0.001 | 0.00001 |
+| `noise.ridged.perlin` | Perlin ridged MF, 1-12 octaves, reproducible 32-bit seed stream | 0.001 | 0.00001 |
+| `noise.domain-warp` | Perlin domain warp, 1-12 octaves, reproducible 32-bit seed stream | 0.001 | 0.00001 |
 | `filter.blur` | Default outer composite; radius/iteration fixture | 2.1 | 0.0055 |
 | `effect.smooth` | Smooth, default outer composite | 1.8 | 0.03 |
 | `effect.inflate` | Inflate, default outer composite | 2.7 | 0.028 |
@@ -35,8 +41,8 @@ Errors compare complete GPU and CPU height fields. Normalized RMSE uses the maxi
 - GPU hydraulic omits full neighbor water/sediment gather (atomic-free preview).
 - GPU value noise is a portable hash approximation, not bit-identical to CPU.
 - Multi-entry distributions, non-Multiply combines, mask asset operations, missing assets, and Noise/Curvature mask sources fall back to CPU.
-- Perlin, fBm, ridged, domain-warp, dunes, mountains, canyons, mesa, volcano, uplift, plateau, non-volcanic island archetypes, RiverCarve, and unratcheted EffectFilter variants fall back to CPU. They may return only after gaining a named full-field contract.
-- Seeds with non-zero upper 32 bits fall back instead of being truncated.
+- OpenSimplex/Worley generators, OpenSimplex fBm/ridged configurations, dunes, mountains, canyons, mesa, volcano, uplift, plateau, non-volcanic island archetypes, RiverCarve, and unratcheted EffectFilter variants fall back to CPU. They may return only after gaining a named full-field contract.
+- Seeds/derived octave streams outside 32 bits and noise configurations above 12 octaves fall back instead of being truncated.
 - Layered/source-driven/multilevel thermal and particle/layered/source-driven hydraulic configurations fall back to CPU.
 - SculptStrokes previews the per-sample stroke kinds (Raise/Lower/Ridge/Valley/Inflate/Terrace/Noise, the distance stamps, and the aux-only kinds) plus Smooth, Pinch, and Coastline, whose base-3x3 pull the stamp kernel reads directly from the layer input (Pinch at a 1.25 overdrive; Coastline a lower-and-blend toward that mean under a weight gate), and Flatten, whose footprint mean a reduce/resolve pair measures against the running field before the stamp path applies it (the stroke run is segmented at each Flatten). Every stroke kind now previews on the GPU. It is a height-only preview — the CPU eval remains authoritative for the protection/uplift/hardness/sediment/edit-region aux, so a stroke layer resumes on CPU whenever an enabled downstream layer consumes that aux.
 - Materials/biomes are ID masks + procedural viewport palette, not a PBR asset library.

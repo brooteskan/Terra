@@ -48,6 +48,19 @@ pub const HYDRAULIC_PREVIEW: ParityTolerance = ParityTolerance::new(3.0, 3.0e-2)
 pub const VOLCANIC_ISLAND_PREVIEW: ParityTolerance = ParityTolerance::new(220.0, 1.0e-1);
 /// Portable value-noise preview; CPU and GPU use different hash arithmetic.
 pub const VALUE_NOISE_PREVIEW: ParityTolerance = ParityTolerance::new(17.0, 2.3e-1);
+/// CPU-aligned noise-family previews (#125). The WGSL ports the CPU integer hash,
+/// four-way Perlin gradient, octave seed streams, remap, ridged feedback, and domain
+/// displacement directly. Residuals are f32 expression-order differences: measured
+/// max abs / normalized RMSE were 2.6e-5 / 1.3e-7 (Perlin), 4.5e-5 / 1.7e-7
+/// (fBm), 4.1e-5 / 3.7e-7 (ridged), and 7.5e-5 / 3.0e-7 (domain warp) on the
+/// non-square parameter fixture. These exact-height-class bounds retain portable
+/// headroom without hiding a hash, gradient, octave, or warp wiring regression.
+pub const PERLIN_NOISE_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-3, 1.0e-5);
+pub const FBM_VALUE_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-3, 1.0e-5);
+pub const FBM_PERLIN_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-3, 1.0e-5);
+pub const RIDGED_VALUE_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-3, 1.0e-5);
+pub const RIDGED_PERLIN_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-3, 1.0e-5);
+pub const DOMAIN_WARP_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-3, 1.0e-5);
 /// Effect-filter modes retained on GPU after the support audit.
 pub const SMOOTH_FILTER_PREVIEW: ParityTolerance = ParityTolerance::new(1.8, 3.0e-2);
 pub const INFLATE_FILTER_PREVIEW: ParityTolerance = ParityTolerance::new(2.7, 2.8e-2);
@@ -86,6 +99,12 @@ pub const FIDELITY_MATRIX_MARKDOWN: &str = "\
 | `authoring.sculpt-strokes` | Per-sample stroke kinds, Smooth/Pinch/Coastline, Flatten, and distance stamps, supported blend/mask | 0.001 | 0.00001 |\n\
 | `mask.simple` | One Constant, Height, or Slope Multiply entry without asset operations | 0.001 | 0.0001 |\n\
 | `noise.value` | Value noise with a 32-bit seed | 17.0 | 0.23 |\n\
+| `noise.perlin` | Perlin, 1-12 octaves, reproducible 32-bit seed stream | 0.001 | 0.00001 |\n\
+| `noise.fbm.value` | Value fBm, 1-12 octaves, reproducible 32-bit seed stream | 0.001 | 0.00001 |\n\
+| `noise.fbm.perlin` | Perlin fBm, 1-12 octaves, reproducible 32-bit seed stream | 0.001 | 0.00001 |\n\
+| `noise.ridged.value` | Value ridged MF, 1-12 octaves, reproducible 32-bit seed stream | 0.001 | 0.00001 |\n\
+| `noise.ridged.perlin` | Perlin ridged MF, 1-12 octaves, reproducible 32-bit seed stream | 0.001 | 0.00001 |\n\
+| `noise.domain-warp` | Perlin domain warp, 1-12 octaves, reproducible 32-bit seed stream | 0.001 | 0.00001 |\n\
 | `filter.blur` | Default outer composite; radius/iteration fixture | 2.1 | 0.0055 |\n\
 | `effect.smooth` | Smooth, default outer composite | 1.8 | 0.03 |\n\
 | `effect.inflate` | Inflate, default outer composite | 2.7 | 0.028 |\n\

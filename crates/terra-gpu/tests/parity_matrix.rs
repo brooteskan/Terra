@@ -3,16 +3,18 @@ use std::collections::HashMap;
 use terra_core::eval::{EvalContext, PreviewQuality, StackEvaluator};
 use terra_core::heightfield::{Heightfield, HeightfieldMetrics};
 use terra_core::layer::{
-    BlendMode, BlurParams, EffectFilterKind, EffectFilterParams, FlatParams,
-    HydraulicErosionParams, IslandParams, Layer, LayerKind, LayerStack, LandscapeEvolutionParams,
-    NoiseParams, RampParams, SculptParams, SculptPoint, SculptStroke, SculptStrokeKind,
-    SculptStrokeParams, TerraceParams, ThermalErosionParams,
+    BlendMode, BlurParams, DomainWarpParams, EffectFilterKind, EffectFilterParams, FbmParams,
+    FlatParams, FractalNoiseType, HydraulicErosionParams, IslandParams, LandscapeEvolutionParams,
+    Layer, LayerKind, LayerStack, NoiseParams, RampParams, SculptParams, SculptPoint, SculptStroke,
+    SculptStrokeKind, SculptStrokeParams, TerraceParams, ThermalErosionParams,
 };
 use terra_core::mask::{bake_mask_assets, MaskAsset, MaskId, MaskRef, MaskSource};
 use terra_gpu::parity::{
-    assert_field_parity, BLUR_PREVIEW, DENOISE_FILTER_PREVIEW, EXACT_HEIGHT, HYDRAULIC_PREVIEW,
-    INFLATE_FILTER_PREVIEW, SCULPT_STROKES_PREVIEW, SIMPLE_MASK, SMOOTH_FILTER_PREVIEW,
-    TERRACE_PREVIEW, THERMAL_PREVIEW, VALUE_NOISE_PREVIEW, VOLCANIC_ISLAND_PREVIEW,
+    assert_field_parity, BLUR_PREVIEW, DENOISE_FILTER_PREVIEW, DOMAIN_WARP_PREVIEW, EXACT_HEIGHT,
+    FBM_PERLIN_PREVIEW, FBM_VALUE_PREVIEW, HYDRAULIC_PREVIEW, INFLATE_FILTER_PREVIEW,
+    PERLIN_NOISE_PREVIEW, RIDGED_PERLIN_PREVIEW, RIDGED_VALUE_PREVIEW, SCULPT_STROKES_PREVIEW,
+    SIMPLE_MASK, SMOOTH_FILTER_PREVIEW, TERRACE_PREVIEW, THERMAL_PREVIEW, VALUE_NOISE_PREVIEW,
+    VOLCANIC_ISLAND_PREVIEW,
 };
 use terra_gpu::GpuTerrainEngine;
 
@@ -240,6 +242,122 @@ fn gpu_required_noise_and_effect_filter_approximations_are_bounded() {
         let gpu = gpu_eval(&stack, &[], metrics);
         assert_field_parity(name, &gpu, &cpu, tolerance);
     }
+}
+
+#[test]
+fn gpu_required_noise_family_previews_are_bounded() {
+    let metrics = HeightfieldMetrics::new(31, 23, 155.0, 92.0);
+    let base = NoiseParams {
+        seed: 17,
+        frequency: 0.035,
+        amplitude: 20.0,
+        octaves: 4,
+        lacunarity: 2.15,
+        persistence: 0.43,
+        offset_x: 7.25,
+        offset_z: -3.75,
+        remap_min: -0.72,
+        remap_max: 0.81,
+    };
+    let cases = [
+        (
+            "noise.perlin",
+            LayerKind::NoisePerlin(NoiseParams {
+                octaves: 1,
+                ..base.clone()
+            }),
+            PERLIN_NOISE_PREVIEW,
+        ),
+        (
+            "noise.fbm.value",
+            LayerKind::Fbm(FbmParams {
+                base: base.clone(),
+                noise: FractalNoiseType::Value,
+            }),
+            FBM_VALUE_PREVIEW,
+        ),
+        (
+            "noise.perlin.fractal",
+            LayerKind::NoisePerlin(base.clone()),
+            PERLIN_NOISE_PREVIEW,
+        ),
+        (
+            "noise.fbm.perlin",
+            LayerKind::Fbm(FbmParams {
+                base: base.clone(),
+                noise: FractalNoiseType::Perlin,
+            }),
+            FBM_PERLIN_PREVIEW,
+        ),
+        (
+            "noise.ridged.value",
+            LayerKind::Ridged(FbmParams {
+                base: base.clone(),
+                noise: FractalNoiseType::Value,
+            }),
+            RIDGED_VALUE_PREVIEW,
+        ),
+        (
+            "noise.ridged.perlin",
+            LayerKind::Ridged(FbmParams {
+                base: base.clone(),
+                noise: FractalNoiseType::Perlin,
+            }),
+            RIDGED_PERLIN_PREVIEW,
+        ),
+        (
+            "noise.domain-warp",
+            LayerKind::DomainWarp(DomainWarpParams {
+                base: base.clone(),
+                warp_strength: 18.0,
+                warp_frequency: 0.012,
+            }),
+            DOMAIN_WARP_PREVIEW,
+        ),
+    ];
+
+    for (name, kind, tolerance) in cases {
+        let ridged_amplitude = match &kind {
+            LayerKind::Ridged(p) => Some(p.base.amplitude),
+            _ => None,
+        };
+        let mut stack = LayerStack::new();
+        stack.push(Layer::new(name, kind));
+        let cpu = cpu_oracle(&stack, &[], metrics);
+        let gpu = gpu_eval(&stack, &[], metrics);
+        assert_field_parity(name, &gpu, &cpu, tolerance);
+        if let Some(amplitude) = ridged_amplitude {
+            assert!(
+                gpu.to_dense()
+                    .iter()
+                    .all(|&height| height >= -1.0e-4 && height <= amplitude + 1.0e-4),
+                "{name} escaped [0, amplitude]"
+            );
+        }
+    }
+
+    let domain = DomainWarpParams {
+        base,
+        warp_strength: 18.0,
+        warp_frequency: 0.012,
+    };
+    let mut warped_stack = LayerStack::new();
+    warped_stack.push(Layer::new("warped", LayerKind::DomainWarp(domain.clone())));
+    let mut unwarped_stack = LayerStack::new();
+    unwarped_stack.push(Layer::new(
+        "unwarped",
+        LayerKind::DomainWarp(DomainWarpParams {
+            warp_strength: 0.0,
+            ..domain
+        }),
+    ));
+    let warped = gpu_eval(&warped_stack, &[], metrics).to_dense();
+    let unwarped = gpu_eval(&unwarped_stack, &[], metrics).to_dense();
+    let warp_effect = terra_gpu::parity::max_abs_diff(&warped, &unwarped);
+    assert!(
+        warp_effect > 1.0,
+        "DomainWarp parameters had no material effect"
+    );
 }
 
 /// Pull the shipped "Shelf Flatten" params straight out of the Tropical Island

@@ -7,8 +7,8 @@
 //! re-derives kernels mid-walk, so planning has a single authority.
 
 use terra_core::layer::{
-    BlendMode, EffectFilterKind, IslandArchetype, Layer, LayerKind, LayerStack, SculptStrokeKind,
-    TransportModel,
+    BlendMode, EffectFilterKind, FractalNoiseType, IslandArchetype, Layer, LayerKind, LayerStack,
+    SculptStrokeKind, TransportModel,
 };
 use terra_core::mask::{MaskAsset, MaskCombine, MaskSource};
 
@@ -16,6 +16,9 @@ use terra_core::mask::{MaskAsset, MaskCombine, MaskSource};
 pub const BLUR_MAX_RADIUS: u32 = 8;
 /// Max per-iteration reach the EffectFilter kernel executes.
 pub const EFFECT_FILTER_MAX_RADIUS: u32 = 16;
+/// Upper bound executed by the interactive noise shader. Larger authored
+/// fractals remain on the CPU oracle rather than silently dropping octaves.
+const NOISE_MAX_OCTAVES: u32 = 12;
 
 /// Concrete executable pipeline selected by the support planner. The engine
 /// consumes this value, so a configuration cannot be advertised merely because
@@ -168,6 +171,24 @@ fn seed_supported(seed: u64) -> bool {
     seed <= u64::from(u32::MAX)
 }
 
+/// The shader carries a 32-bit seed. CPU fractals derive a fresh `u64` seed for
+/// every octave before canonicalizing it, so merely checking the authored base
+/// seed would still let a near-`u32::MAX` stream wrap differently on the GPU.
+fn seed_stream_supported(seed: u64, octaves: u32, stride: u64) -> bool {
+    if octaves.max(1) > NOISE_MAX_OCTAVES {
+        return false;
+    }
+    let last_octave = u64::from(octaves.max(1) - 1);
+    last_octave
+        .checked_mul(stride)
+        .and_then(|offset| seed.checked_add(offset))
+        .is_some_and(seed_supported)
+}
+
+fn fractal_noise_supported(noise: FractalNoiseType) -> bool {
+    matches!(noise, FractalNoiseType::Value | FractalNoiseType::Perlin)
+}
+
 /// Whether the GPU stamp path can reproduce a single sculpt-stroke kind. Most
 /// supported kinds are pure per-sample maps of the running height (plus the
 /// distance-to-polyline SDF); `Smooth`, `Pinch`, and `Coastline` additionally read a
@@ -264,6 +285,35 @@ fn gpu_plan_for_layer(layer: &Layer, mask_assets: &[MaskAsset]) -> Option<GpuLay
         NoiseValue(p) if seed_supported(p.seed) && gpu_blend_mode(layer.common.blend).is_some() => {
             (GpuKernel::Noise, GpuDirtyPolicy::Local, 2)
         }
+        NoisePerlin(p)
+            if seed_stream_supported(p.seed, p.octaves, 1013)
+                && gpu_blend_mode(layer.common.blend).is_some() =>
+        {
+            (GpuKernel::Noise, GpuDirtyPolicy::Local, 2)
+        }
+        Fbm(p)
+            if fractal_noise_supported(p.noise)
+                && seed_stream_supported(p.base.seed, p.base.octaves, 1013)
+                && gpu_blend_mode(layer.common.blend).is_some() =>
+        {
+            (GpuKernel::Noise, GpuDirtyPolicy::Local, 2)
+        }
+        Ridged(p)
+            if fractal_noise_supported(p.noise)
+                && seed_stream_supported(p.base.seed, p.base.octaves, 9173)
+                && gpu_blend_mode(layer.common.blend).is_some() =>
+        {
+            (GpuKernel::Noise, GpuDirtyPolicy::Local, 2)
+        }
+        DomainWarp(p)
+            if seed_stream_supported(p.base.seed, p.base.octaves, 1013)
+                && seed_stream_supported(p.base.seed, 2, 1)
+                && gpu_blend_mode(layer.common.blend).is_some() =>
+        {
+            // The displacement samples procedural noise, not the entering height;
+            // a bounded upstream edit still propagates only through same-texel blend.
+            (GpuKernel::Noise, GpuDirtyPolicy::Local, 2)
+        }
         Island(p)
             if p.archetype == IslandArchetype::VolcanicHighIsland
                 && seed_supported(p.seed)
@@ -271,10 +321,9 @@ fn gpu_plan_for_layer(layer: &Layer, mask_assets: &[MaskAsset]) -> Option<GpuLay
         {
             (GpuKernel::Shape, GpuDirtyPolicy::Local, 2)
         }
-        Flat(_) | Ramp(_) | NoiseValue(_) | NoisePerlin(_) | Mountains(_) | Dunes(_)
-        | Canyons(_) | DomainWarp(_) | SculptBase(_) | Mesa(_) | Volcano(_) | Island(_)
-        | Plateau(_) | Uplift(_) => return None,
-        Fbm(_) | Ridged(_) => return None,
+        Flat(_) | Ramp(_) | NoiseValue(_) | NoisePerlin(_) | Fbm(_) | Ridged(_) | Mountains(_)
+        | Dunes(_) | Canyons(_) | DomainWarp(_) | SculptBase(_) | Mesa(_) | Volcano(_)
+        | Island(_) | Plateau(_) | Uplift(_) => return None,
         Blur(p) if inplace_composite_supported(layer) => (
             GpuKernel::Blur,
             GpuDirtyPolicy::Local,
@@ -397,8 +446,9 @@ mod tests {
         BiomesParams, BlurParams, CoastalParams, DomainWarpParams, DuneParams, EffectFilterKind,
         EffectFilterParams, FbmParams, FlatParams, FractalNoiseType, HydraulicErosionParams,
         LandscapeEvolutionParams, Layer, LayerKind, LayerStack, LayerTypeRegistry, MaterialsParams,
-        MountainParams, NoiseParams, PlateauParams, RiverCarveParams, SculptStroke, SculptStrokeKind,
-        SculptStrokeParams, TerraceParams, ThermalErosionParams, VegetationParams,
+        MountainParams, NoiseParams, PlateauParams, RiverCarveParams, SculptStroke,
+        SculptStrokeKind, SculptStrokeParams, TerraceParams, ThermalErosionParams,
+        VegetationParams,
     };
     use terra_core::mask::{
         bake_distribution, bake_mask_assets, DistributionEntry, MaskId, MaskOp, MaskRef,
@@ -552,9 +602,10 @@ mod tests {
         assert_eq!(edge.1, 0);
     }
 
-    /// Revert check for #48: support depends on the authored fractal noise family.
+    /// #125 admits the shader's Value/Perlin fractal modes without substituting
+    /// OpenSimplex, which remains a CPU boundary for #130.
     #[test]
-    fn fractal_noise_support_rejects_open_simplex_without_substitution() {
+    fn fractal_noise_support_is_explicit_without_substitution() {
         for make_kind in [
             |params| LayerKind::Fbm(params),
             |params| LayerKind::Ridged(params),
@@ -571,11 +622,33 @@ mod tests {
                         ..FbmParams::default()
                     }),
                 );
-                assert!(!layer_gpu_supported(&layer, &[]));
+                let supported = matches!(noise, FractalNoiseType::Value | FractalNoiseType::Perlin);
+                assert_eq!(layer_gpu_supported(&layer, &[]), supported, "{noise:?}");
                 let graph = single_layer_graph(layer);
-                assert!(!graph.fully_gpu());
-                assert_eq!(graph.cpu_from, Some(0));
+                assert_eq!(graph.fully_gpu(), supported, "{noise:?}");
+                assert_eq!(graph.cpu_from, (!supported).then_some(0), "{noise:?}");
             }
+        }
+    }
+
+    #[test]
+    fn noise_family_defaults_compile_to_the_noise_kernel() {
+        let layers = [
+            Layer::new("perlin", LayerKind::NoisePerlin(NoiseParams::default())),
+            Layer::new("fbm", LayerKind::Fbm(FbmParams::default())),
+            Layer::new("ridged", LayerKind::Ridged(FbmParams::default())),
+            Layer::new(
+                "domain warp",
+                LayerKind::DomainWarp(DomainWarpParams::default()),
+            ),
+        ];
+        for layer in layers {
+            let plan = gpu_plan_for_layer(&layer, &[])
+                .unwrap_or_else(|| panic!("{} should compile", layer.common.name));
+            assert_eq!(plan.kernel, GpuKernel::Noise, "{}", layer.common.name);
+            assert_eq!(plan.dirty_policy, GpuDirtyPolicy::Local);
+            assert_eq!(plan.halo_texels, 2);
+            assert!(plan.kernel.matches_layer_kind(&layer.kind));
         }
     }
 
@@ -811,10 +884,6 @@ mod tests {
         ));
         let cases = [
             Layer::new("high seed", LayerKind::NoiseValue(high_seed)),
-            Layer::new(
-                "domain warp",
-                LayerKind::DomainWarp(DomainWarpParams::default()),
-            ),
             Layer::new("mountains", LayerKind::Mountains(MountainParams::default())),
             Layer::new("dunes", LayerKind::Dunes(DuneParams::default())),
             Layer::new("plateau", LayerKind::Plateau(PlateauParams::default())),
