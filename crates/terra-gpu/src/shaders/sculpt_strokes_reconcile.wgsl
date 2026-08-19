@@ -15,6 +15,10 @@ struct Uniforms {
     height: u32,
     reconcile: f32,
     _p0: f32,
+    region_x: u32,
+    region_y: u32,
+    region_w: u32,
+    region_h: u32,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -30,8 +34,11 @@ fn sample_clamped(i: i32, j: i32) -> f32 {
 
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    if (gid.x >= u.width || gid.y >= u.height) { return; }
-    let p = vec2<i32>(i32(gid.x), i32(gid.y));
+    if (gid.x >= u.region_w || gid.y >= u.region_h) { return; }
+    let x = u.region_x + gid.x;
+    let y = u.region_y + gid.y;
+    if (x >= u.width || y >= u.height) { return; }
+    let p = vec2<i32>(i32(x), i32(y));
     let center = textureLoad(stamp, p, 0).r;
 
     var sum = 0.0;

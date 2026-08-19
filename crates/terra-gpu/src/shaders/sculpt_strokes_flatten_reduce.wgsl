@@ -15,9 +15,10 @@ struct Uniforms {
     world_x: f32,
     world_z: f32,
     stroke_index: u32,
-    _p0: u32,
-    _p1: u32,
-    _p2: u32,
+    region_x: u32,
+    region_y: u32,
+    region_w: u32,
+    region_h: u32,
 };
 
 struct StrokeHeader {
@@ -97,19 +98,21 @@ fn main(
     @builtin(num_workgroups) nwg: vec3<u32>,
 ) {
     var contrib = vec2<f32>(0.0, 0.0);
-    if (gid.x < u.width && gid.y < u.height) {
+    if (gid.x < u.region_w && gid.y < u.region_h) {
+        let x = u.region_x + gid.x;
+        let y = u.region_y + gid.y;
         let header = headers[u.stroke_index];
         let dx = u.world_x / f32(u.width);
         let dz = u.world_z / f32(u.height);
-        let wx = (f32(gid.x) + 0.5) * dx;
-        let wz = (f32(gid.y) + 0.5) * dz;
+        let wx = (f32(x) + 0.5) * dx;
+        let wz = (f32(y) + 0.5) * dz;
         if (wx >= header.bbox_min.x && wx <= header.bbox_max.x
             && wz >= header.bbox_min.y && wz <= header.bbox_max.y) {
             var pressure = 0.0;
             let dist = dist_to_polyline(wx, wz, header, &pressure);
             let w = smoothstep_weight(dist, header.radius_m, header.falloff) * pressure;
             if (w > 0.0) {
-                let h = textureLoad(running_in, vec2<i32>(i32(gid.x), i32(gid.y)), 0).r;
+                let h = textureLoad(running_in, vec2<i32>(i32(x), i32(y)), 0).r;
                 contrib = vec2<f32>(h * w, w);
             }
         }

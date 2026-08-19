@@ -13,8 +13,10 @@ struct Uniforms {
     world_z: f32,
     stroke_lo: u32, // always 0 here; shared layout with the stamp pass
     stroke_hi: u32, // stroke_count
-    _p1: u32,
-    _p2: u32,
+    region_x: u32,
+    region_y: u32,
+    region_w: u32,
+    region_h: u32,
 };
 
 struct StrokeHeader {
@@ -85,12 +87,15 @@ fn dist_to_polyline(wx: f32, wz: f32, header: StrokeHeader, pressure: ptr<functi
 
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    if (gid.x >= u.width || gid.y >= u.height) { return; }
-    let p = vec2<i32>(i32(gid.x), i32(gid.y));
+    if (gid.x >= u.region_w || gid.y >= u.region_h) { return; }
+    let x = u.region_x + gid.x;
+    let y = u.region_y + gid.y;
+    if (x >= u.width || y >= u.height) { return; }
+    let p = vec2<i32>(i32(x), i32(y));
     let dx = u.world_x / f32(u.width);
     let dz = u.world_z / f32(u.height);
-    let wx = (f32(gid.x) + 0.5) * dx;
-    let wz = (f32(gid.y) + 0.5) * dz;
+    let wx = (f32(x) + 0.5) * dx;
+    let wz = (f32(y) + 0.5) * dz;
 
     var edited = 0.0;
     for (var si = u.stroke_lo; si < u.stroke_hi; si = si + 1u) {

@@ -3,6 +3,10 @@ struct Uniforms {
     height: u32,
     opacity: f32,
     mode: u32, // 0 Normal … 6 Overlay
+    region_x: u32,
+    region_y: u32,
+    region_w: u32,
+    region_h: u32,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -31,8 +35,11 @@ fn blend_pair(mode: u32, a: f32, b: f32) -> f32 {
 
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    if (gid.x >= u.width || gid.y >= u.height) { return; }
-    let p = vec2<i32>(i32(gid.x), i32(gid.y));
+    if (gid.x >= u.region_w || gid.y >= u.region_h) { return; }
+    let x = u.region_x + gid.x;
+    let y = u.region_y + gid.y;
+    if (x >= u.width || y >= u.height) { return; }
+    let p = vec2<i32>(i32(x), i32(y));
     let hin = textureLoad(src_base, p, 0).r;
     let hlayer = textureLoad(src_layer, p, 0).r;
     let m = textureLoad(src_mask, p, 0).r * textureLoad(src_extra_mask, p, 0).r;
