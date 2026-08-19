@@ -21,8 +21,9 @@ use terra_core::eval::PreviewQuality;
 use terra_core::fields::FieldId;
 use terra_core::heightfield::{Heightfield, HeightfieldMetrics, TileId};
 use terra_core::layer::{
-    BlendMode, EffectFilterParams, FractalNoiseType, Layer, LayerId, LayerKind, LayerStack,
-    NoiseParams, SculptParams, SculptStroke, SculptStrokeKind, SculptStrokeParams,
+    BlendMode, EffectFilterParams, FractalNoiseType, IslandArchetype, IslandParams, Layer, LayerId,
+    LayerKind, LayerStack, NoiseParams, PlateauParams, SculptParams, SculptStroke,
+    SculptStrokeKind, SculptStrokeParams,
 };
 use terra_core::mask::{MaskAsset, MaskSource};
 use terra_core::tiling::{SampleRect, TileScheduler};
@@ -409,6 +410,50 @@ struct ShapeU {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
+struct PlateauU {
+    width: u32,
+    height: u32,
+    low: f32,
+    high: f32,
+    soft: f32,
+    _pad: [f32; 3],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct IslandU {
+    width: u32,
+    height: u32,
+    world_x: f32,
+    world_z: f32,
+    seed: u32,
+    archetype: u32,
+    _pad_u: [u32; 2],
+    center_u: f32,
+    center_v: f32,
+    rotation_deg: f32,
+    radius: f32,
+    aspect: f32,
+    sea_level: f32,
+    ocean_floor: f32,
+    mountain_height: f32,
+    shelf_width: f32,
+    shelf_depth: f32,
+    beach_width: f32,
+    beach_height: f32,
+    reef_width: f32,
+    reef_depth: f32,
+    coastline_warp: f32,
+    coastline_frequency: f32,
+    mountain_power: f32,
+    ridge_strength: f32,
+    ridge_frequency: f32,
+    lagoon_radius: f32,
+    _pad_f: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
 struct RiverAccumU {
     width: u32,
     height: u32,
@@ -741,6 +786,10 @@ fn layer_input_independent(kind: &LayerKind) -> bool {
             | LayerKind::Mountains(_)
             | LayerKind::Dunes(_)
             | LayerKind::Canyons(_)
+            | LayerKind::Mesa(_)
+            | LayerKind::Volcano(_)
+            | LayerKind::Uplift(_)
+            | LayerKind::Island(_)
             | LayerKind::DomainWarp(_)
     )
 }
@@ -791,6 +840,8 @@ pub struct GpuTerrainEngine {
     terrace: Pipe,
     ramp: Pipe,
     shapes: Pipe,
+    island: Pipe,
+    plateau: Pipe,
     river_accum: Pipe,
     river_carve: Pipe,
     effect_filter: Pipe,
@@ -932,6 +983,14 @@ impl GpuTerrainEngine {
             label: Some("shapes-bgl"),
             entries: &[uniform_entry(0), storage_write_entry(1)],
         });
+        let island_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("island-bgl"),
+            entries: &[uniform_entry(0), storage_write_entry(1)],
+        });
+        let plateau_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("plateau-bgl"),
+            entries: &[uniform_entry(0), tex_read_entry(1), storage_write_entry(2)],
+        });
         let river_accum_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("river-accum-bgl"),
             entries: &[
@@ -1002,6 +1061,18 @@ impl GpuTerrainEngine {
             "shapes",
             include_str!("shaders/shapes.wgsl"),
             shapes_bgl,
+        );
+        let island = make_pipe(
+            device,
+            "island",
+            include_str!("shaders/island.wgsl"),
+            island_bgl,
+        );
+        let plateau = make_pipe(
+            device,
+            "plateau",
+            include_str!("shaders/plateau.wgsl"),
+            plateau_bgl,
         );
         let river_accum = make_pipe(
             device,
@@ -1147,6 +1218,8 @@ impl GpuTerrainEngine {
             terrace,
             ramp,
             shapes,
+            island,
+            plateau,
             river_accum,
             river_carve,
             effect_filter,
@@ -1706,6 +1779,128 @@ impl GpuTerrainEngine {
                 1,
             );
         }
+    }
+
+    fn gen_island(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        p: &IslandParams,
+    ) {
+        let archetype = match p.archetype {
+            IslandArchetype::VolcanicHighIsland => 0,
+            IslandArchetype::Archipelago => 1,
+            IslandArchetype::Atoll => 2,
+        };
+        let u = IslandU {
+            width: self.metrics.width,
+            height: self.metrics.height,
+            world_x: self.metrics.world_size_x,
+            world_z: self.metrics.world_size_z,
+            seed: p.seed as u32,
+            archetype,
+            _pad_u: [0; 2],
+            center_u: p.center_u,
+            center_v: p.center_v,
+            rotation_deg: p.rotation_deg,
+            radius: p.radius,
+            aspect: p.aspect,
+            sea_level: p.sea_level,
+            ocean_floor: p.ocean_floor,
+            mountain_height: p.mountain_height,
+            shelf_width: p.shelf_width,
+            shelf_depth: p.shelf_depth,
+            beach_width: p.beach_width,
+            beach_height: p.beach_height,
+            reef_width: p.reef_width,
+            reef_depth: p.reef_depth,
+            coastline_warp: p.coastline_warp,
+            coastline_frequency: p.coastline_frequency,
+            mountain_power: p.mountain_power,
+            ridge_strength: p.ridge_strength,
+            ridge_frequency: p.ridge_frequency,
+            lagoon_radius: p.lagoon_radius,
+            _pad_f: [0.0; 4],
+        };
+        let u_buf = self.write_uniform(device, queue, &u);
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("island-bg"),
+            layout: &self.island.bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: u_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&self.layer_tex.view),
+                },
+            ],
+        });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("island"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.island.pipeline);
+        pass.set_bind_group(0, &bg, &[]);
+        pass.dispatch_workgroups(
+            self.metrics.width.div_ceil(8),
+            self.metrics.height.div_ceil(8),
+            1,
+        );
+    }
+
+    fn gen_plateau(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        p: &PlateauParams,
+    ) {
+        let u = PlateauU {
+            width: self.metrics.width,
+            height: self.metrics.height,
+            low: p.low,
+            high: p.high,
+            soft: p.soft,
+            _pad: [0.0; 3],
+        };
+        let u_buf = self.write_uniform(device, queue, &u);
+        let src_view = if self.current == 0 {
+            &self.ping.view
+        } else {
+            &self.pong.view
+        };
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("plateau-bg"),
+            layout: &self.plateau.bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: u_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(src_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&self.layer_tex.view),
+                },
+            ],
+        });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("plateau"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.plateau.pipeline);
+        pass.set_bind_group(0, &bg, &[]);
+        pass.dispatch_workgroups(
+            self.metrics.width.div_ceil(8),
+            self.metrics.height.div_ceil(8),
+            1,
+        );
     }
 
     fn run_river_carve(
@@ -3281,7 +3476,7 @@ impl GpuTerrainEngine {
                     asymmetry: 0.0,
                     depth: 0.0,
                     canyon_width: 0.0,
-                    meander: 0.0,
+                    meander: p.crest_detail,
                     shape_mode: 0,
                     _pad: 0,
                 };
@@ -3830,32 +4025,36 @@ impl GpuTerrainEngine {
                 )?;
             }
             (GpuKernel::Shape, LayerKind::Island(p)) => {
-                // Preview: volcano-like massif + soft shelf (full island profile remains CPU oracle).
-                let u = ShapeU {
-                    width: self.metrics.width,
-                    height: self.metrics.height,
-                    world_x: self.metrics.world_size_x,
-                    world_z: self.metrics.world_size_z,
-                    seed: (p.seed & 0xFFFF_FFFF) as u32,
-                    octaves: 4,
-                    frequency: p.ridge_frequency.max(0.0001),
-                    amplitude: p.mountain_height,
-                    lacunarity: 2.0,
-                    persistence: 0.5,
-                    offset_x: p.center_u,
-                    offset_z: p.center_v,
-                    ridge_sharpness: p.mountain_power,
-                    range_angle: p.rotation_deg,
-                    range_width: p.radius,
-                    wave_frequency: p.coastline_frequency,
-                    asymmetry: p.aspect,
-                    depth: p.beach_height,
-                    canyon_width: p.lagoon_radius,
-                    meander: p.coastline_warp,
-                    shape_mode: 4,
-                    _pad: 0,
-                };
-                self.gen_shape(device, queue, encoder, u);
+                if p.archetype == IslandArchetype::VolcanicHighIsland {
+                    // Preserve the already-admitted volcanic compatibility preview.
+                    let u = ShapeU {
+                        width: self.metrics.width,
+                        height: self.metrics.height,
+                        world_x: self.metrics.world_size_x,
+                        world_z: self.metrics.world_size_z,
+                        seed: p.seed as u32,
+                        octaves: 4,
+                        frequency: p.ridge_frequency.max(0.0001),
+                        amplitude: p.mountain_height,
+                        lacunarity: 2.0,
+                        persistence: 0.5,
+                        offset_x: p.center_u,
+                        offset_z: p.center_v,
+                        ridge_sharpness: p.mountain_power,
+                        range_angle: p.rotation_deg,
+                        range_width: p.radius,
+                        wave_frequency: p.coastline_frequency,
+                        asymmetry: p.aspect,
+                        depth: p.beach_height,
+                        canyon_width: p.lagoon_radius,
+                        meander: p.coastline_warp,
+                        shape_mode: 6,
+                        _pad: 0,
+                    };
+                    self.gen_shape(device, queue, encoder, u);
+                } else {
+                    self.gen_island(device, queue, encoder, p);
+                }
                 self.expand_range(p.ocean_floor, p.mountain_height);
                 self.blend_into_current(
                     device,
@@ -3866,33 +4065,7 @@ impl GpuTerrainEngine {
                 )?;
             }
             (GpuKernel::Shape, LayerKind::Plateau(p)) => {
-                // Preview: hard height clamp via mesa-style flat top across the field.
-                let mid = (p.low + p.high) * 0.5;
-                let u = ShapeU {
-                    width: self.metrics.width,
-                    height: self.metrics.height,
-                    world_x: self.metrics.world_size_x,
-                    world_z: self.metrics.world_size_z,
-                    seed: 7,
-                    octaves: 2,
-                    frequency: 0.0005,
-                    amplitude: mid,
-                    lacunarity: 2.0,
-                    persistence: 0.5,
-                    offset_x: 0.5,
-                    offset_z: 0.5,
-                    ridge_sharpness: 2.5,
-                    range_angle: 0.0,
-                    range_width: 0.85,
-                    wave_frequency: 0.0,
-                    asymmetry: 0.0,
-                    depth: p.soft,
-                    canyon_width: 0.0,
-                    meander: 0.15,
-                    shape_mode: 5,
-                    _pad: 0,
-                };
-                self.gen_shape(device, queue, encoder, u);
+                self.gen_plateau(device, queue, encoder, p);
                 self.expand_range(p.low, p.high);
                 self.blend_into_current(
                     device,
@@ -5206,6 +5379,78 @@ mod smoke_tests {
             .collect();
         assert_eq!(planned, vec![GpuKernel::Fill, GpuKernel::SculptStrokes]);
         assert_eq!(engine.executed_kernels, planned);
+    }
+
+    /// #126 regression: procedural shapes publish a reusable contribution. An
+    /// upstream sculpt edit must recompute the input-dependent stroke layer but
+    /// blend the cached Volcano contribution without dispatching Shape again.
+    #[test]
+    fn warm_cache_base_edit_reuses_input_independent_volcano_contribution() {
+        let Some(gpu) = terra_test_gpu::headless() else {
+            return;
+        };
+        let metrics = HeightfieldMetrics::new(32, 32, 320.0, 320.0);
+        let mut stack = LayerStack::new();
+        let base = Layer::new("base", LayerKind::SculptBase(SculptParams::filled(32, 5.0)));
+        let base_id = base.id();
+        stack.push(base);
+        stack.push(Layer::new(
+            "strokes",
+            LayerKind::SculptStrokes(raise_strokes(0.5, 0.5, 10.0)),
+        ));
+        stack.push(Layer::new(
+            "volcano",
+            LayerKind::Volcano(terra_core::layer::VolcanoParams::default()),
+        ));
+
+        let mut engine = GpuTerrainEngine::new(&gpu.device, metrics.width);
+        engine.mark_all_dirty(&stack);
+        engine
+            .evaluate(
+                &gpu.device,
+                &gpu.queue,
+                &stack,
+                &[],
+                metrics,
+                PreviewQuality::Draft,
+                false,
+                None,
+            )
+            .expect("warm shape contribution cache");
+        assert!(engine
+            .layer_contrib
+            .contains_key(&stack.flatten_layers()[2].id()));
+
+        let Some(layer) = stack.find_mut(base_id) else {
+            panic!("base layer disappeared");
+        };
+        let LayerKind::SculptBase(params) = &mut layer.kind else {
+            panic!("base changed kind");
+        };
+        params.samples[(16 * 32 + 16) as usize] += 3.0;
+        engine.set_dirty_rect(Some((16, 16, 1, 1)));
+        engine.mark_dirty(base_id);
+        engine
+            .evaluate(
+                &gpu.device,
+                &gpu.queue,
+                &stack,
+                &[],
+                metrics,
+                PreviewQuality::Draft,
+                false,
+                None,
+            )
+            .expect("incremental base edit");
+
+        assert_eq!(
+            engine.executed_kernels,
+            vec![GpuKernel::Sculpt, GpuKernel::SculptStrokes]
+        );
+        assert!(
+            !engine.executed_kernels.contains(&GpuKernel::Shape),
+            "cached Volcano contribution must avoid Shape dispatch"
+        );
     }
 
     /// Two `SculptStrokes` layers in one evaluate walk share the stamp/edited/layer

@@ -1,8 +1,10 @@
 use terra_core::eval::{EvalContext, StackEvaluator};
 use terra_core::heightfield::HeightfieldMetrics;
 use terra_core::layer::{
-    BlendMode, DomainWarpParams, EffectFilterKind, EffectFilterParams, FbmParams, FlatParams,
-    FractalNoiseType, Layer, LayerKind, LayerStack, LayerTypeRegistry, NoiseParams,
+    BlendMode, CanyonParams, DomainWarpParams, DuneParams, EffectFilterKind, EffectFilterParams,
+    FbmParams, FlatParams, FractalNoiseType, IslandParams, Layer, LayerKind, LayerStack,
+    LayerTypeRegistry, MesaParams, MountainParams, NoiseParams, PlateauParams, UpliftParams,
+    VolcanoParams,
 };
 use terra_gpu::{compile_gpu_graph, layer_gpu_supported, GpuKernel};
 
@@ -187,6 +189,36 @@ fn noise_family_defaults_and_seed_stream_boundaries_are_explicit() {
         assert!(!layer_gpu_supported(&layer, &[]), "{}", layer.common.name);
         assert_eq!(graph_for(layer).cpu_from, Some(0));
     }
+}
+
+#[test]
+fn shape_family_defaults_and_island_archetypes_are_explicitly_supported() {
+    let layers = [
+        Layer::new("mountains", LayerKind::Mountains(MountainParams::default())),
+        Layer::new("dunes", LayerKind::Dunes(DuneParams::default())),
+        Layer::new("canyons", LayerKind::Canyons(CanyonParams::default())),
+        Layer::new("mesa", LayerKind::Mesa(MesaParams::default())),
+        Layer::new("volcano", LayerKind::Volcano(VolcanoParams::default())),
+        Layer::new("uplift", LayerKind::Uplift(UpliftParams::default())),
+        Layer::new("plateau", LayerKind::Plateau(PlateauParams::default())),
+        Layer::new("volcanic", LayerKind::Island(IslandParams::default())),
+        Layer::new(
+            "archipelago",
+            LayerKind::Island(IslandParams::archipelago()),
+        ),
+        Layer::new("atoll", LayerKind::Island(IslandParams::atoll())),
+    ];
+    for layer in layers {
+        let graph = graph_for(layer.clone());
+        assert!(graph.fully_gpu(), "{}", layer.common.name);
+        assert_eq!(graph.plans[0].expect("shape plan").kernel, GpuKernel::Shape);
+    }
+
+    let mut custom_transport = DuneParams::default();
+    custom_transport.iterations += 1;
+    let layer = Layer::new("custom dune transport", LayerKind::Dunes(custom_transport));
+    assert!(!layer_gpu_supported(&layer, &[]));
+    assert_eq!(graph_for(layer).cpu_from, Some(0));
 }
 
 #[test]

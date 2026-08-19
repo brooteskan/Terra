@@ -7,8 +7,8 @@
 //! re-derives kernels mid-walk, so planning has a single authority.
 
 use terra_core::layer::{
-    BlendMode, EffectFilterKind, FractalNoiseType, IslandArchetype, Layer, LayerKind, LayerStack,
-    SculptStrokeKind, TransportModel,
+    BlendMode, DuneParams, EffectFilterKind, FractalNoiseType, IslandArchetype, IslandParams,
+    Layer, LayerKind, LayerStack, MountainParams, SculptStrokeKind, TransportModel, UpliftParams,
 };
 use terra_core::mask::{MaskAsset, MaskCombine, MaskSource};
 
@@ -185,6 +185,38 @@ fn seed_stream_supported(seed: u64, octaves: u32, stride: u64) -> bool {
         .is_some_and(seed_supported)
 }
 
+fn mountain_seed_streams_supported(p: &MountainParams) -> bool {
+    seed_stream_supported(p.base.seed, p.base.octaves, 9173)
+        && seed_stream_supported(p.base.seed, p.base.octaves.clamp(2, 4), 9173)
+        && seed_stream_supported(p.base.seed ^ 0xC0DE, 4, 9173)
+}
+
+fn uplift_seed_streams_supported(p: &UpliftParams) -> bool {
+    seed_stream_supported(p.seed, 3, 9173)
+        && seed_stream_supported(p.seed ^ 0xC0FFEE, p.detail_octaves.clamp(1, 8), 1013)
+}
+
+fn island_seed_streams_supported(p: &IslandParams) -> bool {
+    seed_supported(p.seed)
+        && (p.archetype == IslandArchetype::VolcanicHighIsland
+            || (seed_stream_supported(p.seed ^ 0x51AD_E771, 5, 9173)
+                && seed_stream_supported(p.seed ^ 0xD37A_11ED, 3, 1013)))
+}
+
+/// The current preview shader is the bounded procedural dune approximation. It
+/// intentionally represents the shipped transport controls; authoring a
+/// different aeolian relaxation still resumes at the CPU oracle.
+fn dune_preview_config_supported(p: &DuneParams) -> bool {
+    let defaults = DuneParams::default();
+    (2..=4).contains(&p.base.octaves)
+        && seed_stream_supported(p.base.seed, p.base.octaves, 1013)
+        && p.wind_strength == defaults.wind_strength
+        && p.sand_supply == defaults.sand_supply
+        && p.transport_length == defaults.transport_length
+        && p.avalanche_angle == defaults.avalanche_angle
+        && p.iterations == defaults.iterations
+}
+
 fn fractal_noise_supported(noise: FractalNoiseType) -> bool {
     matches!(noise, FractalNoiseType::Value | FractalNoiseType::Perlin)
 }
@@ -314,10 +346,36 @@ fn gpu_plan_for_layer(layer: &Layer, mask_assets: &[MaskAsset]) -> Option<GpuLay
             // a bounded upstream edit still propagates only through same-texel blend.
             (GpuKernel::Noise, GpuDirtyPolicy::Local, 2)
         }
-        Island(p)
-            if p.archetype == IslandArchetype::VolcanicHighIsland
-                && seed_supported(p.seed)
+        Mountains(p)
+            if mountain_seed_streams_supported(p)
                 && gpu_blend_mode(layer.common.blend).is_some() =>
+        {
+            (GpuKernel::Shape, GpuDirtyPolicy::Local, 2)
+        }
+        Dunes(p)
+            if dune_preview_config_supported(p) && gpu_blend_mode(layer.common.blend).is_some() =>
+        {
+            (GpuKernel::Shape, GpuDirtyPolicy::Local, 2)
+        }
+        Canyons(p) if seed_supported(p.seed) && gpu_blend_mode(layer.common.blend).is_some() => {
+            (GpuKernel::Shape, GpuDirtyPolicy::Local, 2)
+        }
+        Mesa(p) if seed_supported(p.seed) && gpu_blend_mode(layer.common.blend).is_some() => {
+            (GpuKernel::Shape, GpuDirtyPolicy::Local, 2)
+        }
+        Volcano(p) if seed_supported(p.seed) && gpu_blend_mode(layer.common.blend).is_some() => {
+            (GpuKernel::Shape, GpuDirtyPolicy::Local, 2)
+        }
+        Uplift(p)
+            if uplift_seed_streams_supported(p) && gpu_blend_mode(layer.common.blend).is_some() =>
+        {
+            (GpuKernel::Shape, GpuDirtyPolicy::Local, 2)
+        }
+        Plateau(_) if gpu_blend_mode(layer.common.blend).is_some() => {
+            (GpuKernel::Shape, GpuDirtyPolicy::Local, 0)
+        }
+        Island(p)
+            if island_seed_streams_supported(p) && gpu_blend_mode(layer.common.blend).is_some() =>
         {
             (GpuKernel::Shape, GpuDirtyPolicy::Local, 2)
         }
@@ -443,12 +501,12 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use terra_core::layer::{
-        BiomesParams, BlurParams, CoastalParams, DomainWarpParams, DuneParams, EffectFilterKind,
-        EffectFilterParams, FbmParams, FlatParams, FractalNoiseType, HydraulicErosionParams,
-        LandscapeEvolutionParams, Layer, LayerKind, LayerStack, LayerTypeRegistry, MaterialsParams,
-        MountainParams, NoiseParams, PlateauParams, RiverCarveParams, SculptStroke,
-        SculptStrokeKind, SculptStrokeParams, TerraceParams, ThermalErosionParams,
-        VegetationParams,
+        BiomesParams, BlurParams, CanyonParams, CoastalParams, DomainWarpParams, DuneParams,
+        EffectFilterKind, EffectFilterParams, FbmParams, FlatParams, FractalNoiseType,
+        HydraulicErosionParams, IslandParams, LandscapeEvolutionParams, Layer, LayerKind,
+        LayerStack, LayerTypeRegistry, MaterialsParams, MesaParams, MountainParams, NoiseParams,
+        PlateauParams, RiverCarveParams, SculptStroke, SculptStrokeKind, SculptStrokeParams,
+        TerraceParams, ThermalErosionParams, UpliftParams, VegetationParams, VolcanoParams,
     };
     use terra_core::mask::{
         bake_distribution, bake_mask_assets, DistributionEntry, MaskId, MaskOp, MaskRef,
@@ -882,11 +940,20 @@ mod tests {
             &Layer::new("low seed", LayerKind::NoiseValue(NoiseParams::default())),
             &[]
         ));
+        let mut high_seed_mountains = MountainParams::default();
+        high_seed_mountains.base.seed = u64::from(u32::MAX) + 1;
+        let mut custom_transport_dunes = DuneParams::default();
+        custom_transport_dunes.iterations += 1;
         let cases = [
             Layer::new("high seed", LayerKind::NoiseValue(high_seed)),
-            Layer::new("mountains", LayerKind::Mountains(MountainParams::default())),
-            Layer::new("dunes", LayerKind::Dunes(DuneParams::default())),
-            Layer::new("plateau", LayerKind::Plateau(PlateauParams::default())),
+            Layer::new(
+                "high-seed mountains",
+                LayerKind::Mountains(high_seed_mountains),
+            ),
+            Layer::new(
+                "custom dune transport",
+                LayerKind::Dunes(custom_transport_dunes),
+            ),
             Layer::new(
                 "D-infinity river",
                 LayerKind::RiverCarve(RiverCarveParams::default()),
@@ -903,6 +970,37 @@ mod tests {
         for layer in cases {
             assert!(!layer_gpu_supported(&layer, &[]), "{}", layer.common.name);
             assert_eq!(single_layer_graph(layer).cpu_from, Some(0));
+        }
+    }
+
+    #[test]
+    fn shape_family_defaults_and_all_island_archetypes_compile_to_shape_kernel() {
+        let mut islands = [
+            IslandParams::default(),
+            IslandParams::archipelago(),
+            IslandParams::atoll(),
+        ];
+        islands[0].archetype = IslandArchetype::VolcanicHighIsland;
+        let mut layers = vec![
+            Layer::new("mountains", LayerKind::Mountains(MountainParams::default())),
+            Layer::new("dunes", LayerKind::Dunes(DuneParams::default())),
+            Layer::new("canyons", LayerKind::Canyons(CanyonParams::default())),
+            Layer::new("mesa", LayerKind::Mesa(MesaParams::default())),
+            Layer::new("volcano", LayerKind::Volcano(VolcanoParams::default())),
+            Layer::new("uplift", LayerKind::Uplift(UpliftParams::default())),
+            Layer::new("plateau", LayerKind::Plateau(PlateauParams::default())),
+        ];
+        layers.extend(
+            islands
+                .into_iter()
+                .map(|p| Layer::new("island", LayerKind::Island(p))),
+        );
+
+        for layer in layers {
+            let name = layer.common.name.clone();
+            let graph = single_layer_graph(layer);
+            assert!(graph.fully_gpu(), "{name}: cpu_from={:?}", graph.cpu_from);
+            assert_eq!(graph.plans[0].unwrap().kernel, GpuKernel::Shape, "{name}");
         }
     }
 

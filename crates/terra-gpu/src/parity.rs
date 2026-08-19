@@ -46,6 +46,18 @@ pub const THERMAL_PREVIEW: ParityTolerance = ParityTolerance::new(3.2, 5.0e-2);
 pub const HYDRAULIC_PREVIEW: ParityTolerance = ParityTolerance::new(3.0, 3.0e-2);
 /// Volcanic-island preview is intentionally a reduced massif/shelf model.
 pub const VOLCANIC_ISLAND_PREVIEW: ParityTolerance = ParityTolerance::new(220.0, 1.0e-1);
+/// GPU shape-family contracts (#126). These are separate named budgets because
+/// the preview kernels range from an exact pointwise remap (Plateau) to bounded
+/// procedural approximations (notably Dunes and the legacy volcanic island).
+pub const MOUNTAINS_PREVIEW: ParityTolerance = ParityTolerance::new(10.0, 5.0e-3);
+pub const DUNES_PREVIEW: ParityTolerance = ParityTolerance::new(36.0, 7.8e-1);
+pub const CANYONS_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-3, 1.0e-5);
+pub const MESA_PREVIEW: ParityTolerance = ParityTolerance::new(3.0e-3, 1.0e-5);
+pub const VOLCANO_PREVIEW: ParityTolerance = ParityTolerance::new(4.0e-3, 1.0e-5);
+pub const UPLIFT_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-1, 2.0e-5);
+pub const PLATEAU_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-3, 1.0e-5);
+pub const ARCHIPELAGO_PREVIEW: ParityTolerance = ParityTolerance::new(3.0e-2, 5.0e-6);
+pub const ATOLL_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-3, 1.0e-5);
 /// Portable value-noise preview; CPU and GPU use different hash arithmetic.
 pub const VALUE_NOISE_PREVIEW: ParityTolerance = ParityTolerance::new(17.0, 2.3e-1);
 /// CPU-aligned noise-family previews (#125). The WGSL ports the CPU integer hash,
@@ -112,6 +124,15 @@ pub const FIDELITY_MATRIX_MARKDOWN: &str = "\
 | `filter.terrace` | Default outer composite | 8.5 | 0.10 |\n\
 | `simulation.thermal` | Non-layered, constant hardness, no weathering extension | 3.2 | 0.05 |\n\
 | `simulation.hydraulic` | Base transport, no sources, particles, layers, or post-effects | 3.0 | 0.03 |\n\
+| `shape.mountains` | Mountains with reproducible 32-bit seed streams | 10.0 | 0.005 |\n\
+| `shape.dunes` | Default transport controls, 2-4 octaves, reproducible 32-bit seed stream | 36.0 | 0.78 |\n\
+| `shape.canyons` | Canyons with a 32-bit seed | 0.001 | 0.00001 |\n\
+| `shape.mesa` | Mesa with a 32-bit seed | 0.003 | 0.00001 |\n\
+| `shape.volcano` | Volcano with a 32-bit seed | 0.004 | 0.00001 |\n\
+| `shape.uplift` | Uplift with reproducible 32-bit seed streams | 0.1 | 0.00002 |\n\
+| `shape.plateau` | Pointwise input remap | 0.001 | 0.00001 |\n\
+| `island.archipelago` | Archipelago with reproducible 32-bit seed streams | 0.03 | 0.000005 |\n\
+| `island.atoll` | Atoll with reproducible 32-bit seed streams | 0.001 | 0.00001 |\n\
 | `island.volcanic-high` | VolcanicHighIsland with a 32-bit seed | 220.0 | 0.10 |";
 
 /// Largest element-wise absolute difference between equally sized slices.

@@ -3,18 +3,21 @@ use std::collections::HashMap;
 use terra_core::eval::{EvalContext, PreviewQuality, StackEvaluator};
 use terra_core::heightfield::{Heightfield, HeightfieldMetrics};
 use terra_core::layer::{
-    BlendMode, BlurParams, DomainWarpParams, EffectFilterKind, EffectFilterParams, FbmParams,
-    FlatParams, FractalNoiseType, HydraulicErosionParams, IslandParams, LandscapeEvolutionParams,
-    Layer, LayerKind, LayerStack, NoiseParams, RampParams, SculptParams, SculptPoint, SculptStroke,
-    SculptStrokeKind, SculptStrokeParams, TerraceParams, ThermalErosionParams,
+    BlendMode, BlurParams, CanyonParams, DomainWarpParams, DuneParams, EffectFilterKind,
+    EffectFilterParams, FbmParams, FlatParams, FractalNoiseType, HydraulicErosionParams,
+    IslandParams, LandscapeEvolutionParams, Layer, LayerKind, LayerStack, MesaParams,
+    MountainParams, NoiseParams, PlateauParams, RampParams, SculptParams, SculptPoint,
+    SculptStroke, SculptStrokeKind, SculptStrokeParams, TerraceParams, ThermalErosionParams,
+    UpliftParams, VolcanoParams,
 };
 use terra_core::mask::{bake_mask_assets, MaskAsset, MaskId, MaskRef, MaskSource};
 use terra_gpu::parity::{
-    assert_field_parity, BLUR_PREVIEW, DENOISE_FILTER_PREVIEW, DOMAIN_WARP_PREVIEW, EXACT_HEIGHT,
-    FBM_PERLIN_PREVIEW, FBM_VALUE_PREVIEW, HYDRAULIC_PREVIEW, INFLATE_FILTER_PREVIEW,
-    PERLIN_NOISE_PREVIEW, RIDGED_PERLIN_PREVIEW, RIDGED_VALUE_PREVIEW, SCULPT_STROKES_PREVIEW,
-    SIMPLE_MASK, SMOOTH_FILTER_PREVIEW, TERRACE_PREVIEW, THERMAL_PREVIEW, VALUE_NOISE_PREVIEW,
-    VOLCANIC_ISLAND_PREVIEW,
+    assert_field_parity, ARCHIPELAGO_PREVIEW, ATOLL_PREVIEW, BLUR_PREVIEW, CANYONS_PREVIEW,
+    DENOISE_FILTER_PREVIEW, DOMAIN_WARP_PREVIEW, DUNES_PREVIEW, EXACT_HEIGHT, FBM_PERLIN_PREVIEW,
+    FBM_VALUE_PREVIEW, HYDRAULIC_PREVIEW, INFLATE_FILTER_PREVIEW, MESA_PREVIEW, MOUNTAINS_PREVIEW,
+    PERLIN_NOISE_PREVIEW, PLATEAU_PREVIEW, RIDGED_PERLIN_PREVIEW, RIDGED_VALUE_PREVIEW,
+    SCULPT_STROKES_PREVIEW, SIMPLE_MASK, SMOOTH_FILTER_PREVIEW, TERRACE_PREVIEW, THERMAL_PREVIEW,
+    UPLIFT_PREVIEW, VALUE_NOISE_PREVIEW, VOLCANIC_ISLAND_PREVIEW, VOLCANO_PREVIEW,
 };
 use terra_gpu::GpuTerrainEngine;
 
@@ -507,6 +510,72 @@ fn gpu_required_volcanic_island_approximation_is_bounded() {
     assert_field_parity("island.volcanic-high", &gpu, &cpu, VOLCANIC_ISLAND_PREVIEW);
 }
 
+#[test]
+fn gpu_required_shape_family_previews_are_bounded() {
+    let metrics = HeightfieldMetrics::new(32, 28, 720.0, 510.0);
+    for (contract, kind, tolerance) in [
+        (
+            "shape.mountains",
+            LayerKind::Mountains(MountainParams::default()),
+            MOUNTAINS_PREVIEW,
+        ),
+        (
+            "shape.dunes",
+            LayerKind::Dunes(DuneParams::default()),
+            DUNES_PREVIEW,
+        ),
+        (
+            "shape.canyons",
+            LayerKind::Canyons(CanyonParams::default()),
+            CANYONS_PREVIEW,
+        ),
+        (
+            "shape.mesa",
+            LayerKind::Mesa(MesaParams::default()),
+            MESA_PREVIEW,
+        ),
+        (
+            "shape.volcano",
+            LayerKind::Volcano(VolcanoParams::default()),
+            VOLCANO_PREVIEW,
+        ),
+        (
+            "shape.uplift",
+            LayerKind::Uplift(UpliftParams::default()),
+            UPLIFT_PREVIEW,
+        ),
+        (
+            "island.archipelago",
+            LayerKind::Island(IslandParams::archipelago()),
+            ARCHIPELAGO_PREVIEW,
+        ),
+        (
+            "island.atoll",
+            LayerKind::Island(IslandParams::atoll()),
+            ATOLL_PREVIEW,
+        ),
+    ] {
+        let mut stack = LayerStack::new();
+        stack.push(Layer::new(contract, kind));
+        let cpu = cpu_oracle(&stack, &[], metrics);
+        let gpu = gpu_eval(&stack, &[], metrics);
+        assert_field_parity(contract, &gpu, &cpu, tolerance);
+    }
+
+    let mut plateau_stack = LayerStack::new();
+    plateau_stack.push(Layer::new(
+        "plateau input",
+        LayerKind::SculptBase(patterned_sculpt(metrics.width, metrics.height)),
+    ));
+    plateau_stack.push(Layer::new(
+        "shape.plateau",
+        LayerKind::Plateau(PlateauParams::default()),
+    ));
+    let cpu = cpu_oracle(&plateau_stack, &[], metrics);
+    let gpu = gpu_eval(&plateau_stack, &[], metrics);
+    assert_field_parity("shape.plateau", &gpu, &cpu, PLATEAU_PREVIEW);
+}
+
 fn pt(u: f32, v: f32, pressure: f32) -> SculptPoint {
     SculptPoint { u, v, pressure }
 }
@@ -534,7 +603,13 @@ fn supported_stroke_set(reconcile: f32) -> SculptStrokeParams {
                 10.0,
                 0.0,
             ),
-            stroke(SculptStrokeKind::Lower, vec![pt(0.7, 0.65, 1.0)], 60.0, 6.0, 0.0),
+            stroke(
+                SculptStrokeKind::Lower,
+                vec![pt(0.7, 0.65, 1.0)],
+                60.0,
+                6.0,
+                0.0,
+            ),
             stroke(
                 SculptStrokeKind::Ridge,
                 vec![pt(0.2, 0.7, 1.0), pt(0.4, 0.75, 1.0), pt(0.55, 0.6, 0.5)],
@@ -549,9 +624,27 @@ fn supported_stroke_set(reconcile: f32) -> SculptStrokeParams {
                 7.0,
                 0.0,
             ),
-            stroke(SculptStrokeKind::Inflate, vec![pt(0.5, 0.5, 1.0)], 65.0, 5.0, 0.0),
-            stroke(SculptStrokeKind::Terrace, vec![pt(0.35, 0.5, 1.0)], 80.0, 5.0, 0.0),
-            stroke(SculptStrokeKind::Noise, vec![pt(0.5, 0.8, 1.0)], 60.0, 4.0, 0.0),
+            stroke(
+                SculptStrokeKind::Inflate,
+                vec![pt(0.5, 0.5, 1.0)],
+                65.0,
+                5.0,
+                0.0,
+            ),
+            stroke(
+                SculptStrokeKind::Terrace,
+                vec![pt(0.35, 0.5, 1.0)],
+                80.0,
+                5.0,
+                0.0,
+            ),
+            stroke(
+                SculptStrokeKind::Noise,
+                vec![pt(0.5, 0.8, 1.0)],
+                60.0,
+                4.0,
+                0.0,
+            ),
             stroke(
                 SculptStrokeKind::HeightStamp,
                 vec![pt(0.8, 0.8, 1.0)],
@@ -566,10 +659,28 @@ fn supported_stroke_set(reconcile: f32) -> SculptStrokeParams {
                 6.0,
                 25.0,
             ),
-            stroke(SculptStrokeKind::CraterStamp, vec![pt(0.65, 0.5, 1.0)], 55.0, 9.0, 0.0),
+            stroke(
+                SculptStrokeKind::CraterStamp,
+                vec![pt(0.65, 0.5, 1.0)],
+                55.0,
+                9.0,
+                0.0,
+            ),
             // Alias of Ridge; aux-only kind exercises the reconcile edit weight.
-            stroke(SculptStrokeKind::MountainStamp, vec![pt(0.15, 0.5, 1.0)], 45.0, 7.0, 0.0),
-            stroke(SculptStrokeKind::Uplift, vec![pt(0.5, 0.15, 1.0)], 50.0, 3.0, 0.0),
+            stroke(
+                SculptStrokeKind::MountainStamp,
+                vec![pt(0.15, 0.5, 1.0)],
+                45.0,
+                7.0,
+                0.0,
+            ),
+            stroke(
+                SculptStrokeKind::Uplift,
+                vec![pt(0.5, 0.15, 1.0)],
+                50.0,
+                3.0,
+                0.0,
+            ),
             // Smooth pulls each sample toward the 3x3 mean of the *layer input*.
             // Placed last and routed across the Raise footprint (0.3, 0.35) so a GPU
             // that wrongly averaged the running (raised) height instead of `base`
@@ -705,7 +816,12 @@ fn gpu_required_sculpt_strokes_match_cpu_under_add_blend_and_mask() {
 
     let cpu = cpu_oracle(&stack, std::slice::from_ref(&mask), metrics);
     let gpu = gpu_eval(&stack, std::slice::from_ref(&mask), metrics);
-    assert_field_parity("authoring.sculpt-strokes-blended", &gpu, &cpu, SCULPT_STROKES_PREVIEW);
+    assert_field_parity(
+        "authoring.sculpt-strokes-blended",
+        &gpu,
+        &cpu,
+        SCULPT_STROKES_PREVIEW,
+    );
 }
 
 #[test]

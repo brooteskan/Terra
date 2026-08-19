@@ -21,7 +21,7 @@ struct Uniforms {
     depth: f32,
     canyon_width: f32,
     meander: f32,
-    shape_mode: u32, // 0 mountains, 1 dunes, 2 canyons, 3 uplift, 4 volcano, 5 mesa
+    shape_mode: u32, // 0 mountains, 1 dunes, 2 canyons, 3 uplift, 4 volcano, 5 mesa, 6 legacy island
     _pad: u32,
 };
 
@@ -37,30 +37,71 @@ fn smooth01(t0: f32) -> f32 {
     return t * t * (3.0 - 2.0 * t);
 }
 
-fn hash2_seeded(p: vec2<u32>, seed: u32) -> f32 {
+fn legacy_hash2_seeded(p: vec2<u32>, seed: u32) -> f32 {
     var n = p.x * 374761393u + p.y * 668265263u + seed * 2246822519u;
     n = (n ^ (n >> 13u)) * 1274126177u;
     n = n ^ (n >> 16u);
     return f32(n & 0x00FFFFFFu) / f32(0x01000000u);
 }
 
-fn grad(h: f32, x: f32, y: f32) -> f32 {
+fn legacy_grad(h: f32, x: f32, y: f32) -> f32 {
     let ang = h * 6.2831853;
     return cos(ang) * x + sin(ang) * y;
 }
 
-fn perlin_seeded(p: vec2<f32>, seed: u32) -> f32 {
+fn legacy_perlin_seeded(p: vec2<f32>, seed: u32) -> f32 {
     let i = vec2<i32>(floor(p));
     let f = fract(p);
-    let aa = hash2_seeded(vec2<u32>(u32(i.x), u32(i.y)), seed);
-    let ba = hash2_seeded(vec2<u32>(u32(i.x + 1), u32(i.y)), seed);
-    let ab = hash2_seeded(vec2<u32>(u32(i.x), u32(i.y + 1)), seed);
-    let bb = hash2_seeded(vec2<u32>(u32(i.x + 1), u32(i.y + 1)), seed);
+    let aa = legacy_hash2_seeded(vec2<u32>(u32(i.x), u32(i.y)), seed);
+    let ba = legacy_hash2_seeded(vec2<u32>(u32(i.x + 1), u32(i.y)), seed);
+    let ab = legacy_hash2_seeded(vec2<u32>(u32(i.x), u32(i.y + 1)), seed);
+    let bb = legacy_hash2_seeded(vec2<u32>(u32(i.x + 1), u32(i.y + 1)), seed);
     let ux = fade(f.x);
     let uy = fade(f.y);
-    let x1 = mix(grad(aa, f.x, f.y), grad(ba, f.x - 1.0, f.y), ux);
-    let x2 = mix(grad(ab, f.x, f.y - 1.0), grad(bb, f.x - 1.0, f.y - 1.0), ux);
+    let x1 = mix(legacy_grad(aa, f.x, f.y), legacy_grad(ba, f.x - 1.0, f.y), ux);
+    let x2 = mix(legacy_grad(ab, f.x, f.y - 1.0), legacy_grad(bb, f.x - 1.0, f.y - 1.0), ux);
     return mix(x1, x2, uy);
+}
+
+fn cpu_hash_u32(x0: u32) -> u32 {
+    var x = x0;
+    x ^= x >> 16u;
+    x *= 0x7feb352du;
+    x ^= x >> 15u;
+    x *= 0x846ca68bu;
+    x ^= x >> 16u;
+    return x;
+}
+
+fn cpu_hash2(ix: i32, iz: i32, seed: u32) -> u32 {
+    var h = seed;
+    h ^= bitcast<u32>(ix);
+    h = cpu_hash_u32(h);
+    h ^= bitcast<u32>(iz);
+    return cpu_hash_u32(h);
+}
+
+fn cpu_grad(h: u32, x: f32, z: f32) -> f32 {
+    switch (h & 3u) {
+        case 0u: { return x + z; }
+        case 1u: { return -x + z; }
+        case 2u: { return x - z; }
+        default: { return -x - z; }
+    }
+}
+
+fn perlin_seeded(p: vec2<f32>, seed: u32) -> f32 {
+    let i = vec2<i32>(floor(p));
+    let f = p - vec2<f32>(f32(i.x), f32(i.y));
+    let ux = fade(f.x);
+    let uy = fade(f.y);
+    let g00 = cpu_grad(cpu_hash2(i.x, i.y, seed), f.x, f.y);
+    let g10 = cpu_grad(cpu_hash2(i.x + 1, i.y, seed), f.x - 1.0, f.y);
+    let g01 = cpu_grad(cpu_hash2(i.x, i.y + 1, seed), f.x, f.y - 1.0);
+    let g11 = cpu_grad(cpu_hash2(i.x + 1, i.y + 1, seed), f.x - 1.0, f.y - 1.0);
+    let nx0 = g00 + (g10 - g00) * ux;
+    let nx1 = g01 + (g11 - g01) * ux;
+    return (nx0 + (nx1 - nx0) * uy) * 1.4142135623730951;
 }
 
 /// CPU-style ridged MF (weight cascade, octave seed stride 9173). Returns ≈ [0, amp].
@@ -349,7 +390,14 @@ fn uplift(x: f32, z: f32) -> f32 {
 /// Mapping: amplitude=height, range_width=radius frac, ridge_sharpness=flank_power,
 /// canyon_width=crater_radius frac, depth=crater_depth, meander=roughness,
 /// offset_x/z = center_u/v.
-fn volcano(x: f32, z: f32) -> f32 {
+fn shape_perlin(p: vec2<f32>, seed: u32, legacy: bool) -> f32 {
+    if (legacy) {
+        return legacy_perlin_seeded(p, seed);
+    }
+    return perlin_seeded(p, seed);
+}
+
+fn volcano_impl(x: f32, z: f32, legacy: bool) -> f32 {
     let short_axis = max(min(u.world_x, u.world_z), 1.0);
     let radius_m = clamp(u.range_width, 0.01, 1.0) * short_axis * 0.5;
     let cx = clamp(u.offset_x, 0.0, 1.0) * u.world_x;
@@ -364,9 +412,10 @@ fn volcano(x: f32, z: f32) -> f32 {
     let dist = sqrt(dx * dx + dz * dz);
     let theta = atan2(dz, dx);
     let macro_freq = 3.2 / max(radius_m, 1.0);
-    let macro_noise = perlin_seeded(
+    let macro_noise = shape_perlin(
         vec2<f32>(x * macro_freq, z * macro_freq),
         u.seed ^ 0xA17C31D5u,
+        legacy,
     );
     let lobe = sin(theta * 5.0 + macro_noise * 1.7);
     let footprint = max(1.0 + macro_noise * 0.09 + lobe * 0.035, 0.72);
@@ -378,9 +427,10 @@ fn volcano(x: f32, z: f32) -> f32 {
     let t = smooth01(1.0 - radial);
     var h = height * pow(t, flank);
     if (rough > 0.0) {
-        let fine = perlin_seeded(
+        let fine = shape_perlin(
             vec2<f32>(x * macro_freq * 4.7 + 11.0, z * macro_freq * 4.7 - 7.0),
             u.seed ^ 0xC011A953u,
+            legacy,
         );
         let groove_phase = theta * 11.0 + macro_noise * 4.2 + fine * 0.9;
         let groove = pow(1.0 - abs(sin(groove_phase)), 5.0);
@@ -404,6 +454,14 @@ fn volcano(x: f32, z: f32) -> f32 {
         }
     }
     return max(h, 0.0);
+}
+
+fn volcano(x: f32, z: f32) -> f32 {
+    return volcano_impl(x, z, false);
+}
+
+fn legacy_volcanic_island(x: f32, z: f32) -> f32 {
+    return volcano_impl(x, z, true);
 }
 /// Hard-cap mesa / butte.
 /// Mapping: amplitude=height, range_width=radius frac, ridge_sharpness=edge_steepness,
@@ -446,22 +504,21 @@ fn mesa(x: f32, z: f32) -> f32 {
         cap_detail = (broad * 0.72 + fine * 0.28) * cap_noise;
     }
     if (warped_dist <= cap_r) {
-        let crown = 1.0 - smooth01(warped_dist / max(cap_r, 1e-3)) * 0.025;
-        return max(height * crown + cap_detail, 0.0);
+        return max(height + cap_detail * 0.85, 0.0);
     }
     if (warped_dist <= radius_m) {
         let t = clamp((warped_dist - cap_r) / max(radius_m - cap_r, 1e-3), 0.0, 1.0);
         let wall = pow(1.0 - t, steep);
-        let strata = 0.94 + 0.06 * sin(t * 10.0 * 6.2831853 + edge_noise * 2.0);
-        return max((height + cap_detail * 0.25) * wall * strata, 0.0);
+        let strata = 0.95 + 0.05 * sin(wall * 11.0 * 6.2831853 + edge_noise * 1.8);
+        return max(height * wall * strata + cap_detail * wall * 0.25, 0.0);
     }
     let t = clamp((warped_dist - radius_m) / skirt, 0.0, 1.0);
     let talus_noise = 0.82 + 0.18 * perlin_seeded(
-        vec2<f32>(x * footprint_freq * 2.1, z * footprint_freq * 2.1),
-        u.seed ^ 0x74105A1Eu,
+        vec2<f32>(x * footprint_freq * 5.0, z * footprint_freq * 5.0),
+        u.seed ^ 0x7A1A5001u,
     );
-    let talus = pow(1.0 - t, 1.35);
-    return max(height * 0.12 * talus * talus_noise, 0.0);
+    let talus = pow(1.0 - smooth01(t), 1.22);
+    return max(height * 0.13 * talus * talus_noise, 0.0);
 }
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -483,8 +540,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         h = uplift(x, z);
     } else if (u.shape_mode == 4u) {
         h = volcano(x, z);
-    } else {
+    } else if (u.shape_mode == 5u) {
         h = mesa(x, z);
+    } else {
+        h = legacy_volcanic_island(x, z);
     }
     textureStore(dst, vec2<i32>(i32(gid.x), i32(gid.y)), vec4<f32>(h, 0.0, 0.0, 0.0));
 }
