@@ -1,7 +1,7 @@
 //! Thin bottom status bar with mesh stats, backend, and processing feedback.
 
 use crate::ui::style::{self, FONT_SCALE, PAD, STATUS_STRIP_H, TYPE_LABEL};
-use crate::ui::UiState;
+use crate::ui::{TerrainPreviewFreshness, UiState};
 use terra_core::document::TerrainDocument;
 use terra_core::eval::PreviewQuality;
 use terra_gui::{DrawList, GuiContext, Id, Rect};
@@ -67,36 +67,80 @@ pub fn draw_bottom_dock(
     let build_ms = ui_state.profile.eval_us as f32 / 1000.0;
 
     // Right: processing / failure / idle status + action (layout first for truncation).
-    let (status_text, show_progress, progress, show_retry) = if ui_state.refining {
-        let pct = ui_state.build_progress.unwrap_or(0.0).clamp(0.0, 1.0);
-        let name = ui_state.refining_layer_name.as_deref().unwrap_or("Terrain");
-        (format!("{name} {:.0}%", pct * 100.0), true, pct, false)
-    } else if let Some(failure) = ui_state.evaluation_failure.as_ref() {
-        let layer = failure.layer_name.as_deref().unwrap_or("Terrain");
-        let recovery = if failure.worker_restarted {
-            "worker restarted; last good preview shown"
+    let (status_text, show_progress, progress, show_retry) =
+        if let Some(failure) = ui_state.evaluation_failure.as_ref() {
+            let layer = failure.layer_name.as_deref().unwrap_or("Terrain");
+            let recovery = if failure.worker_restarted {
+                "worker restarted; last good preview shown"
+            } else {
+                "last good preview shown"
+            };
+            (
+                format!(
+                    "{layer} failed at {} - {recovery}",
+                    quality_name(failure.quality)
+                ),
+                false,
+                0.0,
+                true,
+            )
+        } else if let TerrainPreviewFreshness::Deferred {
+            layer_name,
+            deferred_layers,
+            settling,
+        } = &ui_state.terrain_preview_freshness
+        {
+            let later = deferred_layers.saturating_sub(1);
+            let pending = if later == 0 {
+                format!("{layer_name} pending")
+            } else if later == 1 {
+                format!("{layer_name} + 1 later layer pending")
+            } else {
+                format!("{layer_name} + {later} later layers pending")
+            };
+            let phase = if *settling { "settling" } else { "editing" };
+            (
+                format!("Local preview current - {pending} ({phase})"),
+                false,
+                0.0,
+                false,
+            )
+        } else if let TerrainPreviewFreshness::RefiningSuffix {
+            layer_name,
+            quality,
+        } = &ui_state.terrain_preview_freshness
+        {
+            let pct = ui_state.build_progress.unwrap_or(0.0).clamp(0.0, 1.0);
+            (
+                format!("Refining {layer_name} suffix - {}", quality_name(*quality)),
+                true,
+                pct,
+                false,
+            )
+        } else if matches!(
+            ui_state.terrain_preview_freshness,
+            TerrainPreviewFreshness::LastCompleteStale
+        ) {
+            (
+                "Edit queued - showing last complete preview".into(),
+                false,
+                0.0,
+                false,
+            )
+        } else if ui_state.refining {
+            let pct = ui_state.build_progress.unwrap_or(0.0).clamp(0.0, 1.0);
+            let name = ui_state.refining_layer_name.as_deref().unwrap_or("Terrain");
+            (format!("{name} {:.0}%", pct * 100.0), true, pct, false)
+        } else if ui_state.draft_displayed {
+            (
+                "Interactive preview active - full refinement pending".into(),
+                false,
+                0.0,
+                false,
+            )
         } else {
-            "last good preview shown"
+            (format!("Preview ready - {quality}"), false, 0.0, false)
         };
-        (
-            format!(
-                "{layer} failed at {} - {recovery}",
-                quality_name(failure.quality)
-            ),
-            false,
-            0.0,
-            true,
-        )
-    } else if ui_state.draft_displayed {
-        (
-            "Interactive preview active - full refinement pending".into(),
-            false,
-            0.0,
-            false,
-        )
-    } else {
-        (format!("Preview ready - {quality}"), false, 0.0, false)
-    };
 
     let action_w = if show_progress || show_retry {
         64.0

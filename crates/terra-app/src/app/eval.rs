@@ -1,25 +1,52 @@
 use std::time::{Duration, Instant};
 
 use crate::logging::OperationContext;
-use crate::ui::Preview2dMode;
+use crate::ui::{Preview2dMode, TerrainPreviewFreshness};
 use terra_core::eval::{EvalWorkRequest, PreviewQuality};
 use terra_core::heightfield::Heightfield;
 use terra_core::layer::{LayerId, LayerKind};
 use terra_core::mask::bake_mask_assets;
 use terra_core::tiling::UvRect;
-use terra_gpu::GpuError;
+use terra_gpu::{GpuError, GpuEvaluationIntent, GpuPreviewFreshness};
 
-use super::{quality_stage_progress, TerraApp};
+use super::{quality_stage_progress, DeferredFullField, TerraApp};
 
 /// Interactive Full preview ceiling — same 1 m footing as WC (world metres ≈ samples),
 /// capped at export-class 8192² so extreme worlds stay bounded.
 const INTERACTIVE_PREVIEW_CAP: u32 = 8192;
+
+/// Convert a resolution-independent edit footprint only after the evaluation
+/// quality has selected its actual texture dimensions.
+fn uv_to_texel_rect(region: UvRect, width: u32, height: u32) -> (u32, u32, u32, u32) {
+    if width == 0 || height == 0 {
+        return (0, 0, 0, 0);
+    }
+    if !(region.min_u.is_finite()
+        && region.min_v.is_finite()
+        && region.max_u.is_finite()
+        && region.max_v.is_finite())
+    {
+        return (0, 0, width, height);
+    }
+    let x0 = ((region.min_u.clamp(0.0, 1.0) * width as f32).floor() as u32).min(width - 1);
+    let x1 = ((region.max_u.clamp(0.0, 1.0) * width as f32).ceil() as u32).clamp(x0 + 1, width);
+    let y0 = ((region.min_v.clamp(0.0, 1.0) * height as f32).floor() as u32).min(height - 1);
+    let y1 = ((region.max_v.clamp(0.0, 1.0) * height as f32).ceil() as u32).clamp(y0 + 1, height);
+    (x0, y0, x1 - x0, y1 - y0)
+}
 
 impl TerraApp {
     pub(crate) fn request_rebuild(&mut self) {
         self.eval_token = self.scheduler.request_rebuild();
         self.eval_worker.set_token(self.eval_token);
         self.worker_refine_pending = false;
+        self.deferred_full_field = None;
+        self.full_field_refine_not_before = None;
+        self.ui_state.terrain_preview_freshness = if self.pending_gpu_dirty_region.is_some() {
+            TerrainPreviewFreshness::LastCompleteStale
+        } else {
+            TerrainPreviewFreshness::Current
+        };
         self.ui_state.refining = true;
         self.ui_state.quality = PreviewQuality::Draft;
         self.ui_state.build_progress = Some(0.0);
@@ -48,6 +75,9 @@ impl TerraApp {
         self.scheduler.current_token = self.eval_token;
         self.eval_worker.set_token(self.eval_token);
         self.worker_refine_pending = false;
+        self.deferred_full_field = None;
+        self.full_field_refine_not_before = None;
+        self.ui_state.terrain_preview_freshness = TerrainPreviewFreshness::Current;
         self.force_draft = false;
         self.pending_eval = false;
         self.ui_state.refining = false;
@@ -659,6 +689,10 @@ impl TerraApp {
     }
 
     pub(crate) fn run_eval_step(&mut self) {
+        self.run_eval_step_with_intent(GpuEvaluationIntent::Complete);
+    }
+
+    pub(crate) fn run_eval_step_with_intent(&mut self, intent: GpuEvaluationIntent) {
         profiling::scope!("eval_step");
         let t0 = Instant::now();
         if self.force_draft {
@@ -751,7 +785,20 @@ impl TerraApp {
                 self.renderer.as_mut(),
                 self.gpu.as_ref(),
             ) {
-                match engine.evaluate(
+                if intent == GpuEvaluationIntent::InteractiveLocal {
+                    if let Some(region) = self.pending_gpu_dirty_region {
+                        engine.set_dirty_rect(Some(uv_to_texel_rect(
+                            region,
+                            metrics.width,
+                            metrics.height,
+                        )));
+                    }
+                } else {
+                    // A suffix completion is globally coupled even though the edit that
+                    // triggered it was bounded. Do not leak the prior local rect into it.
+                    engine.set_dirty_rect(None);
+                }
+                match engine.evaluate_with_intent(
                     &gpu.device,
                     &gpu.queue,
                     &preview_stack,
@@ -760,6 +807,7 @@ impl TerraApp {
                     quality,
                     want_cpu,
                     bridge_prefix,
+                    intent,
                 ) {
                     Ok(result) => {
                         if token != self.eval_token {
@@ -838,8 +886,15 @@ impl TerraApp {
                             // Interactive path: GPU present is authoritative for the frame.
                             // Never sync-evaluate CPU on the UI thread — that hangs the app
                             // when stacks include unsupported layers (painted masks, SPE, …).
-                            let full_field_deferred = result.full_field_deferred;
+                            let full_field_deferred = result.freshness.is_deferred();
                             let needs_cpu_suffix = result.resume_cpu_from.is_some();
+                            let completing_deferred_suffix = if full_field_deferred {
+                                None
+                            } else {
+                                self.deferred_full_field.as_ref().map(|pending| {
+                                    (pending.layer_name.clone(), pending.deferred_layers)
+                                })
+                            };
                             self.last_eval_fully_gpu = result.fully_gpu;
                             // want_cpu=false, so the GPU engine never returns a CPU prefix
                             // (`result.cpu` is always None) and the UI thread never runs a CPU
@@ -876,6 +931,29 @@ impl TerraApp {
                                 used_gpu = true;
                                 eval_completed = true;
                                 if full_field_deferred {
+                                    if let GpuPreviewFreshness::Deferred {
+                                        from_layer,
+                                        deferred_layers,
+                                        ..
+                                    } = result.freshness
+                                    {
+                                        let layer_name = preview_stack
+                                            .find(from_layer)
+                                            .map(|layer| layer.common.name.clone())
+                                            .unwrap_or_else(|| "global layer".into());
+                                        self.deferred_full_field = Some(DeferredFullField {
+                                            generation: token,
+                                            layer_name: layer_name.clone(),
+                                            deferred_layers,
+                                            settle_at: None,
+                                        });
+                                        self.ui_state.terrain_preview_freshness =
+                                            TerrainPreviewFreshness::Deferred {
+                                                layer_name,
+                                                deferred_layers,
+                                                settling: false,
+                                            };
+                                    }
                                     // Local generators are live while an expensive
                                     // full-field suffix waits for mouse-up refinement.
                                     // This is not a CPU fallback.
@@ -883,6 +961,14 @@ impl TerraApp {
                                     self.ui_state.build_progress =
                                         Some(quality_stage_progress(quality).max(0.15));
                                 } else if needs_cpu_suffix {
+                                    self.deferred_full_field = None;
+                                    if let Some((layer_name, _)) = completing_deferred_suffix {
+                                        self.ui_state.terrain_preview_freshness =
+                                            TerrainPreviewFreshness::RefiningSuffix {
+                                                layer_name,
+                                                quality,
+                                            };
+                                    }
                                     // Unsupported layers need CPU bake at *this* quality
                                     // (not Draft), then lifecycle advances Draft→Medium→Full.
                                     self.ui_state.profile.path = "GPU→async CPU";
@@ -893,6 +979,9 @@ impl TerraApp {
                                         self.enqueue_async_eval(quality);
                                     }
                                 } else {
+                                    self.deferred_full_field = None;
+                                    self.ui_state.terrain_preview_freshness =
+                                        TerrainPreviewFreshness::Current;
                                     // GPU finished this quality — keep climbing toward Full.
                                     self.ui_state.refining = quality.next_refine().is_some();
                                     if !self.ui_state.refining {
@@ -902,6 +991,11 @@ impl TerraApp {
                             }
                             if used_gpu && !eval_completed {
                                 eval_completed = true;
+                            }
+                            if used_gpu && intent == GpuEvaluationIntent::InteractiveLocal {
+                                // A current-token GPU result consumed this accumulated scope.
+                                // A later edit has a newer token and therefore cannot reach here.
+                                self.pending_gpu_dirty_region = None;
                             }
                         }
                     }
@@ -1220,7 +1314,7 @@ mod tests {
     use terra_core::layer::{FlatParams, Layer, LayerKind, LayerStack, StreamPowerParams};
     use terra_core::tiling::UvRect;
 
-    use super::TerraApp;
+    use super::{uv_to_texel_rect, DeferredFullField, TerraApp};
 
     fn flat(height: f32) -> Layer {
         Layer::new("Flat", LayerKind::Flat(FlatParams { height }))
@@ -1228,6 +1322,60 @@ mod tests {
 
     fn rect(u: f32, v: f32, r: f32) -> UvRect {
         UvRect::from_center_radius(u, v, r)
+    }
+
+    #[test]
+    fn gpu_dirty_uv_is_converted_at_each_evaluation_resolution() {
+        let region = UvRect {
+            min_u: 0.25,
+            min_v: 0.5,
+            max_u: 0.251,
+            max_v: 0.502,
+        };
+        assert_eq!(uv_to_texel_rect(region, 512, 512), (128, 256, 1, 2));
+        assert_eq!(uv_to_texel_rect(region, 4096, 4096), (1024, 2048, 5, 9));
+        assert_eq!(uv_to_texel_rect(region, 512, 256), (128, 128, 1, 1));
+    }
+
+    #[test]
+    fn invalid_gpu_dirty_uv_escalates_to_whole_field() {
+        let region = UvRect {
+            min_u: f32::NAN,
+            min_v: 0.0,
+            max_u: 1.0,
+            max_v: 1.0,
+        };
+        assert_eq!(uv_to_texel_rect(region, 512, 256), (0, 0, 512, 256));
+    }
+
+    #[test]
+    fn full_field_suffix_deadline_starts_once_after_gesture_end() {
+        let start = std::time::Instant::now();
+        let mut pending = DeferredFullField {
+            generation: 7,
+            layer_name: "Rivers".into(),
+            deferred_layers: 3,
+            settle_at: None,
+        };
+        pending.hold_during_gesture();
+        assert_eq!(pending.settle_at, None);
+
+        let released = start + std::time::Duration::from_millis(20);
+        assert!(pending.arm_after_gesture(released));
+        let deadline = released + std::time::Duration::from_millis(75);
+        assert_eq!(pending.settle_at, Some(deadline));
+        assert!(!pending.arm_after_gesture(released + std::time::Duration::from_millis(40)));
+        assert_eq!(
+            pending.settle_at,
+            Some(deadline),
+            "idle ticks must not debounce"
+        );
+        assert!(!pending.ready(7, deadline - std::time::Duration::from_millis(1)));
+        assert!(pending.ready(7, deadline));
+        assert!(
+            !pending.ready(8, deadline),
+            "stale generations never publish"
+        );
     }
 
     /// #100 phase 4 (loss-proof transport): `enqueue_async_eval` must *copy* the

@@ -11,7 +11,9 @@ pub mod parity;
 pub mod tile_cache;
 
 pub use derivatives::{cpu_slope_oracle, run_derivative_gpu, GpuDerivativeMode};
-pub use engine::{GpuEvalResult, GpuEvalStats, GpuTerrainEngine};
+pub use engine::{
+    GpuEvalResult, GpuEvalStats, GpuEvaluationIntent, GpuPreviewFreshness, GpuTerrainEngine,
+};
 pub use graph::{
     compile_gpu_graph, expand_dirty_rect, layer_gpu_supported, GpuComputeGraph, GpuDirtyPolicy,
     GpuKernel, GpuLayerPlan, BLUR_MAX_RADIUS, EFFECT_FILTER_MAX_RADIUS, RIVER_CARVE_MAX_RADIUS,

@@ -107,6 +107,22 @@ pub struct EvaluationFailureStatus {
     pub worker_restarted: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum TerrainPreviewFreshness {
+    #[default]
+    Current,
+    Deferred {
+        layer_name: String,
+        deferred_layers: usize,
+        settling: bool,
+    },
+    RefiningSuffix {
+        layer_name: String,
+        quality: PreviewQuality,
+    },
+    LastCompleteStale,
+}
+
 #[derive(Default)]
 pub struct UiState {
     pub show_mask_editor: bool,
@@ -155,6 +171,9 @@ pub struct UiState {
     pub status: String,
     /// Persistent evaluation failure; cleared only by a successful current build or reset.
     pub evaluation_failure: Option<EvaluationFailureStatus>,
+    /// Whether the visible terrain is the complete stack or a truthful local
+    /// prefix while a globally coupled suffix is deferred.
+    pub terrain_preview_freshness: TerrainPreviewFreshness,
     pub refining: bool,
     /// Best-effort progressive-build completion, from 0.0 through 1.0.
     pub build_progress: Option<f32>,

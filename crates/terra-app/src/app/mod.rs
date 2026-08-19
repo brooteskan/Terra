@@ -13,7 +13,7 @@ mod shapes;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::ui::{
     layers_from_project_template, ChromeGuiState, DockGuiState, InspectorGuiState, LayersGuiState,
@@ -34,6 +34,8 @@ use winit::window::Window;
 
 pub(crate) const EDIT_DEBOUNCE_MS: u128 = 40;
 pub(crate) const REFINE_INTERVAL_MS: u128 = 80;
+pub(crate) const FULL_FIELD_SETTLE_MS: u64 = 75;
+pub(crate) const FULL_FIELD_REFINE_MS: u64 = 225;
 
 /// GPU objects built off the main thread during startup, handed back through
 /// [`BootState::job`]. All three are `wgpu`-backed and therefore `Send`.
@@ -141,6 +143,36 @@ pub(crate) struct LayerPointDrag {
     start_height: f32,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct DeferredFullField {
+    pub generation: u64,
+    pub layer_name: String,
+    pub deferred_layers: usize,
+    /// `None` while the bounded terrain gesture remains active.
+    pub settle_at: Option<Instant>,
+}
+
+impl DeferredFullField {
+    fn hold_during_gesture(&mut self) {
+        self.settle_at = None;
+    }
+
+    /// Arm exactly once after the gesture ends. Further idle ticks do not debounce
+    /// the deadline, so the suffix starts 75 ms after mouse-up rather than 75 ms
+    /// after whichever event loop tick happened most recently.
+    fn arm_after_gesture(&mut self, now: Instant) -> bool {
+        if self.settle_at.is_some() {
+            return false;
+        }
+        self.settle_at = Some(now + Duration::from_millis(FULL_FIELD_SETTLE_MS));
+        true
+    }
+
+    fn ready(&self, generation: u64, now: Instant) -> bool {
+        self.generation == generation && self.settle_at.is_some_and(|deadline| now >= deadline)
+    }
+}
+
 pub struct TerraApp {
     window: Option<Arc<Window>>,
     /// Set only during startup while GPU pipelines compile on a worker thread;
@@ -212,6 +244,13 @@ pub struct TerraApp {
     pending_eval: bool,
     /// When true, next eval starts from Draft even if already refining.
     force_draft: bool,
+    /// Bounded edit scope waiting for the next GPU evaluation. UV is retained
+    /// until quality/metrics are known, then converted to texels.
+    pending_gpu_dirty_region: Option<UvRect>,
+    /// Missing globally coupled suffix for the latest local edit generation.
+    deferred_full_field: Option<DeferredFullField>,
+    /// Earliest instant Medium/Full refinement may follow an accepted Draft suffix.
+    full_field_refine_not_before: Option<Instant>,
     /// Wave C GPU layer preview engine (shares renderer device).
     gpu_engine: Option<GpuTerrainEngine>,
     /// Last interactive GPU eval covered the full height stack (no CPU resume).
@@ -367,6 +406,9 @@ impl Default for TerraApp {
             last_edit: now,
             pending_eval: false,
             force_draft: false,
+            pending_gpu_dirty_region: None,
+            deferred_full_field: None,
+            full_field_refine_not_before: None,
             gpu_engine: None,
             last_eval_fully_gpu: false,
             tile_atlas: None,

@@ -310,34 +310,6 @@ pub(crate) fn try_apply(
                 }
             }
             if ctx.dirty_from == Some(layer) {
-                let resolution = app
-                    .scheduler
-                    .quality
-                    .resolution(
-                        app.session.document.preview_resolution.min(8192),
-                        app.session.document.export_resolution,
-                    )
-                    .max(1);
-                let x0 = ((u - radius).clamp(0.0, 1.0) * resolution as f32).floor() as u32;
-                let y0 = ((v - radius).clamp(0.0, 1.0) * resolution as f32).floor() as u32;
-                let x1 = ((u + radius).clamp(0.0, 1.0) * resolution as f32).ceil() as u32;
-                let y1 = ((v + radius).clamp(0.0, 1.0) * resolution as f32).ceil() as u32;
-                let next = (
-                    x0,
-                    y0,
-                    x1.saturating_sub(x0).max(1),
-                    y1.saturating_sub(y0).max(1),
-                );
-                ctx.sculpt_dirty_rect = Some(match ctx.sculpt_dirty_rect {
-                    Some((ox, oy, ow, oh)) => {
-                        let ex = (ox + ow).max(next.0 + next.2);
-                        let ey = (oy + oh).max(next.1 + next.3);
-                        let nx = ox.min(next.0);
-                        let ny = oy.min(next.1);
-                        (nx, ny, ex - nx, ey - ny)
-                    }
-                    None => next,
-                });
                 // Retain the same footprint in resolution-free UV for the CPU
                 // worker. A continuing stroke's appended segment sweeps from the
                 // previous point, so cover both endpoints ± radius; `last_paint_uv`

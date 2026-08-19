@@ -18,10 +18,8 @@ use super::TerraApp;
 /// Shared mutation flags for a single apply_actions batch.
 pub(crate) struct ApplyCtx {
     pub dirty_from: Option<LayerId>,
-    pub sculpt_dirty_rect: Option<(u32, u32, u32, u32)>,
-    /// The same sculpt footprint as `sculpt_dirty_rect`, but in resolution-free
-    /// normalized UV — carried to the CPU worker so a stroke recomputes only its
-    /// tiles at the worker's own resolution (#100 phase 4).
+    /// Resolution-free bounded edit scope shared by GPU preview and CPU worker.
+    /// It is converted to texels only after the evaluation quality is resolved.
     pub sculpt_dirty_region_uv: Option<UvRect>,
     pub doc_mutated: bool,
     pub mask_assets_mutated: bool,
@@ -33,7 +31,6 @@ impl ApplyCtx {
     pub fn new() -> Self {
         Self {
             dirty_from: None,
-            sculpt_dirty_rect: None,
             sculpt_dirty_region_uv: None,
             doc_mutated: false,
             mask_assets_mutated: false,
@@ -45,42 +42,13 @@ impl ApplyCtx {
 
 /// Fold a sculpt-edit footprint (normalized UV) into the batch's dirty
 /// accumulators, exactly as [`masks::try_apply`]'s paint-dab arm does for a stamp:
-/// union the UV rect carried to the CPU worker scope, and mirror it as a texel
-/// rect (at the same resolution source the dab uses) for the GPU present. Used by
+/// union the UV rect carried to the CPU worker and GPU preview paths. Used by
 /// the per-stroke edit arms (#121) so an inspector slider / eye toggle / delete
 /// rescopes to the edited stroke's footprint instead of escalating whole-field.
-pub(crate) fn accumulate_sculpt_footprint(app: &TerraApp, ctx: &mut ApplyCtx, uv: UvRect) {
+pub(crate) fn accumulate_sculpt_footprint(_app: &TerraApp, ctx: &mut ApplyCtx, uv: UvRect) {
     ctx.sculpt_dirty_region_uv = Some(match ctx.sculpt_dirty_region_uv {
         Some(existing) => existing.union(uv),
         None => uv,
-    });
-    let resolution = app
-        .scheduler
-        .quality
-        .resolution(
-            app.session.document.preview_resolution.min(8192),
-            app.session.document.export_resolution,
-        )
-        .max(1);
-    let x0 = (uv.min_u * resolution as f32).floor() as u32;
-    let y0 = (uv.min_v * resolution as f32).floor() as u32;
-    let x1 = (uv.max_u * resolution as f32).ceil() as u32;
-    let y1 = (uv.max_v * resolution as f32).ceil() as u32;
-    let next = (
-        x0,
-        y0,
-        x1.saturating_sub(x0).max(1),
-        y1.saturating_sub(y0).max(1),
-    );
-    ctx.sculpt_dirty_rect = Some(match ctx.sculpt_dirty_rect {
-        Some((ox, oy, ow, oh)) => {
-            let ex = (ox + ow).max(next.0 + next.2);
-            let ey = (oy + oh).max(next.1 + next.3);
-            let nx = ox.min(next.0);
-            let ny = oy.min(next.1);
-            (nx, ny, ex - nx, ey - ny)
-        }
-        None => next,
     });
 }
 
@@ -144,17 +112,20 @@ impl TerraApp {
             }
         }
         let dirty_from = ctx.dirty_from;
-        let sculpt_dirty_rect = ctx.sculpt_dirty_rect;
+        let sculpt_dirty_region_uv = ctx.sculpt_dirty_region_uv;
         let doc_mutated = ctx.doc_mutated;
         let mask_assets_mutated = ctx.mask_assets_mutated;
         // Set by a paint dab (SculptBase/SculptStrokes stamp) or a per-stroke edit
         // (#121): both carry a bounded UV footprint, so both take the scoped worker
         // path and present just the dirty rect through the GPU.
-        let has_sculpt_footprint = sculpt_dirty_rect.is_some();
-        if let Some(rect) = sculpt_dirty_rect {
-            if let Some(gpu) = self.gpu_engine.as_mut() {
-                gpu.set_dirty_rect(Some(rect));
-            }
+        let has_sculpt_footprint = sculpt_dirty_region_uv.is_some();
+        if let Some(region) = sculpt_dirty_region_uv {
+            self.pending_gpu_dirty_region = Some(match self.pending_gpu_dirty_region {
+                Some(existing) => existing.union(region),
+                None => region,
+            });
+            self.deferred_full_field = None;
+            self.full_field_refine_not_before = None;
         }
         if let Some(id) = dirty_from {
             // Suffix-only dirty â€” do not mark_all_dirty (preserves layer cache).
@@ -176,7 +147,7 @@ impl TerraApp {
                 // Paint dabs and per-stroke edits carry a UV footprint; other suffix
                 // edits are whole-field.
                 let footprint = if has_sculpt_footprint {
-                    ctx.sculpt_dirty_region_uv
+                    sculpt_dirty_region_uv
                 } else {
                     None
                 };

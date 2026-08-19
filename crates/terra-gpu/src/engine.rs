@@ -996,15 +996,40 @@ pub struct GpuEvalResult {
     pub world_size: (f32, f32),
     pub height_range: (f32, f32),
     pub fully_gpu: bool,
-    /// True when interactive local-edit policy intentionally stopped before a
-    /// full-field pass. The unexecuted suffix remains dirty for refinement.
-    pub full_field_deferred: bool,
+    /// Whether the visible texture is the complete stack or the truthful local
+    /// prefix produced while a globally coupled suffix waits for refinement.
+    pub freshness: GpuPreviewFreshness,
     pub cpu: Option<Heightfield>,
     /// First flattened layer that must resume on the CPU. When this is `Some(n)`,
     /// `cpu` is the height entering layer `n`; `Some(0)` is a full-CPU restart seed.
     pub resume_cpu_from: Option<usize>,
     /// True when the evaluate loop ran (filters may have been applied). False on seed failure.
     pub did_eval: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuPreviewFreshness {
+    Current,
+    Deferred {
+        from_index: usize,
+        from_layer: LayerId,
+        deferred_layers: usize,
+    },
+}
+
+impl GpuPreviewFreshness {
+    pub fn is_deferred(self) -> bool {
+        matches!(self, Self::Deferred { .. })
+    }
+}
+
+/// Per-evaluation execution intent. This is deliberately not a user-facing
+/// policy surface: the editor has one default behavior for bounded local edits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GpuEvaluationIntent {
+    InteractiveLocal,
+    #[default]
+    Complete,
 }
 
 /// GPU stack evaluator for interactive preview.
@@ -1091,9 +1116,6 @@ pub struct GpuTerrainEngine {
     last_quality: Option<PreviewQuality>,
     /// Maximum thermal/hydraulic/stream-power iterations submitted in one interactive tick.
     pub max_sim_iters_per_tick: u32,
-    /// During local interaction, stop before a full-field-coupled pass and leave
-    /// its suffix dirty for the next refinement evaluation.
-    defer_full_field: bool,
     /// Last compiled GPU pass graph for the evaluated stack.
     pub last_graph: GpuComputeGraph,
     /// Kernels dispatched by the most recent `evaluate` walk, in order — the
@@ -1608,7 +1630,6 @@ impl GpuTerrainEngine {
             last_dirty_rect: None,
             last_quality: None,
             max_sim_iters_per_tick: 8,
-            defer_full_field: false,
             last_graph: GpuComputeGraph::default(),
             #[cfg(test)]
             executed_kernels: Vec::new(),
@@ -1634,13 +1655,6 @@ impl GpuTerrainEngine {
     /// `None` means uncapped (export / full quality).
     pub fn set_simulation_iteration_cap(&mut self, cap: Option<u32>) {
         self.max_sim_iters_per_tick = cap.unwrap_or(u32::MAX);
-    }
-
-    /// Configure interactive deferral of full-field-coupled passes. Deferral is
-    /// applied only when a local dirty rectangle is present and a local prefix
-    /// can still be evaluated and presented.
-    pub fn set_defer_full_field(&mut self, defer: bool) {
-        self.defer_full_field = defer;
     }
 
     pub fn take_dirty_region(&mut self, pad: u32) -> Option<SampleRect> {
@@ -4187,11 +4201,13 @@ impl GpuTerrainEngine {
         layers: &[&Layer],
         plans: &[Option<crate::graph::GpuLayerPlan>],
         quality_changed: bool,
+        prefix_end: usize,
     ) -> bool {
         let Some(first) = layers.first() else {
             return false;
         };
-        if quality_changed
+        if prefix_end == 0
+            || quality_changed
             || self.last_dirty_rect.is_none()
             || !first.common.enabled
             || !matches!(first.kind, LayerKind::SculptBase(_))
@@ -4201,43 +4217,57 @@ impl GpuTerrainEngine {
                 BlendMode::Normal | BlendMode::Replace | BlendMode::Interpolate
             )
             || !first.common.masks.is_empty()
-            || self.dirty.iter().any(|id| *id != first.id())
-            || plans.len() != layers.len()
-            || plans.iter().zip(layers).any(|(plan, layer)| {
-                layer.common.enabled
-                    && plan.is_none_or(|plan| plan.dirty_policy == GpuDirtyPolicy::FullField)
+            || self.dirty.iter().any(|id| {
+                layers
+                    .iter()
+                    .take(prefix_end)
+                    .any(|layer| layer.id() == *id && *id != first.id())
             })
+            || plans.len() != layers.len()
+            || plans
+                .iter()
+                .zip(layers)
+                .take(prefix_end)
+                .any(|(plan, layer)| {
+                    layer.common.enabled
+                        && plan.is_none_or(|plan| plan.dirty_policy == GpuDirtyPolicy::FullField)
+                })
         {
             return false;
         }
-        if layers.iter().any(|layer| {
+        if layers.iter().take(prefix_end).any(|layer| {
             !self.layer_cache.get(&layer.id()).is_some_and(|cache| {
                 cache.width == self.metrics.width && cache.height == self.metrics.height
             })
         }) {
             return false;
         }
-        layers.iter().skip(1).all(|layer| {
-            if !layer.common.enabled {
-                return true;
-            }
-            if !layer.common.masks.is_empty() || self.dirty.contains(&layer.id()) {
-                return false;
-            }
-            match &layer.kind {
-                LayerKind::SculptStrokes(params) => !params
-                    .strokes
-                    .iter()
-                    .any(|stroke| stroke.enabled && stroke.kind == SculptStrokeKind::Flatten),
-                kind if layer_input_independent(kind) => {
-                    !matches!(kind, LayerKind::ImportHeightmap(_) | LayerKind::Stamp2d(_))
-                        && self.layer_contrib.get(&layer.id()).is_some_and(|cache| {
-                            cache.width == self.metrics.width && cache.height == self.metrics.height
-                        })
+        layers
+            .iter()
+            .skip(1)
+            .take(prefix_end.saturating_sub(1))
+            .all(|layer| {
+                if !layer.common.enabled {
+                    return true;
                 }
-                _ => false,
-            }
-        })
+                if !layer.common.masks.is_empty() || self.dirty.contains(&layer.id()) {
+                    return false;
+                }
+                match &layer.kind {
+                    LayerKind::SculptStrokes(params) => !params
+                        .strokes
+                        .iter()
+                        .any(|stroke| stroke.enabled && stroke.kind == SculptStrokeKind::Flatten),
+                    kind if layer_input_independent(kind) => {
+                        !matches!(kind, LayerKind::ImportHeightmap(_) | LayerKind::Stamp2d(_))
+                            && self.layer_contrib.get(&layer.id()).is_some_and(|cache| {
+                                cache.width == self.metrics.width
+                                    && cache.height == self.metrics.height
+                            })
+                    }
+                    _ => false,
+                }
+            })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4249,6 +4279,8 @@ impl GpuTerrainEngine {
         plans: &[Option<crate::graph::GpuLayerPlan>],
         quality: PreviewQuality,
         want_cpu: bool,
+        prefix_end: usize,
+        freshness: GpuPreviewFreshness,
     ) -> Result<GpuEvalResult, GpuError> {
         let pending = self
             .last_dirty_rect
@@ -4256,6 +4288,7 @@ impl GpuTerrainEngine {
         let halo = layers
             .iter()
             .zip(plans)
+            .take(prefix_end)
             .filter_map(|(layer, plan)| plan.filter(|_| layer.common.enabled).map(|p| (layer, p)))
             .fold(0u32, |halo, (layer, plan)| {
                 halo.saturating_add(
@@ -4290,7 +4323,12 @@ impl GpuTerrainEngine {
         self.dirty.remove(&first.id());
 
         let mut source = TexSlot::Cache(first.id());
-        for layer in layers.iter().skip(1).copied() {
+        for layer in layers
+            .iter()
+            .skip(1)
+            .take(prefix_end.saturating_sub(1))
+            .copied()
+        {
             let id = layer.id();
             if !layer.common.enabled {
                 self.copy_slots_region(
@@ -4372,8 +4410,8 @@ impl GpuTerrainEngine {
             height: self.metrics.height,
             world_size: (self.metrics.world_size_x, self.metrics.world_size_z),
             height_range: self.approx_range,
-            fully_gpu: true,
-            full_field_deferred: false,
+            fully_gpu: !freshness.is_deferred(),
+            freshness,
             cpu,
             resume_cpu_from: None,
             did_eval: true,
@@ -4399,6 +4437,32 @@ impl GpuTerrainEngine {
         quality: PreviewQuality,
         want_cpu: bool,
         bridge_prefix: Option<&Heightfield>,
+    ) -> Result<GpuEvalResult, GpuError> {
+        self.evaluate_with_intent(
+            device,
+            queue,
+            stack,
+            mask_assets,
+            metrics,
+            quality,
+            want_cpu,
+            bridge_prefix,
+            GpuEvaluationIntent::Complete,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn evaluate_with_intent(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        stack: &LayerStack,
+        mask_assets: &[MaskAsset],
+        metrics: HeightfieldMetrics,
+        quality: PreviewQuality,
+        want_cpu: bool,
+        bridge_prefix: Option<&Heightfield>,
+        intent: GpuEvaluationIntent,
     ) -> Result<GpuEvalResult, GpuError> {
         profiling::scope!("gpu_stack_eval");
         // Flattened GPU evaluation cannot preserve scoped-group composition or solo
@@ -4438,7 +4502,7 @@ impl GpuTerrainEngine {
                 world_size: (metrics.world_size_x, metrics.world_size_z),
                 height_range: (0.0, 0.0),
                 fully_gpu: true,
-                full_field_deferred: false,
+                freshness: GpuPreviewFreshness::Current,
                 cpu: if want_cpu {
                     Some(Heightfield::zeros(metrics))
                 } else {
@@ -4462,10 +4526,83 @@ impl GpuTerrainEngine {
             .position(|l| self.dirty.contains(&l.id()))
             .unwrap_or(layers.len());
 
-        if first_dirty == 0 && self.can_evaluate_layer_zero_region(&layers, &plans, quality_changed)
+        // A bounded interactive edit presents the exact local prefix and stops at
+        // the first enabled globally coupled pass. Every later layer is part of
+        // that deferred suffix, including otherwise-local filters.
+        let full_execution_end = if want_cpu {
+            self.last_graph.cpu_from.unwrap_or(layers.len())
+        } else {
+            layers.len()
+        };
+        let bounded_first_dirty = first_dirty.min(full_execution_end);
+        let pass_dirty_rect = self.last_dirty_rect;
+        let deferred_at = if intent == GpuEvaluationIntent::InteractiveLocal
+            && pass_dirty_rect.is_some()
+            && !want_cpu
         {
-            return self
-                .evaluate_layer_zero_region(device, queue, &layers, &plans, quality, want_cpu);
+            let boundary = layers
+                .iter()
+                .enumerate()
+                .skip(bounded_first_dirty)
+                .take(full_execution_end.saturating_sub(bounded_first_dirty))
+                .find_map(|(i, layer)| {
+                    plans[i]
+                        .filter(|plan| {
+                            layer.common.enabled && plan.dirty_policy == GpuDirtyPolicy::FullField
+                        })
+                        .map(|_| i)
+                });
+            boundary.filter(|boundary| {
+                layers
+                    .iter()
+                    .enumerate()
+                    .skip(bounded_first_dirty)
+                    .take(boundary.saturating_sub(bounded_first_dirty))
+                    .all(|(index, layer)| !layer.common.enabled || plans[index].is_some())
+            })
+        } else {
+            None
+        };
+        let freshness = deferred_at.map_or(GpuPreviewFreshness::Current, |from_index| {
+            GpuPreviewFreshness::Deferred {
+                from_index,
+                from_layer: layers[from_index].id(),
+                deferred_layers: layers
+                    .iter()
+                    .skip(from_index)
+                    .filter(|layer| layer.common.enabled)
+                    .count(),
+            }
+        });
+        if let Some(index) = deferred_at {
+            self.dirty
+                .extend(layers.iter().skip(index).map(|layer| layer.id()));
+        }
+
+        let prefix_end = deferred_at.unwrap_or(full_execution_end);
+        if deferred_at == Some(bounded_first_dirty) {
+            // The edited layer itself is globally coupled, so there is no exact local
+            // prefix to present. Keep the last complete preview and retain the whole
+            // boundary suffix as dirty for the scheduled completion pass.
+            self.last_dirty_rect = None;
+            return Ok(GpuEvalResult {
+                width: metrics.width,
+                height: metrics.height,
+                world_size: (metrics.world_size_x, metrics.world_size_z),
+                height_range: self.approx_range,
+                fully_gpu: false,
+                freshness,
+                cpu: None,
+                resume_cpu_from: None,
+                did_eval: false,
+            });
+        }
+        if first_dirty == 0
+            && self.can_evaluate_layer_zero_region(&layers, &plans, quality_changed, prefix_end)
+        {
+            return self.evaluate_layer_zero_region(
+                device, queue, &layers, &plans, quality, want_cpu, prefix_end, freshness,
+            );
         }
 
         // All clean and fully GPU-cached: restore top cache (no recompute).
@@ -4501,7 +4638,7 @@ impl GpuTerrainEngine {
                             world_size: (metrics.world_size_x, metrics.world_size_z),
                             height_range: self.approx_range,
                             fully_gpu: true,
-                            full_field_deferred: false,
+                            freshness: GpuPreviewFreshness::Current,
                             cpu,
                             resume_cpu_from: None,
                             did_eval: true,
@@ -4514,37 +4651,8 @@ impl GpuTerrainEngine {
         // A real CPU checkpoint stops before the first unsupported layer. Interactive
         // preview keeps walking the whole suffix so supported filters above an unsupported
         // layer remain live without forcing a UI-thread readback.
-        let mut execution_end = if want_cpu {
-            self.last_graph.cpu_from.unwrap_or(layers.len())
-        } else {
-            layers.len()
-        };
-        let first_dirty = first_dirty.min(execution_end);
-        let pass_dirty_rect = self.last_dirty_rect;
-        let deferred_at = if self.defer_full_field && pass_dirty_rect.is_some() && !want_cpu {
-            layers
-                .iter()
-                .enumerate()
-                .skip(first_dirty.saturating_add(1))
-                .take(execution_end.saturating_sub(first_dirty.saturating_add(1)))
-                .find_map(|(i, layer)| {
-                    plans[i]
-                        .filter(|plan| {
-                            layer.common.enabled && plan.dirty_policy == GpuDirtyPolicy::FullField
-                        })
-                        .map(|_| i)
-                })
-        } else {
-            None
-        };
-        if let Some(index) = deferred_at {
-            execution_end = index;
-            // Local-edit invalidation may mark only the edited generator. Keep the
-            // deferred pass and every consumer above it dirty so mouse-up refinement
-            // cannot take a stale top-of-stack cache hit.
-            self.dirty
-                .extend(layers.iter().skip(index).map(|layer| layer.id()));
-        }
+        let execution_end = prefix_end;
+        let first_dirty = bounded_first_dirty.min(execution_end);
         // Hybrid resume point (first unsupported we could only passthrough).
         let mut cpu_from = self.last_graph.cpu_from;
         let mut hybrid = false;
@@ -4670,7 +4778,7 @@ impl GpuTerrainEngine {
             if prefix_gpu && first_dirty > 0 {
                 drop(encoder);
                 self.dirty.extend(layers.iter().map(|l| l.id()));
-                return self.evaluate(
+                return self.evaluate_with_intent(
                     device,
                     queue,
                     stack,
@@ -4679,6 +4787,7 @@ impl GpuTerrainEngine {
                     quality,
                     want_cpu,
                     bridge_prefix,
+                    intent,
                 );
             }
             // Cannot seed — keep last-good on screen; async CPU must rebuild.
@@ -4689,7 +4798,7 @@ impl GpuTerrainEngine {
                 world_size: (metrics.world_size_x, metrics.world_size_z),
                 height_range: self.approx_range,
                 fully_gpu: false,
-                full_field_deferred: false,
+                freshness: GpuPreviewFreshness::Current,
                 cpu: None,
                 resume_cpu_from: Some(0),
                 did_eval: false,
@@ -4882,7 +4991,7 @@ impl GpuTerrainEngine {
                 world_size: (metrics.world_size_x, metrics.world_size_z),
                 height_range: self.approx_range,
                 fully_gpu,
-                full_field_deferred: deferred_at.is_some(),
+                freshness,
                 cpu: None,
                 resume_cpu_from: resume,
                 did_eval: true,
@@ -4908,7 +5017,7 @@ impl GpuTerrainEngine {
             world_size: (metrics.world_size_x, metrics.world_size_z),
             height_range: self.approx_range,
             fully_gpu: resume.is_none(),
-            full_field_deferred: false,
+            freshness: GpuPreviewFreshness::Current,
             cpu,
             resume_cpu_from: resume,
             did_eval: true,
@@ -8347,7 +8456,7 @@ mod smoke_tests {
         );
         let base_id = base.id();
         stack.push(base);
-        stack.push(Layer::new(
+        let river = Layer::new(
             "rivers",
             LayerKind::RiverCarve(RiverCarveParams {
                 accumulation_threshold: 2.0,
@@ -8356,7 +8465,9 @@ mod smoke_tests {
                 use_dinfinity: false,
                 ..RiverCarveParams::default()
             }),
-        ));
+        );
+        let river_id = river.id();
+        stack.push(river);
         stack.push(Layer::new("blur", LayerKind::Blur(BlurParams::default())));
 
         let mut engine = GpuTerrainEngine::new(&gpu.device, metrics.width);
@@ -8383,9 +8494,8 @@ mod smoke_tests {
         params.samples[16 * 32 + 16] += 3.0;
         engine.set_dirty_rect(Some((16, 16, 1, 1)));
         engine.mark_dirty(base_id);
-        engine.set_defer_full_field(true);
         let interactive = engine
-            .evaluate(
+            .evaluate_with_intent(
                 &gpu.device,
                 &gpu.queue,
                 &stack,
@@ -8394,14 +8504,27 @@ mod smoke_tests {
                 PreviewQuality::Draft,
                 false,
                 None,
+                GpuEvaluationIntent::InteractiveLocal,
             )
             .expect("interactive prefix");
-        assert!(interactive.full_field_deferred);
+        assert_eq!(
+            interactive.freshness,
+            GpuPreviewFreshness::Deferred {
+                from_index: 1,
+                from_layer: river_id,
+                deferred_layers: 2,
+            }
+        );
         assert!(!interactive.fully_gpu);
         assert_eq!(interactive.resume_cpu_from, None);
         assert_eq!(engine.executed_kernels, vec![GpuKernel::Sculpt]);
+        let stats = engine.last_eval_stats();
+        assert!(stats.used_layer_zero_region);
+        assert!(
+            stats.upload_bytes < u64::from(metrics.width * metrics.height * 4),
+            "interactive prefix must upload only the bounded edit"
+        );
 
-        engine.set_defer_full_field(false);
         let refined = engine
             .evaluate(
                 &gpu.device,
@@ -8414,11 +8537,142 @@ mod smoke_tests {
                 None,
             )
             .expect("refined full-field suffix");
-        assert!(!refined.full_field_deferred);
+        assert_eq!(refined.freshness, GpuPreviewFreshness::Current);
         assert!(refined.fully_gpu);
         assert_eq!(
             engine.executed_kernels,
             vec![GpuKernel::RiverCarve, GpuKernel::Blur]
+        );
+
+        engine.set_dirty_rect(Some((16, 16, 1, 1)));
+        engine.mark_dirty(river_id);
+        let boundary_edit = engine
+            .evaluate_with_intent(
+                &gpu.device,
+                &gpu.queue,
+                &stack,
+                &[],
+                metrics,
+                PreviewQuality::Draft,
+                false,
+                None,
+                GpuEvaluationIntent::InteractiveLocal,
+            )
+            .expect("edit at full-field boundary");
+        assert!(!boundary_edit.did_eval, "there is no exact local prefix");
+        assert_eq!(
+            boundary_edit.freshness,
+            GpuPreviewFreshness::Deferred {
+                from_index: 1,
+                from_layer: river_id,
+                deferred_layers: 2,
+            }
+        );
+        assert!(engine.executed_kernels.is_empty());
+    }
+
+    /// The first enabled FullField pass is a hard boundary: later FullField and
+    /// local layers all belong to one suffix and execute once during completion.
+    #[test]
+    fn local_edit_defers_entire_suffix_from_first_full_field_boundary() {
+        let Some(gpu) = terra_test_gpu::headless() else {
+            return;
+        };
+        let metrics = HeightfieldMetrics::new(16, 16, 160.0, 160.0);
+        let mut stack = LayerStack::new();
+        let base = Layer::new(
+            "base",
+            LayerKind::SculptBase(SculptParams::filled(16, 12.0)),
+        );
+        let base_id = base.id();
+        stack.push(base);
+        let river = Layer::new(
+            "rivers",
+            LayerKind::RiverCarve(RiverCarveParams {
+                accumulation_threshold: 2.0,
+                width: 1.0,
+                bank_smooth: 0.0,
+                use_dinfinity: false,
+                ..RiverCarveParams::default()
+            }),
+        );
+        let river_id = river.id();
+        stack.push(river);
+        stack.push(Layer::new(
+            "stream power",
+            LayerKind::StreamPowerErosion(StreamPowerParams {
+                iterations: 1,
+                k: 0.002,
+                base_level: 0.0,
+                ..StreamPowerParams::default()
+            }),
+        ));
+        stack.push(Layer::new("blur", LayerKind::Blur(BlurParams::default())));
+
+        let mut engine = GpuTerrainEngine::new(&gpu.device, metrics.width);
+        engine.mark_all_dirty(&stack);
+        engine
+            .evaluate(
+                &gpu.device,
+                &gpu.queue,
+                &stack,
+                &[],
+                metrics,
+                PreviewQuality::Draft,
+                false,
+                None,
+            )
+            .expect("warm multi-boundary stack");
+
+        let LayerKind::SculptBase(params) = &mut stack.find_mut(base_id).expect("base").kind else {
+            panic!("base changed kind");
+        };
+        params.samples[8 * 16 + 8] += 3.0;
+        engine.set_dirty_rect(Some((8, 8, 1, 1)));
+        engine.mark_dirty(base_id);
+        let interactive = engine
+            .evaluate_with_intent(
+                &gpu.device,
+                &gpu.queue,
+                &stack,
+                &[],
+                metrics,
+                PreviewQuality::Draft,
+                false,
+                None,
+                GpuEvaluationIntent::InteractiveLocal,
+            )
+            .expect("interactive prefix");
+        assert_eq!(
+            interactive.freshness,
+            GpuPreviewFreshness::Deferred {
+                from_index: 1,
+                from_layer: river_id,
+                deferred_layers: 3,
+            }
+        );
+        assert_eq!(engine.executed_kernels, vec![GpuKernel::Sculpt]);
+
+        let complete = engine
+            .evaluate(
+                &gpu.device,
+                &gpu.queue,
+                &stack,
+                &[],
+                metrics,
+                PreviewQuality::Draft,
+                false,
+                None,
+            )
+            .expect("complete entire suffix");
+        assert_eq!(complete.freshness, GpuPreviewFreshness::Current);
+        assert_eq!(
+            engine.executed_kernels,
+            vec![
+                GpuKernel::RiverCarve,
+                GpuKernel::StreamPower,
+                GpuKernel::Blur
+            ]
         );
     }
 
@@ -8472,9 +8726,8 @@ mod smoke_tests {
         params.samples[8 * 16 + 8] += 3.0;
         engine.set_dirty_rect(Some((8, 8, 1, 1)));
         engine.mark_dirty(base_id);
-        engine.set_defer_full_field(true);
         let interactive = engine
-            .evaluate(
+            .evaluate_with_intent(
                 &gpu.device,
                 &gpu.queue,
                 &stack,
@@ -8483,14 +8736,14 @@ mod smoke_tests {
                 PreviewQuality::Draft,
                 false,
                 None,
+                GpuEvaluationIntent::InteractiveLocal,
             )
             .expect("interactive stream-power prefix");
-        assert!(interactive.full_field_deferred);
+        assert!(interactive.freshness.is_deferred());
         assert!(!interactive.fully_gpu);
         assert_eq!(interactive.resume_cpu_from, None);
         assert_eq!(engine.executed_kernels, vec![GpuKernel::Sculpt]);
 
-        engine.set_defer_full_field(false);
         let refined = engine
             .evaluate(
                 &gpu.device,
@@ -8503,7 +8756,7 @@ mod smoke_tests {
                 None,
             )
             .expect("refined stream-power suffix");
-        assert!(!refined.full_field_deferred);
+        assert_eq!(refined.freshness, GpuPreviewFreshness::Current);
         assert!(refined.fully_gpu);
         assert_eq!(
             engine.executed_kernels,
@@ -8564,9 +8817,8 @@ mod smoke_tests {
         params.samples[8 * 16 + 8] += 3.0;
         engine.set_dirty_rect(Some((8, 8, 1, 1)));
         engine.mark_dirty(base_id);
-        engine.set_defer_full_field(true);
         let interactive = engine
-            .evaluate(
+            .evaluate_with_intent(
                 &gpu.device,
                 &gpu.queue,
                 &stack,
@@ -8575,13 +8827,13 @@ mod smoke_tests {
                 PreviewQuality::Draft,
                 false,
                 None,
+                GpuEvaluationIntent::InteractiveLocal,
             )
             .expect("interactive multi-scale prefix");
-        assert!(interactive.full_field_deferred);
+        assert!(interactive.freshness.is_deferred());
         assert!(!interactive.fully_gpu);
         assert_eq!(engine.executed_kernels, vec![GpuKernel::Sculpt]);
 
-        engine.set_defer_full_field(false);
         let refined = engine
             .evaluate(
                 &gpu.device,
@@ -8594,7 +8846,7 @@ mod smoke_tests {
                 None,
             )
             .expect("refined multi-scale suffix");
-        assert!(!refined.full_field_deferred);
+        assert_eq!(refined.freshness, GpuPreviewFreshness::Current);
         assert!(refined.fully_gpu);
         assert_eq!(
             engine.executed_kernels,

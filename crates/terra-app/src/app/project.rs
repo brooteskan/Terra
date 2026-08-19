@@ -400,10 +400,14 @@ impl TerraApp {
         self.worker_dirty_region = None;
         self.worker_cache_res = None;
         self.worker_mark_all_dirty = true;
+        self.pending_gpu_dirty_region = None;
+        self.deferred_full_field = None;
+        self.full_field_refine_not_before = None;
         self.needs_height_upload = false;
         self.preview_dirty = true;
         self.ui_state.refining = false;
         self.ui_state.evaluation_failure = None;
+        self.ui_state.terrain_preview_freshness = crate::ui::TerrainPreviewFreshness::Current;
         self.ui_state.build_progress = None;
         self.ui_state.draft_displayed = false;
         self.ui_state.quality = PreviewQuality::Draft;

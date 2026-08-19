@@ -2,6 +2,7 @@ use std::time::Instant;
 
 use crate::ui::PanelAction;
 use terra_core::layer::LayerKind;
+use terra_gpu::GpuEvaluationIntent;
 
 use super::{LayerPointDrag, LayerPointKind, TerraApp};
 impl TerraApp {
@@ -11,7 +12,7 @@ impl TerraApp {
         }
         self.pending_eval = false;
         self.force_draft = true;
-        self.run_eval_step();
+        self.run_eval_step_with_intent(GpuEvaluationIntent::InteractiveLocal);
         self.last_refine = Instant::now();
     }
 

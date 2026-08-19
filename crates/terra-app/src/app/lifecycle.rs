@@ -2,10 +2,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::startup::{self, StartupError};
-use crate::ui::{resolve_shortcut_for_input, PanelAction, ShortcutChord, ShortcutModifiers};
+use crate::ui::{
+    resolve_shortcut_for_input, PanelAction, ShortcutChord, ShortcutModifiers,
+    TerrainPreviewFreshness,
+};
 use terra_core::command::EditorCommand;
 use terra_core::eval::{EvalWorkerEvent, PreviewQuality};
-use terra_gpu::{GpuTerrainEngine, GpuTileAtlas};
+use terra_gpu::{GpuEvaluationIntent, GpuTerrainEngine, GpuTileAtlas};
 use terra_gui::{Color, GuiContext, GuiInput, GuiRenderer, GuiState, Rect};
 use terra_render::{GpuContext, TerrainRenderer};
 use winit::application::ApplicationHandler;
@@ -17,7 +20,7 @@ use winit::window::{Window, WindowId};
 use super::helpers::{search_character, ui_tool_search_focused};
 use super::{
     quality_in_flight_progress, quality_stage_progress, AppScreen, TerraApp, EDIT_DEBOUNCE_MS,
-    REFINE_INTERVAL_MS,
+    FULL_FIELD_REFINE_MS, REFINE_INTERVAL_MS,
 };
 
 impl ApplicationHandler for TerraApp {
@@ -573,10 +576,6 @@ impl ApplicationHandler for TerraApp {
                 engine.set_simulation_iteration_cap(
                     refinement_state.simulation_iteration_cap(),
                 );
-                engine.set_defer_full_field(matches!(
-                    refinement_state,
-                    terra_core::EditorRefinementState::Interactive
-                ));
             }
             // The worker is never awaited: drain available completion/failure events.
             while let Some(event) = self.eval_worker.try_recv_event() {
@@ -624,6 +623,10 @@ impl ApplicationHandler for TerraApp {
                         self.preview_dirty = true;
                         self.needs_height_upload = true;
                         self.worker_refine_pending = false;
+                        self.pending_gpu_dirty_region = None;
+                        self.deferred_full_field = None;
+                        self.ui_state.terrain_preview_freshness =
+                            TerrainPreviewFreshness::Current;
                         // Loss-proof transport: a *fresh* result for this token proves
                         // no edit occurred after its submit (an edit bumps the token,
                         // making the result stale-discarded below), so the accumulators
@@ -715,10 +718,69 @@ impl ApplicationHandler for TerraApp {
                 if ready {
                     self.pending_eval = false;
                     self.force_draft = true;
-                    self.run_eval_step();
+                    let intent = if self.pending_gpu_dirty_region.is_some() {
+                        GpuEvaluationIntent::InteractiveLocal
+                    } else {
+                        GpuEvaluationIntent::Complete
+                    };
+                    self.run_eval_step_with_intent(intent);
                     self.last_refine = Instant::now();
                     did_eval = true;
                 }
+            }
+
+            // A bounded edit keeps presenting its exact local prefix during the
+            // gesture. Mouse-up starts one coalescing window for the entire globally
+            // coupled suffix; mouse moves never push this deadline forward.
+            if self
+                .deferred_full_field
+                .as_ref()
+                .is_some_and(|pending| pending.generation != self.eval_token)
+            {
+                self.deferred_full_field = None;
+                self.full_field_refine_not_before = None;
+            }
+            if let Some(pending) = self.deferred_full_field.as_mut() {
+                if live_paint {
+                    pending.hold_during_gesture();
+                    self.ui_state.terrain_preview_freshness = TerrainPreviewFreshness::Deferred {
+                        layer_name: pending.layer_name.clone(),
+                        deferred_layers: pending.deferred_layers,
+                        settling: false,
+                    };
+                } else {
+                    let now = Instant::now();
+                    if pending.arm_after_gesture(now) {
+                        self.full_field_refine_not_before =
+                            Some(now + Duration::from_millis(FULL_FIELD_REFINE_MS));
+                        self.ui_state.terrain_preview_freshness =
+                            TerrainPreviewFreshness::Deferred {
+                                layer_name: pending.layer_name.clone(),
+                                deferred_layers: pending.deferred_layers,
+                                settling: true,
+                            };
+                    }
+                }
+            }
+            let suffix_ready = self
+                .deferred_full_field
+                .as_ref()
+                .is_some_and(|pending| pending.ready(self.eval_token, Instant::now()))
+                && !self.pending_eval
+                && !self.worker_refine_pending;
+            if suffix_ready {
+                if let Some(pending) = self.deferred_full_field.as_ref() {
+                    self.ui_state.terrain_preview_freshness =
+                        TerrainPreviewFreshness::RefiningSuffix {
+                            layer_name: pending.layer_name.clone(),
+                            quality: PreviewQuality::Draft,
+                        };
+                }
+                // Complete the Draft suffix before advancing the quality ladder.
+                self.scheduler.quality = PreviewQuality::Draft;
+                self.run_eval_step_with_intent(GpuEvaluationIntent::Complete);
+                self.last_refine = Instant::now();
+                did_eval = true;
             }
 
             // Expensive physics: only when automatic rebuild is on, debounce elapsed,
@@ -756,8 +818,13 @@ impl ApplicationHandler for TerraApp {
                 && self.ui_state.refining
                 && !self.pending_eval
                 && !self.worker_refine_pending
+                && self.deferred_full_field.is_none()
+                && self
+                    .full_field_refine_not_before
+                    .is_none_or(|deadline| Instant::now() >= deadline)
                 && self.last_refine.elapsed().as_millis() >= REFINE_INTERVAL_MS
             {
+                self.full_field_refine_not_before = None;
                 if self.scheduler.advance_quality() {
                     // HD preview: skip Medium so Camera/Zone sees Full carve sooner.
                     if !matches!(
@@ -824,6 +891,8 @@ impl ApplicationHandler for TerraApp {
             work_pending = self.pending_eval
                 || self.worker_refine_pending
                 || self.ui_state.refining
+                || self.deferred_full_field.is_some()
+                || self.full_field_refine_not_before.is_some()
                 || !self.pending_tile_uploads.is_empty()
                 || export_busy
                 || jobs.any_pending;
@@ -840,6 +909,13 @@ impl ApplicationHandler for TerraApp {
             event_loop.set_control_flow(ControlFlow::WaitUntil(
                 Instant::now() + Duration::from_millis(16),
             ));
+        } else if let Some(deadline) = self
+            .deferred_full_field
+            .as_ref()
+            .and_then(|pending| pending.settle_at)
+            .filter(|deadline| *deadline > Instant::now())
+        {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
         } else if work_pending {
             let wait_ms = if self.pending_eval {
                 // live_paint is impossible here: it took the ControlFlow::Poll arm above.
