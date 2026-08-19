@@ -33,6 +33,8 @@ Errors compare complete GPU and CPU height fields. Normalized RMSE uses the maxi
 | `filter.terrace` | Default outer composite | 8.5 | 0.10 |
 | `simulation.thermal` | Non-layered, constant hardness, no weathering extension | 3.2 | 0.05 |
 | `simulation.hydraulic` | Base transport, no sources, particles, layers, or post-effects | 3.0 | 0.03 |
+| `simulation.river-carve.d8` | D8 routing, no guide mask, bounded bank radius | 0.001 | 0.00001 |
+| `simulation.river-carve.d-infinity` | D-infinity authored mode approximated by D8 preview, no guide mask, bounded bank radius | 6.0 | 0.02 |
 | `shape.mountains` | Mountains with reproducible 32-bit seed streams | 10.0 | 0.005 |
 | `shape.dunes` | Default transport controls, 2-4 octaves, reproducible 32-bit seed stream | 36.0 | 0.78 |
 | `shape.canyons` | Canyons with a 32-bit seed | 0.001 | 0.00001 |
@@ -50,7 +52,8 @@ Errors compare complete GPU and CPU height fields. Normalized RMSE uses the maxi
 - GPU hydraulic omits full neighbor water/sediment gather (atomic-free preview).
 - GPU value noise is a portable hash approximation, not bit-identical to CPU.
 - Multi-entry distributions, non-Multiply combines, mask asset operations, missing assets, and Noise/Curvature mask sources fall back to CPU.
-- OpenSimplex/Worley generators, OpenSimplex fBm/ridged configurations, non-default dune transport controls, RiverCarve, and unratcheted EffectFilter variants fall back to CPU. They may return only after gaining a named full-field contract.
+- OpenSimplex/Worley generators, OpenSimplex fBm/ridged configurations, non-default dune transport controls, and unratcheted EffectFilter variants fall back to CPU. They may return only after gaining a named full-field contract.
+- RiverCarve preview uses iterative D8 routing for both authored routing modes and omits guide-mask bias; guided configurations fall back to CPU. D8 is exact-height class on the monotone drainage fixture, while authored D-infinity has its own bounded approximation contract. CPU priority-fill routing and auxiliary flow/accumulation/wetness fields remain authoritative for export and downstream auxiliary consumers.
 - Seeds/derived octave streams outside 32 bits and noise configurations above 12 octaves fall back instead of being truncated.
 - Layered/source-driven/multilevel thermal and particle/layered/source-driven hydraulic configurations fall back to CPU.
 - SculptStrokes previews the per-sample stroke kinds (Raise/Lower/Ridge/Valley/Inflate/Terrace/Noise, the distance stamps, and the aux-only kinds) plus Smooth, Pinch, and Coastline, whose base-3x3 pull the stamp kernel reads directly from the layer input (Pinch at a 1.25 overdrive; Coastline a lower-and-blend toward that mean under a weight gate), and Flatten, whose footprint mean a reduce/resolve pair measures against the running field before the stamp path applies it (the stroke run is segmented at each Flatten). Every stroke kind now previews on the GPU. It is a height-only preview — the CPU eval remains authoritative for the protection/uplift/hardness/sediment/edit-region aux, so a stroke layer resumes on CPU whenever an enabled downstream layer consumes that aux.

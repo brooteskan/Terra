@@ -11,7 +11,7 @@
 use crate::effect_filter::resolve_effect_mode;
 use crate::graph::{
     compile_gpu_graph, expand_dirty_rect, gpu_blend_mode, GpuComputeGraph, GpuDirtyPolicy,
-    GpuKernel, BLUR_MAX_RADIUS, EFFECT_FILTER_MAX_RADIUS,
+    GpuKernel, BLUR_MAX_RADIUS, EFFECT_FILTER_MAX_RADIUS, RIVER_CARVE_MAX_RADIUS,
 };
 use crate::{readback_f32, GpuError};
 use bytemuck::{Pod, Zeroable};
@@ -818,6 +818,9 @@ pub struct GpuEvalResult {
     pub world_size: (f32, f32),
     pub height_range: (f32, f32),
     pub fully_gpu: bool,
+    /// True when interactive local-edit policy intentionally stopped before a
+    /// full-field pass. The unexecuted suffix remains dirty for refinement.
+    pub full_field_deferred: bool,
     pub cpu: Option<Heightfield>,
     /// First flattened layer that must resume on the CPU. When this is `Some(n)`,
     /// `cpu` is the height entering layer `n`; `Some(0)` is a full-CPU restart seed.
@@ -889,6 +892,9 @@ pub struct GpuTerrainEngine {
     last_quality: Option<PreviewQuality>,
     /// Maximum thermal/hydraulic iterations submitted in one interactive tick.
     pub max_sim_iters_per_tick: u32,
+    /// During local interaction, stop before a full-field-coupled pass and leave
+    /// its suffix dirty for the next refinement evaluation.
+    defer_full_field: bool,
     /// Last compiled GPU pass graph for the evaluated stack.
     pub last_graph: GpuComputeGraph,
     /// Kernels dispatched by the most recent `evaluate` walk, in order — the
@@ -1263,6 +1269,7 @@ impl GpuTerrainEngine {
             last_dirty_rect: None,
             last_quality: None,
             max_sim_iters_per_tick: 8,
+            defer_full_field: false,
             last_graph: GpuComputeGraph::default(),
             #[cfg(test)]
             executed_kernels: Vec::new(),
@@ -1283,6 +1290,13 @@ impl GpuTerrainEngine {
     /// `None` means uncapped (export / full quality).
     pub fn set_simulation_iteration_cap(&mut self, cap: Option<u32>) {
         self.max_sim_iters_per_tick = cap.unwrap_or(u32::MAX);
+    }
+
+    /// Configure interactive deferral of full-field-coupled passes. Deferral is
+    /// applied only when a local dirty rectangle is present and a local prefix
+    /// can still be evaluated and presented.
+    pub fn set_defer_full_field(&mut self, defer: bool) {
+        self.defer_full_field = defer;
     }
 
     pub fn take_dirty_region(&mut self, pad: u32) -> Option<SampleRect> {
@@ -1991,7 +2005,7 @@ impl GpuTerrainEngine {
             max_radius: match quality {
                 PreviewQuality::Draft => 12,
                 PreviewQuality::Medium => 20,
-                PreviewQuality::Full | PreviewQuality::Export => 32,
+                PreviewQuality::Full | PreviewQuality::Export => RIVER_CARVE_MAX_RADIUS,
             },
             _pad: 0,
         };
@@ -2383,6 +2397,7 @@ impl GpuTerrainEngine {
                 world_size: (metrics.world_size_x, metrics.world_size_z),
                 height_range: (0.0, 0.0),
                 fully_gpu: true,
+                full_field_deferred: false,
                 cpu: if want_cpu {
                     Some(Heightfield::zeros(metrics))
                 } else {
@@ -2439,6 +2454,7 @@ impl GpuTerrainEngine {
                             world_size: (metrics.world_size_x, metrics.world_size_z),
                             height_range: self.approx_range,
                             fully_gpu: true,
+                            full_field_deferred: false,
                             cpu,
                             resume_cpu_from: None,
                             did_eval: true,
@@ -2451,12 +2467,38 @@ impl GpuTerrainEngine {
         // A real CPU checkpoint stops before the first unsupported layer. Interactive
         // preview keeps walking the whole suffix so supported filters above an unsupported
         // layer remain live without forcing a UI-thread readback.
-        let execution_end = if want_cpu {
+        let mut execution_end = if want_cpu {
             self.last_graph.cpu_from.unwrap_or(layers.len())
         } else {
             layers.len()
         };
         let first_dirty = first_dirty.min(execution_end);
+        let pass_dirty_rect = self.last_dirty_rect;
+        let deferred_at = if self.defer_full_field && pass_dirty_rect.is_some() && !want_cpu {
+            layers
+                .iter()
+                .enumerate()
+                .skip(first_dirty.saturating_add(1))
+                .take(execution_end.saturating_sub(first_dirty.saturating_add(1)))
+                .find_map(|(i, layer)| {
+                    plans[i]
+                        .filter(|plan| {
+                            layer.common.enabled
+                                && plan.dirty_policy == GpuDirtyPolicy::FullField
+                        })
+                        .map(|_| i)
+                })
+        } else {
+            None
+        };
+        if let Some(index) = deferred_at {
+            execution_end = index;
+            // Local-edit invalidation may mark only the edited generator. Keep the
+            // deferred pass and every consumer above it dirty so mouse-up refinement
+            // cannot take a stale top-of-stack cache hit.
+            self.dirty
+                .extend(layers.iter().skip(index).map(|layer| layer.id()));
+        }
         // Hybrid resume point (first unsupported we could only passthrough).
         let mut cpu_from = self.last_graph.cpu_from;
         let mut hybrid = false;
@@ -2470,13 +2512,12 @@ impl GpuTerrainEngine {
         // A full re-evaluation or quality change affects every sample and needs a
         // full present. A local sculpt edit (dirty rect, first_dirty > 0) can instead
         // update just the touched region — but that region must be sized from the
-        // compiled plan: a full-field-coupled pass (thermal/hydraulic) invalidates any
+        // compiled plan: a full-field-coupled pass (thermal/hydraulic/river) invalidates any
         // local rect, and otherwise the rect expands by each executed local pass's
         // reach (per-iteration halo x its executed iteration count) so the edit
         // resolves correctly and the present covers every texel the kernels rewrite.
         // The expanded rect drives both compute dispatch and presentation — one
         // region, no drift, and no stale leftover rect from a prior stroke.
-        let pass_dirty_rect = self.last_dirty_rect;
         let mut halo_texels: u32 = 0;
         let mut force_full_field = false;
         for (i, layer) in layers
@@ -2601,6 +2642,7 @@ impl GpuTerrainEngine {
                 world_size: (metrics.world_size_x, metrics.world_size_z),
                 height_range: self.approx_range,
                 fully_gpu: false,
+                full_field_deferred: false,
                 cpu: None,
                 resume_cpu_from: Some(0),
                 did_eval: false,
@@ -2724,8 +2766,8 @@ impl GpuTerrainEngine {
         queue.submit(Some(encoder.finish()));
         self.last_dirty_rect = None;
 
-        let fully_gpu = cpu_from.is_none() && !hybrid;
-        let resume = if fully_gpu {
+        let fully_gpu = deferred_at.is_none() && cpu_from.is_none() && !hybrid;
+        let resume = if deferred_at.is_some() || fully_gpu {
             None
         } else {
             cpu_from.or(Some(first_dirty))
@@ -2740,6 +2782,7 @@ impl GpuTerrainEngine {
                 world_size: (metrics.world_size_x, metrics.world_size_z),
                 height_range: self.approx_range,
                 fully_gpu,
+                full_field_deferred: deferred_at.is_some(),
                 cpu: None,
                 resume_cpu_from: resume,
                 did_eval: true,
@@ -2765,6 +2808,7 @@ impl GpuTerrainEngine {
             world_size: (metrics.world_size_x, metrics.world_size_z),
             height_range: self.approx_range,
             fully_gpu: resume.is_none(),
+            full_field_deferred: false,
             cpu,
             resume_cpu_from: resume,
             did_eval: true,
@@ -4234,7 +4278,7 @@ mod smoke_tests {
         BlendMode, BlurParams, CoastalParams, DomainWarpParams, EffectFilterParams, FbmParams,
         FlatParams, FractalNoiseType, GroupInputMode, IslandParams, Layer, LayerGroup, LayerKind,
         LayerStack, MaterialsParams, NamedOutputDecl, NoiseParams, SculptParams, StackNode,
-        ThermalErosionParams,
+        RiverCarveParams, ThermalErosionParams,
     };
     use terra_core::mask::{
         bake_mask_assets, DistributionEntry, MaskAsset, MaskCombine, MaskId, MaskOp, MaskRef,
@@ -5450,6 +5494,97 @@ mod smoke_tests {
         assert!(
             !engine.executed_kernels.contains(&GpuKernel::Shape),
             "cached Volcano contribution must avoid Shape dispatch"
+        );
+    }
+
+    /// #127 interaction policy: a local edit may update its cheap prefix while a
+    /// full-field river pass waits for refinement. The deferred suffix must stay
+    /// dirty so the next non-interactive evaluation cannot reuse a stale top cache.
+    #[test]
+    fn local_edit_defers_full_field_river_suffix_until_refinement() {
+        let Some(gpu) = terra_test_gpu::headless() else {
+            return;
+        };
+        let metrics = HeightfieldMetrics::new(32, 32, 320.0, 320.0);
+        let mut stack = LayerStack::new();
+        let base = Layer::new("base", LayerKind::SculptBase(SculptParams::filled(32, 12.0)));
+        let base_id = base.id();
+        stack.push(base);
+        stack.push(Layer::new(
+            "rivers",
+            LayerKind::RiverCarve(RiverCarveParams {
+                accumulation_threshold: 2.0,
+                width: 1.0,
+                bank_smooth: 0.0,
+                use_dinfinity: false,
+                ..RiverCarveParams::default()
+            }),
+        ));
+        stack.push(Layer::new(
+            "blur",
+            LayerKind::Blur(BlurParams::default()),
+        ));
+
+        let mut engine = GpuTerrainEngine::new(&gpu.device, metrics.width);
+        engine.mark_all_dirty(&stack);
+        engine
+            .evaluate(
+                &gpu.device,
+                &gpu.queue,
+                &stack,
+                &[],
+                metrics,
+                PreviewQuality::Draft,
+                false,
+                None,
+            )
+            .expect("warm full stack");
+
+        let Some(layer) = stack.find_mut(base_id) else {
+            panic!("base layer disappeared");
+        };
+        let LayerKind::SculptBase(params) = &mut layer.kind else {
+            panic!("base changed kind");
+        };
+        params.samples[16 * 32 + 16] += 3.0;
+        engine.set_dirty_rect(Some((16, 16, 1, 1)));
+        engine.mark_dirty(base_id);
+        engine.set_defer_full_field(true);
+        let interactive = engine
+            .evaluate(
+                &gpu.device,
+                &gpu.queue,
+                &stack,
+                &[],
+                metrics,
+                PreviewQuality::Draft,
+                false,
+                None,
+            )
+            .expect("interactive prefix");
+        assert!(interactive.full_field_deferred);
+        assert!(!interactive.fully_gpu);
+        assert_eq!(interactive.resume_cpu_from, None);
+        assert_eq!(engine.executed_kernels, vec![GpuKernel::Sculpt]);
+
+        engine.set_defer_full_field(false);
+        let refined = engine
+            .evaluate(
+                &gpu.device,
+                &gpu.queue,
+                &stack,
+                &[],
+                metrics,
+                PreviewQuality::Draft,
+                false,
+                None,
+            )
+            .expect("refined full-field suffix");
+        assert!(!refined.full_field_deferred);
+        assert!(refined.fully_gpu);
+        assert_eq!(
+            engine.executed_kernels,
+            vec![GpuKernel::RiverCarve, GpuKernel::Blur]
         );
     }
 

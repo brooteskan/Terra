@@ -8,7 +8,8 @@
 
 use terra_core::layer::{
     BlendMode, DuneParams, EffectFilterKind, FractalNoiseType, IslandArchetype, IslandParams,
-    Layer, LayerKind, LayerStack, MountainParams, SculptStrokeKind, TransportModel, UpliftParams,
+    Layer, LayerKind, LayerStack, MountainParams, RiverCarveParams, SculptStrokeKind,
+    TransportModel, UpliftParams,
 };
 use terra_core::mask::{MaskAsset, MaskCombine, MaskSource};
 
@@ -16,6 +17,9 @@ use terra_core::mask::{MaskAsset, MaskCombine, MaskSource};
 pub const BLUR_MAX_RADIUS: u32 = 8;
 /// Max per-iteration reach the EffectFilter kernel executes.
 pub const EFFECT_FILTER_MAX_RADIUS: u32 = 16;
+/// Largest full-quality RiverCarve bank radius represented by the gather shader.
+/// Wider authored banks remain on the CPU oracle instead of being silently clipped.
+pub const RIVER_CARVE_MAX_RADIUS: u32 = 40;
 /// Upper bound executed by the interactive noise shader. Larger authored
 /// fractals remain on the CPU oracle rather than silently dropping octaves.
 const NOISE_MAX_OCTAVES: u32 = 12;
@@ -267,6 +271,25 @@ fn hydraulic_config_supported(p: &terra_core::layer::HydraulicErosionParams) -> 
         && p.level_step_curve.is_empty()
 }
 
+/// The current RiverCarve preview is height-only and uses bounded iterative D8
+/// accumulation. D-infinity is an explicitly parity-bounded preview approximation,
+/// but effective guide masks and banks wider than the gather kernel can represent
+/// must stay on the CPU oracle.
+fn river_carve_config_supported(p: &RiverCarveParams) -> bool {
+    let guide_is_inert = matches!(p.guide, MaskSource::None) || p.guide_boost.max(0.0) <= 1.0e-6;
+    let max_bank_radius = p.width.max(1.0)
+        * 4.0
+        * (1.0 + p.bank_smooth.max(0.0) * 0.75);
+    p.accumulation_threshold.is_finite()
+        && p.accumulation_threshold >= 1.0e-3
+        && p.depth.is_finite()
+        && p.width.is_finite()
+        && p.bank_smooth.is_finite()
+        && p.guide_boost.is_finite()
+        && guide_is_inert
+        && max_bank_radius <= RIVER_CARVE_MAX_RADIUS as f32
+}
+
 fn gpu_plan_for_layer(layer: &Layer, mask_assets: &[MaskAsset]) -> Option<GpuLayerPlan> {
     use LayerKind::*;
     if !gpu_mask_supported(layer, mask_assets) {
@@ -417,6 +440,9 @@ fn gpu_plan_for_layer(layer: &Layer, mask_assets: &[MaskAsset]) -> Option<GpuLay
         {
             (GpuKernel::Hydraulic, GpuDirtyPolicy::FullField, 0)
         }
+        RiverCarve(p) if river_carve_config_supported(p) && inplace_composite_supported(layer) => {
+            (GpuKernel::RiverCarve, GpuDirtyPolicy::FullField, 0)
+        }
         ThermalErosion(_) | HydraulicErosion(_) | RiverCarve(_) => return None,
         // These CPU operations either modify height without a GPU kernel or publish
         // observable auxiliary fields that the GPU preview cannot currently produce.
@@ -548,6 +574,10 @@ mod tests {
                     ..HydraulicErosionParams::default()
                 }),
             ),
+            Layer::new(
+                "river carve",
+                LayerKind::RiverCarve(RiverCarveParams::default()),
+            ),
         ]
     }
 
@@ -612,7 +642,7 @@ mod tests {
         }
         assert!(
             saw_full_field,
-            "expected at least one FullField GPU plan (thermal/hydraulic) to exercise the constraint"
+            "expected at least one FullField GPU plan to exercise the constraint"
         );
 
         // Terrace: GPU localizes it, CPU is deliberately stricter.
@@ -955,10 +985,6 @@ mod tests {
                 LayerKind::Dunes(custom_transport_dunes),
             ),
             Layer::new(
-                "D-infinity river",
-                LayerKind::RiverCarve(RiverCarveParams::default()),
-            ),
-            Layer::new(
                 "layered thermal",
                 LayerKind::ThermalErosion(ThermalErosionParams::default()),
             ),
@@ -971,6 +997,56 @@ mod tests {
             assert!(!layer_gpu_supported(&layer, &[]), "{}", layer.common.name);
             assert_eq!(single_layer_graph(layer).cpu_from, Some(0));
         }
+    }
+
+    #[test]
+    fn river_carve_support_is_full_field_and_semantics_preserving() {
+        let default = Layer::new(
+            "D-infinity river",
+            LayerKind::RiverCarve(RiverCarveParams::default()),
+        );
+        let plan = gpu_plan_for_layer(&default, &[]).expect("default RiverCarve should compile");
+        assert_eq!(plan.kernel, GpuKernel::RiverCarve);
+        assert_eq!(plan.dirty_policy, GpuDirtyPolicy::FullField);
+        assert_eq!(plan.halo_texels, 0);
+
+        let mut guided = RiverCarveParams::default();
+        guided.guide = MaskSource::Wetness;
+        assert!(!layer_gpu_supported(
+            &Layer::new("guided", LayerKind::RiverCarve(guided)),
+            &[]
+        ));
+
+        let inert_guide = RiverCarveParams {
+            guide: MaskSource::Wetness,
+            guide_boost: 0.0,
+            ..RiverCarveParams::default()
+        };
+        assert!(layer_gpu_supported(
+            &Layer::new("inert guide", LayerKind::RiverCarve(inert_guide)),
+            &[]
+        ));
+
+        let too_wide = RiverCarveParams {
+            bank_smooth: 3.0,
+            ..RiverCarveParams::default()
+        };
+        assert!(!layer_gpu_supported(
+            &Layer::new("wide banks", LayerKind::RiverCarve(too_wide)),
+            &[]
+        ));
+
+        let invalid_threshold = RiverCarveParams {
+            accumulation_threshold: 0.0,
+            ..RiverCarveParams::default()
+        };
+        assert!(!layer_gpu_supported(
+            &Layer::new(
+                "invalid threshold",
+                LayerKind::RiverCarve(invalid_threshold)
+            ),
+            &[]
+        ));
     }
 
     #[test]

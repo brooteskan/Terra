@@ -569,12 +569,14 @@ impl ApplicationHandler for TerraApp {
                 renderer.set_interaction_state(self.terrain_runtime.refinement.state());
             }
             if let Some(engine) = self.gpu_engine.as_mut() {
+                let refinement_state = self.terrain_runtime.refinement.state();
                 engine.set_simulation_iteration_cap(
-                    self.terrain_runtime
-                        .refinement
-                        .state()
-                        .simulation_iteration_cap(),
+                    refinement_state.simulation_iteration_cap(),
                 );
+                engine.set_defer_full_field(matches!(
+                    refinement_state,
+                    terra_core::EditorRefinementState::Interactive
+                ));
             }
             // The worker is never awaited: drain available completion/failure events.
             while let Some(event) = self.eval_worker.try_recv_event() {

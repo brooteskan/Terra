@@ -15,6 +15,7 @@ pub use engine::{GpuEvalResult, GpuTerrainEngine};
 pub use graph::{
     compile_gpu_graph, expand_dirty_rect, layer_gpu_supported, GpuComputeGraph, GpuDirtyPolicy,
     GpuKernel, GpuLayerPlan, BLUR_MAX_RADIUS, EFFECT_FILTER_MAX_RADIUS,
+    RIVER_CARVE_MAX_RADIUS,
 };
 pub use tile_cache::{GpuPageTableEntry, GpuTileAtlas, GpuTileCacheError, GpuTileUpload};
 

@@ -52,7 +52,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
             let sigma = channel_width * max(0.35 + bank_smooth * 0.2, 0.1);
             let falloff = exp(-0.5 * (dist / sigma) * (dist / sigma));
-            carve = max(carve, channel_depth * falloff);
+            // CPU RiverCarve subtracts every overlapping source contribution.
+            // This gather visits the same source-cell order for one destination.
+            carve += channel_depth * falloff;
         }
     }
 

@@ -24,25 +24,29 @@ fn acc_at(i: i32, j: i32) -> f32 {
     return textureLoad(acc_in, vec2<i32>(ii, jj), 0).r;
 }
 
-/// Steepest D8 downhill offset from (i,j). Returns (0,0) for pits / flats.
+const D8: array<vec2<i32>, 8> = array<vec2<i32>, 8>(
+    vec2<i32>(1, 0), vec2<i32>(1, 1), vec2<i32>(0, 1), vec2<i32>(-1, 1),
+    vec2<i32>(-1, 0), vec2<i32>(-1, -1), vec2<i32>(0, -1), vec2<i32>(1, -1),
+);
+
+/// Steepest D8 downhill offset from (i,j). The ordering and epsilon tie-break
+/// mirror terra-core's `flow_direction_d8`. Returns (0,0) for pits / flats.
 fn steepest_down(i: i32, j: i32) -> vec2<i32> {
     let h0 = h_at(i, j);
     var best_dh = 0.0;
     var best = vec2<i32>(0, 0);
-    for (var dj = -1; dj <= 1; dj++) {
-        for (var di = -1; di <= 1; di++) {
-            if (di == 0 && dj == 0) { continue; }
-            let ni = i + di;
-            let nj = j + dj;
-            if (ni < 0 || nj < 0 || ni >= i32(u.width) || nj >= i32(u.height)) {
-                continue;
-            }
-            let dist = select(1.41421356, 1.0, di == 0 || dj == 0);
-            let dh = (h0 - h_at(ni, nj)) / dist;
-            if (dh > best_dh) {
-                best_dh = dh;
-                best = vec2<i32>(di, dj);
-            }
+    for (var k = 0u; k < 8u; k++) {
+        let offset = D8[k];
+        let ni = i + offset.x;
+        let nj = j + offset.y;
+        if (ni < 0 || nj < 0 || ni >= i32(u.width) || nj >= i32(u.height)) {
+            continue;
+        }
+        let dist = select(1.0, 1.41421356, offset.x != 0 && offset.y != 0);
+        let dh = (h0 - h_at(ni, nj)) / dist;
+        if (dh > best_dh + 1e-12) {
+            best_dh = dh;
+            best = offset;
         }
     }
     return best;

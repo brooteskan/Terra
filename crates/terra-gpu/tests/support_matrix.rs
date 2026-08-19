@@ -3,10 +3,11 @@ use terra_core::heightfield::HeightfieldMetrics;
 use terra_core::layer::{
     BlendMode, CanyonParams, DomainWarpParams, DuneParams, EffectFilterKind, EffectFilterParams,
     FbmParams, FlatParams, FractalNoiseType, IslandParams, Layer, LayerKind, LayerStack,
-    LayerTypeRegistry, MesaParams, MountainParams, NoiseParams, PlateauParams, UpliftParams,
-    VolcanoParams,
+    LayerTypeRegistry, MesaParams, MountainParams, NoiseParams, PlateauParams, RiverCarveParams,
+    UpliftParams, VolcanoParams,
 };
-use terra_gpu::{compile_gpu_graph, layer_gpu_supported, GpuKernel};
+use terra_core::mask::MaskSource;
+use terra_gpu::{compile_gpu_graph, layer_gpu_supported, GpuDirtyPolicy, GpuKernel};
 
 fn graph_for(layer: Layer) -> terra_gpu::GpuComputeGraph {
     let mut stack = LayerStack::new();
@@ -64,6 +65,39 @@ fn every_effect_filter_variant_has_an_explicit_executable_plan() {
         } else {
             assert_eq!(graph.cpu_from, Some(0));
         }
+    }
+}
+
+#[test]
+fn river_carve_defaults_and_configuration_boundaries_are_explicit() {
+    let default = Layer::new(
+        "river",
+        LayerKind::RiverCarve(RiverCarveParams::default()),
+    );
+    let graph = graph_for(default);
+    assert!(graph.fully_gpu());
+    let plan = graph.plans[0].expect("RiverCarve plan");
+    assert_eq!(plan.kernel, GpuKernel::RiverCarve);
+    assert_eq!(plan.dirty_policy, GpuDirtyPolicy::FullField);
+
+    let unsupported = [
+        RiverCarveParams {
+            guide: MaskSource::Wetness,
+            ..RiverCarveParams::default()
+        },
+        RiverCarveParams {
+            bank_smooth: 3.0,
+            ..RiverCarveParams::default()
+        },
+        RiverCarveParams {
+            accumulation_threshold: 0.0,
+            ..RiverCarveParams::default()
+        },
+    ];
+    for params in unsupported {
+        let layer = Layer::new("unsupported river", LayerKind::RiverCarve(params));
+        assert!(!layer_gpu_supported(&layer, &[]));
+        assert_eq!(graph_for(layer).cpu_from, Some(0));
     }
 }
 

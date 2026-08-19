@@ -44,6 +44,12 @@ pub const THERMAL_PREVIEW: ParityTolerance = ParityTolerance::new(3.2, 5.0e-2);
 /// Hydraulic preview omits the CPU particle/detail pass. The fixture disables
 /// those extensions and bounds the remaining shallow-water approximation.
 pub const HYDRAULIC_PREVIEW: ParityTolerance = ParityTolerance::new(3.0, 3.0e-2);
+/// RiverCarve D8 preview uses bounded iterative accumulation and an additive
+/// gather carve. On the monotone drainage fixture it is exact-height class.
+pub const RIVER_CARVE_D8_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-3, 1.0e-5);
+/// The preview intentionally approximates D-infinity routing with D8. The CPU's
+/// priority-flood/D-infinity solver remains the export oracle.
+pub const RIVER_CARVE_DINFINITY_PREVIEW: ParityTolerance = ParityTolerance::new(6.0, 2.0e-2);
 /// Volcanic-island preview is intentionally a reduced massif/shelf model.
 pub const VOLCANIC_ISLAND_PREVIEW: ParityTolerance = ParityTolerance::new(220.0, 1.0e-1);
 /// GPU shape-family contracts (#126). These are separate named budgets because
@@ -124,6 +130,8 @@ pub const FIDELITY_MATRIX_MARKDOWN: &str = "\
 | `filter.terrace` | Default outer composite | 8.5 | 0.10 |\n\
 | `simulation.thermal` | Non-layered, constant hardness, no weathering extension | 3.2 | 0.05 |\n\
 | `simulation.hydraulic` | Base transport, no sources, particles, layers, or post-effects | 3.0 | 0.03 |\n\
+| `simulation.river-carve.d8` | D8 routing, no guide mask, bounded bank radius | 0.001 | 0.00001 |\n\
+| `simulation.river-carve.d-infinity` | D-infinity authored mode approximated by D8 preview, no guide mask, bounded bank radius | 6.0 | 0.02 |\n\
 | `shape.mountains` | Mountains with reproducible 32-bit seed streams | 10.0 | 0.005 |\n\
 | `shape.dunes` | Default transport controls, 2-4 octaves, reproducible 32-bit seed stream | 36.0 | 0.78 |\n\
 | `shape.canyons` | Canyons with a 32-bit seed | 0.001 | 0.00001 |\n\

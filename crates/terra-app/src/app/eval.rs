@@ -838,6 +838,7 @@ impl TerraApp {
                             // Interactive path: GPU present is authoritative for the frame.
                             // Never sync-evaluate CPU on the UI thread — that hangs the app
                             // when stacks include unsupported layers (painted masks, SPE, …).
+                            let full_field_deferred = result.full_field_deferred;
                             let needs_cpu_suffix = result.resume_cpu_from.is_some();
                             self.last_eval_fully_gpu = result.fully_gpu;
                             // want_cpu=false, so the GPU engine never returns a CPU prefix
@@ -859,8 +860,13 @@ impl TerraApp {
                                     self.enqueue_async_eval(quality);
                                 }
                             } else {
-                                self.ui_state.profile.path =
-                                    if needs_cpu_suffix { "GPU*" } else { "GPU" };
+                                self.ui_state.profile.path = if full_field_deferred {
+                                    "GPU (FullField deferred)"
+                                } else if needs_cpu_suffix {
+                                    "GPU*"
+                                } else {
+                                    "GPU"
+                                };
                                 if let Some(hf) = result.cpu {
                                     self.scheduler.last_good =
                                         Some(std::sync::Arc::new(hf.clone()));
@@ -869,7 +875,14 @@ impl TerraApp {
                                 }
                                 used_gpu = true;
                                 eval_completed = true;
-                                if needs_cpu_suffix {
+                                if full_field_deferred {
+                                    // Local generators are live while an expensive
+                                    // full-field suffix waits for mouse-up refinement.
+                                    // This is not a CPU fallback.
+                                    self.ui_state.refining = true;
+                                    self.ui_state.build_progress =
+                                        Some(quality_stage_progress(quality).max(0.15));
+                                } else if needs_cpu_suffix {
                                     // Unsupported layers need CPU bake at *this* quality
                                     // (not Draft), then lifecycle advances Draft→Medium→Full.
                                     self.ui_state.profile.path = "GPU→async CPU";
