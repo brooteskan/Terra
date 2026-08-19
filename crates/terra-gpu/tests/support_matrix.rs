@@ -1,10 +1,12 @@
 use terra_core::eval::{EvalContext, StackEvaluator};
 use terra_core::heightfield::HeightfieldMetrics;
 use terra_core::layer::{
-    BlendMode, CanyonParams, DomainWarpParams, DuneParams, EffectFilterKind, EffectFilterParams,
-    FbmParams, FlatParams, FractalNoiseType, IslandParams, Layer, LayerKind, LayerStack,
-    LayerTypeRegistry, MesaParams, MountainParams, MultiScaleAmplifyParams, NoiseParams,
-    PlateauParams, RiverCarveParams, StreamPowerParams, UpliftParams, VolcanoParams,
+    BiomesParams, BlendMode, CanyonParams, DomainWarpParams, DuneParams, EffectFilterKind,
+    EffectFilterParams, FbmParams, FlatParams, FractalNoiseType, IslandParams, Layer, LayerKind,
+    LayerStack, LayerTypeRegistry, MesaParams, MountainParams, MultiScaleAmplifyParams,
+    NoiseParams, PathNode, PathParams, PlateauParams, PolygonHeightMode, PolygonHeightParams,
+    ProceduralGenerator, ProceduralShapeParams, RiverCarveParams, StreamPowerParams, UpliftParams,
+    VolcanoParams,
 };
 use terra_core::mask::MaskSource;
 use terra_gpu::{compile_gpu_graph, layer_gpu_supported, GpuDirtyPolicy, GpuKernel};
@@ -41,6 +43,164 @@ fn every_builtin_default_has_consistent_public_support_graph_and_kernel() {
             );
         }
     }
+}
+
+#[test]
+fn authored_shape_layers_have_explicit_gpu_configuration_boundaries() {
+    let path = Layer::new(
+        "path",
+        LayerKind::Path(PathParams {
+            nodes: vec![
+                PathNode {
+                    u: 0.1,
+                    v: 0.2,
+                    height: 2.0,
+                    width: 1.0,
+                },
+                PathNode {
+                    u: 0.8,
+                    v: 0.7,
+                    height: 4.0,
+                    width: 0.8,
+                },
+            ],
+            ..PathParams::default()
+        }),
+    );
+    let path_graph = graph_for(path);
+    assert!(path_graph.fully_gpu());
+    assert_eq!(
+        path_graph.plans[0].expect("path plan").kernel,
+        GpuKernel::Path
+    );
+
+    let polygon = Layer::new(
+        "polygon",
+        LayerKind::PolygonHeight(PolygonHeightParams {
+            points: vec![[0.1, 0.1], [0.8, 0.2], [0.5, 0.9]],
+            mode: PolygonHeightMode::SetElevation,
+            carve: true,
+            ..PolygonHeightParams::default()
+        }),
+    );
+    let polygon_graph = graph_for(polygon);
+    assert!(polygon_graph.fully_gpu());
+    assert_eq!(
+        polygon_graph.plans[0].expect("polygon plan").kernel,
+        GpuKernel::PolygonHeight
+    );
+
+    for &generator in ProceduralGenerator::ALL {
+        let layer = Layer::new(
+            generator.label(),
+            LayerKind::ProceduralShape(ProceduralShapeParams::with_generator(generator)),
+        );
+        let supported = generator != ProceduralGenerator::Dunes;
+        assert_eq!(layer_gpu_supported(&layer, &[]), supported, "{generator:?}");
+        let graph = graph_for(layer);
+        assert_eq!(graph.fully_gpu(), supported, "{generator:?}");
+        if supported {
+            assert_eq!(
+                graph.plans[0].expect("procedural plan").kernel,
+                GpuKernel::ProceduralShape
+            );
+        }
+    }
+
+    let rejected = [
+        Layer::new(
+            "non-finite path",
+            LayerKind::Path(PathParams {
+                width: f32::NAN,
+                ..PathParams::default()
+            }),
+        ),
+        Layer::new(
+            "overflowing path seed",
+            LayerKind::Path(PathParams {
+                noise_strength: 1.0,
+                seed: u64::from(u32::MAX) + 1,
+                ..PathParams::default()
+            }),
+        ),
+        Layer::new(
+            "non-finite polygon",
+            LayerKind::PolygonHeight(PolygonHeightParams {
+                height: f32::NAN,
+                ..PolygonHeightParams::default()
+            }),
+        ),
+        Layer::new(
+            "iterative crater",
+            LayerKind::ProceduralShape(ProceduralShapeParams {
+                crater: EffectFilterParams {
+                    iterations: 2,
+                    ..EffectFilterParams::crater()
+                },
+                generator: ProceduralGenerator::Crater,
+                ..ProceduralShapeParams::default()
+            }),
+        ),
+    ];
+    for layer in rejected {
+        assert!(!layer_gpu_supported(&layer, &[]), "{}", layer.common.name);
+        assert_eq!(graph_for(layer).cpu_from, Some(0));
+    }
+}
+
+#[test]
+fn carved_path_is_demoted_only_when_later_wetness_is_observable() {
+    let make_path = |carve| {
+        Layer::new(
+            "path",
+            LayerKind::Path(PathParams {
+                carve,
+                nodes: vec![
+                    PathNode {
+                        u: 0.1,
+                        v: 0.2,
+                        height: 2.0,
+                        width: 1.0,
+                    },
+                    PathNode {
+                        u: 0.8,
+                        v: 0.7,
+                        height: 4.0,
+                        width: 0.8,
+                    },
+                ],
+                ..PathParams::default()
+            }),
+        )
+    };
+
+    let mut no_consumer = LayerStack::new();
+    no_consumer.push(make_path(true));
+    no_consumer.push(Layer::new(
+        "flat",
+        LayerKind::Flat(FlatParams { height: 1.0 }),
+    ));
+    assert!(compile_gpu_graph(&no_consumer, &[]).plans[0].is_some());
+
+    let mut consumer = LayerStack::new();
+    consumer.push(make_path(true));
+    consumer.push(Layer::new(
+        "biomes",
+        LayerKind::Biomes(BiomesParams::default()),
+    ));
+    let graph = compile_gpu_graph(&consumer, &[]);
+    assert!(graph.plans[0].is_none());
+    assert_eq!(graph.cpu_from, Some(0));
+
+    let mut raise_only = LayerStack::new();
+    raise_only.push(make_path(false));
+    raise_only.push(Layer::new(
+        "biomes",
+        LayerKind::Biomes(BiomesParams::default()),
+    ));
+    let graph = compile_gpu_graph(&raise_only, &[]);
+    assert!(graph.plans[0].is_some());
+    assert_eq!(graph.cpu_from, Some(1));
 }
 
 #[test]

@@ -25,8 +25,9 @@ use terra_core::fields::FieldId;
 use terra_core::heightfield::{Heightfield, HeightfieldMetrics, TileId};
 use terra_core::layer::{
     BlendMode, EffectFilterParams, FractalNoiseType, IslandArchetype, IslandParams, Layer, LayerId,
-    LayerKind, LayerStack, MultiScaleAmplifyParams, NoiseParams, PlateauParams, SculptParams,
-    SculptStroke, SculptStrokeKind, SculptStrokeParams,
+    LayerKind, LayerStack, MultiScaleAmplifyParams, NoiseParams, PathParams, PlateauParams,
+    PolygonHeightMode, PolygonHeightParams, ProceduralGenerator, ProceduralShapeParams,
+    SculptParams, SculptStroke, SculptStrokeKind, SculptStrokeParams,
 };
 use terra_core::mask::{MaskAsset, MaskSource};
 use terra_core::tiling::{SampleRect, TileScheduler};
@@ -243,6 +244,44 @@ struct SculptReconcileU {
     height: u32,
     reconcile: f32,
     _p0: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct PathU {
+    width: u32,
+    height: u32,
+    world_x: f32,
+    world_z: f32,
+    point_count: u32,
+    carve: u32,
+    seed: u32,
+    _pad0: u32,
+    base_width: f32,
+    falloff: f32,
+    noise_strength: f32,
+    noise_scale: f32,
+    height_offset: f32,
+    profile: f32,
+    _pad1: f32,
+    _pad2: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct PolygonHeightU {
+    width: u32,
+    height: u32,
+    world_x: f32,
+    world_z: f32,
+    point_count: u32,
+    mode: u32,
+    carve: u32,
+    _pad0: u32,
+    target_height: f32,
+    falloff: f32,
+    _pad1: f32,
+    _pad2: f32,
 }
 
 /// One stroke's GPU header. Layout mirrors `StrokeHeader` in
@@ -612,6 +651,7 @@ enum TexSlot {
     SedB,
     Rainfall,
     LooseSediment,
+    SculptStamp,
     Cache(LayerId),
     /// Pre-blend layer contribution (noise/shape/flat), reusable when only upstream changed.
     Contrib(LayerId),
@@ -862,6 +902,7 @@ fn layer_input_independent(kind: &LayerKind) -> bool {
             | LayerKind::Uplift(_)
             | LayerKind::Island(_)
             | LayerKind::DomainWarp(_)
+            | LayerKind::ProceduralShape(_)
     )
 }
 
@@ -874,11 +915,12 @@ fn cpu_resume_prefix_is_height_only(layers: &[&Layer], resume_index: usize) -> b
     layers.iter().take(resume_index).all(|layer| {
         !layer.common.enabled
             || (layer.common.outputs.is_empty()
-                && layer
-                    .kind
-                    .produced_fields()
-                    .into_iter()
-                    .all(|field| field == FieldId::Height))
+                && (matches!(&layer.kind, LayerKind::Path(params) if !params.carve)
+                    || layer
+                        .kind
+                        .produced_fields()
+                        .into_iter()
+                        .all(|field| field == FieldId::Height)))
     })
 }
 
@@ -929,6 +971,8 @@ pub struct GpuTerrainEngine {
     sculpt_strokes_flatten_reduce: Pipe,
     sculpt_strokes_flatten_resolve: Pipe,
     sculpt_strokes_reconcile: Pipe,
+    path_height: Pipe,
+    polygon_height: Pipe,
     uniform_pool: UniformPool,
     ping: HeightTex,
     pong: HeightTex,
@@ -1078,6 +1122,25 @@ impl GpuTerrainEngine {
             label: Some("plateau-bgl"),
             entries: &[uniform_entry(0), tex_read_entry(1), storage_write_entry(2)],
         });
+        let path_height_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("path-height-bgl"),
+            entries: &[
+                uniform_entry(0),
+                tex_read_entry(1),
+                storage_read_buffer_entry(2),
+                storage_write_entry(3),
+            ],
+        });
+        let polygon_height_bgl =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("polygon-height-bgl"),
+                entries: &[
+                    uniform_entry(0),
+                    tex_read_entry(1),
+                    storage_read_buffer_entry(2),
+                    storage_write_entry(3),
+                ],
+            });
         let river_accum_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("river-accum-bgl"),
             entries: &[
@@ -1185,6 +1248,18 @@ impl GpuTerrainEngine {
             "plateau",
             include_str!("shaders/plateau.wgsl"),
             plateau_bgl,
+        );
+        let path_height = make_pipe(
+            device,
+            "path-height",
+            include_str!("shaders/path_height.wgsl"),
+            path_height_bgl,
+        );
+        let polygon_height = make_pipe(
+            device,
+            "polygon-height",
+            include_str!("shaders/polygon_height.wgsl"),
+            polygon_height_bgl,
         );
         let river_accum = make_pipe(
             device,
@@ -1393,6 +1468,8 @@ impl GpuTerrainEngine {
             sculpt_strokes_flatten_reduce,
             sculpt_strokes_flatten_resolve,
             sculpt_strokes_reconcile,
+            path_height,
+            polygon_height,
             uniform_pool: UniformPool::new(device, 64),
             ping,
             pong,
@@ -1756,6 +1833,7 @@ impl GpuTerrainEngine {
             TexSlot::SedB => &self.sed_b.view,
             TexSlot::Rainfall => &self.rainfall.view,
             TexSlot::LooseSediment => &self.loose_sediment.view,
+            TexSlot::SculptStamp => &self.sculpt_stamp.view,
             TexSlot::Cache(id) => &self.layer_cache.get(&id).expect("cache").view,
             TexSlot::Contrib(id) => &self.layer_contrib.get(&id).expect("contrib").view,
         }
@@ -1910,6 +1988,18 @@ impl GpuTerrainEngine {
         p: &NoiseParams,
         dispatch: NoiseDispatch,
     ) {
+        self.gen_noise_to(device, queue, encoder, p, dispatch, TexSlot::Layer);
+    }
+
+    fn gen_noise_to(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        p: &NoiseParams,
+        dispatch: NoiseDispatch,
+        destination: TexSlot,
+    ) {
         let u = NoiseU {
             width: self.metrics.width,
             height: self.metrics.height,
@@ -1932,6 +2022,7 @@ impl GpuTerrainEngine {
             _pad: [0.0; 2],
         };
         let u_buf = self.write_uniform(device, queue, &u);
+        let destination = self.view_of(destination);
         let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("noise-bg"),
             layout: &self.noise.bgl,
@@ -1942,7 +2033,7 @@ impl GpuTerrainEngine {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&self.layer_tex.view),
+                    resource: wgpu::BindingResource::TextureView(destination),
                 },
             ],
         });
@@ -2075,6 +2166,23 @@ impl GpuTerrainEngine {
         encoder: &mut wgpu::CommandEncoder,
         p: &PlateauParams,
     ) {
+        let source = if self.current == 0 {
+            TexSlot::Ping
+        } else {
+            TexSlot::Pong
+        };
+        self.gen_plateau_between(device, queue, encoder, p, source, TexSlot::Layer);
+    }
+
+    fn gen_plateau_between(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        p: &PlateauParams,
+        source: TexSlot,
+        destination: TexSlot,
+    ) {
         let u = PlateauU {
             width: self.metrics.width,
             height: self.metrics.height,
@@ -2084,11 +2192,8 @@ impl GpuTerrainEngine {
             _pad: [0.0; 3],
         };
         let u_buf = self.write_uniform(device, queue, &u);
-        let src_view = if self.current == 0 {
-            &self.ping.view
-        } else {
-            &self.pong.view
-        };
+        let src_view = self.view_of(source);
+        let dst_view = self.view_of(destination);
         let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("plateau-bg"),
             layout: &self.plateau.bgl,
@@ -2103,7 +2208,7 @@ impl GpuTerrainEngine {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&self.layer_tex.view),
+                    resource: wgpu::BindingResource::TextureView(dst_view),
                 },
             ],
         });
@@ -2118,6 +2223,415 @@ impl GpuTerrainEngine {
             self.metrics.height.div_ceil(8),
             1,
         );
+    }
+
+    fn run_path_height(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        p: &PathParams,
+    ) {
+        let samples = terra_core::generators::path_samples(
+            p,
+            self.metrics.world_size_x,
+            self.metrics.world_size_z,
+        );
+        let mut points: Vec<[f32; 4]> = samples
+            .iter()
+            .map(|sample| [sample.x, sample.z, sample.height, sample.width])
+            .collect();
+        let point_count = points.len() as u32;
+        if points.is_empty() {
+            points.push([0.0; 4]);
+        }
+        let point_buffer = make_storage_buffer(
+            device,
+            queue,
+            "path-height-points",
+            bytemuck::cast_slice(&points),
+        );
+        let uniform = PathU {
+            width: self.metrics.width,
+            height: self.metrics.height,
+            world_x: self.metrics.world_size_x,
+            world_z: self.metrics.world_size_z,
+            point_count,
+            carve: u32::from(p.carve),
+            seed: p.seed as u32,
+            _pad0: 0,
+            base_width: p.width,
+            falloff: p.falloff,
+            noise_strength: p.noise_strength,
+            noise_scale: p.noise_scale,
+            height_offset: p.height_offset,
+            profile: p.profile,
+            _pad1: 0.0,
+            _pad2: 0.0,
+        };
+        let uniform_buffer = self.write_uniform(device, queue, &uniform);
+        let src = if self.current == 0 {
+            &self.ping.view
+        } else {
+            &self.pong.view
+        };
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("path-height-bg"),
+            layout: &self.path_height.bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(src),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: point_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&self.layer_tex.view),
+                },
+            ],
+        });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("path-height"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.path_height.pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(
+            self.metrics.width.div_ceil(8),
+            self.metrics.height.div_ceil(8),
+            1,
+        );
+    }
+
+    fn run_polygon_height(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        p: &PolygonHeightParams,
+    ) {
+        let mut points: Vec<[f32; 4]> = p
+            .points
+            .iter()
+            .map(|point| [point[0], point[1], 0.0, 0.0])
+            .collect();
+        let point_count = points.len() as u32;
+        if points.is_empty() {
+            points.push([0.0; 4]);
+        }
+        let point_buffer = make_storage_buffer(
+            device,
+            queue,
+            "polygon-height-points",
+            bytemuck::cast_slice(&points),
+        );
+        let short_axis = self
+            .metrics
+            .world_size_x
+            .min(self.metrics.world_size_z)
+            .max(1.0);
+        let uniform = PolygonHeightU {
+            width: self.metrics.width,
+            height: self.metrics.height,
+            world_x: self.metrics.world_size_x,
+            world_z: self.metrics.world_size_z,
+            point_count,
+            mode: match p.mode {
+                PolygonHeightMode::RaiseBy => 0,
+                PolygonHeightMode::SetElevation => 1,
+            },
+            carve: u32::from(p.carve),
+            _pad0: 0,
+            target_height: p.height,
+            falloff: (p.falloff.clamp(0.0, 0.5) * short_axis).max(1.0e-3),
+            _pad1: 0.0,
+            _pad2: 0.0,
+        };
+        let uniform_buffer = self.write_uniform(device, queue, &uniform);
+        let src = if self.current == 0 {
+            &self.ping.view
+        } else {
+            &self.pong.view
+        };
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("polygon-height-bg"),
+            layout: &self.polygon_height.bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(src),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: point_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&self.layer_tex.view),
+                },
+            ],
+        });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("polygon-height"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.polygon_height.pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(
+            self.metrics.width.div_ceil(8),
+            self.metrics.height.div_ceil(8),
+            1,
+        );
+    }
+
+    fn run_procedural_crater(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        p: &EffectFilterParams,
+    ) {
+        self.fill_slot(device, queue, encoder, TexSlot::SculptStamp, 80.0);
+        let spec = effect_filter_gpu_spec(p)
+            .expect("planner admitted only an executable procedural Crater");
+        let uniform = self.effect_filter_uniform(p, spec.mode, 1, (0, 0, 0, 0));
+        let uniform_buffer = self.write_uniform(device, queue, &uniform);
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("procedural-crater-bg"),
+            layout: &self.effect_filter.bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&self.sculpt_stamp.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&self.layer_tex.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.effect_filter_range_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("procedural-crater"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.effect_filter.pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(
+            self.metrics.width.div_ceil(8),
+            self.metrics.height.div_ceil(8),
+            1,
+        );
+    }
+
+    fn run_procedural_shape(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        p: &ProceduralShapeParams,
+    ) -> Result<(), GpuError> {
+        match p.generator {
+            ProceduralGenerator::Mountain => {
+                let q = &p.mountain;
+                self.gen_shape(
+                    device,
+                    queue,
+                    encoder,
+                    ShapeU {
+                        width: self.metrics.width,
+                        height: self.metrics.height,
+                        world_x: self.metrics.world_size_x,
+                        world_z: self.metrics.world_size_z,
+                        seed: q.base.seed as u32,
+                        octaves: q.base.octaves.max(1),
+                        frequency: q.base.frequency,
+                        amplitude: q.base.amplitude,
+                        lacunarity: q.base.lacunarity,
+                        persistence: q.base.persistence,
+                        offset_x: q.base.offset_x,
+                        offset_z: q.base.offset_z,
+                        ridge_sharpness: q.ridge_sharpness,
+                        range_angle: q.range_angle,
+                        range_width: q.range_width,
+                        wave_frequency: 0.0,
+                        asymmetry: 0.0,
+                        depth: 0.0,
+                        canyon_width: 0.0,
+                        meander: q.crest_detail,
+                        shape_mode: 0,
+                        _pad: 0,
+                    },
+                );
+                self.expand_range(0.0, q.base.amplitude);
+            }
+            ProceduralGenerator::Hills => {
+                let noise_type = Self::noise_type_u(p.hills.noise).ok_or(GpuError::RequiresCpu)?;
+                self.gen_noise(
+                    device,
+                    queue,
+                    encoder,
+                    &p.hills.base,
+                    NoiseDispatch::new(noise_type, NoiseKernelMode::Fbm),
+                );
+                let amplitude = p.hills.base.amplitude.abs();
+                self.expand_range(-amplitude, amplitude);
+            }
+            ProceduralGenerator::Plateau => {
+                let noise_type = Self::noise_type_u(p.hills.noise).ok_or(GpuError::RequiresCpu)?;
+                self.gen_noise_to(
+                    device,
+                    queue,
+                    encoder,
+                    &p.hills.base,
+                    NoiseDispatch::new(noise_type, NoiseKernelMode::Fbm),
+                    TexSlot::SculptStamp,
+                );
+                self.gen_plateau_between(
+                    device,
+                    queue,
+                    encoder,
+                    &p.plateau,
+                    TexSlot::SculptStamp,
+                    TexSlot::Layer,
+                );
+                self.expand_range(p.plateau.low, p.plateau.high);
+            }
+            ProceduralGenerator::Mesa => {
+                let q = &p.mesa;
+                self.gen_shape(
+                    device,
+                    queue,
+                    encoder,
+                    ShapeU {
+                        width: self.metrics.width,
+                        height: self.metrics.height,
+                        world_x: self.metrics.world_size_x,
+                        world_z: self.metrics.world_size_z,
+                        seed: q.seed as u32,
+                        octaves: 3,
+                        frequency: 0.001,
+                        amplitude: q.height,
+                        lacunarity: 2.0,
+                        persistence: 0.5,
+                        offset_x: q.center_u,
+                        offset_z: q.center_v,
+                        ridge_sharpness: q.edge_steepness,
+                        range_angle: 0.0,
+                        range_width: q.radius,
+                        wave_frequency: 0.0,
+                        asymmetry: 0.0,
+                        depth: q.cap_noise,
+                        canyon_width: 0.0,
+                        meander: q.soft,
+                        shape_mode: 5,
+                        _pad: 0,
+                    },
+                );
+                self.expand_range(0.0, q.height);
+            }
+            ProceduralGenerator::Volcano => {
+                let q = &p.volcano;
+                self.gen_shape(
+                    device,
+                    queue,
+                    encoder,
+                    ShapeU {
+                        width: self.metrics.width,
+                        height: self.metrics.height,
+                        world_x: self.metrics.world_size_x,
+                        world_z: self.metrics.world_size_z,
+                        seed: q.seed as u32,
+                        octaves: 3,
+                        frequency: 0.001,
+                        amplitude: q.height,
+                        lacunarity: 2.0,
+                        persistence: 0.5,
+                        offset_x: q.center_u,
+                        offset_z: q.center_v,
+                        ridge_sharpness: q.flank_power,
+                        range_angle: 0.0,
+                        range_width: q.radius,
+                        wave_frequency: 0.0,
+                        asymmetry: 0.0,
+                        depth: q.crater_depth,
+                        canyon_width: q.crater_radius,
+                        meander: q.roughness,
+                        shape_mode: 4,
+                        _pad: 0,
+                    },
+                );
+                self.expand_range(0.0, q.height);
+            }
+            ProceduralGenerator::Canyon => {
+                let q = &p.canyon;
+                self.gen_shape(
+                    device,
+                    queue,
+                    encoder,
+                    ShapeU {
+                        width: self.metrics.width,
+                        height: self.metrics.height,
+                        world_x: self.metrics.world_size_x,
+                        world_z: self.metrics.world_size_z,
+                        seed: q.seed as u32,
+                        octaves: 1,
+                        frequency: 1.0,
+                        amplitude: 1.0,
+                        lacunarity: 2.0,
+                        persistence: 0.5,
+                        offset_x: 0.0,
+                        offset_z: 0.0,
+                        ridge_sharpness: 0.0,
+                        range_angle: 0.0,
+                        range_width: 0.0,
+                        wave_frequency: 0.0,
+                        asymmetry: 0.0,
+                        depth: q.depth,
+                        canyon_width: q.width,
+                        meander: q.meander,
+                        shape_mode: 2,
+                        _pad: 0,
+                    },
+                );
+                self.expand_range(-q.depth, 0.0);
+            }
+            ProceduralGenerator::Noise => {
+                self.gen_noise(
+                    device,
+                    queue,
+                    encoder,
+                    &p.noise,
+                    NoiseDispatch::new(1, NoiseKernelMode::Perlin),
+                );
+                let amplitude = p.noise.amplitude.abs();
+                self.expand_range(-amplitude, amplitude);
+            }
+            ProceduralGenerator::Crater => {
+                self.run_procedural_crater(device, queue, encoder, &p.crater);
+                self.expand_range(80.0 - p.crater.amount.abs(), 80.0 + p.crater.amount.abs());
+            }
+            ProceduralGenerator::Dunes => return Err(GpuError::RequiresCpu),
+        }
+        Ok(())
     }
 
     fn river_accumulation_iters(&self, quality: PreviewQuality) -> u32 {
@@ -3180,6 +3694,68 @@ impl GpuTerrainEngine {
         );
     }
 
+    fn effect_filter_uniform(
+        &self,
+        p: &EffectFilterParams,
+        mode: u32,
+        iterations: u32,
+        region: (u32, u32, u32, u32),
+    ) -> EffectFilterU {
+        let (region_x, region_y, region_w, region_h) = region;
+        EffectFilterU {
+            width: self.metrics.width,
+            height: self.metrics.height,
+            world_x: self.metrics.world_size_x,
+            world_z: self.metrics.world_size_z,
+            mode,
+            radius: p.radius.clamp(1, EFFECT_FILTER_MAX_RADIUS),
+            iterations,
+            seed: (p.seed & 0xFFFF_FFFF) as u32,
+            strength: p.strength.clamp(0.0, 1.0),
+            amount: p.amount,
+            frequency: p.effective_frequency(),
+            sea_level: p.sea_level,
+            beach_width: p
+                .beach_width
+                .max(p.crater_radius * self.metrics.world_size_x * 0.5),
+            slope_min: p.slope_min,
+            slope_max: p.slope_max,
+            rock_hardness: p.rock_hardness,
+            terrace_height: p.terrace_height,
+            terrace_offset: p.terrace_offset,
+            rotation_deg: p.rotation_deg,
+            anisotropy: p.anisotropy,
+            warp_strength: p.warp_strength,
+            warp_frequency: p.warp_frequency,
+            dx: self.metrics.dx(),
+            invert: if p.invert { 1.0 } else { 0.0 },
+            flow_threshold: p.flow_threshold,
+            wall_steepness: p.wall_steepness,
+            valley_floor: p.valley_floor,
+            talus_mix: p.talus_mix,
+            top_smoothness: p.top_smoothness,
+            riser_sharpness: p.riser_sharpness,
+            lacunarity: p.lacunarity,
+            persistence: p.persistence,
+            octaves: p.octaves,
+            voronoi_feature: match p.voronoi_feature {
+                terra_core::noise::WorleyFeature::F1 => 0,
+                terra_core::noise::WorleyFeature::F2 => 1,
+                terra_core::noise::WorleyFeature::F2MinusF1 => 2,
+            },
+            tileable: u32::from(p.tileable),
+            _pad_params: 0,
+            crater_radius: p.crater_radius,
+            dz: self.metrics.dz(),
+            _pad_metric0: 0.0,
+            _pad_metric1: 0.0,
+            region_x,
+            region_y,
+            region_w,
+            region_h,
+        }
+    }
+
     fn run_effect_filter(
         &mut self,
         device: &wgpu::Device,
@@ -3197,58 +3773,7 @@ impl GpuTerrainEngine {
         }
         let (rx, ry, rw, rh, gx, gy) = self.dirty_dispatch_extent();
         for _ in 0..iters {
-            let u = EffectFilterU {
-                width: self.metrics.width,
-                height: self.metrics.height,
-                world_x: self.metrics.world_size_x,
-                world_z: self.metrics.world_size_z,
-                mode,
-                radius: p.radius.clamp(1, EFFECT_FILTER_MAX_RADIUS),
-                iterations: iters,
-                seed: (p.seed & 0xFFFF_FFFF) as u32,
-                strength: p.strength.clamp(0.0, 1.0),
-                amount: p.amount,
-                frequency: p.effective_frequency(),
-                sea_level: p.sea_level,
-                beach_width: p
-                    .beach_width
-                    .max(p.crater_radius * self.metrics.world_size_x * 0.5),
-                slope_min: p.slope_min,
-                slope_max: p.slope_max,
-                rock_hardness: p.rock_hardness,
-                terrace_height: p.terrace_height,
-                terrace_offset: p.terrace_offset,
-                rotation_deg: p.rotation_deg,
-                anisotropy: p.anisotropy,
-                warp_strength: p.warp_strength,
-                warp_frequency: p.warp_frequency,
-                dx: self.metrics.dx(),
-                invert: if p.invert { 1.0 } else { 0.0 },
-                flow_threshold: p.flow_threshold,
-                wall_steepness: p.wall_steepness,
-                valley_floor: p.valley_floor,
-                talus_mix: p.talus_mix,
-                top_smoothness: p.top_smoothness,
-                riser_sharpness: p.riser_sharpness,
-                lacunarity: p.lacunarity,
-                persistence: p.persistence,
-                octaves: p.octaves,
-                voronoi_feature: match p.voronoi_feature {
-                    terra_core::noise::WorleyFeature::F1 => 0,
-                    terra_core::noise::WorleyFeature::F2 => 1,
-                    terra_core::noise::WorleyFeature::F2MinusF1 => 2,
-                },
-                tileable: u32::from(p.tileable),
-                _pad_params: 0,
-                crater_radius: p.crater_radius,
-                dz: self.metrics.dz(),
-                _pad_metric0: 0.0,
-                _pad_metric1: 0.0,
-                region_x: rx,
-                region_y: ry,
-                region_w: rw,
-                region_h: rh,
-            };
+            let u = self.effect_filter_uniform(p, mode, iters, (rx, ry, rw, rh));
             let u_buf = self.write_uniform(device, queue, &u);
             let src_ping = self.current == 0;
             let (src, dst) = if src_ping {
@@ -4400,6 +4925,58 @@ impl GpuTerrainEngine {
                         self.expand_range(stroke.target_height, stroke.target_height);
                     }
                 }
+                self.blend_into_current(
+                    device,
+                    queue,
+                    encoder,
+                    layer.common.opacity,
+                    layer.common.blend,
+                )?;
+            }
+            (GpuKernel::Path, LayerKind::Path(p)) => {
+                self.run_path_height(device, queue, encoder, p);
+                let node_height = p
+                    .nodes
+                    .iter()
+                    .map(|node| node.height.abs())
+                    .fold(0.0, f32::max);
+                let reach = p.height_offset.abs() + node_height + p.noise_strength.abs();
+                self.expand_range(self.approx_range.0 - reach, self.approx_range.1 + reach);
+                self.blend_into_current(
+                    device,
+                    queue,
+                    encoder,
+                    layer.common.opacity,
+                    layer.common.blend,
+                )?;
+            }
+            (GpuKernel::PolygonHeight, LayerKind::PolygonHeight(p)) => {
+                self.run_polygon_height(device, queue, encoder, p);
+                match p.mode {
+                    PolygonHeightMode::RaiseBy => {
+                        let reach = p.height.abs();
+                        self.expand_range(self.approx_range.0 - reach, self.approx_range.1 + reach);
+                    }
+                    PolygonHeightMode::SetElevation if p.carve => {
+                        self.expand_range(
+                            self.approx_range.0 - p.height.abs(),
+                            self.approx_range.1,
+                        );
+                    }
+                    PolygonHeightMode::SetElevation => {
+                        self.expand_range(p.height, p.height);
+                    }
+                }
+                self.blend_into_current(
+                    device,
+                    queue,
+                    encoder,
+                    layer.common.opacity,
+                    layer.common.blend,
+                )?;
+            }
+            (GpuKernel::ProceduralShape, LayerKind::ProceduralShape(p)) => {
+                self.run_procedural_shape(device, queue, encoder, p)?;
                 self.blend_into_current(
                     device,
                     queue,
@@ -6550,6 +7127,75 @@ mod smoke_tests {
         assert!(
             !engine.executed_kernels.contains(&GpuKernel::Shape),
             "cached Volcano contribution must avoid Shape dispatch"
+        );
+    }
+
+    /// #132 regression: the picker wrapper has the same input-independent cache
+    /// semantics as its delegated generator. A base edit reblends the cached
+    /// contribution without redispatching the procedural kernel.
+    #[test]
+    fn warm_cache_base_edit_reuses_procedural_shape_contribution() {
+        let Some(gpu) = terra_test_gpu::headless() else {
+            return;
+        };
+        let metrics = HeightfieldMetrics::new(24, 24, 240.0, 240.0);
+        let mut stack = LayerStack::new();
+        let base = Layer::new("base", LayerKind::SculptBase(SculptParams::filled(24, 5.0)));
+        let base_id = base.id();
+        stack.push(base);
+        stack.push(Layer::new(
+            "procedural volcano",
+            LayerKind::ProceduralShape(ProceduralShapeParams::with_generator(
+                ProceduralGenerator::Volcano,
+            )),
+        ));
+
+        let mut engine = GpuTerrainEngine::new(&gpu.device, metrics.width);
+        engine.mark_all_dirty(&stack);
+        engine
+            .evaluate(
+                &gpu.device,
+                &gpu.queue,
+                &stack,
+                &[],
+                metrics,
+                PreviewQuality::Draft,
+                false,
+                None,
+            )
+            .expect("warm procedural contribution cache");
+        assert!(engine
+            .layer_contrib
+            .contains_key(&stack.flatten_layers()[1].id()));
+
+        let Some(layer) = stack.find_mut(base_id) else {
+            panic!("base layer disappeared");
+        };
+        let LayerKind::SculptBase(params) = &mut layer.kind else {
+            panic!("base changed kind");
+        };
+        params.samples[12 * 24 + 12] += 3.0;
+        engine.set_dirty_rect(Some((12, 12, 1, 1)));
+        engine.mark_dirty(base_id);
+        engine
+            .evaluate(
+                &gpu.device,
+                &gpu.queue,
+                &stack,
+                &[],
+                metrics,
+                PreviewQuality::Draft,
+                false,
+                None,
+            )
+            .expect("incremental base edit");
+
+        assert_eq!(engine.executed_kernels, vec![GpuKernel::Sculpt]);
+        assert!(
+            !engine
+                .executed_kernels
+                .contains(&GpuKernel::ProceduralShape),
+            "cached picker contribution must avoid ProceduralShape dispatch"
         );
     }
 

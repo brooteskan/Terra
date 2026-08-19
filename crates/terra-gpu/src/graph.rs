@@ -9,9 +9,10 @@
 use crate::effect_filter::{effect_filter_gpu_spec, EffectFilterGpuScope};
 use terra_core::fields::FieldId;
 use terra_core::layer::{
-    BlendMode, DuneParams, FractalNoiseType, IslandArchetype, IslandParams, Layer, LayerKind,
-    LayerStack, MountainParams, MultiScaleAmplifyParams, RiverCarveParams, SculptStrokeKind,
-    StreamPowerParams, TransportModel, UpliftParams,
+    BlendMode, DuneParams, EffectFilterKind, FractalNoiseType, IslandArchetype, IslandParams,
+    Layer, LayerKind, LayerStack, MountainParams, MultiScaleAmplifyParams, PathParams,
+    PolygonHeightParams, ProceduralGenerator, ProceduralShapeParams, RiverCarveParams,
+    SculptStrokeKind, StreamPowerParams, TransportModel, UpliftParams,
 };
 use terra_core::mask::{MaskAsset, MaskCombine, MaskSource};
 
@@ -37,6 +38,9 @@ pub enum GpuKernel {
     Shape,
     Sculpt,
     SculptStrokes,
+    Path,
+    PolygonHeight,
+    ProceduralShape,
     Blur,
     EffectFilter,
     Terrace,
@@ -55,6 +59,9 @@ impl GpuKernel {
                 | (Self::Ramp, LayerKind::Ramp(_))
                 | (Self::Sculpt, LayerKind::SculptBase(_))
                 | (Self::SculptStrokes, LayerKind::SculptStrokes(_))
+                | (Self::Path, LayerKind::Path(_))
+                | (Self::PolygonHeight, LayerKind::PolygonHeight(_))
+                | (Self::ProceduralShape, LayerKind::ProceduralShape(_))
                 | (
                     Self::Noise,
                     LayerKind::NoiseValue(_)
@@ -231,6 +238,52 @@ fn fractal_noise_supported(noise: FractalNoiseType) -> bool {
     matches!(noise, FractalNoiseType::Value | FractalNoiseType::Perlin)
 }
 
+fn path_config_supported(p: &PathParams) -> bool {
+    let scalars_finite = p.width.is_finite()
+        && p.falloff.is_finite()
+        && p.noise_strength.is_finite()
+        && p.noise_scale.is_finite()
+        && p.height_offset.is_finite()
+        && p.profile.is_finite();
+    let nodes_finite = p.nodes.iter().all(|node| {
+        node.u.is_finite()
+            && node.v.is_finite()
+            && node.height.is_finite()
+            && node.width.is_finite()
+    });
+    scalars_finite && nodes_finite && (p.noise_strength.abs() <= 1.0e-5 || seed_supported(p.seed))
+}
+
+fn polygon_height_config_supported(p: &PolygonHeightParams) -> bool {
+    p.height.is_finite()
+        && p.falloff.is_finite()
+        && p.points
+            .iter()
+            .all(|point| point[0].is_finite() && point[1].is_finite())
+}
+
+fn procedural_shape_config_supported(p: &ProceduralShapeParams) -> bool {
+    match p.generator {
+        ProceduralGenerator::Mountain => mountain_seed_streams_supported(&p.mountain),
+        ProceduralGenerator::Hills | ProceduralGenerator::Plateau => {
+            fractal_noise_supported(p.hills.noise)
+                && seed_stream_supported(p.hills.base.seed, p.hills.base.octaves, 1013)
+        }
+        ProceduralGenerator::Mesa => seed_supported(p.mesa.seed),
+        ProceduralGenerator::Volcano => seed_supported(p.volcano.seed),
+        ProceduralGenerator::Canyon => seed_supported(p.canyon.seed),
+        ProceduralGenerator::Noise => seed_stream_supported(p.noise.seed, p.noise.octaves, 1013),
+        ProceduralGenerator::Crater => {
+            p.crater.kind == EffectFilterKind::Crater
+                && effect_filter_gpu_spec(&p.crater).is_some_and(|spec| {
+                    spec.scope == EffectFilterGpuScope::LocalPointwise && !spec.needs_height_range
+                })
+        }
+        // The CPU Dunes generator evolves a globally coupled aeolian field.
+        ProceduralGenerator::Dunes => false,
+    }
+}
+
 /// Whether the GPU stamp path can reproduce a single sculpt-stroke kind. Most
 /// supported kinds are pure per-sample maps of the running height (plus the
 /// distance-to-polyline SDF); `Smooth`, `Pinch`, and `Coastline` additionally read a
@@ -393,6 +446,22 @@ fn gpu_plan_for_layer(layer: &Layer, mask_assets: &[MaskAsset]) -> Option<GpuLay
             (GpuKernel::SculptStrokes, GpuDirtyPolicy::Local, halo)
         }
         SculptStrokes(_) => return None,
+        Path(p) if path_config_supported(p) && gpu_blend_mode(layer.common.blend).is_some() => {
+            (GpuKernel::Path, GpuDirtyPolicy::Local, 0)
+        }
+        PolygonHeight(p)
+            if polygon_height_config_supported(p)
+                && gpu_blend_mode(layer.common.blend).is_some() =>
+        {
+            (GpuKernel::PolygonHeight, GpuDirtyPolicy::Local, 0)
+        }
+        ProceduralShape(p)
+            if procedural_shape_config_supported(p)
+                && gpu_blend_mode(layer.common.blend).is_some() =>
+        {
+            (GpuKernel::ProceduralShape, GpuDirtyPolicy::Local, 0)
+        }
+        Path(_) | PolygonHeight(_) | ProceduralShape(_) => return None,
         NoiseValue(p) if seed_supported(p.seed) && gpu_blend_mode(layer.common.blend).is_some() => {
             (GpuKernel::Noise, GpuDirtyPolicy::Local, 2)
         }
@@ -527,6 +596,42 @@ pub fn layer_gpu_supported(layer: &Layer, mask_assets: &[MaskAsset]) -> bool {
     gpu_plan_for_layer(layer, mask_assets).is_some()
 }
 
+fn layer_consumes_wetness(layer: &Layer, mask_assets: &[MaskAsset]) -> bool {
+    if layer.kind.required_fields().contains(&FieldId::Wetness)
+        || layer.kind.optional_fields().contains(&FieldId::Wetness)
+    {
+        return true;
+    }
+
+    let parameter_source_uses_wetness = match &layer.kind {
+        LayerKind::ThermalErosion(p) => matches!(p.hardness_source, MaskSource::Wetness),
+        LayerKind::DebrisFlow(p) => matches!(p.hardness_source, MaskSource::Wetness),
+        LayerKind::HydraulicErosion(p) => matches!(
+            (&p.rainfall_source, &p.protection_source, &p.hardness_source),
+            (MaskSource::Wetness, _, _) | (_, MaskSource::Wetness, _) | (_, _, MaskSource::Wetness)
+        ),
+        LayerKind::StreamPowerErosion(p) => {
+            matches!(p.hardness_source, MaskSource::Wetness)
+        }
+        LayerKind::MultiScaleAmplify(p) => matches!(
+            (&p.hardness_source, &p.ridge_lock),
+            (MaskSource::Wetness, _) | (_, MaskSource::Wetness)
+        ),
+        LayerKind::RiverCarve(p) => matches!(p.guide, MaskSource::Wetness),
+        _ => false,
+    };
+    if parameter_source_uses_wetness {
+        return true;
+    }
+
+    layer.common.masks.entries.iter().any(|entry| {
+        mask_assets
+            .iter()
+            .find(|asset| asset.id == entry.mask.id)
+            .is_some_and(|asset| matches!(asset.source, MaskSource::Wetness))
+    })
+}
+
 /// Compile the preview stack into per-layer GPU plans.
 ///
 /// Records a plan slot for every flattened layer (`None` = disabled or
@@ -560,6 +665,24 @@ pub fn compile_gpu_graph(stack: &LayerStack, mask_assets: &[MaskAsset]) -> GpuCo
             .iter()
             .any(|l| l.common.enabled && l.kind.consumes_sculpt_aux());
         if downstream_consumer {
+            plans[i] = None;
+        }
+    }
+
+    // Carved paths publish wetness on the CPU. The GPU path is deliberately a
+    // height kernel, so keep it only when no enabled suffix layer can observe that
+    // omitted field. Raise-only paths publish no auxiliary data and need no gate.
+    for i in 0..layers.len() {
+        let LayerKind::Path(params) = &layers[i].kind else {
+            continue;
+        };
+        if plans[i].is_none() || !params.carve {
+            continue;
+        }
+        if layers[i + 1..]
+            .iter()
+            .any(|layer| layer.common.enabled && layer_consumes_wetness(layer, mask_assets))
+        {
             plans[i] = None;
         }
     }

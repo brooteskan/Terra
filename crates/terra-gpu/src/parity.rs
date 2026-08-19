@@ -131,6 +131,10 @@ pub const EFFECT_FILTER_WARP_PREVIEW: ParityTolerance = ParityTolerance::new(5.0
 /// 16-kind stroke set (unchanged, and located on a distance stamp, not a Flatten);
 /// this holds portable headroom.
 pub const SCULPT_STROKES_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-3, 1.0e-5);
+/// CPU-tessellated path and direct polygon raster contracts. Both kernels share
+/// the CPU's world-space sampling and differ only by portable f32 expression order.
+pub const PATH_HEIGHT_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-3, 1.0e-5);
+pub const POLYGON_HEIGHT_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-3, 1.0e-5);
 
 /// Canonical documentation table. A unit test keeps the checked-in fidelity
 /// document synchronized with these executable contracts.
@@ -139,6 +143,8 @@ pub const FIDELITY_MATRIX_MARKDOWN: &str = "\
 | --- | --- | ---: | ---: |\n\
 | `exact-height` | Flat, Ramp, SculptBase, exact blends, hybrid checkpoint | 0.001 | 0.00001 |\n\
 | `authoring.sculpt-strokes` | Per-sample stroke kinds, Smooth/Pinch/Coastline, Flatten, and distance stamps, supported blend/mask | 0.001 | 0.00001 |\n\
+| `authoring.path-height` | CPU-tessellated spline, raise/carve height preview; carved wetness falls back when consumed | 0.001 | 0.00001 |\n\
+| `authoring.polygon-height` | RaiseBy/SetElevation, raise/carve, world-space feather | 0.001 | 0.00001 |\n\
 | `mask.simple` | One Constant, Height, or Slope Multiply entry without asset operations | 0.001 | 0.0001 |\n\
 | `noise.value` | Value noise with a 32-bit seed | 17.0 | 0.23 |\n\
 | `noise.perlin` | Perlin, 1-12 octaves, reproducible 32-bit seed stream | 0.001 | 0.00001 |\n\
@@ -173,6 +179,7 @@ pub const FIDELITY_MATRIX_MARKDOWN: &str = "\
 | `shape.volcano` | Volcano with a 32-bit seed | 0.004 | 0.00001 |\n\
 | `shape.uplift` | Uplift with reproducible 32-bit seed streams | 0.1 | 0.00002 |\n\
 | `shape.plateau` | Pointwise input remap | 0.001 | 0.00001 |\n\
+| `shape.procedural` | Mountain, Hills, Plateau, Mesa, Volcano, Canyon, Crater, or Noise picker; delegates to the named shape/noise/effect contract | per delegated contract | per delegated contract |\n\
 | `island.archipelago` | Archipelago with reproducible 32-bit seed streams | 0.03 | 0.000005 |\n\
 | `island.atoll` | Atoll with reproducible 32-bit seed streams | 0.001 | 0.00001 |\n\
 | `island.volcanic-high` | VolcanicHighIsland with a 32-bit seed | 220.0 | 0.10 |";

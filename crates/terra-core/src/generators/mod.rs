@@ -1993,15 +1993,18 @@ pub fn path_stamp_tile(input: &Heightfield, p: &PathParams, id: TileId) -> Optio
     })
 }
 
-#[derive(Clone, Copy)]
-struct PathSample {
-    x: f32,
-    z: f32,
-    height: f32,
-    width: f32,
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PathSample {
+    pub x: f32,
+    pub z: f32,
+    pub height: f32,
+    pub width: f32,
 }
 
-fn path_samples(p: &PathParams, world_x: f32, world_z: f32) -> Vec<PathSample> {
+/// Tessellate an authored path into the exact world-space polyline consumed by
+/// [`path_stamp`]. GPU preview uploads this result rather than reimplementing the
+/// Catmull-Rom endpoint and adaptive-step rules in a second place.
+pub fn path_samples(p: &PathParams, world_x: f32, world_z: f32) -> Vec<PathSample> {
     let node = |index: usize| {
         let n = &p.nodes[index];
         PathSample {

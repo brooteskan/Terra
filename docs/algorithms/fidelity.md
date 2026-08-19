@@ -18,6 +18,8 @@ Errors compare complete GPU and CPU height fields. Normalized RMSE uses the maxi
 | --- | --- | ---: | ---: |
 | `exact-height` | Flat, Ramp, SculptBase, exact blends, hybrid checkpoint | 0.001 | 0.00001 |
 | `authoring.sculpt-strokes` | Per-sample stroke kinds, Smooth/Pinch/Coastline, Flatten, and distance stamps, supported blend/mask | 0.001 | 0.00001 |
+| `authoring.path-height` | CPU-tessellated spline, raise/carve height preview; carved wetness falls back when consumed | 0.001 | 0.00001 |
+| `authoring.polygon-height` | RaiseBy/SetElevation, raise/carve, world-space feather | 0.001 | 0.00001 |
 | `mask.simple` | One Constant, Height, or Slope Multiply entry without asset operations | 0.001 | 0.0001 |
 | `noise.value` | Value noise with a 32-bit seed | 17.0 | 0.23 |
 | `noise.perlin` | Perlin, 1-12 octaves, reproducible 32-bit seed stream | 0.001 | 0.00001 |
@@ -52,6 +54,7 @@ Errors compare complete GPU and CPU height fields. Normalized RMSE uses the maxi
 | `shape.volcano` | Volcano with a 32-bit seed | 0.004 | 0.00001 |
 | `shape.uplift` | Uplift with reproducible 32-bit seed streams | 0.1 | 0.00002 |
 | `shape.plateau` | Pointwise input remap | 0.001 | 0.00001 |
+| `shape.procedural` | Mountain, Hills, Plateau, Mesa, Volcano, Canyon, Crater, or Noise picker; delegates to the named shape/noise/effect contract | per delegated contract | per delegated contract |
 | `island.archipelago` | Archipelago with reproducible 32-bit seed streams | 0.03 | 0.000005 |
 | `island.atoll` | Atoll with reproducible 32-bit seed streams | 0.001 | 0.00001 |
 | `island.volcanic-high` | VolcanicHighIsland with a 32-bit seed | 220.0 | 0.10 |

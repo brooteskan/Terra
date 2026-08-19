@@ -6,7 +6,8 @@ use terra_core::layer::{
     BlendMode, BlurParams, CanyonParams, DomainWarpParams, DuneParams, EffectFilterKind,
     EffectFilterParams, FbmParams, FlatParams, FractalNoiseType, HydraulicErosionParams,
     IslandParams, LandscapeEvolutionParams, Layer, LayerKind, LayerStack, MesaParams,
-    MountainParams, MultiScaleAmplifyParams, NoiseParams, PlateauParams, RampParams,
+    MountainParams, MultiScaleAmplifyParams, NoiseParams, PathNode, PathParams, PlateauParams,
+    PolygonHeightMode, PolygonHeightParams, ProceduralGenerator, ProceduralShapeParams, RampParams,
     RiverCarveParams, SculptParams, SculptPoint, SculptStroke, SculptStrokeKind,
     SculptStrokeParams, StreamPowerParams, TerraceParams, ThermalErosionParams, UpliftParams,
     VolcanoParams,
@@ -18,11 +19,11 @@ use terra_gpu::parity::{
     DENOISE_FILTER_PREVIEW, DOMAIN_WARP_PREVIEW, DUNES_PREVIEW, EFFECT_FILTER_EXACT_PREVIEW,
     EFFECT_FILTER_SPATIAL_PREVIEW, EFFECT_FILTER_WARP_PREVIEW, EXACT_HEIGHT, FBM_PERLIN_PREVIEW,
     FBM_VALUE_PREVIEW, HYDRAULIC_PREVIEW, INFLATE_FILTER_PREVIEW, MESA_PREVIEW, MOUNTAINS_PREVIEW,
-    MULTI_SCALE_AMPLIFY_PREVIEW, PERLIN_NOISE_PREVIEW, PLATEAU_PREVIEW, RIDGED_PERLIN_PREVIEW,
-    RIDGED_VALUE_PREVIEW, RIVER_CARVE_D8_PREVIEW, RIVER_CARVE_DINFINITY_PREVIEW,
-    SCULPT_STROKES_PREVIEW, SIMPLE_MASK, SMOOTH_FILTER_PREVIEW, STREAM_POWER_D8_PREVIEW,
-    STREAM_POWER_DINFINITY_PREVIEW, TERRACE_PREVIEW, THERMAL_PREVIEW, UPLIFT_PREVIEW,
-    VALUE_NOISE_PREVIEW, VOLCANIC_ISLAND_PREVIEW, VOLCANO_PREVIEW,
+    MULTI_SCALE_AMPLIFY_PREVIEW, PATH_HEIGHT_PREVIEW, PERLIN_NOISE_PREVIEW, PLATEAU_PREVIEW,
+    POLYGON_HEIGHT_PREVIEW, RIDGED_PERLIN_PREVIEW, RIDGED_VALUE_PREVIEW, RIVER_CARVE_D8_PREVIEW,
+    RIVER_CARVE_DINFINITY_PREVIEW, SCULPT_STROKES_PREVIEW, SIMPLE_MASK, SMOOTH_FILTER_PREVIEW,
+    STREAM_POWER_D8_PREVIEW, STREAM_POWER_DINFINITY_PREVIEW, TERRACE_PREVIEW, THERMAL_PREVIEW,
+    UPLIFT_PREVIEW, VALUE_NOISE_PREVIEW, VOLCANIC_ISLAND_PREVIEW, VOLCANO_PREVIEW,
 };
 use terra_gpu::GpuTerrainEngine;
 
@@ -1275,4 +1276,126 @@ fn gpu_required_hybrid_checkpoint_applies_suffix_once() {
         &expected,
         EXACT_HEIGHT,
     );
+}
+
+#[test]
+fn gpu_required_path_and_polygon_height_match_cpu() {
+    let metrics = HeightfieldMetrics::new(29, 21, 290.0, 84.0);
+    let base = Layer::new(
+        "pattern",
+        LayerKind::SculptBase(patterned_sculpt(metrics.width, metrics.height)),
+    );
+
+    for carve in [false, true] {
+        let mut stack = LayerStack::new();
+        stack.push(base.clone());
+        stack.push(Layer::new(
+            if carve { "carved path" } else { "raised path" },
+            LayerKind::Path(PathParams {
+                nodes: vec![
+                    PathNode {
+                        u: 0.08,
+                        v: 0.2,
+                        height: 1.0,
+                        width: 0.8,
+                    },
+                    PathNode {
+                        u: 0.35,
+                        v: 0.75,
+                        height: 4.0,
+                        width: 1.2,
+                    },
+                    PathNode {
+                        u: 0.7,
+                        v: 0.35,
+                        height: -2.0,
+                        width: 0.7,
+                    },
+                    PathNode {
+                        u: 0.94,
+                        v: 0.8,
+                        height: 2.0,
+                        width: 1.0,
+                    },
+                ],
+                width: 12.0,
+                falloff: 7.0,
+                noise_strength: 1.5,
+                noise_scale: 0.025,
+                height_offset: 6.0,
+                carve,
+                seed: 19,
+                spline: true,
+                profile: 1.6,
+                closed: false,
+            }),
+        ));
+        let cpu = cpu_oracle(&stack, &[], metrics);
+        let gpu = gpu_eval(&stack, &[], metrics);
+        assert_field_parity("authoring.path-height", &gpu, &cpu, PATH_HEIGHT_PREVIEW);
+    }
+
+    for (mode, carve) in [
+        (PolygonHeightMode::RaiseBy, false),
+        (PolygonHeightMode::RaiseBy, true),
+        (PolygonHeightMode::SetElevation, false),
+        (PolygonHeightMode::SetElevation, true),
+    ] {
+        let mut stack = LayerStack::new();
+        stack.push(base.clone());
+        stack.push(Layer::new(
+            "concave polygon",
+            LayerKind::PolygonHeight(PolygonHeightParams {
+                points: vec![
+                    [0.12, 0.15],
+                    [0.86, 0.18],
+                    [0.5, 0.48],
+                    [0.82, 0.86],
+                    [0.16, 0.78],
+                ],
+                height: 13.0,
+                falloff: 0.08,
+                carve,
+                mode,
+            }),
+        ));
+        let cpu = cpu_oracle(&stack, &[], metrics);
+        let gpu = gpu_eval(&stack, &[], metrics);
+        assert_field_parity(
+            "authoring.polygon-height",
+            &gpu,
+            &cpu,
+            POLYGON_HEIGHT_PREVIEW,
+        );
+    }
+}
+
+#[test]
+fn gpu_required_procedural_shape_variants_delegate_to_bounded_kernels() {
+    let metrics = HeightfieldMetrics::new(24, 19, 144.0, 76.0);
+    for &generator in ProceduralGenerator::ALL {
+        if generator == ProceduralGenerator::Dunes {
+            continue;
+        }
+        let params = ProceduralShapeParams::with_generator(generator);
+        let mut stack = LayerStack::new();
+        stack.push(Layer::new(
+            generator.label(),
+            LayerKind::ProceduralShape(params),
+        ));
+        let tolerance = match generator {
+            ProceduralGenerator::Mountain => MOUNTAINS_PREVIEW,
+            ProceduralGenerator::Hills => FBM_PERLIN_PREVIEW,
+            ProceduralGenerator::Plateau => PLATEAU_PREVIEW,
+            ProceduralGenerator::Mesa => MESA_PREVIEW,
+            ProceduralGenerator::Volcano => VOLCANO_PREVIEW,
+            ProceduralGenerator::Canyon => CANYONS_PREVIEW,
+            ProceduralGenerator::Crater => EFFECT_FILTER_SPATIAL_PREVIEW,
+            ProceduralGenerator::Noise => PERLIN_NOISE_PREVIEW,
+            ProceduralGenerator::Dunes => unreachable!(),
+        };
+        let cpu = cpu_oracle(&stack, &[], metrics);
+        let gpu = gpu_eval(&stack, &[], metrics);
+        assert_field_parity("shape.procedural", &gpu, &cpu, tolerance);
+    }
 }
