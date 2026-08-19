@@ -16,6 +16,8 @@ use crate::graph::{
 use crate::{readback_f32, GpuError};
 use bytemuck::{Pod, Zeroable};
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 use terra_core::analyze::{
     amplify_sim_levels, apply_transport_model, clamp_timestep_cfl, default_sim_levels,
     draft_sim_levels, LevelStepSettings,
@@ -638,12 +640,37 @@ struct MaskBakeU {
     region_h: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct HeightmapSampleU {
+    width: u32,
+    height: u32,
+    source_width: u32,
+    source_height: u32,
+    mode: u32,
+    _pad0: u32,
+    height_scale: f32,
+    height_offset: f32,
+    world_x: f32,
+    world_z: f32,
+    offset_x: f32,
+    offset_z: f32,
+    inv_scale: f32,
+    sin_t: f32,
+    cos_t: f32,
+    blend_size: f32,
+    blend_roundness: f32,
+    _pad1: [f32; 3],
+}
+
 #[derive(Clone, Copy)]
 enum TexSlot {
     Ping,
     Pong,
     Layer,
     MaskOnes,
+    UnitMask,
+    StampMask,
     Hardness,
     WaterA,
     WaterB,
@@ -655,6 +682,7 @@ enum TexSlot {
     Cache(LayerId),
     /// Pre-blend layer contribution (noise/shape/flat), reusable when only upstream changed.
     Contrib(LayerId),
+    ContribMask(LayerId),
 }
 
 struct HeightTex {
@@ -691,6 +719,17 @@ impl HeightTex {
             height,
         }
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SourceFingerprint {
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+struct SourceRasterTex {
+    tex: HeightTex,
+    fingerprint: Option<SourceFingerprint>,
 }
 
 /// RGBA float texture for hydraulic outflow fluxes (L,R,D,U).
@@ -903,6 +942,8 @@ fn layer_input_independent(kind: &LayerKind) -> bool {
             | LayerKind::Island(_)
             | LayerKind::DomainWarp(_)
             | LayerKind::ProceduralShape(_)
+            | LayerKind::ImportHeightmap(_)
+            | LayerKind::Stamp2d(_)
     )
 }
 
@@ -973,11 +1014,14 @@ pub struct GpuTerrainEngine {
     sculpt_strokes_reconcile: Pipe,
     path_height: Pipe,
     polygon_height: Pipe,
+    heightmap_sample: Pipe,
     uniform_pool: UniformPool,
     ping: HeightTex,
     pong: HeightTex,
     layer_tex: HeightTex,
     mask_ones: HeightTex,
+    unit_mask: HeightTex,
+    stamp_mask: HeightTex,
     hardness: HeightTex,
     water_a: HeightTex,
     water_b: HeightTex,
@@ -1005,6 +1049,12 @@ pub struct GpuTerrainEngine {
     layer_cache: HashMap<LayerId, HeightTex>,
     /// Pre-blend generator output, keyed by layer id.
     layer_contrib: HashMap<LayerId, HeightTex>,
+    /// Transform-composited masks paired with cached raster contributions.
+    layer_contrib_mask: HashMap<LayerId, HeightTex>,
+    /// Raw normalized source rasters, independent from output-sized contributions.
+    source_rasters: HashMap<PathBuf, SourceRasterTex>,
+    #[cfg(test)]
+    source_upload_count: usize,
     dirty: HashSet<LayerId>,
     metrics: HeightfieldMetrics,
     approx_range: (f32, f32),
@@ -1046,7 +1096,8 @@ impl GpuTerrainEngine {
                 tex_read_entry(1),
                 tex_read_entry(2),
                 tex_read_entry(3),
-                storage_write_entry(4),
+                tex_read_entry(4),
+                storage_write_entry(5),
             ],
         });
         let copy_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1138,6 +1189,16 @@ impl GpuTerrainEngine {
                     uniform_entry(0),
                     tex_read_entry(1),
                     storage_read_buffer_entry(2),
+                    storage_write_entry(3),
+                ],
+            });
+        let heightmap_sample_bgl =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("heightmap-sample-bgl"),
+                entries: &[
+                    uniform_entry(0),
+                    tex_read_entry(1),
+                    storage_write_entry(2),
                     storage_write_entry(3),
                 ],
             });
@@ -1260,6 +1321,12 @@ impl GpuTerrainEngine {
             "polygon-height",
             include_str!("shaders/polygon_height.wgsl"),
             polygon_height_bgl,
+        );
+        let heightmap_sample = make_pipe(
+            device,
+            "heightmap-sample",
+            include_str!("shaders/heightmap_sample.wgsl"),
+            heightmap_sample_bgl,
         );
         let river_accum = make_pipe(
             device,
@@ -1418,6 +1485,8 @@ impl GpuTerrainEngine {
         let pong = HeightTex::new(device, "pong", w, w);
         let layer_tex = HeightTex::new(device, "layer", w, w);
         let mask_ones = HeightTex::new(device, "mask-ones", w, w);
+        let unit_mask = HeightTex::new(device, "unit-mask", w, w);
+        let stamp_mask = HeightTex::new(device, "stamp-mask", w, w);
         let sim_side = w;
         let hardness = HeightTex::new(device, "hardness", sim_side, sim_side);
         let water_a = HeightTex::new(device, "water-a", sim_side, sim_side);
@@ -1470,11 +1539,14 @@ impl GpuTerrainEngine {
             sculpt_strokes_reconcile,
             path_height,
             polygon_height,
+            heightmap_sample,
             uniform_pool: UniformPool::new(device, 64),
             ping,
             pong,
             layer_tex,
             mask_ones,
+            unit_mask,
+            stamp_mask,
             hardness,
             water_a,
             water_b,
@@ -1492,6 +1564,10 @@ impl GpuTerrainEngine {
             effect_filter_range_buffer,
             layer_cache: HashMap::new(),
             layer_contrib: HashMap::new(),
+            layer_contrib_mask: HashMap::new(),
+            source_rasters: HashMap::new(),
+            #[cfg(test)]
+            source_upload_count: 0,
             dirty: HashSet::new(),
             metrics: HeightfieldMetrics {
                 width: w,
@@ -1720,6 +1796,8 @@ impl GpuTerrainEngine {
     pub fn reset_project_state(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
         self.layer_cache.clear();
         self.layer_contrib.clear();
+        self.layer_contrib_mask.clear();
+        self.source_rasters.clear();
         self.dirty.clear();
         self.last_dirty_rect = None;
         self.last_quality = None;
@@ -1744,6 +1822,7 @@ impl GpuTerrainEngine {
         self.fill_slot(device, queue, &mut encoder, TexSlot::Pong, 0.0);
         self.fill_slot(device, queue, &mut encoder, TexSlot::Layer, 0.0);
         self.fill_slot(device, queue, &mut encoder, TexSlot::MaskOnes, 1.0);
+        self.fill_slot(device, queue, &mut encoder, TexSlot::UnitMask, 1.0);
         queue.submit(Some(encoder.finish()));
     }
 
@@ -1784,6 +1863,8 @@ impl GpuTerrainEngine {
         self.pong = HeightTex::new(device, "pong", w, h);
         self.layer_tex = HeightTex::new(device, "layer", w, h);
         self.mask_ones = HeightTex::new(device, "mask-ones", w, h);
+        self.unit_mask = HeightTex::new(device, "unit-mask", w, h);
+        self.stamp_mask = HeightTex::new(device, "stamp-mask", w, h);
         self.hardness = HeightTex::new(device, "hardness", w, h);
         self.water_a = HeightTex::new(device, "water-a", w, h);
         self.water_b = HeightTex::new(device, "water-b", w, h);
@@ -1800,6 +1881,7 @@ impl GpuTerrainEngine {
         self.sculpt_edited = HeightTex::new(device, "sculpt-edited", w, h);
         self.layer_cache.clear();
         self.layer_contrib.clear();
+        self.layer_contrib_mask.clear();
         self.dirty.clear();
     }
 
@@ -1826,6 +1908,8 @@ impl GpuTerrainEngine {
             TexSlot::Pong => &self.pong.view,
             TexSlot::Layer => &self.layer_tex.view,
             TexSlot::MaskOnes => &self.mask_ones.view,
+            TexSlot::UnitMask => &self.unit_mask.view,
+            TexSlot::StampMask => &self.stamp_mask.view,
             TexSlot::Hardness => &self.hardness.view,
             TexSlot::WaterA => &self.water_a.view,
             TexSlot::WaterB => &self.water_b.view,
@@ -1836,6 +1920,9 @@ impl GpuTerrainEngine {
             TexSlot::SculptStamp => &self.sculpt_stamp.view,
             TexSlot::Cache(id) => &self.layer_cache.get(&id).expect("cache").view,
             TexSlot::Contrib(id) => &self.layer_contrib.get(&id).expect("contrib").view,
+            TexSlot::ContribMask(id) => {
+                &self.layer_contrib_mask.get(&id).expect("contrib mask").view
+            }
         }
     }
 
@@ -3532,6 +3619,25 @@ impl GpuTerrainEngine {
         opacity: f32,
         mode: BlendMode,
     ) -> Result<(), GpuError> {
+        self.blend_into_current_with_mask(
+            device,
+            queue,
+            encoder,
+            opacity,
+            mode,
+            [TexSlot::MaskOnes, TexSlot::UnitMask],
+        )
+    }
+
+    fn blend_into_current_with_mask(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        opacity: f32,
+        mode: BlendMode,
+        masks: [TexSlot; 2],
+    ) -> Result<(), GpuError> {
         let u = BlendU {
             width: self.metrics.width,
             height: self.metrics.height,
@@ -3563,10 +3669,14 @@ impl GpuTerrainEngine {
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&self.mask_ones.view),
+                    resource: wgpu::BindingResource::TextureView(self.view_of(masks[0])),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
+                    resource: wgpu::BindingResource::TextureView(self.view_of(masks[1])),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
                     resource: wgpu::BindingResource::TextureView(dst),
                 },
             ],
@@ -3946,6 +4056,7 @@ impl GpuTerrainEngine {
             // caller already marked the dirty suffix — do not force a full rebuild (that
             // produces the "weird Draft/zero frame" on filter add).
             self.layer_contrib.clear();
+            self.layer_contrib_mask.clear();
             self.layer_cache
                 .retain(|_, tex| tex.width == metrics.width && tex.height == metrics.height);
             if bridge_prefix.is_none() {
@@ -4075,6 +4186,7 @@ impl GpuTerrainEngine {
             label: Some("gpu-stack"),
         });
         self.fill_slot(device, queue, &mut encoder, TexSlot::MaskOnes, 1.0);
+        self.fill_slot(device, queue, &mut encoder, TexSlot::UnitMask, 1.0);
 
         // A full re-evaluation or quality change affects every sample and needs a
         // full present. A local sculpt edit (dirty rect, first_dirty > 0) can instead
@@ -4276,8 +4388,19 @@ impl GpuTerrainEngine {
                 .get(&id)
                 .map(|c| c.width == metrics.width && c.height == metrics.height)
                 .unwrap_or(false);
-            let reuse_contrib =
-                !content_dirty && layer_input_independent(&layer.kind) && contrib_ok;
+            let raster_layer = matches!(
+                layer.kind,
+                LayerKind::ImportHeightmap(_) | LayerKind::Stamp2d(_)
+            );
+            let contrib_mask_ok = !raster_layer
+                || self
+                    .layer_contrib_mask
+                    .get(&id)
+                    .is_some_and(|c| c.width == metrics.width && c.height == metrics.height);
+            let reuse_contrib = !content_dirty
+                && layer_input_independent(&layer.kind)
+                && contrib_ok
+                && contrib_mask_ok;
 
             if reuse_contrib {
                 self.copy_slots(
@@ -4287,13 +4410,31 @@ impl GpuTerrainEngine {
                     TexSlot::Contrib(id),
                     TexSlot::Layer,
                 );
-                self.blend_into_current(
-                    device,
-                    queue,
-                    &mut encoder,
-                    layer.common.opacity,
-                    layer.common.blend,
-                )?;
+                if raster_layer {
+                    self.copy_slots(
+                        device,
+                        queue,
+                        &mut encoder,
+                        TexSlot::ContribMask(id),
+                        TexSlot::StampMask,
+                    );
+                    self.blend_into_current_with_mask(
+                        device,
+                        queue,
+                        &mut encoder,
+                        layer.common.opacity,
+                        layer.common.blend,
+                        [TexSlot::MaskOnes, TexSlot::StampMask],
+                    )?;
+                } else {
+                    self.blend_into_current(
+                        device,
+                        queue,
+                        &mut encoder,
+                        layer.common.opacity,
+                        layer.common.blend,
+                    )?;
+                }
             } else {
                 if let LayerKind::SculptBase(params) = &layer.kind {
                     queue.submit(Some(encoder.finish()));
@@ -4324,6 +4465,30 @@ impl GpuTerrainEngine {
                         TexSlot::Layer,
                         TexSlot::Contrib(id),
                     );
+                    if raster_layer {
+                        let needs_new = self
+                            .layer_contrib_mask
+                            .get(&id)
+                            .is_none_or(|t| t.width != metrics.width || t.height != metrics.height);
+                        if needs_new {
+                            self.layer_contrib_mask.insert(
+                                id,
+                                HeightTex::new(
+                                    device,
+                                    "layer-contrib-mask",
+                                    metrics.width,
+                                    metrics.height,
+                                ),
+                            );
+                        }
+                        self.copy_slots(
+                            device,
+                            queue,
+                            &mut encoder,
+                            TexSlot::StampMask,
+                            TexSlot::ContribMask(id),
+                        );
+                    }
                 }
             }
             self.cache_current(device, queue, &mut encoder, id);
@@ -4413,6 +4578,181 @@ impl GpuTerrainEngine {
                 depth_or_array_layers: 1,
             },
         );
+    }
+
+    fn ensure_source_raster(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        path: &str,
+    ) -> Result<PathBuf, GpuError> {
+        let key = if path.is_empty() {
+            PathBuf::from("<empty-heightmap>")
+        } else {
+            std::fs::canonicalize(path).unwrap_or_else(|_| Path::new(path).to_path_buf())
+        };
+        let fingerprint = if path.is_empty() {
+            None
+        } else {
+            let metadata = std::fs::metadata(path)
+                .map_err(|error| GpuError::SourceAsset(format!("{path}: {error}")))?;
+            Some(SourceFingerprint {
+                len: metadata.len(),
+                modified: metadata.modified().ok(),
+            })
+        };
+        if self
+            .source_rasters
+            .get(&key)
+            .is_some_and(|entry| entry.fingerprint == fingerprint)
+        {
+            return Ok(key);
+        }
+        let decoded = if path.is_empty() {
+            terra_core::generators::DecodedHeightmap {
+                width: 1,
+                height: 1,
+                samples: vec![0.0],
+            }
+        } else {
+            terra_core::generators::load_heightmap(path)
+                .map_err(|error| GpuError::SourceAsset(error.to_string()))?
+        };
+        let limit = device.limits().max_texture_dimension_2d;
+        if decoded.width > limit || decoded.height > limit {
+            return Err(GpuError::RequiresCpu);
+        }
+        let tex = HeightTex::new(
+            device,
+            "source-heightmap",
+            decoded.width.max(1),
+            decoded.height.max(1),
+        );
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &tex.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytemuck::cast_slice(&decoded.samples),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(decoded.width * 4),
+                rows_per_image: Some(decoded.height),
+            },
+            wgpu::Extent3d {
+                width: decoded.width,
+                height: decoded.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.source_rasters
+            .insert(key.clone(), SourceRasterTex { tex, fingerprint });
+        #[cfg(test)]
+        {
+            self.source_upload_count += 1;
+        }
+        Ok(key)
+    }
+
+    fn run_heightmap_sample(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        layer: &Layer,
+    ) -> Result<(), GpuError> {
+        let (params, transform) = match &layer.kind {
+            LayerKind::ImportHeightmap(params) => (params, None),
+            LayerKind::Stamp2d(params) => {
+                (&params.heightmap, layer.common.shape_transform.as_ref())
+            }
+            _ => return Err(GpuError::RequiresCpu),
+        };
+        let key = self.ensure_source_raster(device, queue, &params.path)?;
+        let source = self.source_rasters.get(&key).expect("source just loaded");
+        let (mode, offset_x, offset_z, inv_scale, sin_t, cos_t, blend_size, roundness) =
+            if let Some(transform) = transform {
+                let theta = -transform.rotation_deg.to_radians();
+                let (sin_t, cos_t) = theta.sin_cos();
+                (
+                    1,
+                    transform.offset_x,
+                    transform.offset_z,
+                    1.0 / transform.scale.max(1e-6),
+                    sin_t,
+                    cos_t,
+                    transform.blend_size,
+                    transform.blend_roundness,
+                )
+            } else {
+                (0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0)
+            };
+        let uniform = HeightmapSampleU {
+            width: self.metrics.width,
+            height: self.metrics.height,
+            source_width: source.tex.width,
+            source_height: source.tex.height,
+            mode,
+            _pad0: 0,
+            height_scale: if params.path.is_empty() {
+                0.0
+            } else {
+                params.height_scale
+            },
+            height_offset: if params.path.is_empty() {
+                0.0
+            } else {
+                params.height_offset
+            },
+            world_x: self.metrics.world_size_x,
+            world_z: self.metrics.world_size_z,
+            offset_x,
+            offset_z,
+            inv_scale,
+            sin_t,
+            cos_t,
+            blend_size,
+            blend_roundness: roundness,
+            _pad1: [0.0; 3],
+        };
+        let uniform_buf = self.write_uniform(device, queue, &uniform);
+        let source = self.source_rasters.get(&key).expect("source retained");
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("heightmap-sample-bg"),
+            layout: &self.heightmap_sample.bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&source.tex.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&self.layer_tex.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&self.stamp_mask.view),
+                },
+            ],
+        });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("heightmap-sample"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.heightmap_sample.pipeline);
+        pass.set_bind_group(0, &bg, &[]);
+        pass.dispatch_workgroups(
+            self.metrics.width.div_ceil(8),
+            self.metrics.height.div_ceil(8),
+            1,
+        );
+        Ok(())
     }
 
     /// Stamp the stroke set into the running height, measure each Flatten target,
@@ -4889,6 +5229,35 @@ impl GpuTerrainEngine {
         #[cfg(test)]
         self.executed_kernels.push(kernel);
         match (kernel, &layer.kind) {
+            (GpuKernel::HeightmapSample, LayerKind::ImportHeightmap(p)) => {
+                self.run_heightmap_sample(device, queue, encoder, layer)?;
+                let endpoint = p.height_offset + p.height_scale;
+                self.expand_range(p.height_offset.min(endpoint), p.height_offset.max(endpoint));
+                self.blend_into_current_with_mask(
+                    device,
+                    queue,
+                    encoder,
+                    layer.common.opacity,
+                    layer.common.blend,
+                    [TexSlot::MaskOnes, TexSlot::StampMask],
+                )?;
+            }
+            (GpuKernel::HeightmapSample, LayerKind::Stamp2d(p)) => {
+                self.run_heightmap_sample(device, queue, encoder, layer)?;
+                let endpoint = p.heightmap.height_offset + p.heightmap.height_scale;
+                self.expand_range(
+                    p.heightmap.height_offset.min(endpoint),
+                    p.heightmap.height_offset.max(endpoint),
+                );
+                self.blend_into_current_with_mask(
+                    device,
+                    queue,
+                    encoder,
+                    layer.common.opacity,
+                    layer.common.blend,
+                    [TexSlot::MaskOnes, TexSlot::StampMask],
+                )?;
+            }
             (GpuKernel::Sculpt, LayerKind::SculptBase(p)) => {
                 // `layer_tex` was filled by `upload_sculpt_to_layer` just before this call.
                 let (lo, hi) = p.sample_range();
@@ -5900,9 +6269,10 @@ mod smoke_tests {
     use terra_core::heightfield::HeightfieldMetrics;
     use terra_core::layer::{
         BlendMode, BlurParams, CoastalParams, DomainWarpParams, EffectFilterParams, FbmParams,
-        FlatParams, FractalNoiseType, GroupInputMode, IslandParams, Layer, LayerGroup, LayerKind,
-        LayerStack, MaterialsParams, MultiScaleAmplifyParams, NamedOutputDecl, NoiseParams,
-        RiverCarveParams, SculptParams, StackNode, StreamPowerParams, ThermalErosionParams,
+        FlatParams, FractalNoiseType, GroupInputMode, ImportHeightmapParams, IslandParams, Layer,
+        LayerGroup, LayerKind, LayerStack, MaterialsParams, MultiScaleAmplifyParams,
+        NamedOutputDecl, NoiseParams, RiverCarveParams, SculptParams, StackNode, Stamp2dParams,
+        StreamPowerParams, ThermalErosionParams,
     };
     use terra_core::mask::{
         bake_mask_assets, DistributionEntry, MaskAsset, MaskCombine, MaskId, MaskOp, MaskRef,
@@ -6848,6 +7218,8 @@ mod smoke_tests {
             &engine.pong,
             &engine.layer_tex,
             &engine.mask_ones,
+            &engine.unit_mask,
+            &engine.stamp_mask,
             &engine.hardness,
             &engine.water_a,
             &engine.water_b,
@@ -7128,6 +7500,87 @@ mod smoke_tests {
             !engine.executed_kernels.contains(&GpuKernel::Shape),
             "cached Volcano contribution must avoid Shape dispatch"
         );
+    }
+
+    /// #133 regression: decoded source textures are shared by asset identity,
+    /// while each layer keeps an output-sized contribution cache. A bounded base
+    /// edit therefore reblends both raster contributions without decoding,
+    /// uploading, or dispatching the sampling kernel again.
+    #[test]
+    fn warm_cache_base_edit_reuses_heightmap_contributions_and_source_texture() {
+        let Some(gpu) = terra_test_gpu::headless() else {
+            return;
+        };
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("terra-gpu-cache-{unique}.png"));
+        let fixture = image::ImageBuffer::from_fn(5, 7, |x, y| {
+            image::Luma([((x * 8000 + y * 6000) % 65536) as u16])
+        });
+        fixture.save(&path).expect("write source fixture");
+
+        let metrics = HeightfieldMetrics::new(32, 32, 320.0, 320.0);
+        let mut stack = LayerStack::new();
+        let base = Layer::new("base", LayerKind::SculptBase(SculptParams::filled(32, 5.0)));
+        let base_id = base.id();
+        stack.push(base);
+        let params = ImportHeightmapParams {
+            path: path.to_string_lossy().into_owned(),
+            height_scale: 20.0,
+            height_offset: 2.0,
+        };
+        stack.push(Layer::new(
+            "import",
+            LayerKind::ImportHeightmap(params.clone()),
+        ));
+        stack.push(Layer::new(
+            "stamp",
+            LayerKind::Stamp2d(Stamp2dParams { heightmap: params }),
+        ));
+
+        let mut engine = GpuTerrainEngine::new(&gpu.device, metrics.width);
+        engine.mark_all_dirty(&stack);
+        engine
+            .evaluate(
+                &gpu.device,
+                &gpu.queue,
+                &stack,
+                &[],
+                metrics,
+                PreviewQuality::Draft,
+                false,
+                None,
+            )
+            .expect("warm raster contributions");
+        assert_eq!(engine.source_upload_count, 1, "same asset uploads once");
+
+        let Some(layer) = stack.find_mut(base_id) else {
+            panic!("base layer disappeared");
+        };
+        let LayerKind::SculptBase(params) = &mut layer.kind else {
+            panic!("base changed kind");
+        };
+        params.samples[16 * 32 + 16] += 3.0;
+        engine.set_dirty_rect(Some((16, 16, 1, 1)));
+        engine.mark_dirty(base_id);
+        engine
+            .evaluate(
+                &gpu.device,
+                &gpu.queue,
+                &stack,
+                &[],
+                metrics,
+                PreviewQuality::Draft,
+                false,
+                None,
+            )
+            .expect("incremental base edit");
+
+        assert_eq!(engine.executed_kernels, vec![GpuKernel::Sculpt]);
+        assert_eq!(engine.source_upload_count, 1);
+        let _ = std::fs::remove_file(path);
     }
 
     /// #132 regression: the picker wrapper has the same input-independent cache

@@ -1,16 +1,17 @@
 use std::collections::HashMap;
 
+use terra_core::biome_paint::ShapeTransform;
 use terra_core::eval::{EvalContext, PreviewQuality, StackEvaluator};
 use terra_core::heightfield::{Heightfield, HeightfieldMetrics};
 use terra_core::layer::{
     BlendMode, BlurParams, CanyonParams, DomainWarpParams, DuneParams, EffectFilterKind,
     EffectFilterParams, FbmParams, FlatParams, FractalNoiseType, HydraulicErosionParams,
-    IslandParams, LandscapeEvolutionParams, Layer, LayerKind, LayerStack, MesaParams,
-    MountainParams, MultiScaleAmplifyParams, NoiseParams, PathNode, PathParams, PlateauParams,
-    PolygonHeightMode, PolygonHeightParams, ProceduralGenerator, ProceduralShapeParams, RampParams,
-    RiverCarveParams, SculptParams, SculptPoint, SculptStroke, SculptStrokeKind,
-    SculptStrokeParams, StreamPowerParams, TerraceParams, ThermalErosionParams, UpliftParams,
-    VolcanoParams,
+    ImportHeightmapParams, IslandParams, LandscapeEvolutionParams, Layer, LayerKind, LayerStack,
+    MesaParams, MountainParams, MultiScaleAmplifyParams, NoiseParams, PathNode, PathParams,
+    PlateauParams, PolygonHeightMode, PolygonHeightParams, ProceduralGenerator,
+    ProceduralShapeParams, RampParams, RiverCarveParams, SculptParams, SculptPoint, SculptStroke,
+    SculptStrokeKind, SculptStrokeParams, Stamp2dParams, StreamPowerParams, TerraceParams,
+    ThermalErosionParams, UpliftParams, VolcanoParams,
 };
 use terra_core::mask::{bake_mask_assets, MaskAsset, MaskId, MaskRef, MaskSource};
 use terra_gpu::parity::{
@@ -18,16 +19,44 @@ use terra_gpu::parity::{
     CANYONS_PREVIEW, CURVE_FILTER_PREVIEW, CUTOFF_FILTER_PREVIEW, DEFLATE_FILTER_PREVIEW,
     DENOISE_FILTER_PREVIEW, DOMAIN_WARP_PREVIEW, DUNES_PREVIEW, EFFECT_FILTER_EXACT_PREVIEW,
     EFFECT_FILTER_SPATIAL_PREVIEW, EFFECT_FILTER_WARP_PREVIEW, EXACT_HEIGHT, FBM_PERLIN_PREVIEW,
-    FBM_VALUE_PREVIEW, HYDRAULIC_PREVIEW, INFLATE_FILTER_PREVIEW, MESA_PREVIEW, MOUNTAINS_PREVIEW,
-    MULTI_SCALE_AMPLIFY_PREVIEW, PATH_HEIGHT_PREVIEW, PERLIN_NOISE_PREVIEW, PLATEAU_PREVIEW,
-    POLYGON_HEIGHT_PREVIEW, RIDGED_PERLIN_PREVIEW, RIDGED_VALUE_PREVIEW, RIVER_CARVE_D8_PREVIEW,
-    RIVER_CARVE_DINFINITY_PREVIEW, SCULPT_STROKES_PREVIEW, SIMPLE_MASK, SMOOTH_FILTER_PREVIEW,
-    STREAM_POWER_D8_PREVIEW, STREAM_POWER_DINFINITY_PREVIEW, TERRACE_PREVIEW, THERMAL_PREVIEW,
-    UPLIFT_PREVIEW, VALUE_NOISE_PREVIEW, VOLCANIC_ISLAND_PREVIEW, VOLCANO_PREVIEW,
+    FBM_VALUE_PREVIEW, HEIGHTMAP_SAMPLE_PREVIEW, HYDRAULIC_PREVIEW, INFLATE_FILTER_PREVIEW,
+    MESA_PREVIEW, MOUNTAINS_PREVIEW, MULTI_SCALE_AMPLIFY_PREVIEW, PATH_HEIGHT_PREVIEW,
+    PERLIN_NOISE_PREVIEW, PLATEAU_PREVIEW, POLYGON_HEIGHT_PREVIEW, RIDGED_PERLIN_PREVIEW,
+    RIDGED_VALUE_PREVIEW, RIVER_CARVE_D8_PREVIEW, RIVER_CARVE_DINFINITY_PREVIEW,
+    SCULPT_STROKES_PREVIEW, SIMPLE_MASK, SMOOTH_FILTER_PREVIEW, STREAM_POWER_D8_PREVIEW,
+    STREAM_POWER_DINFINITY_PREVIEW, TERRACE_PREVIEW, THERMAL_PREVIEW, UPLIFT_PREVIEW,
+    VALUE_NOISE_PREVIEW, VOLCANIC_ISLAND_PREVIEW, VOLCANO_PREVIEW,
 };
 use terra_gpu::GpuTerrainEngine;
 
 const QUALITY: PreviewQuality = PreviewQuality::Draft;
+
+struct TempHeightmap(std::path::PathBuf);
+
+impl TempHeightmap {
+    fn new() -> Self {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("terra-heightmap-{unique}.png"));
+        let image = image::ImageBuffer::from_fn(7, 5, |x, y| {
+            image::Luma([((x * 7000 + y * 9000) % 65536) as u16])
+        });
+        image.save(&path).expect("write heightmap fixture");
+        Self(path)
+    }
+
+    fn path(&self) -> String {
+        self.0.to_string_lossy().into_owned()
+    }
+}
+
+impl Drop for TempHeightmap {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
 
 fn cpu_oracle(
     stack: &LayerStack,
@@ -124,6 +153,68 @@ fn gpu_required_authored_stack_matches_cpu_with_named_tolerance() {
     let cpu = cpu_oracle(&stack, std::slice::from_ref(&mask), metrics);
     let gpu = gpu_eval(&stack, std::slice::from_ref(&mask), metrics);
     assert_field_parity("stack.flat-ramp-constant-mask", &gpu, &cpu, EXACT_HEIGHT);
+}
+
+#[test]
+fn gpu_required_import_heightmap_matches_cpu_oracle() {
+    let source = TempHeightmap::new();
+    let metrics = HeightfieldMetrics::new(31, 19, 310.0, 95.0);
+    let mut stack = LayerStack::new();
+    stack.push(Layer::new(
+        "import",
+        LayerKind::ImportHeightmap(ImportHeightmapParams {
+            path: source.path(),
+            height_scale: 173.0,
+            height_offset: -21.5,
+        }),
+    ));
+    let cpu = cpu_oracle(&stack, &[], metrics);
+    let gpu = gpu_eval(&stack, &[], metrics);
+    assert_field_parity(
+        "asset.heightmap-sample.import",
+        &gpu,
+        &cpu,
+        HEIGHTMAP_SAMPLE_PREVIEW,
+    );
+}
+
+#[test]
+fn gpu_required_transformed_stamp2d_matches_cpu_oracle() {
+    let source = TempHeightmap::new();
+    let metrics = HeightfieldMetrics::new(37, 23, 370.0, 138.0);
+    let mut stack = LayerStack::new();
+    stack.push(Layer::new(
+        "base",
+        LayerKind::Flat(FlatParams { height: 12.0 }),
+    ));
+    let mut stamp = Layer::new(
+        "stamp",
+        LayerKind::Stamp2d(Stamp2dParams {
+            heightmap: ImportHeightmapParams {
+                path: source.path(),
+                height_scale: 91.0,
+                height_offset: 4.0,
+            },
+        }),
+    );
+    stamp.common.shape_transform = Some(ShapeTransform {
+        offset_x: 27.0,
+        offset_z: -9.0,
+        scale: 0.63,
+        rotation_deg: 31.0,
+        blend_size: 0.28,
+        blend_roundness: 0.42,
+    });
+    stamp.common.opacity = 0.73;
+    stack.push(stamp);
+    let cpu = cpu_oracle(&stack, &[], metrics);
+    let gpu = gpu_eval(&stack, &[], metrics);
+    assert_field_parity(
+        "asset.heightmap-sample.stamp2d",
+        &gpu,
+        &cpu,
+        HEIGHTMAP_SAMPLE_PREVIEW,
+    );
 }
 
 #[test]

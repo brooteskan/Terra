@@ -2,11 +2,11 @@ use terra_core::eval::{EvalContext, StackEvaluator};
 use terra_core::heightfield::HeightfieldMetrics;
 use terra_core::layer::{
     BiomesParams, BlendMode, CanyonParams, DomainWarpParams, DuneParams, EffectFilterKind,
-    EffectFilterParams, FbmParams, FlatParams, FractalNoiseType, IslandParams, Layer, LayerKind,
-    LayerStack, LayerTypeRegistry, MesaParams, MountainParams, MultiScaleAmplifyParams,
-    NoiseParams, PathNode, PathParams, PlateauParams, PolygonHeightMode, PolygonHeightParams,
-    ProceduralGenerator, ProceduralShapeParams, RiverCarveParams, StreamPowerParams, UpliftParams,
-    VolcanoParams,
+    EffectFilterParams, FbmParams, FlatParams, FractalNoiseType, ImportHeightmapParams,
+    IslandParams, Layer, LayerKind, LayerStack, LayerTypeRegistry, MesaParams, MountainParams,
+    MultiScaleAmplifyParams, NoiseParams, PathNode, PathParams, PlateauParams, PolygonHeightMode,
+    PolygonHeightParams, ProceduralGenerator, ProceduralShapeParams, RiverCarveParams,
+    Stamp2dParams, Stamp3dParams, StreamPowerParams, UpliftParams, VolcanoParams,
 };
 use terra_core::mask::MaskSource;
 use terra_gpu::{compile_gpu_graph, layer_gpu_supported, GpuDirtyPolicy, GpuKernel};
@@ -15,6 +15,24 @@ fn graph_for(layer: Layer) -> terra_gpu::GpuComputeGraph {
     let mut stack = LayerStack::new();
     stack.push(layer);
     compile_gpu_graph(&stack, &[])
+}
+
+#[test]
+fn heightmap_assets_have_explicit_kernel_and_stamp3d_boundary() {
+    for kind in [
+        LayerKind::ImportHeightmap(ImportHeightmapParams::default()),
+        LayerKind::Stamp2d(Stamp2dParams::default()),
+    ] {
+        let graph = graph_for(Layer::new("raster", kind));
+        assert!(graph.fully_gpu());
+        assert_eq!(
+            graph.plans[0].expect("raster plan").kernel,
+            GpuKernel::HeightmapSample
+        );
+    }
+    let stamp3d = Layer::new("3d", LayerKind::Stamp3d(Stamp3dParams::default()));
+    assert!(!layer_gpu_supported(&stamp3d, &[]));
+    assert_eq!(graph_for(stamp3d).cpu_from, Some(0));
 }
 
 #[test]

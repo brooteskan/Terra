@@ -915,6 +915,10 @@ impl TerraApp {
                                 target: "terra_app::evaluation",
                                 "GPU evaluation failed: {error}; {operation_context}"
                             ),
+                            GpuError::SourceAsset(_) => log::warn!(
+                                target: "terra_app::evaluation",
+                                "GPU source asset failed: {error}; {operation_context}"
+                            ),
                         }
                         // GPU path failed — async CPU, keep last-good on screen.
                         self.last_eval_fully_gpu = false;

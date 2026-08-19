@@ -265,7 +265,21 @@ impl ProcessorRegistry {
                 generators::procedural_shape(ctx.metrics, &cancel, p).ok_or(EvalError::Cancelled)
             }
             LayerKind::Stamp2d(p) => {
-                generators::import_heightmap(ctx.metrics, &p.heightmap).map_err(EvalError::from)
+                if let Some(transform) = layer.common.shape_transform.as_ref() {
+                    generators::sample_heightmap_with(ctx.metrics, &p.heightmap, |i, j| {
+                        transform
+                            .world_to_local(
+                                ctx.metrics.world_x(i),
+                                ctx.metrics.world_z(j),
+                                ctx.metrics.world_size_x,
+                                ctx.metrics.world_size_z,
+                            )
+                            .map(|(u, v, _)| (u, v))
+                    })
+                    .map_err(EvalError::from)
+                } else {
+                    generators::import_heightmap(ctx.metrics, &p.heightmap).map_err(EvalError::from)
+                }
             }
             LayerKind::Stamp3d(p) => generators::stamp_3d(ctx.metrics, p).map_err(EvalError::from),
             LayerKind::PolygonHeight(p) => Ok(generators::polygon_height(input, p)),

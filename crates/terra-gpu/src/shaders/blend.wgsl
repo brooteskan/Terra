@@ -9,7 +9,8 @@ struct Uniforms {
 @group(0) @binding(1) var src_base: texture_2d<f32>;
 @group(0) @binding(2) var src_layer: texture_2d<f32>;
 @group(0) @binding(3) var src_mask: texture_2d<f32>;
-@group(0) @binding(4) var dst: texture_storage_2d<r32float, write>;
+@group(0) @binding(4) var src_extra_mask: texture_2d<f32>;
+@group(0) @binding(5) var dst: texture_storage_2d<r32float, write>;
 
 fn blend_pair(mode: u32, a: f32, b: f32) -> f32 {
     switch mode {
@@ -34,7 +35,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p = vec2<i32>(i32(gid.x), i32(gid.y));
     let hin = textureLoad(src_base, p, 0).r;
     let hlayer = textureLoad(src_layer, p, 0).r;
-    let m = textureLoad(src_mask, p, 0).r;
+    let m = textureLoad(src_mask, p, 0).r * textureLoad(src_extra_mask, p, 0).r;
     let w = clamp(u.opacity * m, 0.0, 1.0);
     let blended = blend_pair(u.mode, hin, hlayer);
     let out_h = hin * (1.0 - w) + blended * w;

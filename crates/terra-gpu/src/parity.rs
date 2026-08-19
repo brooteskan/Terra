@@ -135,6 +135,8 @@ pub const SCULPT_STROKES_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-3,
 /// the CPU's world-space sampling and differ only by portable f32 expression order.
 pub const PATH_HEIGHT_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-3, 1.0e-5);
 pub const POLYGON_HEIGHT_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-3, 1.0e-5);
+/// Nearest-neighbour R16 source sampling and Stamp2d placement/feathering.
+pub const HEIGHTMAP_SAMPLE_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-3, 1.0e-5);
 
 /// Canonical documentation table. A unit test keeps the checked-in fidelity
 /// document synchronized with these executable contracts.
@@ -145,6 +147,7 @@ pub const FIDELITY_MATRIX_MARKDOWN: &str = "\
 | `authoring.sculpt-strokes` | Per-sample stroke kinds, Smooth/Pinch/Coastline, Flatten, and distance stamps, supported blend/mask | 0.001 | 0.00001 |\n\
 | `authoring.path-height` | CPU-tessellated spline, raise/carve height preview; carved wetness falls back when consumed | 0.001 | 0.00001 |\n\
 | `authoring.polygon-height` | RaiseBy/SetElevation, raise/carve, world-space feather | 0.001 | 0.00001 |\n\
+| `asset.heightmap-sample` | ImportHeightmap and transformed Stamp2d, normalized R16 nearest/clamp sampling | 0.001 | 0.00001 |\n\
 | `mask.simple` | One Constant, Height, or Slope Multiply entry without asset operations | 0.001 | 0.0001 |\n\
 | `noise.value` | Value noise with a 32-bit seed | 17.0 | 0.23 |\n\
 | `noise.perlin` | Perlin, 1-12 octaves, reproducible 32-bit seed stream | 0.001 | 0.00001 |\n\

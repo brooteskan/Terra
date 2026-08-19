@@ -1118,6 +1118,47 @@ pub enum SourceImportError {
     ObjNoVertices { path: String },
 }
 
+/// Decoded, normalized height samples shared by CPU generators and GPU uploads.
+/// Keeping decoding here makes the CPU exporter the format/precision oracle.
+#[derive(Debug, Clone)]
+pub struct DecodedHeightmap {
+    pub width: u32,
+    pub height: u32,
+    pub samples: Vec<f32>,
+}
+
+impl DecodedHeightmap {
+    #[inline]
+    pub fn sample_nearest(&self, u: f32, v: f32) -> f32 {
+        if self.width == 0 || self.height == 0 {
+            return 0.0;
+        }
+        let x = ((u.clamp(0.0, 1.0) * self.width as f32) as u32).min(self.width - 1);
+        let y = ((v.clamp(0.0, 1.0) * self.height as f32) as u32).min(self.height - 1);
+        self.samples[(y * self.width + x) as usize]
+    }
+}
+
+/// Decode a source image exactly once into the normalized representation used
+/// by both CPU sampling and the GPU source-texture cache.
+pub fn load_heightmap(path: &str) -> Result<DecodedHeightmap, SourceImportError> {
+    let img = image::open(path).map_err(|e| SourceImportError::Image {
+        path: path.to_owned(),
+        message: e.to_string(),
+    })?;
+    let gray = img.to_luma16();
+    let (width, height) = gray.dimensions();
+    let samples = gray
+        .pixels()
+        .map(|pixel| pixel.0[0] as f32 / 65535.0)
+        .collect();
+    Ok(DecodedHeightmap {
+        width,
+        height,
+        samples,
+    })
+}
+
 pub fn import_heightmap(
     metrics: HeightfieldMetrics,
     p: &ImportHeightmapParams,
@@ -1125,21 +1166,38 @@ pub fn import_heightmap(
     if p.path.is_empty() {
         return Ok(Heightfield::zeros(metrics));
     }
-    let img = image::open(&p.path).map_err(|e| SourceImportError::Image {
-        path: p.path.clone(),
-        message: e.to_string(),
-    })?;
-    let g = img.to_luma16();
-    let (iw, ih) = g.dimensions();
+    let source = load_heightmap(&p.path)?;
     let mut hf = Heightfield::zeros(metrics);
     for j in 0..metrics.height {
         for i in 0..metrics.width {
             let u = i as f32 / metrics.width as f32;
             let v = j as f32 / metrics.height as f32;
-            let x = ((u * iw as f32) as u32).min(iw - 1);
-            let y = ((v * ih as f32) as u32).min(ih - 1);
-            let pix = g.get_pixel(x, y).0[0] as f32 / 65535.0;
+            let pix = source.sample_nearest(u, v);
             hf.set(i, j, pix * p.height_scale + p.height_offset);
+        }
+    }
+    Ok(hf)
+}
+
+/// Sample a heightmap through caller-provided destination-to-source UV mapping.
+/// Placement semantics stay at the evaluator boundary; this module remains
+/// independent of authoring-layer transform types.
+pub fn sample_heightmap_with(
+    metrics: HeightfieldMetrics,
+    p: &ImportHeightmapParams,
+    mut source_uv: impl FnMut(u32, u32) -> Option<(f32, f32)>,
+) -> Result<Heightfield, SourceImportError> {
+    if p.path.is_empty() {
+        return Ok(Heightfield::zeros(metrics));
+    }
+    let source = load_heightmap(&p.path)?;
+    let mut hf = Heightfield::zeros(metrics);
+    for j in 0..metrics.height {
+        for i in 0..metrics.width {
+            if let Some((u, v)) = source_uv(i, j) {
+                let pix = source.sample_nearest(u, v);
+                hf.set(i, j, pix * p.height_scale + p.height_offset);
+            }
         }
     }
     Ok(hf)

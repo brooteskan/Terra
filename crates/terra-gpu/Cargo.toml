@@ -16,6 +16,7 @@ profiling = { workspace = true }
 
 [dev-dependencies]
 terra-test-gpu = { workspace = true }
+image = { workspace = true }
 
 [lints]
 workspace = true

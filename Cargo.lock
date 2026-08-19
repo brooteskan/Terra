@@ -2619,6 +2619,7 @@ version = "0.1.0-beta.1"
 dependencies = [
  "bytemuck",
  "glam",
+ "image",
  "log",
  "profiling",
  "terra-core",

@@ -671,7 +671,7 @@ impl StackEvaluator {
                         ctx.aux = aux_hash_snapshot;
                         ctx.sync_aux_hashmap();
 
-                        let mask = effective_layer_mask(ctx, &group.masks, &current);
+                        let mask = composite_distribution(ctx, &group.masks, &current);
                         // Biome Filters blend toward lower biomes at `filter_blending`
                         // (1.0 = full mix, 0.0 = no contribution) rather than a hard cut.
                         // Height-delta semantics: with CopyInput, Normal mix is equivalent to
@@ -827,7 +827,7 @@ impl StackEvaluator {
         };
         // Avoid unused-mut warning if future passes mutate further.
         let _ = &mut bound_layer;
-        let mask = effective_layer_mask(ctx, &layer.common.masks, input);
+        let mask = effective_layer_mask(ctx, &bound_layer, input);
         // Gate materials / vegetation aux by local placement (Biome × Local at group+layer).
         if matches!(
             layer.kind,
@@ -925,7 +925,7 @@ impl StackEvaluator {
         let scaled_layer = layer_with_world_scale(layer, ctx.level_steps.world_scale);
         let bound_layer = apply_param_bindings(ctx, &scaled_layer);
         let generated = self.generate_scoped(ctx, input, &bound_layer, scope)?;
-        let mask = effective_layer_mask(ctx, &layer.common.masks, input);
+        let mask = effective_layer_mask(ctx, &bound_layer, input);
 
         let mut out = prev;
         for &id in scope {
@@ -1659,12 +1659,29 @@ fn composite_distribution(
 }
 
 /// Effective contribution mask from the layer's local distribution.
-fn effective_layer_mask(
-    ctx: &EvalContext,
-    local: &crate::mask::Distribution,
-    input: &Heightfield,
-) -> MaskField {
-    composite_distribution(ctx, local, input)
+fn effective_layer_mask(ctx: &EvalContext, layer: &Layer, input: &Heightfield) -> MaskField {
+    let mut mask = composite_distribution(ctx, &layer.common.masks, input);
+    let crate::layer::LayerKind::Stamp2d(_) = layer.kind else {
+        return mask;
+    };
+    let Some(transform) = layer.common.shape_transform.as_ref() else {
+        return mask;
+    };
+    let metrics = input.metrics;
+    for j in 0..metrics.height {
+        for i in 0..metrics.width {
+            let weight = transform
+                .world_to_local(
+                    metrics.world_x(i),
+                    metrics.world_z(j),
+                    metrics.world_size_x,
+                    metrics.world_size_z,
+                )
+                .map_or(0.0, |(_, _, weight)| weight);
+            mask.set(i, j, mask.get(i, j) * weight);
+        }
+    }
+    mask
 }
 
 /// Fingerprint of height data for group-cache keyed reuse.

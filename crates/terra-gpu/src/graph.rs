@@ -41,6 +41,7 @@ pub enum GpuKernel {
     Path,
     PolygonHeight,
     ProceduralShape,
+    HeightmapSample,
     Blur,
     EffectFilter,
     Terrace,
@@ -62,6 +63,10 @@ impl GpuKernel {
                 | (Self::Path, LayerKind::Path(_))
                 | (Self::PolygonHeight, LayerKind::PolygonHeight(_))
                 | (Self::ProceduralShape, LayerKind::ProceduralShape(_))
+                | (
+                    Self::HeightmapSample,
+                    LayerKind::ImportHeightmap(_) | LayerKind::Stamp2d(_)
+                )
                 | (
                     Self::Noise,
                     LayerKind::NoiseValue(_)
@@ -461,7 +466,31 @@ fn gpu_plan_for_layer(layer: &Layer, mask_assets: &[MaskAsset]) -> Option<GpuLay
         {
             (GpuKernel::ProceduralShape, GpuDirtyPolicy::Local, 0)
         }
-        Path(_) | PolygonHeight(_) | ProceduralShape(_) => return None,
+        ImportHeightmap(p)
+            if p.height_scale.is_finite()
+                && p.height_offset.is_finite()
+                && gpu_blend_mode(layer.common.blend).is_some() =>
+        {
+            (GpuKernel::HeightmapSample, GpuDirtyPolicy::Local, 0)
+        }
+        Stamp2d(p)
+            if p.heightmap.height_scale.is_finite()
+                && p.heightmap.height_offset.is_finite()
+                && layer.common.shape_transform.as_ref().is_none_or(|t| {
+                    t.offset_x.is_finite()
+                        && t.offset_z.is_finite()
+                        && t.scale.is_finite()
+                        && t.rotation_deg.is_finite()
+                        && t.blend_size.is_finite()
+                        && t.blend_roundness.is_finite()
+                })
+                && gpu_blend_mode(layer.common.blend).is_some() =>
+        {
+            (GpuKernel::HeightmapSample, GpuDirtyPolicy::Local, 0)
+        }
+        Path(_) | PolygonHeight(_) | ProceduralShape(_) | ImportHeightmap(_) | Stamp2d(_) => {
+            return None;
+        }
         NoiseValue(p) if seed_supported(p.seed) && gpu_blend_mode(layer.common.blend).is_some() => {
             (GpuKernel::Noise, GpuDirtyPolicy::Local, 2)
         }
@@ -741,11 +770,12 @@ mod tests {
     use terra_core::layer::{
         BiomesParams, BlurParams, CanyonParams, CoastalParams, DomainWarpParams, DuneParams,
         EffectFilterKind, EffectFilterParams, FbmParams, FlatParams, FractalNoiseType,
-        HydraulicErosionParams, IslandParams, LandscapeEvolutionParams, Layer, LayerKind,
-        LayerStack, LayerTypeRegistry, MaterialsParams, MesaParams, MountainParams,
-        MultiScaleAmplifyParams, NoiseParams, PlateauParams, RiverCarveParams, SculptStroke,
-        SculptStrokeKind, SculptStrokeParams, StreamPowerParams, TerraceParams,
-        ThermalErosionParams, UpliftParams, VegetationParams, VolcanoParams,
+        HydraulicErosionParams, ImportHeightmapParams, IslandParams, LandscapeEvolutionParams,
+        Layer, LayerKind, LayerStack, LayerTypeRegistry, MaterialsParams, MesaParams,
+        MountainParams, MultiScaleAmplifyParams, NoiseParams, PlateauParams, RiverCarveParams,
+        SculptStroke, SculptStrokeKind, SculptStrokeParams, Stamp2dParams, Stamp3dParams,
+        StreamPowerParams, TerraceParams, ThermalErosionParams, UpliftParams, VegetationParams,
+        VolcanoParams,
     };
     use terra_core::mask::{
         bake_distribution, bake_mask_assets, DistributionEntry, MaskId, MaskOp, MaskRef,
@@ -755,6 +785,32 @@ mod tests {
         let mut stack = LayerStack::new();
         stack.push(layer);
         compile_gpu_graph(&stack, &[])
+    }
+
+    #[test]
+    fn heightmap_asset_support_gate_is_explicit() {
+        let import = Layer::new(
+            "import",
+            LayerKind::ImportHeightmap(ImportHeightmapParams::default()),
+        );
+        let stamp = Layer::new("stamp", LayerKind::Stamp2d(Stamp2dParams::default()));
+        let stamp3d = Layer::new("stamp3d", LayerKind::Stamp3d(Stamp3dParams::default()));
+        assert_eq!(
+            gpu_plan_for_layer(&import, &[]).map(|plan| plan.kernel),
+            Some(GpuKernel::HeightmapSample)
+        );
+        assert_eq!(
+            gpu_plan_for_layer(&stamp, &[]).map(|plan| plan.kernel),
+            Some(GpuKernel::HeightmapSample)
+        );
+        assert!(!layer_gpu_supported(&stamp3d, &[]));
+
+        let mut invalid = import;
+        let LayerKind::ImportHeightmap(params) = &mut invalid.kind else {
+            unreachable!();
+        };
+        params.height_scale = f32::NAN;
+        assert!(!layer_gpu_supported(&invalid, &[]));
     }
 
     fn masked_flat(asset: &MaskAsset) -> Layer {

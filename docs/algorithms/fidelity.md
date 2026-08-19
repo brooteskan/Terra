@@ -6,6 +6,7 @@
 - **GPU** preview supports only configurations covered by the executable matrix below. Generator compositing supports Replace/Normal/Interpolate, Add, Subtract, Multiply, Min, Max, and Overlay. HeightBlend and smooth blend modes fall back to CPU rather than being substituted.
 - **In-place GPU kernels** (Blur, Terrace, EffectFilter, Thermal, Hydraulic, RiverCarve, StreamPower, and MultiScaleAmplify) are supported only with their exact default outer composite: full opacity, no layer mask, and Replace/Normal/Interpolate blending. Masked, partial-opacity, or otherwise blended configurations fall back to CPU because these kernels do not yet preserve and composite their entering height.
 - **GPU masks** are limited to one Multiply entry referencing an existing, operation-free Constant, Height, or Slope asset.
+- **Heightmap assets** are decoded to normalized R16-equivalent samples and uploaded to a source-texture cache keyed by canonical path plus file metadata. `ImportHeightmap` and transformed `Stamp2d` use nearest/clamp edge sampling; `Stamp3d` remains CPU-only.
 - **CPU fallback**: Coastal currently requires CPU evaluation. Materials, Biomes, and Vegetation also require CPU evaluation because their observable auxiliary fields are not published by the GPU path.
 - **Hybrid**: GPU preview may continue supported work speculatively above an unsupported layer when no readback is requested. A requested CPU checkpoint instead stops before the first unsupported layer, and its height is exactly the field entering `resume_cpu_from`. Prefixes that publish auxiliary fields or named outputs cannot be represented by height alone and conservatively restart the CPU evaluator from layer zero.
 
@@ -20,6 +21,7 @@ Errors compare complete GPU and CPU height fields. Normalized RMSE uses the maxi
 | `authoring.sculpt-strokes` | Per-sample stroke kinds, Smooth/Pinch/Coastline, Flatten, and distance stamps, supported blend/mask | 0.001 | 0.00001 |
 | `authoring.path-height` | CPU-tessellated spline, raise/carve height preview; carved wetness falls back when consumed | 0.001 | 0.00001 |
 | `authoring.polygon-height` | RaiseBy/SetElevation, raise/carve, world-space feather | 0.001 | 0.00001 |
+| `asset.heightmap-sample` | ImportHeightmap and transformed Stamp2d, normalized R16 nearest/clamp sampling | 0.001 | 0.00001 |
 | `mask.simple` | One Constant, Height, or Slope Multiply entry without asset operations | 0.001 | 0.0001 |
 | `noise.value` | Value noise with a 32-bit seed | 17.0 | 0.23 |
 | `noise.perlin` | Perlin, 1-12 octaves, reproducible 32-bit seed stream | 0.001 | 0.00001 |
