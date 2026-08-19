@@ -7,10 +7,11 @@
 //! re-derives kernels mid-walk, so planning has a single authority.
 
 use crate::effect_filter::{effect_filter_gpu_spec, EffectFilterGpuScope};
+use terra_core::fields::FieldId;
 use terra_core::layer::{
     BlendMode, DuneParams, FractalNoiseType, IslandArchetype, IslandParams, Layer, LayerKind,
-    LayerStack, MountainParams, RiverCarveParams, SculptStrokeKind, StreamPowerParams,
-    TransportModel, UpliftParams,
+    LayerStack, MountainParams, MultiScaleAmplifyParams, RiverCarveParams, SculptStrokeKind,
+    StreamPowerParams, TransportModel, UpliftParams,
 };
 use terra_core::mask::{MaskAsset, MaskCombine, MaskSource};
 
@@ -43,6 +44,7 @@ pub enum GpuKernel {
     Hydraulic,
     RiverCarve,
     StreamPower,
+    MultiScaleAmplify,
 }
 
 impl GpuKernel {
@@ -79,6 +81,7 @@ impl GpuKernel {
                 | (Self::Hydraulic, LayerKind::HydraulicErosion(_))
                 | (Self::RiverCarve, LayerKind::RiverCarve(_))
                 | (Self::StreamPower, LayerKind::StreamPowerErosion(_))
+                | (Self::MultiScaleAmplify, LayerKind::MultiScaleAmplify(_))
         )
     }
 }
@@ -280,9 +283,7 @@ fn hydraulic_config_supported(p: &terra_core::layer::HydraulicErosionParams) -> 
 /// must stay on the CPU oracle.
 fn river_carve_config_supported(p: &RiverCarveParams) -> bool {
     let guide_is_inert = matches!(p.guide, MaskSource::None) || p.guide_boost.max(0.0) <= 1.0e-6;
-    let max_bank_radius = p.width.max(1.0)
-        * 4.0
-        * (1.0 + p.bank_smooth.max(0.0) * 0.75);
+    let max_bank_radius = p.width.max(1.0) * 4.0 * (1.0 + p.bank_smooth.max(0.0) * 0.75);
     p.accumulation_threshold.is_finite()
         && p.accumulation_threshold >= 1.0e-3
         && p.depth.is_finite()
@@ -318,6 +319,31 @@ fn stream_power_config_supported(p: &StreamPowerParams) -> bool {
         && p.start_level == 0
         && p.level_step_strength == 1.0
         && p.level_step_curve.is_empty()
+}
+
+/// Height-only multi-scale preview. The executor mirrors the CPU coarse-to-fine
+/// schedule but currently carries only uniform hardness and ridge-lock values;
+/// field-sourced masks and inherited hardness remain on the CPU oracle.
+fn multi_scale_amplify_config_supported(p: &MultiScaleAmplifyParams) -> bool {
+    let hardness_supported = match p.hardness_source {
+        MaskSource::None => true,
+        MaskSource::Constant(value) => value.is_finite(),
+        _ => false,
+    };
+    let ridge_lock_supported = match p.ridge_lock {
+        MaskSource::None => true,
+        MaskSource::Constant(value) => value.is_finite(),
+        _ => false,
+    };
+    hardness_supported
+        && ridge_lock_supported
+        && p.thermal_strength.is_finite()
+        && p.talus_angle_deg.is_finite()
+        && p.spe_strength.is_finite()
+        && p.deposition_strength.is_finite()
+        && p.detail_boost.is_finite()
+        && p.hardness.is_finite()
+        && p.lock_strength.is_finite()
 }
 
 fn gpu_plan_for_layer(layer: &Layer, mask_assets: &[MaskAsset]) -> Option<GpuLayerPlan> {
@@ -472,7 +498,16 @@ fn gpu_plan_for_layer(layer: &Layer, mask_assets: &[MaskAsset]) -> Option<GpuLay
         {
             (GpuKernel::StreamPower, GpuDirtyPolicy::FullField, 0)
         }
-        ThermalErosion(_) | HydraulicErosion(_) | RiverCarve(_) | StreamPowerErosion(_) => {
+        MultiScaleAmplify(p)
+            if multi_scale_amplify_config_supported(p) && inplace_composite_supported(layer) =>
+        {
+            (GpuKernel::MultiScaleAmplify, GpuDirtyPolicy::FullField, 0)
+        }
+        ThermalErosion(_)
+        | HydraulicErosion(_)
+        | RiverCarve(_)
+        | StreamPowerErosion(_)
+        | MultiScaleAmplify(_) => {
             return None;
         }
         // These CPU operations either modify height without a GPU kernel or publish
@@ -529,6 +564,29 @@ pub fn compile_gpu_graph(stack: &LayerStack, mask_assets: &[MaskAsset]) -> GpuCo
         }
     }
 
+    // MultiScaleAmplify's GPU path is height-only. `MaskSource::None` inherits a
+    // previously published hardness field on the CPU, so retain the plan only when
+    // the prefix proves no such field exists. Likewise, do not advertise a fully-GPU
+    // suffix that would consume hardness/erosion/deposition the preview omits.
+    for i in 0..layers.len() {
+        let LayerKind::MultiScaleAmplify(params) = &layers[i].kind else {
+            continue;
+        };
+        if plans[i].is_none() {
+            continue;
+        }
+        let inherits_hardness = matches!(params.hardness_source, MaskSource::None)
+            && layers[..i].iter().any(|layer| {
+                layer.common.enabled && layer.kind.produced_fields().contains(&FieldId::Hardness)
+            });
+        let downstream_aux_consumer = layers[i + 1..]
+            .iter()
+            .any(|layer| layer.common.enabled && layer.kind.consumes_sculpt_aux());
+        if inherits_hardness || downstream_aux_consumer {
+            plans[i] = None;
+        }
+    }
+
     // First enabled layer with no executable plan is the CPU-resume boundary.
     let cpu_from = layers
         .iter()
@@ -561,10 +619,10 @@ mod tests {
         BiomesParams, BlurParams, CanyonParams, CoastalParams, DomainWarpParams, DuneParams,
         EffectFilterKind, EffectFilterParams, FbmParams, FlatParams, FractalNoiseType,
         HydraulicErosionParams, IslandParams, LandscapeEvolutionParams, Layer, LayerKind,
-        LayerStack, LayerTypeRegistry, MaterialsParams, MesaParams, MountainParams, NoiseParams,
-        PlateauParams, RiverCarveParams, SculptStroke, SculptStrokeKind, SculptStrokeParams,
-        StreamPowerParams, TerraceParams, ThermalErosionParams, UpliftParams, VegetationParams,
-        VolcanoParams,
+        LayerStack, LayerTypeRegistry, MaterialsParams, MesaParams, MountainParams,
+        MultiScaleAmplifyParams, NoiseParams, PlateauParams, RiverCarveParams, SculptStroke,
+        SculptStrokeKind, SculptStrokeParams, StreamPowerParams, TerraceParams,
+        ThermalErosionParams, UpliftParams, VegetationParams, VolcanoParams,
     };
     use terra_core::mask::{
         bake_distribution, bake_mask_assets, DistributionEntry, MaskId, MaskOp, MaskRef,
@@ -883,9 +941,7 @@ mod tests {
                     | EffectFilterKind::Swirl
                     | EffectFilterKind::Distortion
                     | EffectFilterKind::Hexagons
-                    | EffectFilterKind::TerraceSteep => {
-                        GpuDirtyPolicy::FullField
-                    }
+                    | EffectFilterKind::TerraceSteep => GpuDirtyPolicy::FullField,
                     _ => GpuDirtyPolicy::Local,
                 };
                 assert_eq!(plan.dirty_policy, expected_policy, "{}", kind.label());
@@ -1174,6 +1230,66 @@ mod tests {
         let mut partial = default;
         partial.common.opacity = 0.5;
         assert!(!layer_gpu_supported(&partial, &[]));
+    }
+
+    #[test]
+    fn multi_scale_amplify_support_is_full_field_and_aux_safe() {
+        let default = Layer::new(
+            "multi scale",
+            LayerKind::MultiScaleAmplify(MultiScaleAmplifyParams::default()),
+        );
+        let plan = gpu_plan_for_layer(&default, &[]).expect("default amplify should compile");
+        assert_eq!(plan.kernel, GpuKernel::MultiScaleAmplify);
+        assert_eq!(plan.dirty_policy, GpuDirtyPolicy::FullField);
+        assert_eq!(plan.halo_texels, 0);
+
+        for params in [
+            MultiScaleAmplifyParams {
+                hardness_source: MaskSource::Hardness,
+                ..MultiScaleAmplifyParams::default()
+            },
+            MultiScaleAmplifyParams {
+                ridge_lock: MaskSource::Slope {
+                    min_deg: 2.0,
+                    max_deg: 20.0,
+                },
+                ..MultiScaleAmplifyParams::default()
+            },
+            MultiScaleAmplifyParams {
+                detail_boost: f32::NAN,
+                ..MultiScaleAmplifyParams::default()
+            },
+        ] {
+            assert!(!layer_gpu_supported(
+                &Layer::new("unsupported amplify", LayerKind::MultiScaleAmplify(params)),
+                &[]
+            ));
+        }
+
+        let mut inherited = LayerStack::new();
+        inherited.push(Layer::new(
+            "thermal",
+            LayerKind::ThermalErosion(ThermalErosionParams {
+                layered_materials: false,
+                weathering_rate: 0.0,
+                ..ThermalErosionParams::default()
+            }),
+        ));
+        inherited.push(default.clone());
+        let graph = compile_gpu_graph(&inherited, &[]);
+        assert!(graph.plans[0].is_some());
+        assert!(graph.plans[1].is_none());
+        assert_eq!(graph.cpu_from, Some(1));
+
+        let mut consumed = LayerStack::new();
+        consumed.push(default);
+        consumed.push(Layer::new(
+            "stream power",
+            LayerKind::StreamPowerErosion(StreamPowerParams::default()),
+        ));
+        let graph = compile_gpu_graph(&consumed, &[]);
+        assert!(graph.plans[0].is_none());
+        assert_eq!(graph.cpu_from, Some(0));
     }
 
     #[test]

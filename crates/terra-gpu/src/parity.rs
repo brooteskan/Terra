@@ -57,8 +57,13 @@ pub const STREAM_POWER_D8_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-3
 /// Authored D-infinity routing is deliberately approximated with the same D8
 /// accumulation preview; the CPU D-infinity/Priority-Flood path remains authoritative.
 /// Measured max abs / normalized RMSE are 0.0576 m / 0.000170 on the open basin.
-pub const STREAM_POWER_DINFINITY_PREVIEW: ParityTolerance =
-    ParityTolerance::new(1.0e-1, 5.0e-4);
+pub const STREAM_POWER_DINFINITY_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-1, 5.0e-4);
+/// MultiScaleAmplify runs the CPU coarse-to-fine schedule with the existing
+/// bounded thermal, D8 stream-power, and hydraulic preview solvers. The CPU
+/// export path remains authoritative for Priority-Flood routing and aux fields.
+/// Measured max abs / normalized RMSE are 0.564 m / 0.000261 on the two-level
+/// open-basin fixture; the contract retains portable headroom around both axes.
+pub const MULTI_SCALE_AMPLIFY_PREVIEW: ParityTolerance = ParityTolerance::new(8.0e-1, 4.0e-4);
 /// Volcanic-island preview is intentionally a reduced massif/shelf model.
 pub const VOLCANIC_ISLAND_PREVIEW: ParityTolerance = ParityTolerance::new(220.0, 1.0e-1);
 /// GPU shape-family contracts (#126). These are separate named budgets because
@@ -160,6 +165,7 @@ pub const FIDELITY_MATRIX_MARKDOWN: &str = "\
 | `simulation.river-carve.d-infinity` | D-infinity authored mode approximated by D8 preview, no guide mask, bounded bank radius | 6.0 | 0.02 |\n\
 | `simulation.stream-power.d8` | Constant hardness, iterative D8 accumulation, no Priority-Flood or dendritic seed | 0.001 | 0.00001 |\n\
 | `simulation.stream-power.d-infinity` | D-infinity authored mode approximated by D8 preview, constant hardness | 0.1 | 0.0005 |\n\
+| `simulation.multi-scale-amplify` | Uniform hardness/lock, coarse-to-fine thermal + D8 stream-power + hydraulic preview | 0.8 | 0.0004 |\n\
 | `shape.mountains` | Mountains with reproducible 32-bit seed streams | 10.0 | 0.005 |\n\
 | `shape.dunes` | Default transport controls, 2-4 octaves, reproducible 32-bit seed stream | 36.0 | 0.78 |\n\
 | `shape.canyons` | Canyons with a 32-bit seed | 0.001 | 0.00001 |\n\

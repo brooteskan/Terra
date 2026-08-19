@@ -327,6 +327,12 @@ impl LayerKind {
                 FieldId::StreamOrder,
                 FieldId::SpeIncision,
             ],
+            LayerKind::MultiScaleAmplify(_) => vec![
+                FieldId::Height,
+                FieldId::Hardness,
+                FieldId::Erosion,
+                FieldId::Deposition,
+            ],
             LayerKind::Materials(_) => {
                 vec![
                     FieldId::Materials,
@@ -490,19 +496,18 @@ impl LayerKind {
                 // agreement with the GPU plan halo for Smooth (#114). Flatten stays
                 // tile-scoped too — its footprint fixpoint (#110) keeps a self-edit
                 // recompute bit-exact without escalating the layer's reach.
-                halo_samples: 1
-                    + u32::from(
-                        p.reconcile > 0.0
-                            && p.strokes.iter().any(|s| {
-                                s.enabled
-                                    && matches!(
-                                        s.kind,
-                                        crate::authoring::SculptStrokeKind::Smooth
-                                            | crate::authoring::SculptStrokeKind::Pinch
-                                            | crate::authoring::SculptStrokeKind::Coastline
-                                    )
-                            }),
-                    ),
+                halo_samples: 1 + u32::from(
+                    p.reconcile > 0.0
+                        && p.strokes.iter().any(|s| {
+                            s.enabled
+                                && matches!(
+                                    s.kind,
+                                    crate::authoring::SculptStrokeKind::Smooth
+                                        | crate::authoring::SculptStrokeKind::Pinch
+                                        | crate::authoring::SculptStrokeKind::Coastline
+                                )
+                        }),
+                ),
             },
             other => match other.spatial_dependency() {
                 DirtyClass::Local => Reach::LOCAL,
@@ -804,6 +809,20 @@ mod tests {
             ScaleBand::MultiScale
         );
         assert!(ScaleBand::Micro.respects_macro_silhouette());
+    }
+
+    #[test]
+    fn multi_scale_amplify_declares_the_aux_fields_its_processor_publishes() {
+        let fields =
+            LayerKind::MultiScaleAmplify(MultiScaleAmplifyParams::default()).produced_fields();
+        for field in [
+            FieldId::Height,
+            FieldId::Hardness,
+            FieldId::Erosion,
+            FieldId::Deposition,
+        ] {
+            assert!(fields.contains(&field), "missing {field:?}");
+        }
     }
 
     #[test]

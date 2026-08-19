@@ -17,16 +17,16 @@ use crate::{readback_f32, GpuError};
 use bytemuck::{Pod, Zeroable};
 use std::collections::{HashMap, HashSet};
 use terra_core::analyze::{
-    apply_transport_model, clamp_timestep_cfl, default_sim_levels, draft_sim_levels,
-    LevelStepSettings,
+    amplify_sim_levels, apply_transport_model, clamp_timestep_cfl, default_sim_levels,
+    draft_sim_levels, LevelStepSettings,
 };
 use terra_core::eval::PreviewQuality;
 use terra_core::fields::FieldId;
 use terra_core::heightfield::{Heightfield, HeightfieldMetrics, TileId};
 use terra_core::layer::{
     BlendMode, EffectFilterParams, FractalNoiseType, IslandArchetype, IslandParams, Layer, LayerId,
-    LayerKind, LayerStack, NoiseParams, PlateauParams, SculptParams, SculptStroke,
-    SculptStrokeKind, SculptStrokeParams,
+    LayerKind, LayerStack, MultiScaleAmplifyParams, NoiseParams, PlateauParams, SculptParams,
+    SculptStroke, SculptStrokeKind, SculptStrokeParams,
 };
 use terra_core::mask::{MaskAsset, MaskSource};
 use terra_core::tiling::{SampleRect, TileScheduler};
@@ -496,6 +496,32 @@ struct StreamPowerU {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
+struct AmplifyDownsampleU {
+    src_width: u32,
+    src_height: u32,
+    dst_width: u32,
+    dst_height: u32,
+    area_mode: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct AmplifyBlendU {
+    src_width: u32,
+    src_height: u32,
+    dst_width: u32,
+    dst_height: u32,
+    hardness: f32,
+    ridge_lock: f32,
+    lock_strength: f32,
+    detail_boost: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
 struct EffectFilterU {
     width: u32,
     height: u32,
@@ -893,6 +919,8 @@ pub struct GpuTerrainEngine {
     river_accum: Pipe,
     river_carve: Pipe,
     stream_power: Pipe,
+    amplify_downsample: Pipe,
+    amplify_upsample_blend: Pipe,
     effect_filter_range: Pipe,
     effect_filter: Pipe,
     mask_bake: Pipe,
@@ -917,6 +945,10 @@ pub struct GpuTerrainEngine {
     /// Loose sediment thickness for layered erodibility (meters).
     loose_sediment: HeightTex,
     outflow: RgbaTex,
+    /// Square reusable level textures used by MultiScaleAmplify. CPU SimLevels
+    /// are square and keyed from document width, including on non-square fields.
+    amplify_a: HeightTex,
+    amplify_b: HeightTex,
     /// SculptStrokes preview scratch: the running stamped height (`sculpt_stamp` and
     /// the ping-pong partner `sculpt_stamp_b`) and the per-texel brush coverage
     /// (`sculpt_edited`), read by the reconcile pass (#113, #117). The Flatten
@@ -1074,6 +1106,21 @@ impl GpuTerrainEngine {
                 storage_write_entry(4),
             ],
         });
+        let amplify_downsample_bgl =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("amplify-downsample-bgl"),
+                entries: &[uniform_entry(0), tex_read_entry(1), storage_write_entry(2)],
+            });
+        let amplify_upsample_blend_bgl =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("amplify-upsample-blend-bgl"),
+                entries: &[
+                    uniform_entry(0),
+                    tex_read_entry(1),
+                    tex_read_entry(2),
+                    storage_write_entry(3),
+                ],
+            });
 
         let fill = make_pipe(device, "fill", include_str!("shaders/fill.wgsl"), fill_bgl);
         let noise = make_pipe(
@@ -1157,6 +1204,18 @@ impl GpuTerrainEngine {
             include_str!("shaders/stream_power_incision.wgsl"),
             stream_power_bgl,
         );
+        let amplify_downsample = make_pipe(
+            device,
+            "amplify-downsample",
+            include_str!("shaders/amplify_downsample.wgsl"),
+            amplify_downsample_bgl,
+        );
+        let amplify_upsample_blend = make_pipe(
+            device,
+            "amplify-upsample-blend",
+            include_str!("shaders/amplify_upsample_blend.wgsl"),
+            amplify_upsample_blend_bgl,
+        );
         let effect_filter_range_bgl =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("effect-filter-range-bgl"),
@@ -1197,18 +1256,19 @@ impl GpuTerrainEngine {
             include_str!("shaders/mask_bake.wgsl"),
             mask_bake_bgl,
         );
-        let sculpt_strokes_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("sculpt-strokes-bgl"),
-            entries: &[
-                uniform_entry(0),
-                tex_read_entry(1),            // src_original (base neighborhood)
-                tex_read_entry(2),            // running_in (chained height)
-                storage_read_buffer_entry(3), // headers
-                storage_read_buffer_entry(4), // points
-                storage_read_buffer_entry(5), // targets (Flatten footprint means)
-                storage_write_entry(6),       // stamp_out
-            ],
-        });
+        let sculpt_strokes_bgl =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("sculpt-strokes-bgl"),
+                entries: &[
+                    uniform_entry(0),
+                    tex_read_entry(1), // src_original (base neighborhood)
+                    tex_read_entry(2), // running_in (chained height)
+                    storage_read_buffer_entry(3), // headers
+                    storage_read_buffer_entry(4), // points
+                    storage_read_buffer_entry(5), // targets (Flatten footprint means)
+                    storage_write_entry(6), // stamp_out
+                ],
+            });
         let sculpt_strokes_edited_bgl =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("sculpt-strokes-edited-bgl"),
@@ -1224,10 +1284,10 @@ impl GpuTerrainEngine {
                 label: Some("sculpt-strokes-flatten-reduce-bgl"),
                 entries: &[
                     uniform_entry(0),
-                    tex_read_entry(1),            // running field entering the stroke
+                    tex_read_entry(1), // running field entering the stroke
                     storage_read_buffer_entry(2), // headers
                     storage_read_buffer_entry(3), // points
-                    storage_rw_buffer_entry(4),   // partials
+                    storage_rw_buffer_entry(4), // partials
                 ],
             });
         let sculpt_strokes_flatten_resolve_bgl =
@@ -1283,15 +1343,18 @@ impl GpuTerrainEngine {
         let pong = HeightTex::new(device, "pong", w, w);
         let layer_tex = HeightTex::new(device, "layer", w, w);
         let mask_ones = HeightTex::new(device, "mask-ones", w, w);
-        let hardness = HeightTex::new(device, "hardness", w, w);
-        let water_a = HeightTex::new(device, "water-a", w, w);
-        let water_b = HeightTex::new(device, "water-b", w, w);
-        let delta = HeightTex::new(device, "thermal-delta", w, w);
-        let sed_a = HeightTex::new(device, "sed-a", w, w);
-        let sed_b = HeightTex::new(device, "sed-b", w, w);
-        let rainfall = HeightTex::new(device, "rainfall", w, w);
-        let loose_sediment = HeightTex::new(device, "loose-sediment", w, w);
-        let outflow = RgbaTex::new(device, "hydraulic-outflow", w, w);
+        let sim_side = w;
+        let hardness = HeightTex::new(device, "hardness", sim_side, sim_side);
+        let water_a = HeightTex::new(device, "water-a", sim_side, sim_side);
+        let water_b = HeightTex::new(device, "water-b", sim_side, sim_side);
+        let delta = HeightTex::new(device, "thermal-delta", sim_side, sim_side);
+        let sed_a = HeightTex::new(device, "sed-a", sim_side, sim_side);
+        let sed_b = HeightTex::new(device, "sed-b", sim_side, sim_side);
+        let rainfall = HeightTex::new(device, "rainfall", sim_side, sim_side);
+        let loose_sediment = HeightTex::new(device, "loose-sediment", sim_side, sim_side);
+        let outflow = RgbaTex::new(device, "hydraulic-outflow", sim_side, sim_side);
+        let amplify_a = HeightTex::new(device, "amplify-a", sim_side, sim_side);
+        let amplify_b = HeightTex::new(device, "amplify-b", sim_side, sim_side);
         let sculpt_stamp = HeightTex::new(device, "sculpt-stamp", w, w);
         let sculpt_stamp_b = HeightTex::new(device, "sculpt-stamp-b", w, w);
         let sculpt_edited = HeightTex::new(device, "sculpt-edited", w, w);
@@ -1320,6 +1383,8 @@ impl GpuTerrainEngine {
             river_accum,
             river_carve,
             stream_power,
+            amplify_downsample,
+            amplify_upsample_blend,
             effect_filter_range,
             effect_filter,
             mask_bake,
@@ -1342,6 +1407,8 @@ impl GpuTerrainEngine {
             rainfall,
             loose_sediment,
             outflow,
+            amplify_a,
+            amplify_b,
             sculpt_stamp,
             sculpt_stamp_b,
             sculpt_edited,
@@ -1649,6 +1716,8 @@ impl GpuTerrainEngine {
         self.rainfall = HeightTex::new(device, "rainfall", w, h);
         self.loose_sediment = HeightTex::new(device, "loose-sediment", w, h);
         self.outflow = RgbaTex::new(device, "hydraulic-outflow", w, h);
+        self.amplify_a = HeightTex::new(device, "amplify-a", w, h);
+        self.amplify_b = HeightTex::new(device, "amplify-b", w, h);
         self.sculpt_stamp = HeightTex::new(device, "sculpt-stamp", w, h);
         self.sculpt_stamp_b = HeightTex::new(device, "sculpt-stamp-b", w, h);
         self.sculpt_edited = HeightTex::new(device, "sculpt-edited", w, h);
@@ -1735,6 +1804,46 @@ impl GpuTerrainEngine {
                 1,
             );
         }
+    }
+
+    fn fill_view_extent(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        extent: [u32; 2],
+        value: f32,
+    ) {
+        let [width, height] = extent;
+        let uniform = FillU {
+            width,
+            height,
+            value,
+            _pad: 0.0,
+        };
+        let buffer = self.write_uniform(device, queue, &uniform);
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("fill-extent-bg"),
+            layout: &self.fill.bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(view),
+                },
+            ],
+        });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("fill-extent"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.fill.pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
     }
 
     fn copy_slots(
@@ -2208,20 +2317,14 @@ impl GpuTerrainEngine {
             let count = levels.len() as f32;
             (
                 levels.iter().map(|level| level.iter_scale).sum::<f32>() / count,
-                levels
-                    .iter()
-                    .map(|level| level.effect_scale)
-                    .sum::<f32>()
-                    / count,
+                levels.iter().map(|level| level.effect_scale).sum::<f32>() / count,
             )
         };
         let iters = ((authored_iters as f32 * iter_scale).round() as u32)
             .max(1)
             .min(match quality {
                 PreviewQuality::Draft => self.max_sim_iters_per_tick.max(1),
-                PreviewQuality::Medium | PreviewQuality::Full | PreviewQuality::Export => {
-                    u32::MAX
-                }
+                PreviewQuality::Medium | PreviewQuality::Full | PreviewQuality::Export => u32::MAX,
             });
         let drainage_stride = match quality {
             PreviewQuality::Draft => p.drainage_reuse_stride.max(2),
@@ -2319,6 +2422,592 @@ impl GpuTerrainEngine {
                 .max(p.base_level),
             (self.approx_range.1 + p.uplift_rate.max(0.0) * iter_scale).max(p.base_level),
         );
+    }
+
+    fn run_amplify_accumulation(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        level_res: u32,
+        height_a: bool,
+        quality: PreviewQuality,
+    ) -> bool {
+        let water_a = self.water_a.view.clone();
+        let water_b = self.water_b.view.clone();
+        self.fill_view_extent(device, queue, encoder, &water_a, [level_res; 2], 1.0);
+        self.fill_view_extent(device, queue, encoder, &water_b, [level_res; 2], 0.0);
+        let iterations = match quality {
+            PreviewQuality::Draft => 12,
+            PreviewQuality::Medium => 32,
+            PreviewQuality::Full | PreviewQuality::Export => (level_res / 4).clamp(48, 160),
+        };
+        let uniform = RiverAccumU {
+            width: level_res,
+            height: level_res,
+            _p0: 0.0,
+            _p1: 0.0,
+        };
+        let mut src_a = true;
+        for _ in 0..iterations {
+            let buffer = self.write_uniform(device, queue, &uniform);
+            let height = if height_a {
+                &self.amplify_a.view
+            } else {
+                &self.amplify_b.view
+            };
+            let (acc_in, acc_out) = if src_a {
+                (&self.water_a.view, &self.water_b.view)
+            } else {
+                (&self.water_b.view, &self.water_a.view)
+            };
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("amplify-river-accum-bg"),
+                layout: &self.river_accum.bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(height),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(acc_in),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(acc_out),
+                    },
+                ],
+            });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("amplify-river-accum"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.river_accum.pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(level_res.div_ceil(8), level_res.div_ceil(8), 1);
+            drop(pass);
+            src_a = !src_a;
+        }
+        src_a
+    }
+
+    fn run_multi_scale_amplify(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        authored: &MultiScaleAmplifyParams,
+        quality: PreviewQuality,
+    ) {
+        let mut params = authored.clone();
+        match quality {
+            PreviewQuality::Draft => {
+                params.thermal_iters = params.thermal_iters.clamp(1, 6);
+                params.spe_iters = params.spe_iters.min(2);
+                params.level_count = if params.level_count == 0 {
+                    2
+                } else {
+                    params.level_count.min(2)
+                };
+            }
+            PreviewQuality::Medium => {
+                params.thermal_iters = params.thermal_iters.clamp(1, 10);
+                params.spe_iters = params.spe_iters.min(4);
+            }
+            PreviewQuality::Full | PreviewQuality::Export => {}
+        }
+        let levels = match quality {
+            PreviewQuality::Draft => {
+                amplify_sim_levels(self.metrics.width, params.level_count.clamp(1, 2))
+            }
+            PreviewQuality::Medium | PreviewQuality::Full | PreviewQuality::Export => {
+                amplify_sim_levels(self.metrics.width, params.level_count)
+            }
+        };
+        let required_side = levels
+            .iter()
+            .map(|level| level.resolution)
+            .max()
+            .unwrap_or(self.metrics.width)
+            .max(1);
+        if self.amplify_a.width < required_side || self.amplify_a.height < required_side {
+            self.hardness = HeightTex::new(device, "hardness", required_side, required_side);
+            self.water_a = HeightTex::new(device, "water-a", required_side, required_side);
+            self.water_b = HeightTex::new(device, "water-b", required_side, required_side);
+            self.delta = HeightTex::new(device, "thermal-delta", required_side, required_side);
+            self.sed_a = HeightTex::new(device, "sed-a", required_side, required_side);
+            self.sed_b = HeightTex::new(device, "sed-b", required_side, required_side);
+            self.rainfall = HeightTex::new(device, "rainfall", required_side, required_side);
+            self.loose_sediment =
+                HeightTex::new(device, "loose-sediment", required_side, required_side);
+            self.outflow = RgbaTex::new(device, "hydraulic-outflow", required_side, required_side);
+            self.amplify_a = HeightTex::new(device, "amplify-a", required_side, required_side);
+            self.amplify_b = HeightTex::new(device, "amplify-b", required_side, required_side);
+        }
+        let hardness = match params.hardness_source {
+            MaskSource::Constant(value) => value,
+            MaskSource::None => params.hardness,
+            _ => unreachable!("planner rejected non-uniform amplify hardness"),
+        }
+        .clamp(0.0, 1.0);
+        let ridge_lock = match params.ridge_lock {
+            MaskSource::Constant(value) => value,
+            MaskSource::None => 0.0,
+            _ => unreachable!("planner rejected non-uniform amplify ridge lock"),
+        }
+        .clamp(0.0, 1.0);
+
+        let hardness_view = self.hardness.view.clone();
+        let rainfall_view = self.rainfall.view.clone();
+        let loose_view = self.loose_sediment.view.clone();
+        for (index, level) in levels.iter().enumerate() {
+            let level_res = level.resolution;
+            let source_slot = if self.current == 0 {
+                TexSlot::Ping
+            } else {
+                TexSlot::Pong
+            };
+            self.copy_slots(device, queue, encoder, source_slot, TexSlot::Layer);
+
+            let downsample = AmplifyDownsampleU {
+                src_width: self.metrics.width,
+                src_height: self.metrics.height,
+                dst_width: level_res,
+                dst_height: level_res,
+                area_mode: u32::from(
+                    level_res < self.metrics.width || level_res < self.metrics.height,
+                ),
+                _pad0: 0,
+                _pad1: 0,
+                _pad2: 0,
+            };
+            let buffer = self.write_uniform(device, queue, &downsample);
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("amplify-downsample-bg"),
+                layout: &self.amplify_downsample.bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&self.layer_tex.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&self.amplify_a.view),
+                    },
+                ],
+            });
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("amplify-downsample"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.amplify_downsample.pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.dispatch_workgroups(level_res.div_ceil(8), level_res.div_ceil(8), 1);
+            }
+
+            self.fill_view_extent(
+                device,
+                queue,
+                encoder,
+                &hardness_view,
+                [level_res; 2],
+                hardness,
+            );
+            let fine_t = if levels.len() <= 1 {
+                1.0
+            } else {
+                index as f32 / (levels.len() - 1) as f32
+            };
+            let thermal_w = (1.0 - 0.65 * fine_t) * level.iter_scale;
+            let spe_w = (0.25 + 0.75 * fine_t) * level.effect_scale;
+            let dep_w = fine_t * level.effect_scale;
+            let level_dx = self.metrics.world_size_x / level_res.max(1) as f32;
+            let level_dz = self.metrics.world_size_z / level_res.max(1) as f32;
+
+            let thermal_iters = ((params.thermal_iters as f32 * thermal_w).round() as u32).max(1);
+            let thermal = ThermalU {
+                width: level_res,
+                height: level_res,
+                dx: level_dx,
+                talus: params.talus_angle_deg.to_radians().tan() * level_dx,
+                strength: (params.thermal_strength * thermal_w).clamp(0.0, 1.0),
+                _p2: 0.0,
+                _p3: 0.0,
+                _pad: 0.0,
+            };
+            let mut height_a = true;
+            for _ in 0..thermal_iters {
+                let uniform = self.write_uniform(device, queue, &thermal);
+                let (src, dst) = if height_a {
+                    (&self.amplify_a.view, &self.amplify_b.view)
+                } else {
+                    (&self.amplify_b.view, &self.amplify_a.view)
+                };
+                let delta_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("amplify-thermal-delta-bg"),
+                    layout: &self.thermal.bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: uniform.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(src),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::TextureView(&self.delta.view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::TextureView(&self.hardness.view),
+                        },
+                    ],
+                });
+                {
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("amplify-thermal-delta"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(&self.thermal.pipeline);
+                    pass.set_bind_group(0, &delta_group, &[]);
+                    pass.dispatch_workgroups(level_res.div_ceil(8), level_res.div_ceil(8), 1);
+                }
+                let apply_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("amplify-thermal-apply-bg"),
+                    layout: &self.thermal_apply.bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: uniform.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(src),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::TextureView(&self.delta.view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::TextureView(dst),
+                        },
+                    ],
+                });
+                {
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("amplify-thermal-apply"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(&self.thermal_apply.pipeline);
+                    pass.set_bind_group(0, &apply_group, &[]);
+                    pass.dispatch_workgroups(level_res.div_ceil(8), level_res.div_ceil(8), 1);
+                }
+                height_a = !height_a;
+            }
+
+            if params.spe_strength > 1.0e-6 && params.spe_iters > 0 {
+                let spe_iters = ((params.spe_iters as f32 * spe_w).round() as u32)
+                    .max(if spe_w > 0.15 { 1 } else { 0 });
+                let stream_power = StreamPowerU {
+                    width: level_res,
+                    height: level_res,
+                    k: 0.05 * params.spe_strength * spe_w,
+                    m: 0.5,
+                    n: 1.0,
+                    dt: 0.85,
+                    uplift: 0.0,
+                    base_level: 0.0,
+                    cell_area: (level_dx * level_dz).max(1.0e-6),
+                    _pad0: 0.0,
+                    _pad1: 0.0,
+                    _pad2: 0.0,
+                };
+                for _ in 0..spe_iters {
+                    let accum_a = self.run_amplify_accumulation(
+                        device, queue, encoder, level_res, height_a, quality,
+                    );
+                    let uniform = self.write_uniform(device, queue, &stream_power);
+                    let (src, dst) = if height_a {
+                        (&self.amplify_a.view, &self.amplify_b.view)
+                    } else {
+                        (&self.amplify_b.view, &self.amplify_a.view)
+                    };
+                    let accumulation = if accum_a {
+                        &self.water_a.view
+                    } else {
+                        &self.water_b.view
+                    };
+                    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("amplify-stream-power-bg"),
+                        layout: &self.stream_power.bgl,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: uniform.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::TextureView(src),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: wgpu::BindingResource::TextureView(accumulation),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 3,
+                                resource: wgpu::BindingResource::TextureView(&self.hardness.view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 4,
+                                resource: wgpu::BindingResource::TextureView(dst),
+                            },
+                        ],
+                    });
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("amplify-stream-power"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(&self.stream_power.pipeline);
+                    pass.set_bind_group(0, &bind_group, &[]);
+                    pass.dispatch_workgroups(level_res.div_ceil(8), level_res.div_ceil(8), 1);
+                    drop(pass);
+                    height_a = !height_a;
+                }
+            }
+
+            if params.deposition_strength > 1.0e-6 && dep_w > 0.2 {
+                let hydraulic = terra_core::layer::HydraulicErosionParams {
+                    iterations: ((8.0 * dep_w).round() as u32).max(2),
+                    rainfall: 0.02 * dep_w,
+                    evaporation: 0.015,
+                    capacity: 0.12,
+                    erosion: 0.12 * dep_w,
+                    deposition: (0.55 * params.deposition_strength * dep_w).clamp(0.0, 1.0),
+                    timestep: 0.2,
+                    hardness: 0.0,
+                    hardness_source: MaskSource::None,
+                    fan_boost: 0.8 * params.deposition_strength,
+                    floodplain_bias: 0.5 * params.deposition_strength,
+                    bank_slip: 0.0,
+                    sediment_softness: 0.0,
+                    ..Default::default()
+                };
+                let water_a = self.water_a.view.clone();
+                let water_b = self.water_b.view.clone();
+                let sed_a = self.sed_a.view.clone();
+                let sed_b = self.sed_b.view.clone();
+                self.fill_view_extent(device, queue, encoder, &water_a, [level_res; 2], 0.0);
+                self.fill_view_extent(device, queue, encoder, &water_b, [level_res; 2], 0.0);
+                self.fill_view_extent(device, queue, encoder, &sed_a, [level_res; 2], 0.0);
+                self.fill_view_extent(device, queue, encoder, &sed_b, [level_res; 2], 0.0);
+                self.fill_view_extent(device, queue, encoder, &rainfall_view, [level_res; 2], 1.0);
+                self.fill_view_extent(device, queue, encoder, &loose_view, [level_res; 2], 0.0);
+                let uniform = HydraulicU {
+                    width: level_res,
+                    height: level_res,
+                    timestep: clamp_timestep_cfl(hydraulic.timestep, level_dx, 4.0),
+                    rainfall: hydraulic.rainfall,
+                    evaporation: hydraulic.evaporation,
+                    erosion: hydraulic.erosion,
+                    deposition: hydraulic.deposition,
+                    capacity: hydraulic.capacity,
+                    fan_boost: hydraulic.fan_boost,
+                    floodplain_bias: hydraulic.floodplain_bias,
+                    dx: level_dx,
+                    incision_bias: hydraulic.incision_bias.max(0.05),
+                    bedrock_k: hydraulic.bedrock_hardness.clamp(0.0, 1.0),
+                    sediment_k: hydraulic.sediment_hardness.clamp(0.0, 1.0),
+                    layered: 0.0,
+                    _pad1: 0.0,
+                };
+                let mut water_flip = false;
+                for _ in 0..hydraulic.iterations {
+                    let buffer = self.write_uniform(device, queue, &uniform);
+                    let (height_src, height_dst) = if height_a {
+                        (&self.amplify_a.view, &self.amplify_b.view)
+                    } else {
+                        (&self.amplify_b.view, &self.amplify_a.view)
+                    };
+                    let (water_src, water_dst) = if water_flip {
+                        (&self.water_b.view, &self.water_a.view)
+                    } else {
+                        (&self.water_a.view, &self.water_b.view)
+                    };
+                    let (sed_src, sed_dst) = if water_flip {
+                        (&self.sed_b.view, &self.sed_a.view)
+                    } else {
+                        (&self.sed_a.view, &self.sed_b.view)
+                    };
+                    let outflow_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("amplify-hydraulic-outflow-bg"),
+                        layout: &self.hydraulic_outflow.bgl,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: buffer.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::TextureView(height_src),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: wgpu::BindingResource::TextureView(water_src),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 3,
+                                resource: wgpu::BindingResource::TextureView(&self.outflow.view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 4,
+                                resource: wgpu::BindingResource::TextureView(&self.rainfall.view),
+                            },
+                        ],
+                    });
+                    {
+                        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: Some("amplify-hydraulic-outflow"),
+                            timestamp_writes: None,
+                        });
+                        pass.set_pipeline(&self.hydraulic_outflow.pipeline);
+                        pass.set_bind_group(0, &outflow_group, &[]);
+                        pass.dispatch_workgroups(level_res.div_ceil(8), level_res.div_ceil(8), 1);
+                    }
+                    let hydraulic_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("amplify-hydraulic-bg"),
+                        layout: &self.hydraulic.bgl,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: buffer.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::TextureView(height_src),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: wgpu::BindingResource::TextureView(water_src),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 3,
+                                resource: wgpu::BindingResource::TextureView(sed_src),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 4,
+                                resource: wgpu::BindingResource::TextureView(&self.outflow.view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 5,
+                                resource: wgpu::BindingResource::TextureView(height_dst),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 6,
+                                resource: wgpu::BindingResource::TextureView(water_dst),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 7,
+                                resource: wgpu::BindingResource::TextureView(sed_dst),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 8,
+                                resource: wgpu::BindingResource::TextureView(&self.hardness.view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 9,
+                                resource: wgpu::BindingResource::TextureView(&self.rainfall.view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 10,
+                                resource: wgpu::BindingResource::TextureView(
+                                    &self.loose_sediment.view,
+                                ),
+                            },
+                        ],
+                    });
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("amplify-hydraulic"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(&self.hydraulic.pipeline);
+                    pass.set_bind_group(0, &hydraulic_group, &[]);
+                    pass.dispatch_workgroups(level_res.div_ceil(8), level_res.div_ceil(8), 1);
+                    drop(pass);
+                    height_a = !height_a;
+                    water_flip = !water_flip;
+                }
+            }
+
+            let blend = AmplifyBlendU {
+                src_width: level_res,
+                src_height: level_res,
+                dst_width: self.metrics.width,
+                dst_height: self.metrics.height,
+                hardness,
+                ridge_lock,
+                lock_strength: params.lock_strength,
+                detail_boost: params.detail_boost,
+            };
+            let buffer = self.write_uniform(device, queue, &blend);
+            let processed = if height_a {
+                &self.amplify_a.view
+            } else {
+                &self.amplify_b.view
+            };
+            let destination = if self.current == 0 {
+                &self.pong.view
+            } else {
+                &self.ping.view
+            };
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("amplify-upsample-blend-bg"),
+                layout: &self.amplify_upsample_blend.bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(processed),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&self.layer_tex.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(destination),
+                    },
+                ],
+            });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("amplify-upsample-blend"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.amplify_upsample_blend.pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(
+                self.metrics.width.div_ceil(8),
+                self.metrics.height.div_ceil(8),
+                1,
+            );
+            drop(pass);
+            self.swap_current();
+        }
     }
 
     fn blend_into_current(
@@ -2837,8 +3526,7 @@ impl GpuTerrainEngine {
                 .find_map(|(i, layer)| {
                     plans[i]
                         .filter(|plan| {
-                            layer.common.enabled
-                                && plan.dirty_policy == GpuDirtyPolicy::FullField
+                            layer.common.enabled && plan.dirty_policy == GpuDirtyPolicy::FullField
                         })
                         .map(|_| i)
                 })
@@ -3223,8 +3911,7 @@ impl GpuTerrainEngine {
         encoder: &mut wgpu::CommandEncoder,
         p: &SculptStrokeParams,
     ) {
-        let strokes: Vec<&SculptStroke> =
-            p.strokes.iter().filter(|s| s.enabled).collect();
+        let strokes: Vec<&SculptStroke> = p.strokes.iter().filter(|s| s.enabled).collect();
         let (headers, points) = build_stroke_buffers(&strokes, &self.metrics);
         let header_buf = make_storage_buffer(
             device,
@@ -4265,6 +4952,9 @@ impl GpuTerrainEngine {
             (GpuKernel::StreamPower, LayerKind::StreamPowerErosion(p)) => {
                 self.run_stream_power(device, queue, encoder, p, quality);
             }
+            (GpuKernel::MultiScaleAmplify, LayerKind::MultiScaleAmplify(p)) => {
+                self.run_multi_scale_amplify(device, queue, encoder, p, quality);
+            }
             (GpuKernel::Blur, LayerKind::Blur(p)) => {
                 let iters = Self::blur_iters(p);
                 for _ in 0..iters {
@@ -4634,8 +5324,8 @@ mod smoke_tests {
     use terra_core::layer::{
         BlendMode, BlurParams, CoastalParams, DomainWarpParams, EffectFilterParams, FbmParams,
         FlatParams, FractalNoiseType, GroupInputMode, IslandParams, Layer, LayerGroup, LayerKind,
-        LayerStack, MaterialsParams, NamedOutputDecl, NoiseParams, RiverCarveParams, SculptParams,
-        StackNode, StreamPowerParams, ThermalErosionParams,
+        LayerStack, MaterialsParams, MultiScaleAmplifyParams, NamedOutputDecl, NoiseParams,
+        RiverCarveParams, SculptParams, StackNode, StreamPowerParams, ThermalErosionParams,
     };
     use terra_core::mask::{
         bake_mask_assets, DistributionEntry, MaskAsset, MaskCombine, MaskId, MaskOp, MaskRef,
@@ -5589,6 +6279,8 @@ mod smoke_tests {
             &engine.sed_b,
             &engine.rainfall,
             &engine.loose_sediment,
+            &engine.amplify_a,
+            &engine.amplify_b,
         ] {
             assert_eq!((texture.width, texture.height), (width, height));
             assert_eq!(
@@ -5871,7 +6563,10 @@ mod smoke_tests {
         };
         let metrics = HeightfieldMetrics::new(32, 32, 320.0, 320.0);
         let mut stack = LayerStack::new();
-        let base = Layer::new("base", LayerKind::SculptBase(SculptParams::filled(32, 12.0)));
+        let base = Layer::new(
+            "base",
+            LayerKind::SculptBase(SculptParams::filled(32, 12.0)),
+        );
         let base_id = base.id();
         stack.push(base);
         stack.push(Layer::new(
@@ -5884,10 +6579,7 @@ mod smoke_tests {
                 ..RiverCarveParams::default()
             }),
         ));
-        stack.push(Layer::new(
-            "blur",
-            LayerKind::Blur(BlurParams::default()),
-        ));
+        stack.push(Layer::new("blur", LayerKind::Blur(BlurParams::default())));
 
         let mut engine = GpuTerrainEngine::new(&gpu.device, metrics.width);
         engine.mark_all_dirty(&stack);
@@ -6038,6 +6730,97 @@ mod smoke_tests {
         assert_eq!(
             engine.executed_kernels,
             vec![GpuKernel::StreamPower, GpuKernel::Blur]
+        );
+    }
+
+    /// #131 interaction policy: the multi-level solver must use the same generic
+    /// FullField deferral as the other drainage-coupled GPU previews.
+    #[test]
+    fn local_edit_defers_multi_scale_amplify_suffix_until_refinement() {
+        let Some(gpu) = terra_test_gpu::headless() else {
+            return;
+        };
+        let metrics = HeightfieldMetrics::new(16, 16, 160.0, 160.0);
+        let mut stack = LayerStack::new();
+        let base = Layer::new(
+            "base",
+            LayerKind::SculptBase(SculptParams::filled(16, 12.0)),
+        );
+        let base_id = base.id();
+        stack.push(base);
+        stack.push(Layer::new(
+            "multi scale",
+            LayerKind::MultiScaleAmplify(MultiScaleAmplifyParams {
+                thermal_iters: 1,
+                spe_strength: 0.0,
+                spe_iters: 0,
+                deposition_strength: 0.0,
+                hardness_source: MaskSource::Constant(0.2),
+                ridge_lock: MaskSource::Constant(0.15),
+                ..MultiScaleAmplifyParams::default()
+            }),
+        ));
+        stack.push(Layer::new("blur", LayerKind::Blur(BlurParams::default())));
+
+        let mut engine = GpuTerrainEngine::new(&gpu.device, metrics.width);
+        engine.mark_all_dirty(&stack);
+        engine
+            .evaluate(
+                &gpu.device,
+                &gpu.queue,
+                &stack,
+                &[],
+                metrics,
+                PreviewQuality::Draft,
+                false,
+                None,
+            )
+            .expect("warm multi-scale stack");
+
+        let Some(layer) = stack.find_mut(base_id) else {
+            panic!("base layer disappeared");
+        };
+        let LayerKind::SculptBase(params) = &mut layer.kind else {
+            panic!("base changed kind");
+        };
+        params.samples[8 * 16 + 8] += 3.0;
+        engine.set_dirty_rect(Some((8, 8, 1, 1)));
+        engine.mark_dirty(base_id);
+        engine.set_defer_full_field(true);
+        let interactive = engine
+            .evaluate(
+                &gpu.device,
+                &gpu.queue,
+                &stack,
+                &[],
+                metrics,
+                PreviewQuality::Draft,
+                false,
+                None,
+            )
+            .expect("interactive multi-scale prefix");
+        assert!(interactive.full_field_deferred);
+        assert!(!interactive.fully_gpu);
+        assert_eq!(engine.executed_kernels, vec![GpuKernel::Sculpt]);
+
+        engine.set_defer_full_field(false);
+        let refined = engine
+            .evaluate(
+                &gpu.device,
+                &gpu.queue,
+                &stack,
+                &[],
+                metrics,
+                PreviewQuality::Draft,
+                false,
+                None,
+            )
+            .expect("refined multi-scale suffix");
+        assert!(!refined.full_field_deferred);
+        assert!(refined.fully_gpu);
+        assert_eq!(
+            engine.executed_kernels,
+            vec![GpuKernel::MultiScaleAmplify, GpuKernel::Blur]
         );
     }
 

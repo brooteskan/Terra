@@ -6,9 +6,10 @@ use terra_core::layer::{
     BlendMode, BlurParams, CanyonParams, DomainWarpParams, DuneParams, EffectFilterKind,
     EffectFilterParams, FbmParams, FlatParams, FractalNoiseType, HydraulicErosionParams,
     IslandParams, LandscapeEvolutionParams, Layer, LayerKind, LayerStack, MesaParams,
-    MountainParams, NoiseParams, PlateauParams, RampParams, RiverCarveParams, SculptParams,
-    SculptPoint, SculptStroke, SculptStrokeKind, SculptStrokeParams, TerraceParams,
-    StreamPowerParams, ThermalErosionParams, UpliftParams, VolcanoParams,
+    MountainParams, MultiScaleAmplifyParams, NoiseParams, PlateauParams, RampParams,
+    RiverCarveParams, SculptParams, SculptPoint, SculptStroke, SculptStrokeKind,
+    SculptStrokeParams, StreamPowerParams, TerraceParams, ThermalErosionParams, UpliftParams,
+    VolcanoParams,
 };
 use terra_core::mask::{bake_mask_assets, MaskAsset, MaskId, MaskRef, MaskSource};
 use terra_gpu::parity::{
@@ -17,11 +18,11 @@ use terra_gpu::parity::{
     DENOISE_FILTER_PREVIEW, DOMAIN_WARP_PREVIEW, DUNES_PREVIEW, EFFECT_FILTER_EXACT_PREVIEW,
     EFFECT_FILTER_SPATIAL_PREVIEW, EFFECT_FILTER_WARP_PREVIEW, EXACT_HEIGHT, FBM_PERLIN_PREVIEW,
     FBM_VALUE_PREVIEW, HYDRAULIC_PREVIEW, INFLATE_FILTER_PREVIEW, MESA_PREVIEW, MOUNTAINS_PREVIEW,
-    PERLIN_NOISE_PREVIEW, PLATEAU_PREVIEW, RIDGED_PERLIN_PREVIEW, RIDGED_VALUE_PREVIEW,
-    RIVER_CARVE_D8_PREVIEW, RIVER_CARVE_DINFINITY_PREVIEW, SCULPT_STROKES_PREVIEW, SIMPLE_MASK,
-    SMOOTH_FILTER_PREVIEW, STREAM_POWER_D8_PREVIEW, STREAM_POWER_DINFINITY_PREVIEW,
-    TERRACE_PREVIEW, THERMAL_PREVIEW, UPLIFT_PREVIEW, VALUE_NOISE_PREVIEW,
-    VOLCANIC_ISLAND_PREVIEW, VOLCANO_PREVIEW,
+    MULTI_SCALE_AMPLIFY_PREVIEW, PERLIN_NOISE_PREVIEW, PLATEAU_PREVIEW, RIDGED_PERLIN_PREVIEW,
+    RIDGED_VALUE_PREVIEW, RIVER_CARVE_D8_PREVIEW, RIVER_CARVE_DINFINITY_PREVIEW,
+    SCULPT_STROKES_PREVIEW, SIMPLE_MASK, SMOOTH_FILTER_PREVIEW, STREAM_POWER_D8_PREVIEW,
+    STREAM_POWER_DINFINITY_PREVIEW, TERRACE_PREVIEW, THERMAL_PREVIEW, UPLIFT_PREVIEW,
+    VALUE_NOISE_PREVIEW, VOLCANIC_ISLAND_PREVIEW, VOLCANO_PREVIEW,
 };
 use terra_gpu::GpuTerrainEngine;
 
@@ -778,6 +779,52 @@ fn gpu_required_stream_power_d8_and_dinfinity_previews_are_bounded() {
             "{contract} must incise at least one texel"
         );
     }
+}
+
+#[test]
+fn gpu_required_multi_scale_amplify_preview_is_bounded_across_two_levels() {
+    const RES: u32 = 128;
+    let metrics = HeightfieldMetrics::new(RES, RES, 512.0, 384.0);
+    let center = (RES as f32 - 1.0) * 0.5;
+    let samples: Vec<f32> = (0..RES)
+        .flat_map(|y| {
+            (0..RES).map(move |x| {
+                let basin = 220.0 - y as f32 * 0.45 + (x as f32 - center).abs() * 0.22;
+                let ripple = ((x * 7 + y * 3) % 11) as f32 * 0.15;
+                basin + ripple
+            })
+        })
+        .collect();
+    let mut stack = LayerStack::new();
+    stack.push(Layer::new(
+        "open basin",
+        LayerKind::SculptBase(SculptParams {
+            width: RES,
+            height: RES,
+            samples,
+            fill_height: 0.0,
+        }),
+    ));
+    stack.push(Layer::new(
+        "multi scale",
+        LayerKind::MultiScaleAmplify(MultiScaleAmplifyParams {
+            level_count: 2,
+            thermal_iters: 2,
+            spe_iters: 1,
+            hardness: 0.2,
+            ..MultiScaleAmplifyParams::default()
+        }),
+    ));
+
+    let cpu = cpu_oracle(&stack, &[], metrics);
+    let gpu = gpu_eval(&stack, &[], metrics);
+    assert_field_parity(
+        "simulation.multi-scale-amplify",
+        &gpu,
+        &cpu,
+        MULTI_SCALE_AMPLIFY_PREVIEW,
+    );
+    assert!(gpu.to_dense().iter().all(|height| height.is_finite()));
 }
 
 #[test]

@@ -3,8 +3,8 @@ use terra_core::heightfield::HeightfieldMetrics;
 use terra_core::layer::{
     BlendMode, CanyonParams, DomainWarpParams, DuneParams, EffectFilterKind, EffectFilterParams,
     FbmParams, FlatParams, FractalNoiseType, IslandParams, Layer, LayerKind, LayerStack,
-    LayerTypeRegistry, MesaParams, MountainParams, NoiseParams, PlateauParams, RiverCarveParams,
-    StreamPowerParams, UpliftParams, VolcanoParams,
+    LayerTypeRegistry, MesaParams, MountainParams, MultiScaleAmplifyParams, NoiseParams,
+    PlateauParams, RiverCarveParams, StreamPowerParams, UpliftParams, VolcanoParams,
 };
 use terra_core::mask::MaskSource;
 use terra_gpu::{compile_gpu_graph, layer_gpu_supported, GpuDirtyPolicy, GpuKernel};
@@ -248,6 +248,39 @@ fn stream_power_defaults_and_configuration_boundaries_are_explicit() {
             "unsupported stream power",
             LayerKind::StreamPowerErosion(params),
         );
+        assert!(!layer_gpu_supported(&layer, &[]));
+        assert_eq!(graph_for(layer).cpu_from, Some(0));
+    }
+}
+
+#[test]
+fn multi_scale_amplify_defaults_and_configuration_boundaries_are_explicit() {
+    let default = Layer::new(
+        "multi scale",
+        LayerKind::MultiScaleAmplify(MultiScaleAmplifyParams::default()),
+    );
+    let graph = graph_for(default);
+    assert!(graph.fully_gpu());
+    let plan = graph.plans[0].expect("MultiScaleAmplify plan");
+    assert_eq!(plan.kernel, GpuKernel::MultiScaleAmplify);
+    assert_eq!(plan.dirty_policy, GpuDirtyPolicy::FullField);
+    assert_eq!(plan.halo_texels, 0);
+
+    for params in [
+        MultiScaleAmplifyParams {
+            hardness_source: MaskSource::Hardness,
+            ..MultiScaleAmplifyParams::default()
+        },
+        MultiScaleAmplifyParams {
+            ridge_lock: MaskSource::Wetness,
+            ..MultiScaleAmplifyParams::default()
+        },
+        MultiScaleAmplifyParams {
+            thermal_strength: f32::NAN,
+            ..MultiScaleAmplifyParams::default()
+        },
+    ] {
+        let layer = Layer::new("unsupported amplify", LayerKind::MultiScaleAmplify(params));
         assert!(!layer_gpu_supported(&layer, &[]));
         assert_eq!(graph_for(layer).cpu_from, Some(0));
     }
