@@ -148,7 +148,7 @@ pub const FIDELITY_MATRIX_MARKDOWN: &str = "\
 | `authoring.path-height` | CPU-tessellated spline, raise/carve height preview; carved wetness falls back when consumed | 0.001 | 0.00001 |\n\
 | `authoring.polygon-height` | RaiseBy/SetElevation, raise/carve, world-space feather | 0.001 | 0.00001 |\n\
 | `asset.heightmap-sample` | ImportHeightmap and transformed Stamp2d, normalized R16 nearest/clamp sampling | 0.001 | 0.00001 |\n\
-| `mask.simple` | One Constant, Height, or Slope Multiply entry without asset operations | 0.001 | 0.0001 |\n\
+| `mask.simple` | Ordered Constant, Height, or Slope entries; all combines and operations, blur radius up to 16 | 0.001 | 0.0001 |\n\
 | `noise.value` | Value noise with a 32-bit seed | 17.0 | 0.23 |\n\
 | `noise.perlin` | Perlin, 1-12 octaves, reproducible 32-bit seed stream | 0.001 | 0.00001 |\n\
 | `noise.fbm.value` | Value fBm, 1-12 octaves, reproducible 32-bit seed stream | 0.001 | 0.00001 |\n\
@@ -156,18 +156,18 @@ pub const FIDELITY_MATRIX_MARKDOWN: &str = "\
 | `noise.ridged.value` | Value ridged MF, 1-12 octaves, reproducible 32-bit seed stream | 0.001 | 0.00001 |\n\
 | `noise.ridged.perlin` | Perlin ridged MF, 1-12 octaves, reproducible 32-bit seed stream | 0.001 | 0.00001 |\n\
 | `noise.domain-warp` | Perlin domain warp, 1-12 octaves, reproducible 32-bit seed stream | 0.001 | 0.00001 |\n\
-| `filter.blur` | Default outer composite; radius/iteration fixture | 2.1 | 0.0055 |\n\
-| `effect.smooth` | Smooth, default outer composite | 1.8 | 0.03 |\n\
-| `effect.inflate` | Inflate, default outer composite | 2.7 | 0.028 |\n\
-| `effect.denoise` | Denoise (bilateral), default outer composite | 2.2 | 0.038 |\n\
-| `effect.add-set` | Add and Set pointwise remaps, default outer composite | 0.001 | 0.00001 |\n\
-| `effect.deflate` | Amount-limited greyscale erosion, default outer composite | 0.001 | 0.00001 |\n\
-| `effect.curve` | Exact entering-field range reduction, default outer composite | 0.001 | 0.00001 |\n\
-| `effect.cutoff` | Exact entering-field range reduction, default outer composite | 0.001 | 0.00001 |\n\
+| `filter.blur` | Authored outer composite; radius/iteration fixture | 2.1 | 0.0055 |\n\
+| `effect.smooth` | Smooth, authored outer composite | 1.8 | 0.03 |\n\
+| `effect.inflate` | Inflate, authored outer composite | 2.7 | 0.028 |\n\
+| `effect.denoise` | Denoise (bilateral), authored outer composite | 2.2 | 0.038 |\n\
+| `effect.add-set` | Add and Set pointwise remaps, authored outer composite | 0.001 | 0.00001 |\n\
+| `effect.deflate` | Amount-limited greyscale erosion, authored outer composite | 0.001 | 0.00001 |\n\
+| `effect.curve` | Exact entering-field range reduction, authored outer composite | 0.001 | 0.00001 |\n\
+| `effect.cutoff` | Exact entering-field range reduction, authored outer composite | 0.001 | 0.00001 |\n\
 | `effect.pointwise-procedural` | TerraceSimple, Shore, Blocks, ZeroEdge, Squeeze, Perlin-family noise, scatter, Hexagons, and authored absolute border/flatten targets | 0.001 | 0.00001 |\n\
 | `effect.spatial` | DirectionalBlur, AngleBlur, Balloon, Crater, TerraceSteep, and radius-one SpikeRemoval | 0.02 | 0.0002 |\n\
 | `effect.warp` | Swirl and Distortion with a reproducible 32-bit seed | 0.05 | 0.001 |\n\
-| `filter.terrace` | Default outer composite | 8.5 | 0.10 |\n\
+| `filter.terrace` | Authored outer composite | 8.5 | 0.10 |\n\
 | `simulation.thermal` | Non-layered, constant hardness, no weathering extension | 3.2 | 0.05 |\n\
 | `simulation.hydraulic` | Base transport, no sources, particles, layers, or post-effects | 3.0 | 0.03 |\n\
 | `simulation.river-carve.d8` | D8 routing, no guide mask, bounded bank radius | 0.001 | 0.00001 |\n\

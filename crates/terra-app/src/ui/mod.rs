@@ -1256,6 +1256,8 @@ pub struct FrameProfile {
     pub quality: &'static str,
     /// `"GPU"` preview engine or `"CPU"` fallback.
     pub path: &'static str,
+    /// First layer and stable reason code at an intentional GPU-to-CPU boundary.
+    pub gpu_fallback: Option<terra_gpu::GpuFallbackDiagnostic>,
     pub terrain_grid_size: u32,
     pub tiles_x: u32,
     pub tiles_z: u32,

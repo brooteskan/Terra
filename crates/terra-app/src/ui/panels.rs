@@ -554,6 +554,16 @@ fn profiler_panel(ui: &mut GuiContext<'_>, ui_state: &UiState) {
             if p.path.is_empty() { "-" } else { p.path }
         ),
     );
+    if let Some(fallback) = &p.gpu_fallback {
+        label(
+            ui,
+            &format!(
+                "CPU boundary: #{} {} [{:?}]",
+                fallback.layer_index, fallback.layer_name, fallback.reason.code
+            ),
+        );
+        label(ui, &format!("Reason: {}", fallback.reason.user_message()));
+    }
     label(
         ui,
         &format!(

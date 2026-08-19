@@ -4,14 +4,14 @@ use terra_core::biome_paint::ShapeTransform;
 use terra_core::eval::{EvalContext, PreviewQuality, StackEvaluator};
 use terra_core::heightfield::{Heightfield, HeightfieldMetrics};
 use terra_core::layer::{
-    BlendMode, BlurParams, CanyonParams, DomainWarpParams, DuneParams, EffectFilterKind,
-    EffectFilterParams, FbmParams, FlatParams, FractalNoiseType, HydraulicErosionParams,
-    ImportHeightmapParams, IslandParams, LandscapeEvolutionParams, Layer, LayerKind, LayerStack,
-    MesaParams, MountainParams, MultiScaleAmplifyParams, NoiseParams, PathNode, PathParams,
-    PlateauParams, PolygonHeightMode, PolygonHeightParams, ProceduralGenerator,
-    ProceduralShapeParams, RampParams, RiverCarveParams, SculptParams, SculptPoint, SculptStroke,
-    SculptStrokeKind, SculptStrokeParams, Stamp2dParams, StreamPowerParams, TerraceParams,
-    ThermalErosionParams, UpliftParams, VolcanoParams,
+    BindingSource, BlendMode, BlurParams, CanyonParams, DomainWarpParams, DuneParams,
+    EffectFilterKind, EffectFilterParams, FbmParams, FlatParams, FractalNoiseType,
+    HydraulicErosionParams, ImportHeightmapParams, IslandParams, LandscapeEvolutionParams, Layer,
+    LayerKind, LayerStack, MesaParams, MountainParams, MultiScaleAmplifyParams, NoiseParams,
+    ParamBinding, PathNode, PathParams, PlateauParams, PolygonHeightMode, PolygonHeightParams,
+    ProceduralGenerator, ProceduralShapeParams, RampParams, RiverCarveParams, SculptParams,
+    SculptPoint, SculptStroke, SculptStrokeKind, SculptStrokeParams, Stamp2dParams,
+    StreamPowerParams, TerraceParams, ThermalErosionParams, UpliftParams, VolcanoParams,
 };
 use terra_core::mask::{bake_mask_assets, MaskAsset, MaskId, MaskRef, MaskSource};
 use terra_gpu::parity::{
@@ -1328,10 +1328,13 @@ fn gpu_required_hybrid_checkpoint_applies_suffix_once() {
         LayerKind::Flat(FlatParams { height: 10.0 }),
     ));
     let mut unsupported = Layer::new(
-        "half add-set",
-        LayerKind::EffectFilter(EffectFilterParams::add_set()),
+        "CPU-bound opacity binding",
+        LayerKind::Flat(FlatParams { height: 10.0 }),
     );
-    unsupported.common.opacity = 0.5;
+    unsupported
+        .common
+        .param_bindings
+        .push(ParamBinding::new("opacity", BindingSource::Constant(0.5)));
     stack.push(unsupported);
     let mut downstream = Layer::new("downstream", LayerKind::Flat(FlatParams { height: 2.0 }));
     downstream.common.blend = BlendMode::Add;

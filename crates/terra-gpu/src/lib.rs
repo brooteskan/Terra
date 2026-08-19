@@ -16,7 +16,8 @@ pub use engine::{
 };
 pub use graph::{
     compile_gpu_graph, expand_dirty_rect, layer_gpu_supported, GpuComputeGraph, GpuDirtyPolicy,
-    GpuKernel, GpuLayerPlan, BLUR_MAX_RADIUS, EFFECT_FILTER_MAX_RADIUS, RIVER_CARVE_MAX_RADIUS,
+    GpuFallbackCode, GpuFallbackDiagnostic, GpuFallbackReason, GpuKernel, GpuLayerPlan,
+    BLUR_MAX_RADIUS, EFFECT_FILTER_MAX_RADIUS, RIVER_CARVE_MAX_RADIUS,
 };
 pub use tile_cache::{GpuPageTableEntry, GpuTileAtlas, GpuTileCacheError, GpuTileUpload};
 
@@ -26,9 +27,9 @@ use thiserror::Error;
 pub enum GpuError {
     #[error("wgpu: {0}")]
     Wgpu(String),
-    /// Stack needs the CPU tree evaluator (scoped groups / unsupported layers).
-    #[error("cpu evaluation required")]
-    RequiresCpu,
+    /// Stack needs the CPU evaluator for a structured, user-visible reason.
+    #[error("cpu evaluation required: {0:?}")]
+    RequiresCpu(GpuFallbackReason),
     #[error("failed to load source asset: {0}")]
     SourceAsset(String),
 }

@@ -1,20 +1,78 @@
 use terra_core::eval::{EvalContext, StackEvaluator};
 use terra_core::heightfield::HeightfieldMetrics;
 use terra_core::layer::{
-    BiomesParams, BlendMode, CanyonParams, DomainWarpParams, DuneParams, EffectFilterKind,
-    EffectFilterParams, FbmParams, FlatParams, FractalNoiseType, ImportHeightmapParams,
-    IslandParams, Layer, LayerKind, LayerStack, LayerTypeRegistry, MesaParams, MountainParams,
-    MultiScaleAmplifyParams, NoiseParams, PathNode, PathParams, PlateauParams, PolygonHeightMode,
-    PolygonHeightParams, ProceduralGenerator, ProceduralShapeParams, RiverCarveParams,
-    Stamp2dParams, Stamp3dParams, StreamPowerParams, UpliftParams, VolcanoParams,
+    BindingSource, BiomesParams, BlendMode, CanyonParams, DomainWarpParams, DuneParams,
+    EffectFilterKind, EffectFilterParams, FbmParams, FlatParams, FractalNoiseType,
+    ImportHeightmapParams, IslandParams, Layer, LayerKind, LayerStack, LayerTypeRegistry,
+    MesaParams, MountainParams, MultiScaleAmplifyParams, NoiseParams, ParamBinding, PathNode,
+    PathParams, PlateauParams, PolygonHeightMode, PolygonHeightParams, ProceduralGenerator,
+    ProceduralShapeParams, RiverCarveParams, Stamp2dParams, Stamp3dParams, StreamPowerParams,
+    UpliftParams, VolcanoParams,
 };
-use terra_core::mask::MaskSource;
-use terra_gpu::{compile_gpu_graph, layer_gpu_supported, GpuDirtyPolicy, GpuKernel};
+use terra_core::mask::{MaskAsset, MaskId, MaskOp, MaskRef, MaskSource};
+use terra_gpu::{
+    compile_gpu_graph, layer_gpu_supported, GpuDirtyPolicy, GpuFallbackCode, GpuKernel,
+};
 
 fn graph_for(layer: Layer) -> terra_gpu::GpuComputeGraph {
     let mut stack = LayerStack::new();
     stack.push(layer);
     compile_gpu_graph(&stack, &[])
+}
+
+#[test]
+fn configuration_gates_publish_stable_fallback_codes() {
+    let reason_for = |layer: Layer| {
+        graph_for(layer)
+            .cpu_fallback
+            .expect("configuration must have a CPU boundary")
+            .reason
+            .code
+    };
+
+    let mut bound = Layer::new("bound", LayerKind::Flat(FlatParams::default()));
+    bound
+        .common
+        .param_bindings
+        .push(ParamBinding::new("opacity", BindingSource::Constant(0.5)));
+    assert_eq!(reason_for(bound), GpuFallbackCode::ParameterBinding);
+
+    let derived_seed_overflow = Layer::new(
+        "seed overflow",
+        LayerKind::NoisePerlin(NoiseParams {
+            seed: u64::from(u32::MAX),
+            octaves: 2,
+            ..NoiseParams::default()
+        }),
+    );
+    assert_eq!(
+        reason_for(derived_seed_overflow),
+        GpuFallbackCode::SeedRange
+    );
+
+    let unsupported_options = Layer::new(
+        "unsupported fractal options",
+        LayerKind::Fbm(FbmParams {
+            noise: FractalNoiseType::OpenSimplex,
+            ..FbmParams::default()
+        }),
+    );
+    assert_eq!(
+        reason_for(unsupported_options),
+        GpuFallbackCode::UnsupportedOptions
+    );
+
+    let mut asset = MaskAsset::new(MaskId::new(), "wide blur", MaskSource::Constant(0.5));
+    asset.ops.push(MaskOp::Blur { radius: 17 });
+    let mut masked = Layer::new("masked", LayerKind::Flat(FlatParams::default()));
+    masked.common.masks.push(MaskRef::new(asset.id));
+    let mut stack = LayerStack::new();
+    stack.push(masked);
+    let graph = compile_gpu_graph(&stack, &[asset]);
+    assert_eq!(
+        graph.cpu_fallback.expect("mask fallback").reason.code,
+        GpuFallbackCode::MaskOperations
+    );
 }
 
 #[test]
@@ -209,6 +267,10 @@ fn carved_path_is_demoted_only_when_later_wetness_is_observable() {
     let graph = compile_gpu_graph(&consumer, &[]);
     assert!(graph.plans[0].is_none());
     assert_eq!(graph.cpu_from, Some(0));
+    assert_eq!(
+        graph.cpu_fallback.expect("aux boundary").reason.code,
+        GpuFallbackCode::AuxiliaryDependency
+    );
 
     let mut raise_only = LayerStack::new();
     raise_only.push(make_path(false));
@@ -494,11 +556,11 @@ fn fractal_noise_variants_and_blend_modes_are_explicitly_classified() {
         (BlendMode::Min, true),
         (BlendMode::Max, true),
         (BlendMode::Overlay, true),
-        (BlendMode::HeightBlend, false),
-        (BlendMode::SmoothMaximum, false),
-        (BlendMode::SmoothMinimum, false),
-        (BlendMode::SmoothUnion, false),
-        (BlendMode::SmoothSubtraction, false),
+        (BlendMode::HeightBlend, true),
+        (BlendMode::SmoothMaximum, true),
+        (BlendMode::SmoothMinimum, true),
+        (BlendMode::SmoothUnion, true),
+        (BlendMode::SmoothSubtraction, true),
     ] {
         let mut layer = Layer::new("blend", LayerKind::Flat(FlatParams { height: 2.0 }));
         layer.common.blend = blend;
@@ -523,13 +585,13 @@ fn noise_family_defaults_and_seed_stream_boundaries_are_explicit() {
         assert_eq!(graph.plans[0].expect("noise plan").kernel, GpuKernel::Noise);
     }
 
-    let mut unsupported_blend = Layer::new(
+    let mut height_blend = Layer::new(
         "warped height blend",
         LayerKind::DomainWarp(DomainWarpParams::default()),
     );
-    unsupported_blend.common.blend = BlendMode::HeightBlend;
-    assert!(!layer_gpu_supported(&unsupported_blend, &[]));
-    assert_eq!(graph_for(unsupported_blend).cpu_from, Some(0));
+    height_blend.common.blend = BlendMode::HeightBlend;
+    assert!(layer_gpu_supported(&height_blend, &[]));
+    assert_eq!(graph_for(height_blend).cpu_from, None);
 
     let near_limit = u64::from(u32::MAX) - 100;
     let rejected = [

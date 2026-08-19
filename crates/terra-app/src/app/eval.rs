@@ -882,6 +882,7 @@ impl TerraApp {
                                 PreviewQuality::Full => "Final (viewport)",
                                 PreviewQuality::Export => "Export quality",
                             };
+                            self.ui_state.profile.gpu_fallback = result.cpu_fallback.clone();
 
                             // Interactive path: GPU present is authoritative for the frame.
                             // Never sync-evaluate CPU on the UI thread — that hangs the app
@@ -1000,10 +1001,13 @@ impl TerraApp {
                         }
                     }
                     Err(error) => {
+                        self.ui_state.profile.gpu_fallback = None;
                         match &error {
-                            GpuError::RequiresCpu => log::debug!(
+                            GpuError::RequiresCpu(reason) => log::debug!(
                                 target: "terra_app::evaluation",
-                                "GPU path requires CPU fallback; {operation_context}"
+                                "GPU path requires CPU fallback ({:?}: {}); {operation_context}",
+                                reason.code,
+                                reason.user_message()
                             ),
                             GpuError::Wgpu(_) => log::error!(
                                 target: "terra_app::evaluation",

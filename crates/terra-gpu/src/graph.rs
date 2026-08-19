@@ -9,12 +9,12 @@
 use crate::effect_filter::{effect_filter_gpu_spec, EffectFilterGpuScope};
 use terra_core::fields::FieldId;
 use terra_core::layer::{
-    BlendMode, DuneParams, EffectFilterKind, FractalNoiseType, IslandArchetype, IslandParams,
-    Layer, LayerKind, LayerStack, MountainParams, MultiScaleAmplifyParams, PathParams,
-    PolygonHeightParams, ProceduralGenerator, ProceduralShapeParams, RiverCarveParams,
+    BindingSource, BlendMode, DuneParams, EffectFilterKind, FractalNoiseType, IslandArchetype,
+    IslandParams, Layer, LayerKind, LayerStack, MountainParams, MultiScaleAmplifyParams,
+    PathParams, PolygonHeightParams, ProceduralGenerator, ProceduralShapeParams, RiverCarveParams,
     SculptStrokeKind, StreamPowerParams, TransportModel, UpliftParams,
 };
-use terra_core::mask::{MaskAsset, MaskCombine, MaskSource};
+use terra_core::mask::{MaskAsset, MaskOp, MaskSource};
 
 /// Max per-iteration blur radius the Blur kernel executes (`shaders/blur.wgsl`).
 pub const BLUR_MAX_RADIUS: u32 = 8;
@@ -120,6 +120,59 @@ pub struct GpuLayerPlan {
     pub halo_texels: u32,
 }
 
+/// Stable category used by tests, profiling, and UI without parsing prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GpuFallbackCode {
+    UnsupportedLayerKind,
+    MaskNodes,
+    MissingMaskAsset,
+    MaskOperations,
+    MaskSource,
+    BlendMode,
+    InPlaceComposite,
+    ParameterBinding,
+    SeedRange,
+    AuxiliaryDependency,
+    UnsupportedOptions,
+    InvalidConfiguration,
+    TreeEvaluation,
+    RuntimeResourceLimit,
+}
+
+/// Why a complete layer configuration cannot execute in the GPU preview.
+///
+/// `code` is the stable machine-readable contract. The remaining fields are
+/// diagnostic context and may be shown in the profiler or logs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GpuFallbackReason {
+    pub code: GpuFallbackCode,
+    pub family: &'static str,
+    pub detail: String,
+}
+
+impl GpuFallbackReason {
+    pub fn new(code: GpuFallbackCode, family: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            code,
+            family,
+            detail: detail.into(),
+        }
+    }
+
+    pub fn user_message(&self) -> String {
+        format!("{}: {}", self.family, self.detail)
+    }
+}
+
+/// First enabled layer at which the authoritative CPU evaluator must resume.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GpuFallbackDiagnostic {
+    pub layer_index: usize,
+    pub layer_id: terra_core::layer::LayerId,
+    pub layer_name: String,
+    pub reason: GpuFallbackReason,
+}
+
 /// Compiled interactive GPU plan: one slot per flattened layer plus the CPU
 /// resume boundary.
 #[derive(Debug, Clone, Default)]
@@ -127,36 +180,70 @@ pub struct GpuComputeGraph {
     /// One entry per `stack.flatten_layers()` index. `Some` = this layer runs on
     /// the GPU with the given plan; `None` = disabled or not GPU-supported.
     pub plans: Vec<Option<GpuLayerPlan>>,
+    /// One structured rejection per flattened layer. Disabled and executable
+    /// layers have no rejection. This remains parallel to `plans` so the engine
+    /// can retain its compact hot-path representation while diagnostics never
+    /// have to infer a reason from `None`.
+    pub fallback_reasons: Vec<Option<GpuFallbackReason>>,
     /// First flat index that is enabled but not GPU-supported (None = fully GPU).
     pub cpu_from: Option<usize>,
+    /// Structured diagnostic for `cpu_from`.
+    pub cpu_fallback: Option<GpuFallbackDiagnostic>,
 }
 
 impl GpuComputeGraph {
     pub fn fully_gpu(&self) -> bool {
         self.cpu_from.is_none()
     }
+
+    pub fn fallback_counts(&self) -> std::collections::HashMap<GpuFallbackCode, usize> {
+        let mut counts = std::collections::HashMap::new();
+        for reason in self.fallback_reasons.iter().flatten() {
+            *counts.entry(reason.code).or_insert(0) += 1;
+        }
+        counts
+    }
 }
 
-fn gpu_mask_supported(layer: &Layer, assets: &[MaskAsset]) -> bool {
+fn gpu_mask_supported(layer: &Layer, assets: &[MaskAsset]) -> Result<(), GpuFallbackReason> {
     if !layer.common.masks.nodes.is_empty() {
-        return false;
+        return Err(GpuFallbackReason::new(
+            GpuFallbackCode::MaskNodes,
+            "mask",
+            "distribution nodes are not yet GPU-resident",
+        ));
     }
-    let [entry] = layer.common.masks.entries.as_slice() else {
-        return layer.common.masks.entries.is_empty();
-    };
-    if entry.combine != MaskCombine::Multiply {
-        return false;
+    for entry in &layer.common.masks.entries {
+        let Some(asset) = assets.iter().find(|asset| asset.id == entry.mask.id) else {
+            return Err(GpuFallbackReason::new(
+                GpuFallbackCode::MissingMaskAsset,
+                "mask",
+                "referenced mask asset is missing",
+            ));
+        };
+        if asset
+            .ops
+            .iter()
+            .any(|op| matches!(op, MaskOp::Blur { radius } if *radius > 16))
+        {
+            return Err(GpuFallbackReason::new(
+                GpuFallbackCode::MaskOperations,
+                "mask",
+                "mask blur radius exceeds the GPU limit of 16 texels",
+            ));
+        }
+        if !matches!(
+            asset.source,
+            MaskSource::Constant(_) | MaskSource::Height { .. } | MaskSource::Slope { .. }
+        ) {
+            return Err(GpuFallbackReason::new(
+                GpuFallbackCode::MaskSource,
+                "mask",
+                format!("{:?} source is not GPU-resident", asset.source),
+            ));
+        }
     }
-    assets
-        .iter()
-        .find(|asset| asset.id == entry.mask.id)
-        .is_some_and(|asset| {
-            asset.ops.is_empty()
-                && matches!(
-                    asset.source,
-                    MaskSource::Constant(_) | MaskSource::Height { .. } | MaskSource::Slope { .. }
-                )
-        })
+    Ok(())
 }
 
 /// Exact mode IDs implemented by `shaders/blend.wgsl`.
@@ -172,21 +259,16 @@ pub(crate) fn gpu_blend_mode(mode: BlendMode) -> Option<u32> {
         BlendMode::Min => Some(4),
         BlendMode::Max => Some(5),
         BlendMode::Overlay => Some(6),
-        BlendMode::HeightBlend
-        | BlendMode::SmoothMaximum
-        | BlendMode::SmoothMinimum
-        | BlendMode::SmoothUnion
-        | BlendMode::SmoothSubtraction => None,
+        BlendMode::HeightBlend => Some(7),
+        BlendMode::SmoothMaximum => Some(8),
+        BlendMode::SmoothMinimum => Some(9),
+        BlendMode::SmoothUnion => Some(10),
+        BlendMode::SmoothSubtraction => Some(11),
     }
 }
 
 fn inplace_composite_supported(layer: &Layer) -> bool {
-    layer.common.opacity == 1.0
-        && layer.common.masks.is_empty()
-        && matches!(
-            layer.common.blend,
-            BlendMode::Normal | BlendMode::Replace | BlendMode::Interpolate
-        )
+    layer.common.opacity.is_finite() && gpu_blend_mode(layer.common.blend).is_some()
 }
 
 fn seed_supported(seed: u64) -> bool {
@@ -404,11 +486,122 @@ fn multi_scale_amplify_config_supported(p: &MultiScaleAmplifyParams) -> bool {
         && p.lock_strength.is_finite()
 }
 
-fn gpu_plan_for_layer(layer: &Layer, mask_assets: &[MaskAsset]) -> Option<GpuLayerPlan> {
-    use LayerKind::*;
-    if !gpu_mask_supported(layer, mask_assets) {
-        return None;
+fn binding_source_name(source: &BindingSource) -> &'static str {
+    match source {
+        BindingSource::Mask(_) => "mask",
+        BindingSource::Field(_) => "field",
+        BindingSource::LayerOutput(_) => "layer-output",
+        BindingSource::GroupOutput(_) => "group-output",
+        BindingSource::Constant(_) => "constant",
     }
+}
+
+fn rejected_layer_reason(layer: &Layer) -> GpuFallbackReason {
+    if gpu_blend_mode(layer.common.blend).is_none() {
+        return GpuFallbackReason::new(
+            GpuFallbackCode::BlendMode,
+            "blend",
+            format!(
+                "{:?} is not implemented by the preview compositor",
+                layer.common.blend
+            ),
+        );
+    }
+    if !inplace_composite_supported(layer)
+        && matches!(
+            layer.kind,
+            LayerKind::Blur(_)
+                | LayerKind::EffectFilter(_)
+                | LayerKind::Terrace(_)
+                | LayerKind::ThermalErosion(_)
+                | LayerKind::HydraulicErosion(_)
+                | LayerKind::RiverCarve(_)
+                | LayerKind::StreamPowerErosion(_)
+                | LayerKind::MultiScaleAmplify(_)
+        )
+    {
+        return GpuFallbackReason::new(
+            GpuFallbackCode::InPlaceComposite,
+            "composite",
+            "in-place composite contains a non-finite opacity or unsupported equation",
+        );
+    }
+    let seed_limited = match &layer.kind {
+        LayerKind::NoiseValue(p) => !seed_supported(p.seed),
+        LayerKind::NoisePerlin(p) => !seed_stream_supported(p.seed, p.octaves, 1013),
+        LayerKind::Fbm(p) => !seed_stream_supported(p.base.seed, p.base.octaves, 1013),
+        LayerKind::Ridged(p) => !seed_stream_supported(p.base.seed, p.base.octaves, 9173),
+        LayerKind::DomainWarp(p) => {
+            !seed_stream_supported(p.base.seed, p.base.octaves, 1013)
+                || !seed_stream_supported(p.base.seed, 2, 1)
+        }
+        LayerKind::Mountains(p) => !mountain_seed_streams_supported(p),
+        LayerKind::Dunes(p) => !seed_stream_supported(p.base.seed, p.base.octaves, 1013),
+        LayerKind::Canyons(p) => !seed_supported(p.seed),
+        LayerKind::Mesa(p) => !seed_supported(p.seed),
+        LayerKind::Volcano(p) => !seed_supported(p.seed),
+        LayerKind::Uplift(p) => !uplift_seed_streams_supported(p),
+        LayerKind::Island(p) => !island_seed_streams_supported(p),
+        LayerKind::Path(p) => p.noise_strength.abs() > 1.0e-5 && !seed_supported(p.seed),
+        _ => false,
+    };
+    if seed_limited {
+        return GpuFallbackReason::new(
+            GpuFallbackCode::SeedRange,
+            "seed",
+            "authored or derived seed stream exceeds the 32-bit preview contract",
+        );
+    }
+    match layer.kind {
+        LayerKind::Coastal(_)
+        | LayerKind::Materials(_)
+        | LayerKind::Biomes(_)
+        | LayerKind::Vegetation(_)
+        | LayerKind::LandscapeEvolution(_)
+        | LayerKind::DebrisFlow(_)
+        | LayerKind::HydrologyRepair(_)
+        | LayerKind::GradientReconstruct(_)
+        | LayerKind::TerrainConstraints(_)
+        | LayerKind::GeomorphicDetail(_)
+        | LayerKind::EcosystemFeedback(_)
+        | LayerKind::OverhangStamp(_)
+        | LayerKind::LocalSdf(_)
+        | LayerKind::Stamp3d(_)
+        | LayerKind::SandSimulation(_)
+        | LayerKind::FluidSimulation(_)
+        | LayerKind::RiverNetwork(_)
+        | LayerKind::NoiseOpenSimplex(_)
+        | LayerKind::NoiseWorley(_)
+        | LayerKind::VoronoiRegions(_) => GpuFallbackReason::new(
+            GpuFallbackCode::UnsupportedLayerKind,
+            "layer",
+            "layer kind has no admitted GPU preview plan",
+        ),
+        _ => GpuFallbackReason::new(
+            GpuFallbackCode::UnsupportedOptions,
+            "options",
+            "one or more family-specific options are outside the parity-covered contract",
+        ),
+    }
+}
+
+fn gpu_plan_for_layer(
+    layer: &Layer,
+    mask_assets: &[MaskAsset],
+) -> Result<GpuLayerPlan, GpuFallbackReason> {
+    use LayerKind::*;
+    if let Some(binding) = layer.common.param_bindings.first() {
+        return Err(GpuFallbackReason::new(
+            GpuFallbackCode::ParameterBinding,
+            "binding",
+            format!(
+                "{} binding for '{}' is resolved only by the CPU evaluator",
+                binding_source_name(&binding.source),
+                binding.target.0
+            ),
+        ));
+    }
+    gpu_mask_supported(layer, mask_assets)?;
     let (kernel, dirty_policy, halo_texels) = match &layer.kind {
         Flat(_) if gpu_blend_mode(layer.common.blend).is_some() => {
             (GpuKernel::Fill, GpuDirtyPolicy::Local, 0)
@@ -450,7 +643,7 @@ fn gpu_plan_for_layer(layer: &Layer, mask_assets: &[MaskAsset]) -> Option<GpuLay
             let halo = u32::from(reads_base_neighborhood) + u32::from(p.reconcile > 0.0);
             (GpuKernel::SculptStrokes, GpuDirtyPolicy::Local, halo)
         }
-        SculptStrokes(_) => return None,
+        SculptStrokes(_) => return Err(rejected_layer_reason(layer)),
         Path(p) if path_config_supported(p) && gpu_blend_mode(layer.common.blend).is_some() => {
             (GpuKernel::Path, GpuDirtyPolicy::Local, 0)
         }
@@ -489,7 +682,7 @@ fn gpu_plan_for_layer(layer: &Layer, mask_assets: &[MaskAsset]) -> Option<GpuLay
             (GpuKernel::HeightmapSample, GpuDirtyPolicy::Local, 0)
         }
         Path(_) | PolygonHeight(_) | ProceduralShape(_) | ImportHeightmap(_) | Stamp2d(_) => {
-            return None;
+            return Err(rejected_layer_reason(layer));
         }
         NoiseValue(p) if seed_supported(p.seed) && gpu_blend_mode(layer.common.blend).is_some() => {
             (GpuKernel::Noise, GpuDirtyPolicy::Local, 2)
@@ -558,14 +751,14 @@ fn gpu_plan_for_layer(layer: &Layer, mask_assets: &[MaskAsset]) -> Option<GpuLay
         }
         Flat(_) | Ramp(_) | NoiseValue(_) | NoisePerlin(_) | Fbm(_) | Ridged(_) | Mountains(_)
         | Dunes(_) | Canyons(_) | DomainWarp(_) | SculptBase(_) | Mesa(_) | Volcano(_)
-        | Island(_) | Plateau(_) | Uplift(_) => return None,
+        | Island(_) | Plateau(_) | Uplift(_) => return Err(rejected_layer_reason(layer)),
         Blur(p) if inplace_composite_supported(layer) => (
             GpuKernel::Blur,
             GpuDirtyPolicy::Local,
             p.radius.clamp(1, BLUR_MAX_RADIUS),
         ),
         EffectFilter(p) if inplace_composite_supported(layer) => {
-            let spec = effect_filter_gpu_spec(p)?;
+            let spec = effect_filter_gpu_spec(p).ok_or_else(|| rejected_layer_reason(layer))?;
             let (dirty_policy, halo_texels) = match spec.scope {
                 EffectFilterGpuScope::LocalPointwise => (GpuDirtyPolicy::Local, 0),
                 EffectFilterGpuScope::LocalExpanding { halo_per_pass } => {
@@ -575,11 +768,11 @@ fn gpu_plan_for_layer(layer: &Layer, mask_assets: &[MaskAsset]) -> Option<GpuLay
             };
             (GpuKernel::EffectFilter, dirty_policy, halo_texels)
         }
-        Blur(_) | EffectFilter(_) => return None,
+        Blur(_) | EffectFilter(_) => return Err(rejected_layer_reason(layer)),
         Terrace(_) if inplace_composite_supported(layer) => {
             (GpuKernel::Terrace, GpuDirtyPolicy::Local, 4)
         }
-        Terrace(_) => return None,
+        Terrace(_) => return Err(rejected_layer_reason(layer)),
         ThermalErosion(p) if thermal_config_supported(p) && inplace_composite_supported(layer) => {
             (GpuKernel::Thermal, GpuDirtyPolicy::FullField, 0)
         }
@@ -606,14 +799,16 @@ fn gpu_plan_for_layer(layer: &Layer, mask_assets: &[MaskAsset]) -> Option<GpuLay
         | RiverCarve(_)
         | StreamPowerErosion(_)
         | MultiScaleAmplify(_) => {
-            return None;
+            return Err(rejected_layer_reason(layer));
         }
         // These CPU operations either modify height without a GPU kernel or publish
         // observable auxiliary fields that the GPU preview cannot currently produce.
-        Coastal(_) | Materials(_) | Biomes(_) | Vegetation(_) => return None,
-        _ => return None,
+        Coastal(_) | Materials(_) | Biomes(_) | Vegetation(_) => {
+            return Err(rejected_layer_reason(layer));
+        }
+        _ => return Err(rejected_layer_reason(layer)),
     };
-    Some(GpuLayerPlan {
+    Ok(GpuLayerPlan {
         kernel,
         dirty_policy,
         halo_texels,
@@ -622,7 +817,7 @@ fn gpu_plan_for_layer(layer: &Layer, mask_assets: &[MaskAsset]) -> Option<GpuLay
 
 /// Whether this complete layer configuration can run on the GPU preview path.
 pub fn layer_gpu_supported(layer: &Layer, mask_assets: &[MaskAsset]) -> bool {
-    gpu_plan_for_layer(layer, mask_assets).is_some()
+    gpu_plan_for_layer(layer, mask_assets).is_ok()
 }
 
 fn layer_consumes_wetness(layer: &Layer, mask_assets: &[MaskAsset]) -> bool {
@@ -669,15 +864,27 @@ fn layer_consumes_wetness(layer: &Layer, mask_assets: &[MaskAsset]) -> bool {
 /// so the engine's speculative suffix walk keeps them live on the GPU.
 pub fn compile_gpu_graph(stack: &LayerStack, mask_assets: &[MaskAsset]) -> GpuComputeGraph {
     let layers: Vec<&Layer> = stack.flatten_layers();
-    let mut plans: Vec<Option<GpuLayerPlan>> = layers
+    let decisions: Vec<Option<Result<GpuLayerPlan, GpuFallbackReason>>> = layers
         .iter()
         .map(|layer| {
             layer
                 .common
                 .enabled
                 .then(|| gpu_plan_for_layer(layer, mask_assets))
-                .flatten()
         })
+        .collect();
+    let mut plans: Vec<Option<GpuLayerPlan>> = decisions
+        .iter()
+        .map(|decision| {
+            decision
+                .as_ref()
+                .and_then(|result| result.as_ref().ok())
+                .copied()
+        })
+        .collect();
+    let mut fallback_reasons: Vec<Option<GpuFallbackReason>> = decisions
+        .into_iter()
+        .map(|decision| decision.and_then(Result::err))
         .collect();
 
     // A `SculptStrokes` GPU plan is a height-only preview; it does not reproduce the
@@ -695,6 +902,22 @@ pub fn compile_gpu_graph(stack: &LayerStack, mask_assets: &[MaskAsset]) -> GpuCo
             .any(|l| l.common.enabled && l.kind.consumes_sculpt_aux());
         if downstream_consumer {
             plans[i] = None;
+            let consumer = layers[i + 1..]
+                .iter()
+                .find(|l| l.common.enabled && l.kind.consumes_sculpt_aux());
+            fallback_reasons[i] = Some(GpuFallbackReason::new(
+                GpuFallbackCode::AuxiliaryDependency,
+                "auxiliary field",
+                consumer.map_or_else(
+                    || "downstream layer consumes omitted sculpt auxiliary fields".to_string(),
+                    |layer| {
+                        format!(
+                            "'{}' consumes auxiliary fields omitted by the SculptStrokes preview",
+                            layer.common.name
+                        )
+                    },
+                ),
+            ));
         }
     }
 
@@ -713,6 +936,22 @@ pub fn compile_gpu_graph(stack: &LayerStack, mask_assets: &[MaskAsset]) -> GpuCo
             .any(|layer| layer.common.enabled && layer_consumes_wetness(layer, mask_assets))
         {
             plans[i] = None;
+            let consumer = layers[i + 1..]
+                .iter()
+                .find(|layer| layer.common.enabled && layer_consumes_wetness(layer, mask_assets));
+            fallback_reasons[i] = Some(GpuFallbackReason::new(
+                GpuFallbackCode::AuxiliaryDependency,
+                "wetness",
+                consumer.map_or_else(
+                    || "downstream layer consumes omitted Path wetness".to_string(),
+                    |layer| {
+                        format!(
+                            "'{}' consumes wetness omitted by the Path preview",
+                            layer.common.name
+                        )
+                    },
+                ),
+            ));
         }
     }
 
@@ -736,6 +975,15 @@ pub fn compile_gpu_graph(stack: &LayerStack, mask_assets: &[MaskAsset]) -> GpuCo
             .any(|layer| layer.common.enabled && layer.kind.consumes_sculpt_aux());
         if inherits_hardness || downstream_aux_consumer {
             plans[i] = None;
+            fallback_reasons[i] = Some(GpuFallbackReason::new(
+                GpuFallbackCode::AuxiliaryDependency,
+                "hardness",
+                if inherits_hardness {
+                    "MultiScaleAmplify inherits a hardness field unavailable to the GPU preview"
+                } else {
+                    "a downstream layer consumes auxiliary fields omitted by MultiScaleAmplify"
+                },
+            ));
         }
     }
 
@@ -745,7 +993,21 @@ pub fn compile_gpu_graph(stack: &LayerStack, mask_assets: &[MaskAsset]) -> GpuCo
         .zip(&plans)
         .position(|(layer, plan)| layer.common.enabled && plan.is_none());
 
-    GpuComputeGraph { plans, cpu_from }
+    let cpu_fallback = cpu_from.map(|layer_index| GpuFallbackDiagnostic {
+        layer_index,
+        layer_id: layers[layer_index].id(),
+        layer_name: layers[layer_index].common.name.clone(),
+        reason: fallback_reasons[layer_index]
+            .clone()
+            .expect("enabled CPU resume must have a structured fallback reason"),
+    });
+
+    GpuComputeGraph {
+        plans,
+        fallback_reasons,
+        cpu_from,
+        cpu_fallback,
+    }
 }
 
 /// Expand a dirty rect by halo, clamped to field bounds.
@@ -772,19 +1034,68 @@ mod tests {
         EffectFilterKind, EffectFilterParams, FbmParams, FlatParams, FractalNoiseType,
         HydraulicErosionParams, ImportHeightmapParams, IslandParams, LandscapeEvolutionParams,
         Layer, LayerKind, LayerStack, LayerTypeRegistry, MaterialsParams, MesaParams,
-        MountainParams, MultiScaleAmplifyParams, NoiseParams, PlateauParams, RiverCarveParams,
-        SculptStroke, SculptStrokeKind, SculptStrokeParams, Stamp2dParams, Stamp3dParams,
-        StreamPowerParams, TerraceParams, ThermalErosionParams, UpliftParams, VegetationParams,
-        VolcanoParams,
+        MountainParams, MultiScaleAmplifyParams, NoiseParams, ParamBinding, PlateauParams,
+        RiverCarveParams, SculptStroke, SculptStrokeKind, SculptStrokeParams, Stamp2dParams,
+        Stamp3dParams, StreamPowerParams, TerraceParams, ThermalErosionParams, UpliftParams,
+        VegetationParams, VolcanoParams,
     };
     use terra_core::mask::{
-        bake_distribution, bake_mask_assets, DistributionEntry, MaskId, MaskOp, MaskRef,
+        bake_distribution, bake_mask_assets, DistributionEntry, MaskCombine, MaskId, MaskOp,
+        MaskRef,
     };
 
     fn single_layer_graph(layer: Layer) -> GpuComputeGraph {
         let mut stack = LayerStack::new();
         stack.push(layer);
         compile_gpu_graph(&stack, &[])
+    }
+
+    #[test]
+    fn structured_fallback_inventory_reports_stable_codes_and_owner() {
+        let mut bound = Layer::new("bound flat", LayerKind::Flat(FlatParams::default()));
+        bound
+            .common
+            .param_bindings
+            .push(ParamBinding::new("height", BindingSource::Constant(0.5)));
+        let bound_id = bound.id();
+        let graph = single_layer_graph(bound);
+        let diagnostic = graph.cpu_fallback.expect("binding fallback");
+        assert_eq!(diagnostic.layer_index, 0);
+        assert_eq!(diagnostic.layer_id, bound_id);
+        assert_eq!(diagnostic.layer_name, "bound flat");
+        assert_eq!(diagnostic.reason.code, GpuFallbackCode::ParameterBinding);
+
+        let overflowing = Layer::new(
+            "derived seed overflow",
+            LayerKind::NoisePerlin(NoiseParams {
+                seed: u64::from(u32::MAX),
+                octaves: 2,
+                ..NoiseParams::default()
+            }),
+        );
+        assert_eq!(
+            single_layer_graph(overflowing)
+                .cpu_fallback
+                .expect("seed fallback")
+                .reason
+                .code,
+            GpuFallbackCode::SeedRange
+        );
+
+        let mut asset = MaskAsset::new(MaskId::new(), "wide blur", MaskSource::Constant(0.5));
+        asset.ops.push(MaskOp::Blur { radius: 17 });
+        let layer = masked_flat(&asset);
+        let mut stack = LayerStack::new();
+        stack.push(layer);
+        let graph = compile_gpu_graph(&stack, &[asset]);
+        assert_eq!(
+            graph
+                .cpu_fallback
+                .expect("mask operation fallback")
+                .reason
+                .code,
+            GpuFallbackCode::MaskOperations
+        );
     }
 
     #[test]
@@ -797,11 +1108,11 @@ mod tests {
         let stamp3d = Layer::new("stamp3d", LayerKind::Stamp3d(Stamp3dParams::default()));
         assert_eq!(
             gpu_plan_for_layer(&import, &[]).map(|plan| plan.kernel),
-            Some(GpuKernel::HeightmapSample)
+            Ok(GpuKernel::HeightmapSample)
         );
         assert_eq!(
             gpu_plan_for_layer(&stamp, &[]).map(|plan| plan.kernel),
-            Some(GpuKernel::HeightmapSample)
+            Ok(GpuKernel::HeightmapSample)
         );
         assert!(!layer_gpu_supported(&stamp3d, &[]));
 
@@ -893,7 +1204,7 @@ mod tests {
 
         let mut saw_full_field = false;
         for layer in &candidates {
-            let Some(plan) = gpu_plan_for_layer(layer, &[]) else {
+            let Ok(plan) = gpu_plan_for_layer(layer, &[]) else {
                 continue;
             };
             let cpu = layer.kind.spatial_dependency();
@@ -922,7 +1233,7 @@ mod tests {
         let terrace = Layer::new("terrace", LayerKind::Terrace(TerraceParams::default()));
         assert_eq!(
             gpu_plan_for_layer(&terrace, &[]).map(|p| p.dirty_policy),
-            Some(GpuDirtyPolicy::Local)
+            Ok(GpuDirtyPolicy::Local)
         );
         assert_eq!(
             terrace.kind.spatial_dependency(),
@@ -1005,7 +1316,7 @@ mod tests {
         ];
         for layer in layers {
             let plan = gpu_plan_for_layer(&layer, &[])
-                .unwrap_or_else(|| panic!("{} should compile", layer.common.name));
+                .unwrap_or_else(|_| panic!("{} should compile", layer.common.name));
             assert_eq!(plan.kernel, GpuKernel::Noise, "{}", layer.common.name);
             assert_eq!(plan.dirty_policy, GpuDirtyPolicy::Local);
             assert_eq!(plan.halo_texels, 2);
@@ -1107,8 +1418,8 @@ mod tests {
                     | EffectFilterKind::TerraceSteep
             );
             let plan = gpu_plan_for_layer(&layer, &[]);
-            assert_eq!(plan.is_some(), supported, "{}", kind.label());
-            if let Some(plan) = plan {
+            assert_eq!(plan.is_ok(), supported, "{}", kind.label());
+            if let Ok(plan) = plan {
                 assert_eq!(plan.kernel, GpuKernel::EffectFilter, "{}", kind.label());
                 assert!(plan.kernel.matches_layer_kind(&layer.kind));
                 let expected_policy = match kind {
@@ -1174,7 +1485,7 @@ mod tests {
         ] {
             let layer = strokes_layer(kind, reconcile);
             let plan = gpu_plan_for_layer(&layer, &[])
-                .unwrap_or_else(|| panic!("{kind:?} should compile to a GPU plan"));
+                .unwrap_or_else(|_| panic!("{kind:?} should compile to a GPU plan"));
             assert_eq!(plan.kernel, GpuKernel::SculptStrokes, "{kind:?}");
             assert!(plan.kernel.matches_layer_kind(&layer.kind), "{kind:?}");
             assert_eq!(plan.dirty_policy, GpuDirtyPolicy::Local, "{kind:?}");
@@ -1193,7 +1504,7 @@ mod tests {
         let kind = SculptStrokeKind::Flatten;
         let layer = strokes_layer(kind, 0.15);
         let plan = gpu_plan_for_layer(&layer, &[])
-            .unwrap_or_else(|| panic!("{kind:?} should compile to a GPU plan"));
+            .unwrap_or_else(|_| panic!("{kind:?} should compile to a GPU plan"));
         assert_eq!(plan.kernel, GpuKernel::SculptStrokes, "{kind:?}");
         // Flatten stays tile-scoped like the CPU (its #110 footprint fixpoint keeps a
         // self-edit recompute bit-exact), so it takes the same Local policy.
@@ -1223,12 +1534,12 @@ mod tests {
     }
 
     #[test]
-    fn sculpt_strokes_require_a_supported_blend() {
+    fn sculpt_strokes_accept_extended_gpu_blends() {
         let mut layer = strokes_layer(SculptStrokeKind::Raise, 0.15);
         layer.common.blend = BlendMode::SmoothMaximum;
-        assert!(gpu_blend_mode(layer.common.blend).is_none());
-        assert!(!layer_gpu_supported(&layer, &[]));
-        assert_eq!(single_layer_graph(layer).cpu_from, Some(0));
+        assert!(gpu_blend_mode(layer.common.blend).is_some());
+        assert!(layer_gpu_supported(&layer, &[]));
+        assert_eq!(single_layer_graph(layer).cpu_from, None);
     }
 
     #[test]
@@ -1408,7 +1719,7 @@ mod tests {
 
         let mut partial = default;
         partial.common.opacity = 0.5;
-        assert!(!layer_gpu_supported(&partial, &[]));
+        assert!(layer_gpu_supported(&partial, &[]));
     }
 
     #[test]
@@ -1524,10 +1835,10 @@ mod tests {
         assert!(graph.plans[2].is_some());
     }
 
-    /// Revert check for #50: in-place kernels only implement the default outer
-    /// composite, so richer LayerCommon settings must begin CPU fallback at the owner.
+    /// #138: in-place kernels preserve their entering field and run the same outer
+    /// compositor as generators, including masks and partial opacity.
     #[test]
-    fn inplace_kernels_require_default_outer_composite() {
+    fn inplace_kernels_accept_supported_outer_composites() {
         let mask = MaskAsset::new(MaskId::new(), "constant", MaskSource::Constant(0.5));
         for default_layer in inplace_layers() {
             assert!(
@@ -1551,18 +1862,31 @@ mod tests {
 
             for (layer, assets, reason) in cases {
                 assert!(
-                    !layer_gpu_supported(&layer, &assets),
-                    "{} unexpectedly supports {reason}",
+                    layer_gpu_supported(&layer, &assets),
+                    "{} should support {reason}",
                     layer.common.name
                 );
                 let mut stack = LayerStack::new();
                 stack.push(Layer::new("prefix", LayerKind::Flat(FlatParams::default())));
                 stack.push(layer);
                 let graph = compile_gpu_graph(&stack, &assets);
-                assert_eq!(graph.cpu_from, Some(1), "{reason}");
+                assert_eq!(graph.cpu_from, None, "{reason}");
                 assert!(graph.plans[0].is_some(), "{reason}");
-                assert!(graph.plans[1].is_none(), "{reason}");
+                assert!(graph.plans[1].is_some(), "{reason}");
             }
+
+            let mut invalid = default_layer;
+            invalid.common.opacity = f32::NAN;
+            let graph = single_layer_graph(invalid);
+            assert_eq!(graph.cpu_from, Some(0));
+            assert_eq!(
+                graph
+                    .cpu_fallback
+                    .expect("invalid opacity reason")
+                    .reason
+                    .code,
+                GpuFallbackCode::InPlaceComposite
+            );
         }
     }
 
@@ -1580,30 +1904,21 @@ mod tests {
             (BlendMode::Min, 4),
             (BlendMode::Max, 5),
             (BlendMode::Overlay, 6),
+            (BlendMode::HeightBlend, 7),
+            (BlendMode::SmoothMaximum, 8),
+            (BlendMode::SmoothMinimum, 9),
+            (BlendMode::SmoothUnion, 10),
+            (BlendMode::SmoothSubtraction, 11),
         ] {
             assert_eq!(gpu_blend_mode(mode), Some(shader_mode));
             let mut layer = Layer::new("generator", LayerKind::Flat(FlatParams::default()));
             layer.common.blend = mode;
             assert!(layer_gpu_supported(&layer, &[]), "{mode:?}");
         }
-
-        for mode in [
-            BlendMode::HeightBlend,
-            BlendMode::SmoothMaximum,
-            BlendMode::SmoothMinimum,
-            BlendMode::SmoothUnion,
-            BlendMode::SmoothSubtraction,
-        ] {
-            assert_eq!(gpu_blend_mode(mode), None, "{mode:?}");
-            let mut layer = Layer::new("generator", LayerKind::Flat(FlatParams::default()));
-            layer.common.blend = mode;
-            assert!(!layer_gpu_supported(&layer, &[]), "{mode:?}");
-            assert_eq!(single_layer_graph(layer).cpu_from, Some(0), "{mode:?}");
-        }
     }
 
     #[test]
-    fn simple_single_entry_masks_are_the_only_gpu_supported_contract() {
+    fn gpu_resident_mask_sources_are_explicitly_admitted() {
         for source in [
             MaskSource::Constant(0.5),
             MaskSource::Height {
@@ -1625,7 +1940,7 @@ mod tests {
     }
 
     #[test]
-    fn complex_or_unproven_masks_start_cpu_fallback_at_the_owner() {
+    fn unsupported_mask_sources_start_cpu_fallback_at_the_owner() {
         let mut cases = Vec::new();
 
         let missing = MaskAsset::new(MaskId::new(), "missing", MaskSource::Constant(0.5));
@@ -1645,15 +1960,6 @@ mod tests {
             cases.push((masked_flat(&asset), vec![asset], "unproven source"));
         }
 
-        let mut operated = MaskAsset::new(MaskId::new(), "operated", MaskSource::Constant(0.2));
-        operated.ops.push(MaskOp::Invert);
-        cases.push((masked_flat(&operated), vec![operated], "asset operation"));
-
-        let combined = MaskAsset::new(MaskId::new(), "combined", MaskSource::Constant(0.5));
-        let mut non_multiply = masked_flat(&combined);
-        non_multiply.common.masks.entries[0].combine = MaskCombine::Subtract;
-        cases.push((non_multiply, vec![combined], "non-Multiply combine"));
-
         for (layer, assets, reason) in cases {
             assert!(!layer_gpu_supported(&layer, &assets), "{reason}");
             let mut stack = LayerStack::new();
@@ -1665,7 +1971,7 @@ mod tests {
     }
 
     #[test]
-    fn ordered_distribution_fixture_is_non_commutative_and_cpu_bound() {
+    fn ordered_distribution_fixture_is_non_commutative_and_gpu_planned() {
         let metrics = terra_core::heightfield::HeightfieldMetrics::new(2, 2, 2.0, 2.0);
         let first = MaskAsset::new(MaskId::new(), "first", MaskSource::Constant(0.8));
         let second = MaskAsset::new(MaskId::new(), "second", MaskSource::Constant(0.25));
@@ -1684,15 +1990,15 @@ mod tests {
         });
         let oracle = bake_distribution(&layer.common.masks, &baked, metrics);
         assert!((oracle.get(0, 0) - 0.55).abs() < 1.0e-6);
-        assert!(!layer_gpu_supported(&layer, &assets));
+        assert!(layer_gpu_supported(&layer, &assets));
 
         let mut stack = LayerStack::new();
         stack.push(layer);
-        assert_eq!(compile_gpu_graph(&stack, &assets).cpu_from, Some(0));
+        assert_eq!(compile_gpu_graph(&stack, &assets).cpu_from, None);
     }
 
     #[test]
-    fn asset_operation_fixture_changes_the_cpu_mask_and_requires_fallback() {
+    fn asset_operation_fixture_changes_the_cpu_mask_and_is_gpu_planned() {
         let metrics = terra_core::heightfield::HeightfieldMetrics::new(2, 2, 2.0, 2.0);
         let mut asset = MaskAsset::new(MaskId::new(), "invert", MaskSource::Constant(0.2));
         asset.ops.push(MaskOp::Invert);
@@ -1705,6 +2011,6 @@ mod tests {
         let layer = masked_flat(&asset);
         let oracle = bake_distribution(&layer.common.masks, &baked, metrics);
         assert!((oracle.get(0, 0) - 0.8).abs() < 1.0e-6);
-        assert!(!layer_gpu_supported(&layer, std::slice::from_ref(&asset)));
+        assert!(layer_gpu_supported(&layer, std::slice::from_ref(&asset)));
     }
 }
