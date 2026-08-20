@@ -101,9 +101,7 @@ pub(crate) enum BootPoll<T> {
 }
 
 /// Classify a `JobHandle::try_take` result into the app's startup policy.
-pub(crate) fn classify_boot_poll<T>(
-    poll: Option<Result<T, terra_jobs::JobError>>,
-) -> BootPoll<T> {
+pub(crate) fn classify_boot_poll<T>(poll: Option<Result<T, terra_jobs::JobError>>) -> BootPoll<T> {
     match poll {
         None => BootPoll::Pending,
         Some(Ok(value)) => BootPoll::Ready(value),
@@ -113,10 +111,7 @@ pub(crate) fn classify_boot_poll<T>(
 }
 
 /// Build the text lines for the boot-failure splash frame.
-pub(crate) fn failure_splash_lines(
-    error: &StartupError,
-    log_file: Option<&Path>,
-) -> Vec<String> {
+pub(crate) fn failure_splash_lines(error: &StartupError, log_file: Option<&Path>) -> Vec<String> {
     let mut lines = Vec::with_capacity(5);
     lines.push(format!("{error}"));
     lines.push(String::new());
@@ -155,12 +150,8 @@ mod tests {
     fn startup_error_variants_are_distinguishable() {
         // OsError::new is pub(crate) in winit, so Window is tested only via
         // the smoke matrix. The other three are constructible.
-        let event_loop = StartupError::EventLoop(
-            winit::error::EventLoopError::ExitFailure(1),
-        );
-        let gpu = StartupError::Gpu(terra_render::RenderError::Msg(
-            "no adapter".into(),
-        ));
+        let event_loop = StartupError::EventLoop(winit::error::EventLoopError::ExitFailure(1));
+        let gpu = StartupError::Gpu(terra_render::RenderError::Msg("no adapter".into()));
         let boot = StartupError::BootWorker(JobError::Panicked("boom".into()));
 
         let msgs: Vec<String> = [&event_loop, &gpu, &boot]
@@ -191,13 +182,15 @@ mod tests {
 
     #[test]
     fn classify_panicked_is_failed() {
-        let poll: Option<Result<u32, _>> =
-            Some(Err(JobError::Panicked("segfault".into())));
+        let poll: Option<Result<u32, _>> = Some(Err(JobError::Panicked("segfault".into())));
         match classify_boot_poll(poll) {
             BootPoll::Failed(StartupError::BootWorker(JobError::Panicked(msg))) => {
                 assert!(msg.contains("segfault"));
             }
-            other => panic!("expected Failed(BootWorker(Panicked)), got {:?}", variant_name(&other)),
+            other => panic!(
+                "expected Failed(BootWorker(Panicked)), got {:?}",
+                variant_name(&other)
+            ),
         }
     }
 

@@ -186,8 +186,8 @@ impl EvalWorker {
                         self.cancelled_results = self.cancelled_results.saturating_add(1);
                     }
                     match job_result_event(token, quality, result) {
-                    Some(event) => event,
-                    None => continue, // cancelled result: suppressed
+                        Some(event) => event,
+                        None => continue, // cancelled result: suppressed
                     }
                 }
                 JobEvent::Failed {
@@ -871,8 +871,7 @@ mod tests {
         // Fixed ids across build/scoped/control so the warm cache keys line up.
         let mut prev_stack = LayerStack::new();
         prev_stack.push(Layer::new("Sculpt", LayerKind::SculptBase(sculpt)));
-        let strokes_layer =
-            Layer::new("Strokes", LayerKind::SculptStrokes(prev_params.clone()));
+        let strokes_layer = Layer::new("Strokes", LayerKind::SculptStrokes(prev_params.clone()));
         let strokes_id = strokes_layer.id();
         prev_stack.push(strokes_layer);
         // A coupled downstream pass with a 6-sample halo: the scope must reach-expand
@@ -934,8 +933,12 @@ mod tests {
             // Warm Full cache from prev, then scoped resubmit of next.
             let live = Arc::new(AtomicU64::new(1));
             let mut evaluator = StackEvaluator::new();
-            run_cpu_job(&mut evaluator, &make(1, prev_stack.clone(), None, None, true), &live)
-                .expect("warm build");
+            run_cpu_job(
+                &mut evaluator,
+                &make(1, prev_stack.clone(), None, None, true),
+                &live,
+            )
+            .expect("warm build");
             live.store(2, Ordering::Release);
             let scoped = run_cpu_job(
                 &mut evaluator,
@@ -947,13 +950,25 @@ mod tests {
             // Cold whole-field control of next.
             let control_live = Arc::new(AtomicU64::new(9));
             let mut control_eval = StackEvaluator::new();
-            let control = run_cpu_job(&mut control_eval, &make(9, edited, None, None, true), &control_live)
-                .expect("control build");
+            let control = run_cpu_job(
+                &mut control_eval,
+                &make(9, edited, None, None, true),
+                &control_live,
+            )
+            .expect("control build");
 
-            let scoped_bits: Vec<u32> =
-                scoped.height.to_dense().iter().map(|f| f.to_bits()).collect();
-            let control_bits: Vec<u32> =
-                control.height.to_dense().iter().map(|f| f.to_bits()).collect();
+            let scoped_bits: Vec<u32> = scoped
+                .height
+                .to_dense()
+                .iter()
+                .map(|f| f.to_bits())
+                .collect();
+            let control_bits: Vec<u32> = control
+                .height
+                .to_dense()
+                .iter()
+                .map(|f| f.to_bits())
+                .collect();
             assert_eq!(
                 scoped_bits, control_bits,
                 "{label}: a scoped stroke edit diverged from the whole-field rebuild"

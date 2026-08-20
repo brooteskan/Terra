@@ -17,26 +17,67 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
-use super::helpers::{search_character, ui_tool_search_focused};
 use super::frame_trace::FrameTraceEventKind;
+use super::helpers::{search_character, ui_tool_search_focused};
 use super::input::{InputEvent, InputModifiers, PointerCancelReason};
 use super::logical_frame::{
-    EditGeneration, FrameIdentity, FramePhase, FrameRequestReason, LogicalFrameId,
+    EditGeneration, FrameDeadlineKind, FrameIdentity, FramePhase, FrameRequestReason, FrameWake,
+    LogicalFrameId,
 };
 use super::{
-    quality_in_flight_progress, quality_stage_progress, AppScreen, TerraApp, EDIT_DEBOUNCE_MS,
+    quality_in_flight_progress, quality_stage_progress, AppScreen, RuntimeEvent, TerraApp,
     FULL_FIELD_REFINE_MS, POST_INPUT_REFINE_GRACE_MS, REFINE_INTERVAL_MS,
 };
 
 impl TerraApp {
+    pub(crate) fn request_app_frame(&mut self, reason: FrameRequestReason) {
+        self.logical_frames
+            .request(EditGeneration::new(self.eval_token), reason);
+    }
+
+    pub(crate) fn record_frame_event(&mut self, kind: FrameTraceEventKind) {
+        let identity = self
+            .logical_frames
+            .active_identity()
+            .or_else(|| self.logical_frames.pending_identity());
+        self.frame_trace.record(
+            Instant::now(),
+            kind,
+            identity,
+            self.logical_frames.active_phase(),
+            None,
+            None,
+            None,
+            None,
+        );
+    }
+
+    fn capture_surface_resize(&mut self, size: winit::dpi::PhysicalSize<u32>) {
+        self.pending_surface_resize = Some(size);
+        self.request_app_frame(FrameRequestReason::Resize);
+        self.record_frame_event(FrameTraceEventKind::ResizeCaptured);
+    }
+
+    fn handle_runtime_event(&mut self, event: RuntimeEvent) {
+        match event {
+            RuntimeEvent::DeviceLost { reason, message }
+                if reason != wgpu::DeviceLostReason::Destroyed =>
+            {
+                log::error!("GPU device lost ({reason:?}): {message}");
+                self.ui_state.status = format!("GPU device lost: {message}");
+                self.logical_frames
+                    .request_shutdown(EditGeneration::new(self.eval_token));
+                self.record_frame_event(FrameTraceEventKind::DeviceLost);
+            }
+            RuntimeEvent::DeviceLost { .. } => {}
+        }
+    }
+
     fn queue_input(&mut self, event: InputEvent) {
         let now = Instant::now();
         let generation = EditGeneration::new(self.eval_token);
         self.input.record(event, now);
-        self.logical_frames.request(
-            EditGeneration::new(self.eval_token),
-            FrameRequestReason::Input,
-        );
+        self.request_app_frame(FrameRequestReason::Input);
         let identity = self.logical_frames.pending_identity();
         self.frame_trace.record(
             now,
@@ -67,10 +108,18 @@ impl TerraApp {
                 None,
             );
         }
-        if matches!(event, InputEvent::PointerButton { button: MouseButton::Left, .. }) {
-            self.optional_refine_not_before =
-                now.checked_add(Duration::from_millis(POST_INPUT_REFINE_GRACE_MS));
-            self.optional_refine_generation = generation.get();
+        if matches!(
+            event,
+            InputEvent::PointerButton {
+                button: MouseButton::Left,
+                ..
+            }
+        ) {
+            self.logical_frames.schedule_deadline(
+                FrameDeadlineKind::OptionalRefinement,
+                generation,
+                now + Duration::from_millis(POST_INPUT_REFINE_GRACE_MS),
+            );
         }
     }
 
@@ -90,7 +139,6 @@ impl TerraApp {
         let event_count = snapshot.len();
         let pointer_samples = snapshot.pointer_sample_count();
         let first_primary_press = snapshot.first_primary_press_receipt();
-        let has_primary_edge = snapshot.has_primary_pointer_edge();
         self.logical_frames
             .begin(Instant::now(), event_count, pointer_samples);
         self.logical_frames.transition(FramePhase::SealingInput);
@@ -99,7 +147,7 @@ impl TerraApp {
         let first_receipt = snapshot.events().first().map(|event| event.received_at());
         let last_sequence = snapshot.events().last().map(|event| event.sequence());
         let mut want_redraw = false;
-        for event in snapshot.events() {
+        for event in snapshot.into_events() {
             want_redraw |= self.apply_input_event(event.event());
         }
         self.logical_frames
@@ -139,9 +187,6 @@ impl TerraApp {
                 Some(received_at.elapsed()),
             );
         }
-        if has_primary_edge {
-            self.optional_refine_generation = self.eval_token;
-        }
         self.logical_frames
             .transition(FramePhase::RequiredInteractiveWork);
         if let (Some(identity), Some(received_at), Some(sequence)) = (
@@ -172,14 +217,23 @@ impl TerraApp {
             || self.refinement_job.is_some()
             || self.ui_state.refining
             || self.deferred_full_field.is_some()
-            || !self.pending_tile_uploads.is_empty();
+            || !self.pending_tile_uploads.is_empty()
+            || !self.pending_ui_effects.is_empty()
+            || self.pending_surface_resize.is_some()
+            || self.logical_frames.has_pending();
         if !known_work {
             return;
         }
-        self.logical_frames.request(
-            EditGeneration::new(self.eval_token),
-            FrameRequestReason::ScheduledWork,
-        );
+        if !self.logical_frames.has_pending() {
+            let reason = if self.pending_eval {
+                FrameRequestReason::RequiredEvaluation
+            } else if self.refinement_job.is_some() || self.ui_state.refining {
+                FrameRequestReason::OptionalRefinement
+            } else {
+                FrameRequestReason::Animation
+            };
+            self.request_app_frame(reason);
+        }
         self.logical_frames.begin(Instant::now(), 0, 0);
         self.logical_frames
             .transition(FramePhase::RequiredInteractiveWork);
@@ -206,9 +260,9 @@ impl TerraApp {
                 true
             }
             InputEvent::CursorEntered | InputEvent::CursorLeft => true,
-            InputEvent::PointerCancelled(PointerCancelReason::FocusLost) => {
-                self.cancel_pointer_gesture()
-            }
+            InputEvent::PointerCancelled(
+                PointerCancelReason::FocusLost | PointerCancelReason::CaptureLost,
+            ) => self.cancel_pointer_gesture(),
         }
     }
 
@@ -409,9 +463,11 @@ impl TerraApp {
             }
             let now = Instant::now();
             let generation = EditGeneration::new(self.eval_token);
-            self.optional_refine_not_before =
-                now.checked_add(Duration::from_millis(POST_INPUT_REFINE_GRACE_MS));
-            self.optional_refine_generation = self.eval_token;
+            self.logical_frames.schedule_deadline(
+                FrameDeadlineKind::OptionalRefinement,
+                generation,
+                now + Duration::from_millis(POST_INPUT_REFINE_GRACE_MS),
+            );
             self.frame_trace.note_release(now, generation);
             self.frame_trace.record(
                 now,
@@ -523,7 +579,7 @@ impl TerraApp {
     }
 }
 
-impl ApplicationHandler for TerraApp {
+impl ApplicationHandler<RuntimeEvent> for TerraApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
@@ -546,9 +602,9 @@ impl ApplicationHandler for TerraApp {
         };
 
         if startup::injected_fault("gpu-init") {
-            self.startup_failure = Some(StartupError::Gpu(
-                terra_render::RenderError::Msg("injected gpu-init fault".into()),
-            ));
+            self.startup_failure = Some(StartupError::Gpu(terra_render::RenderError::Msg(
+                "injected gpu-init fault".into(),
+            )));
             event_loop.exit();
             return;
         }
@@ -561,6 +617,11 @@ impl ApplicationHandler for TerraApp {
                 return;
             }
         };
+        if let Some(proxy) = self.runtime_event_proxy.clone() {
+            gpu.device.set_device_lost_callback(move |reason, message| {
+                let _ = proxy.send_event(RuntimeEvent::DeviceLost { reason, message });
+            });
+        }
 
         // The GUI renderer only needs the device/queue/format, so it is ready
         // long before the terrain pipelines. Paint the first splash frame, reveal
@@ -706,21 +767,22 @@ impl ApplicationHandler for TerraApp {
             }
             WindowEvent::CursorLeft { .. } => {
                 self.queue_input(InputEvent::CursorLeft);
+                self.queue_input(InputEvent::PointerCancelled(
+                    PointerCancelReason::CaptureLost,
+                ));
                 return;
             }
             event => event,
         };
 
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                self.logical_frames
+                    .request_shutdown(EditGeneration::new(self.eval_token));
+                self.record_frame_event(FrameTraceEventKind::ShutdownRequested);
+            }
             WindowEvent::Resized(size) => {
-                if let Some(renderer) = self.renderer.as_mut() {
-                    renderer.resize(size);
-                }
-                self.refresh_viewport_rect();
-                if let Some(window) = &self.window {
-                    window.request_redraw();
-                }
+                self.capture_surface_resize(size);
             }
             WindowEvent::RedrawRequested => {
                 let presentation_identity = self.logical_frames.take_presentation_identity();
@@ -740,7 +802,10 @@ impl ApplicationHandler for TerraApp {
                     }
                 }
                 self.redraw();
-                if let Some(timings) = self.renderer.as_ref().map(|renderer| renderer.last_gpu_timings)
+                if let Some(timings) = self
+                    .renderer
+                    .as_ref()
+                    .map(|renderer| renderer.last_gpu_timings)
                 {
                     let newly_resolved =
                         timings.source_frame > self.last_reported_presentation_timing_frame;
@@ -776,10 +841,8 @@ impl ApplicationHandler for TerraApp {
                 }
                 if let Some(identity) = presentation_identity {
                     let now = Instant::now();
-                    self.frame_trace.note_surface_presented(
-                        now,
-                        self.last_complete_generation,
-                    );
+                    self.frame_trace
+                        .note_surface_presented(now, self.last_complete_generation);
                     let input_visible = self.frame_trace.input_to_visible_summary();
                     let refinement = self.frame_trace.refinement_summary();
                     let follow_up_press = self.frame_trace.follow_up_press_summary();
@@ -809,8 +872,18 @@ impl ApplicationHandler for TerraApp {
         }
     }
 
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: RuntimeEvent) {
+        self.handle_runtime_event(event);
+    }
+
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if self.pending_exit || self.startup_failure.is_some() {
+        self.frame_trace.set_verbose(self.ui_state.show_profiler);
+        self.ui_state.profile.trace_orphaned_events = self.frame_trace.orphaned_events();
+        if self.pending_exit
+            || self.startup_failure.is_some()
+            || self.logical_frames.shutdown_requested()
+        {
+            self.prepare_shutdown();
             event_loop.exit();
             return;
         }
@@ -821,10 +894,12 @@ impl ApplicationHandler for TerraApp {
         // Wait (input-driven) and request one final redraw for the failure frame.
         if self.is_booting() {
             let finished = self.try_finish_boot();
-            let boot_failed = self
-                .boot
-                .as_ref()
-                .is_some_and(|b| b.failure.is_some());
+            let boot_failed = self.boot.as_ref().is_some_and(|b| b.failure.is_some());
+            if finished {
+                // The handoff redraw is the final bootstrap exception. Prepare
+                // the newly attached renderer before that bounded presentation.
+                self.prepare_presentation();
+            }
             if let Some(w) = &self.window {
                 w.request_redraw();
             }
@@ -838,13 +913,12 @@ impl ApplicationHandler for TerraApp {
             return;
         }
 
-        let completed_gpu_evaluations = if let (Some(engine), Some(gpu)) =
-            (self.gpu_engine.as_mut(), self.gpu.as_ref())
-        {
-            engine.poll_evaluation_timings(&gpu.device, &gpu.queue)
-        } else {
-            Vec::new()
-        };
+        let completed_gpu_evaluations =
+            if let (Some(engine), Some(gpu)) = (self.gpu_engine.as_mut(), self.gpu.as_ref()) {
+                engine.poll_evaluation_timings(&gpu.device, &gpu.queue)
+            } else {
+                Vec::new()
+            };
         for timing in completed_gpu_evaluations {
             self.ui_state.profile.gpu_evaluation_us = timing.gpu_us;
             self.frame_trace.record(
@@ -867,6 +941,26 @@ impl ApplicationHandler for TerraApp {
 
         let input_frame_processed = self.process_pending_input_frame();
         self.begin_scheduled_frame_if_needed();
+        let ui_effects_applied = self.apply_pending_ui_effects();
+        if ui_effects_applied {
+            self.record_frame_event(FrameTraceEventKind::UiEffectsApplied);
+        }
+        let mut surface_changed = false;
+        if self.pending_surface_reconfigure {
+            if let Some(renderer) = self.renderer.as_mut() {
+                renderer.reconfigure();
+            }
+            self.pending_surface_reconfigure = false;
+            surface_changed = true;
+        }
+        if let Some(size) = self.pending_surface_resize.take() {
+            if let Some(renderer) = self.renderer.as_mut() {
+                renderer.resize(size);
+            }
+            self.refresh_viewport_rect();
+            self.record_frame_event(FrameTraceEventKind::ResizeApplied);
+            surface_changed = true;
+        }
 
         // One registry tick pumps the background subsystems (export, project IO,
         // tool thumbnails) and folds their pending/wake facts together. The Arc
@@ -949,9 +1043,7 @@ impl ApplicationHandler for TerraApp {
             }
             if let Some(engine) = self.gpu_engine.as_mut() {
                 let refinement_state = self.terrain_runtime.refinement.state();
-                engine.set_simulation_iteration_cap(
-                    refinement_state.simulation_iteration_cap(),
-                );
+                engine.set_simulation_iteration_cap(refinement_state.simulation_iteration_cap());
             }
             // The worker is never awaited: drain available completion/failure events.
             while let Some(event) = self.eval_worker.try_recv_event() {
@@ -1003,8 +1095,7 @@ impl ApplicationHandler for TerraApp {
                         self.worker_refine_pending = false;
                         self.pending_gpu_dirty_region = None;
                         self.deferred_full_field = None;
-                        self.ui_state.terrain_preview_freshness =
-                            TerrainPreviewFreshness::Current;
+                        self.ui_state.terrain_preview_freshness = TerrainPreviewFreshness::Current;
                         // Loss-proof transport: a *fresh* result for this token proves
                         // no edit occurred after its submit (an edit bumps the token,
                         // making the result stale-discarded below), so the accumulators
@@ -1043,7 +1134,7 @@ impl ApplicationHandler for TerraApp {
                             self.ui_state.refining_layer_name = None;
                             self.ui_state.draft_displayed = false;
                         }
-                        self.last_refine = Instant::now();
+                        self.note_refinement_activity();
                         did_eval = true;
                     }
                     EvalWorkerEvent::Completed(result) => {
@@ -1085,25 +1176,33 @@ impl ApplicationHandler for TerraApp {
             // Draft as soon as the previous preview finishes, with per-frame coalescing
             // handled in `redraw`. Manual edits debounce on last_edit.
             if !stall_draft && self.pending_eval {
-                let edit_ms = self.session.rebuild_feedback.prefs.edit_debounce_ms.max(1) as u128;
                 let live_ok = self.session.rebuild_feedback.prefs.live_preview;
-                let ready = if live_paint {
-                    true
-                } else if !live_ok {
-                    false
-                } else {
-                    self.last_edit.elapsed().as_millis() >= edit_ms
-                };
+                let generation = EditGeneration::new(self.eval_token);
+                let deadline_ready = self.logical_frames.deadline_ready(
+                    FrameDeadlineKind::InteractiveEvaluation,
+                    generation,
+                    Instant::now(),
+                );
+                let ready =
+                    self.pending_eval_immediate || live_paint || (live_ok && deadline_ready);
                 if ready {
+                    let immediate = self.pending_eval_immediate;
                     self.pending_eval = false;
-                    self.force_draft = true;
-                    let intent = if self.pending_gpu_dirty_region.is_some() {
-                        GpuEvaluationIntent::InteractiveLocal
-                    } else {
+                    self.pending_eval_immediate = false;
+                    self.logical_frames
+                        .clear_deadline(FrameDeadlineKind::InteractiveEvaluation);
+                    let intent = if immediate {
                         GpuEvaluationIntent::Complete
+                    } else {
+                        self.force_draft = true;
+                        if self.pending_gpu_dirty_region.is_some() {
+                            GpuEvaluationIntent::InteractiveLocal
+                        } else {
+                            GpuEvaluationIntent::Complete
+                        }
                     };
                     self.run_eval_step_with_intent(intent);
-                    self.last_refine = Instant::now();
+                    self.note_refinement_activity();
                     did_eval = true;
                 }
             }
@@ -1117,7 +1216,8 @@ impl ApplicationHandler for TerraApp {
                 .is_some_and(|pending| pending.generation != self.eval_token)
             {
                 self.deferred_full_field = None;
-                self.full_field_refine_not_before = None;
+                self.logical_frames
+                    .clear_deadline(FrameDeadlineKind::FullFieldRefinement);
             }
             if let Some(pending) = self.deferred_full_field.as_mut() {
                 if live_paint {
@@ -1130,8 +1230,16 @@ impl ApplicationHandler for TerraApp {
                 } else {
                     let now = Instant::now();
                     if pending.arm_after_gesture(now) {
-                        self.full_field_refine_not_before =
-                            Some(now + Duration::from_millis(FULL_FIELD_REFINE_MS));
+                        self.logical_frames.schedule_deadline(
+                            FrameDeadlineKind::DeferredFullField,
+                            EditGeneration::new(self.eval_token),
+                            pending.settle_at.expect("deadline armed"),
+                        );
+                        self.logical_frames.schedule_deadline(
+                            FrameDeadlineKind::FullFieldRefinement,
+                            EditGeneration::new(self.eval_token),
+                            now + Duration::from_millis(FULL_FIELD_REFINE_MS),
+                        );
                         self.ui_state.terrain_preview_freshness =
                             TerrainPreviewFreshness::Deferred {
                                 layer_name: pending.layer_name.clone(),
@@ -1148,6 +1256,8 @@ impl ApplicationHandler for TerraApp {
                 && !self.pending_eval
                 && !self.worker_refine_pending;
             if suffix_ready {
+                self.logical_frames
+                    .clear_deadline(FrameDeadlineKind::DeferredFullField);
                 if let Some(pending) = self.deferred_full_field.as_ref() {
                     self.ui_state.terrain_preview_freshness =
                         TerrainPreviewFreshness::RefiningSuffix {
@@ -1155,10 +1265,10 @@ impl ApplicationHandler for TerraApp {
                             quality: PreviewQuality::Draft,
                         };
                 }
-                // Complete the Draft suffix before advancing the quality ladder.
-                self.scheduler.quality = PreviewQuality::Draft;
-                self.run_eval_step_with_intent(GpuEvaluationIntent::Complete);
-                self.last_refine = Instant::now();
+                // Complete the suffix at the quality of the resident local prefix.
+                // A forced Draft here replaces a Full texture immediately after
+                // gesture end and permanently knocks rapid dabs onto the coarse path.
+                self.complete_deferred_full_field();
                 did_eval = true;
             }
 
@@ -1193,7 +1303,12 @@ impl ApplicationHandler for TerraApp {
             // Required input/evaluation work gets a presentation request before
             // optional refinement is allowed to start. The actual surface present
             // occurs on the following RedrawRequested callback.
-            if input_frame_processed || did_eval || self.needs_height_upload {
+            if input_frame_processed
+                || ui_effects_applied
+                || surface_changed
+                || did_eval
+                || self.needs_height_upload
+            {
                 self.logical_frames
                     .transition(FramePhase::PresentationRequest);
                 self.logical_frames.mark_presentation_requested();
@@ -1207,9 +1322,6 @@ impl ApplicationHandler for TerraApp {
                     None,
                     None,
                 );
-                if let Some(window) = &self.window {
-                    window.request_redraw();
-                }
             }
             self.logical_frames
                 .transition(FramePhase::OptionalRefinement);
@@ -1231,21 +1343,25 @@ impl ApplicationHandler for TerraApp {
                 && !stall_refine
                 && self.logical_frames.can_start_optional(Instant::now())
                 && !self.input.has_pending()
-                && self.optional_refine_generation == self.eval_token
-                && self
-                    .optional_refine_not_before
-                    .is_none_or(|deadline| Instant::now() >= deadline)
+                && self.logical_frames.deadline_ready(
+                    FrameDeadlineKind::OptionalRefinement,
+                    EditGeneration::new(self.eval_token),
+                    Instant::now(),
+                )
                 && self.ui_state.refining
                 && !self.pending_eval
                 && !self.worker_refine_pending
                 && self.deferred_full_field.is_none()
-                && self
-                    .full_field_refine_not_before
-                    .is_none_or(|deadline| Instant::now() >= deadline)
-                && self.last_refine.elapsed().as_millis() >= REFINE_INTERVAL_MS
+                && self.logical_frames.deadline_ready(
+                    FrameDeadlineKind::FullFieldRefinement,
+                    EditGeneration::new(self.eval_token),
+                    Instant::now(),
+                )
             {
-                self.optional_refine_not_before = None;
-                self.full_field_refine_not_before = None;
+                self.logical_frames
+                    .clear_deadline(FrameDeadlineKind::OptionalRefinement);
+                self.logical_frames
+                    .clear_deadline(FrameDeadlineKind::FullFieldRefinement);
                 if let Some(mut target_quality) = self.scheduler.quality.next_refine() {
                     // HD preview: skip Medium so Camera/Zone sees Full carve sooner.
                     if !matches!(
@@ -1276,18 +1392,14 @@ impl ApplicationHandler for TerraApp {
                             ];
                         }
                     }
-                    if self.gpu_engine.is_some()
-                        && self.begin_gpu_refinement(target_quality)
-                    {
+                    if self.gpu_engine.is_some() && self.begin_gpu_refinement(target_quality) {
                         did_eval = true;
                     } else {
                         self.scheduler.quality = target_quality;
                         self.ui_state.quality = target_quality;
                         self.enqueue_refine_job();
-                        self.ui_state.build_progress = Some(quality_in_flight_progress(
-                            target_quality,
-                            0.0,
-                        ));
+                        self.ui_state.build_progress =
+                            Some(quality_in_flight_progress(target_quality, 0.0));
                         did_eval = true;
                     }
                 } else {
@@ -1296,7 +1408,7 @@ impl ApplicationHandler for TerraApp {
                     self.ui_state.build_progress = None;
                     self.ui_state.refining_layer_name = None;
                 }
-                self.last_refine = Instant::now();
+                self.note_refinement_activity();
             }
 
             // Keep the dock bar moving while Medium/Full run on the worker.
@@ -1315,59 +1427,45 @@ impl ApplicationHandler for TerraApp {
                 || self.refinement_job.is_some()
                 || self.ui_state.refining
                 || self.deferred_full_field.is_some()
-                || self.full_field_refine_not_before.is_some()
                 || !self.pending_tile_uploads.is_empty()
                 || export_busy
                 || jobs.any_pending;
         }
 
-        if live_paint && self.pending_eval {
-            // Keep pumping the event loop so Draft can flush between mouse moves.
-            event_loop.set_control_flow(ControlFlow::Poll);
-        } else if camera_flying {
-            // Smooth WASD fly while keys are held.
-            event_loop.set_control_flow(ControlFlow::Poll);
-        } else if self.worker_refine_pending || self.refinement_job.is_some() || jobs.animate {
-            // Wake often enough to animate progress and pick up the worker result.
-            event_loop.set_control_flow(ControlFlow::WaitUntil(
-                Instant::now() + Duration::from_millis(16),
-            ));
-        } else if let Some(deadline) = self
-            .deferred_full_field
-            .as_ref()
-            .and_then(|pending| pending.settle_at)
-            .filter(|deadline| *deadline > Instant::now())
-        {
-            event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
-        } else if work_pending {
-            let wait_ms = if self.pending_eval {
-                // live_paint is impossible here: it took the ControlFlow::Poll arm above.
-                EDIT_DEBOUNCE_MS
-                    .saturating_sub(self.last_edit.elapsed().as_millis())
-                    .max(1)
+        let now = Instant::now();
+        let continuous = (live_paint && self.pending_eval) || camera_flying;
+        let fallback_deadline =
+            if self.worker_refine_pending || self.refinement_job.is_some() || jobs.animate {
+                Some(now + Duration::from_millis(16))
+            } else if export_busy || jobs.any_pending || work_pending {
+                Some(now + Duration::from_millis(REFINE_INTERVAL_MS as u64))
             } else {
-                REFINE_INTERVAL_MS
-                    .saturating_sub(self.last_refine.elapsed().as_millis())
-                    .max(1)
+                None
             };
-            event_loop.set_control_flow(ControlFlow::WaitUntil(
-                Instant::now() + Duration::from_millis(wait_ms as u64),
-            ));
-        } else {
-            event_loop.set_control_flow(ControlFlow::Wait);
+        match self.logical_frames.wake_decision(
+            EditGeneration::new(self.eval_token),
+            now,
+            continuous,
+            fallback_deadline,
+        ) {
+            FrameWake::Poll => event_loop.set_control_flow(ControlFlow::Poll),
+            FrameWake::WaitUntil(deadline) => {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+            }
+            FrameWake::Wait => event_loop.set_control_flow(ControlFlow::Wait),
         }
 
         if did_eval
             || input_frame_processed
+            || ui_effects_applied
+            || surface_changed
             || export_busy
             || self.needs_height_upload
             || jobs.redraw
             || camera_flying
         {
-            self.logical_frames.mark_presentation_requested();
-            if let Some(w) = &self.window {
-                w.request_redraw();
-            }
+            self.prepare_presentation();
+            self.request_window_presentation();
         }
         if let Some(diagnostics) = self.logical_frames.complete(Instant::now()) {
             self.ui_state.profile.logical_frame_id = diagnostics.identity.id.get();
@@ -1400,6 +1498,37 @@ impl ApplicationHandler for TerraApp {
                 );
             }
         }
+    }
+}
+
+impl TerraApp {
+    /// The only post-bootstrap adapter from logical presentation demand to winit.
+    fn request_window_presentation(&mut self) {
+        self.logical_frames.mark_presentation_requested();
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    fn prepare_shutdown(&mut self) {
+        if self.logical_frames.active_identity().is_some() {
+            self.record_frame_event(FrameTraceEventKind::FrameAborted);
+        }
+        self.eval_token = self.eval_token.wrapping_add(1);
+        self.scheduler.current_token = self.eval_token;
+        self.eval_worker.set_token(self.eval_token);
+        self.supersede_gpu_refinement();
+        self.worker_refine_pending = false;
+        self.pending_eval = false;
+        self.pending_eval_immediate = false;
+        self.deferred_full_field = None;
+        self.pending_tile_uploads.clear();
+        self.pending_ui_effects.clear();
+        self.input.clear();
+        self.pending_surface_resize = None;
+        self.pending_surface_reconfigure = false;
+        self.logical_frames.clear_presentation();
+        self.logical_frames.abort(Instant::now());
     }
 }
 
@@ -1687,8 +1816,73 @@ fn paint_failure_splash(gui: &mut GuiContext, screen_w: f32, screen_h: f32, line
             y += line_height * 0.5;
             continue;
         }
-        let color = if i == lines.len() - 1 { dim_color } else { text_color };
+        let color = if i == lines.len() - 1 {
+            dim_color
+        } else {
+            text_color
+        };
         gui.label_centered(screen_w * 0.5, y, line, color, 1.0);
         y += line_height;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repeated_focus_and_capture_loss_cancel_a_pointer_gesture_once() {
+        let mut app = TerraApp::default();
+        app.mouse_pressed = Some(MouseButton::Left);
+        assert!(app.apply_input_event(InputEvent::PointerCancelled(PointerCancelReason::FocusLost)));
+        assert_eq!(app.mouse_pressed, None);
+        assert!(app.apply_input_event(InputEvent::PointerCancelled(
+            PointerCancelReason::CaptureLost
+        )));
+        assert_eq!(app.mouse_pressed, None);
+    }
+
+    #[test]
+    fn resize_capture_coalesces_to_the_latest_size() {
+        let mut app = TerraApp::default();
+        app.capture_surface_resize(winit::dpi::PhysicalSize::new(800, 600));
+        app.capture_surface_resize(winit::dpi::PhysicalSize::new(1200, 700));
+        assert_eq!(
+            app.pending_surface_resize,
+            Some(winit::dpi::PhysicalSize::new(1200, 700))
+        );
+        assert!(app.logical_frames.has_pending());
+    }
+
+    #[test]
+    fn device_loss_requests_controlled_shutdown() {
+        let mut app = TerraApp::default();
+        app.handle_runtime_event(RuntimeEvent::DeviceLost {
+            reason: wgpu::DeviceLostReason::Unknown,
+            message: "injected".into(),
+        });
+        assert!(app.logical_frames.shutdown_requested());
+        assert!(app.ui_state.status.contains("injected"));
+    }
+
+    #[test]
+    fn shutdown_clears_pending_input_and_work() {
+        let mut app = TerraApp::default();
+        app.queue_input(InputEvent::CursorEntered);
+        app.pending_eval = true;
+        app.pending_eval_immediate = true;
+        app.worker_refine_pending = true;
+        app.logical_frames
+            .request_shutdown(EditGeneration::new(app.eval_token));
+
+        app.prepare_shutdown();
+
+        assert!(!app.input.has_pending());
+        assert!(!app.pending_eval);
+        assert!(!app.pending_eval_immediate);
+        assert!(!app.worker_refine_pending);
+        assert!(!app.logical_frames.has_pending());
+        assert_eq!(app.logical_frames.active_identity(), None);
+        assert_eq!(app.logical_frames.take_presentation_identity(), None);
     }
 }

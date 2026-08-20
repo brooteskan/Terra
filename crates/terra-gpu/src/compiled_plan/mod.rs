@@ -11,6 +11,6 @@ mod resources;
 pub use operations::{GpuGroupCompositeParams, GpuPlanOperationError, GpuPlanOperations};
 pub use resources::{
     GpuFieldBinding, GpuFieldResidency, GpuPhysicalFieldId, GpuPlanAllocation,
-    GpuPlanResourceCache, GpuPlanResourceCacheStats, GpuPlanResourceError, GpuPlanResourceKey,
-    GpuPlanResourceBuilder, GpuPlanResourceLayout, GpuPlanResources,
+    GpuPlanResourceBuilder, GpuPlanResourceCache, GpuPlanResourceCacheStats, GpuPlanResourceError,
+    GpuPlanResourceKey, GpuPlanResourceLayout, GpuPlanResources,
 };

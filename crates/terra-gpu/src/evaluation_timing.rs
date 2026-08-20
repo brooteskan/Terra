@@ -41,7 +41,7 @@ pub(crate) struct GpuEvaluationTimer {
 
 impl GpuEvaluationTimer {
     pub(crate) fn try_new(device: &wgpu::Device) -> Option<Self> {
-        if !device.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
+        if !supports_encoder_timestamps(device.features()) {
             return None;
         }
         let query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
@@ -144,5 +144,26 @@ impl GpuEvaluationTimer {
 
     pub(crate) fn take_completed(&mut self) -> Vec<GpuEvaluationTiming> {
         std::mem::take(&mut self.completed)
+    }
+}
+
+fn supports_encoder_timestamps(features: wgpu::Features) -> bool {
+    features
+        .contains(wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn evaluation_timer_requires_encoder_timestamp_support() {
+        assert!(!supports_encoder_timestamps(wgpu::Features::empty()));
+        assert!(!supports_encoder_timestamps(
+            wgpu::Features::TIMESTAMP_QUERY
+        ));
+        assert!(supports_encoder_timestamps(
+            wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS
+        ));
     }
 }

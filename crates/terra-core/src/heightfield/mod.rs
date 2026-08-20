@@ -505,14 +505,22 @@ mod tests {
     #[test]
     fn zero_dimensions_are_rejected() {
         assert_eq!(
-            HeightfieldMetrics { width: 0, ..valid() }.validate(),
+            HeightfieldMetrics {
+                width: 0,
+                ..valid()
+            }
+            .validate(),
             Err(MetricsError::InvalidDimensions {
                 width: 0,
                 height: 16
             })
         );
         assert_eq!(
-            HeightfieldMetrics { height: 0, ..valid() }.validate(),
+            HeightfieldMetrics {
+                height: 0,
+                ..valid()
+            }
+            .validate(),
             Err(MetricsError::InvalidDimensions {
                 width: 16,
                 height: 0
@@ -619,7 +627,10 @@ mod tests {
         assert_eq!((down.world_size_x, down.world_size_z), (4096.0, 2048.0));
         assert_eq!(down.halo, 2);
         // Above the base tile size, tile size is unchanged.
-        assert_eq!(base.at_resolution(512).expect("512 is valid").tile_size, 256);
+        assert_eq!(
+            base.at_resolution(512).expect("512 is valid").tile_size,
+            256
+        );
         // A zero resolution is rejected, not silently produced.
         assert_eq!(
             base.at_resolution(0),

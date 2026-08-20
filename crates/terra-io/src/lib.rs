@@ -479,7 +479,10 @@ mod worker_tests {
                     "the panic message should surface, got: {message}"
                 );
                 let display = format!("{}", ExportError::Panicked(message));
-                assert!(display.starts_with("panicked:"), "Display format: {display}");
+                assert!(
+                    display.starts_with("panicked:"),
+                    "Display format: {display}"
+                );
             }
             Some(Err(other)) => panic!("expected Panicked, got: {other}"),
             Some(Ok(_)) => panic!("expected a failed export, got a successful result"),
@@ -647,10 +650,8 @@ mod worker_tests {
 
     #[test]
     fn load_malformed_json_crosses_worker_as_document_error() {
-        let path = std::env::temp_dir().join(format!(
-            "terra-io-bad-json-{}.terra",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("terra-io-bad-json-{}.terra", std::process::id()));
         std::fs::write(&path, "{ not json").expect("write fixture");
 
         let mut io = BackgroundProjectIo::new();
@@ -686,14 +687,12 @@ mod worker_tests {
             !io.is_busy() && io.result.is_some()
         });
         match io.result.take() {
-            Some(ProjectIoResult::Failed { error, .. }) => {
-                match &error {
-                    ProjectIoError::Fs(e) => {
-                        assert_eq!(e.kind(), std::io::ErrorKind::NotFound);
-                    }
-                    _ => panic!("expected Fs(NotFound), got: {error}"),
+            Some(ProjectIoResult::Failed { error, .. }) => match &error {
+                ProjectIoError::Fs(e) => {
+                    assert_eq!(e.kind(), std::io::ErrorKind::NotFound);
                 }
-            }
+                _ => panic!("expected Fs(NotFound), got: {error}"),
+            },
             other => panic!("expected Failed, got {other:?}"),
         }
     }
@@ -737,9 +736,7 @@ mod worker_tests {
         });
         match exporter.job.result.take() {
             Some(Err(ExportError::Eval(terra_core::eval::EvalError::InvalidMetrics(_)))) => {}
-            other => panic!(
-                "expected Eval(InvalidMetrics), got: {other:?}"
-            ),
+            other => panic!("expected Eval(InvalidMetrics), got: {other:?}"),
         }
     }
 
@@ -747,10 +744,8 @@ mod worker_tests {
     fn export_package_failure_crosses_worker_typed() {
         let doc = flat_doc();
         // Point out_dir at a regular file so create_dir_all fails.
-        let blocker = std::env::temp_dir().join(format!(
-            "terra-io-export-blocker-{}",
-            std::process::id()
-        ));
+        let blocker =
+            std::env::temp_dir().join(format!("terra-io-export-blocker-{}", std::process::id()));
         std::fs::write(&blocker, b"block").expect("write blocker");
 
         let mut exporter = BackgroundExporter::new();
@@ -761,9 +756,7 @@ mod worker_tests {
         });
         match exporter.job.result.take() {
             Some(Err(ExportError::Package(IoError::Io(_)))) => {}
-            other => panic!(
-                "expected Package(Io(_)), got: {other:?}"
-            ),
+            other => panic!("expected Package(Io(_)), got: {other:?}"),
         }
         let _ = std::fs::remove_file(&blocker);
     }

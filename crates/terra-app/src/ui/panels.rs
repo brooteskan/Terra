@@ -572,6 +572,10 @@ fn profiler_panel(ui: &mut GuiContext<'_>, ui_state: &UiState) {
     label(ui, &format!("Generation ID: {}", p.gen_id));
     label(
         ui,
+        &format!("Trace orphaned events: {}", p.trace_orphaned_events),
+    );
+    label(
+        ui,
         &format!(
             "Base trace (n={}): input-visible p50/p95/max {} / {} / {} us",
             p.brush_trace_samples,

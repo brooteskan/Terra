@@ -89,8 +89,7 @@ fn main() {
 
     // --- Now paint one pinch stroke and time the scoped incremental. ---
     let (u, v, radius_uv) = (0.5f32, 0.5f32, 0.03f32);
-    let world_radius =
-        radius_uv * 0.5 * (doc.metrics.world_size_x + doc.metrics.world_size_z);
+    let world_radius = radius_uv * 0.5 * (doc.metrics.world_size_x + doc.metrics.world_size_z);
     let new_stroke = SculptStroke {
         kind: SculptStrokeKind::Pinch,
         points: vec![SculptPoint {

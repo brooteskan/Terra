@@ -9,6 +9,7 @@ use terra_core::tiling::UvRect;
 use terra_gpu::{GpuError, GpuEvaluationIntent, GpuPreviewFreshness, GpuRefinementStep};
 
 use super::frame_trace::FrameTraceEventKind;
+use super::logical_frame::{EditGeneration, FrameDeadlineKind, FrameRequestReason};
 use super::refinement_job::{RefinementJob, RefinementPublicationState};
 use super::{quality_stage_progress, DeferredFullField, TerraApp};
 
@@ -37,13 +38,24 @@ fn uv_to_texel_rect(region: UvRect, width: u32, height: u32) -> (u32, u32, u32, 
 }
 
 impl TerraApp {
+    pub(crate) fn note_refinement_activity(&mut self) {
+        let now = Instant::now();
+        self.last_refine = now;
+        self.logical_frames.schedule_deadline(
+            FrameDeadlineKind::OptionalRefinement,
+            EditGeneration::new(self.eval_token),
+            now + Duration::from_millis(super::REFINE_INTERVAL_MS as u64),
+        );
+    }
+
     pub(crate) fn request_rebuild(&mut self) {
         self.eval_token = self.scheduler.request_rebuild();
         self.eval_worker.set_token(self.eval_token);
         self.supersede_gpu_refinement();
         self.worker_refine_pending = false;
         self.deferred_full_field = None;
-        self.full_field_refine_not_before = None;
+        self.logical_frames
+            .clear_deadline(FrameDeadlineKind::FullFieldRefinement);
         self.ui_state.terrain_preview_freshness = if self.pending_gpu_dirty_region.is_some() {
             TerrainPreviewFreshness::LastCompleteStale
         } else {
@@ -61,10 +73,27 @@ impl TerraApp {
             .map(|layer| layer.common.name.clone())
             .or_else(|| Some("terrain".into()));
         self.scheduler.quality = PreviewQuality::Draft;
-        self.last_edit = Instant::now();
+        let now = Instant::now();
+        self.last_edit = now;
         self.pending_eval = true;
+        self.pending_eval_immediate = false;
         self.force_draft = true;
         self.ui_state.profile.gen_id = self.eval_token;
+        let generation = EditGeneration::new(self.eval_token);
+        self.logical_frames.discard_stale_deadlines(generation);
+        self.logical_frames.schedule_deadline(
+            FrameDeadlineKind::InteractiveEvaluation,
+            generation,
+            now + Duration::from_millis(
+                self.session.rebuild_feedback.prefs.edit_debounce_ms.max(1),
+            ),
+        );
+        self.logical_frames.schedule_deadline(
+            FrameDeadlineKind::OptionalRefinement,
+            generation,
+            now + Duration::from_millis(super::POST_INPUT_REFINE_GRACE_MS),
+        );
+        self.request_app_frame(FrameRequestReason::RequiredEvaluation);
     }
 
     /// Interactive structural edit (add filter/layer): keep current viewport resolution
@@ -79,10 +108,15 @@ impl TerraApp {
         self.supersede_gpu_refinement();
         self.worker_refine_pending = false;
         self.deferred_full_field = None;
-        self.full_field_refine_not_before = None;
+        self.logical_frames
+            .clear_deadline(FrameDeadlineKind::FullFieldRefinement);
         self.ui_state.terrain_preview_freshness = TerrainPreviewFreshness::Current;
-        self.force_draft = false;
-        self.pending_eval = false;
+        // Structural edits may use a complete GPU intent at the currently visible
+        // resolution, but an unsupported CPU suffix must still enter through the
+        // non-blocking Draft worker path.
+        self.force_draft = true;
+        self.pending_eval = true;
+        self.pending_eval_immediate = true;
         self.ui_state.refining = false;
         self.ui_state.build_progress = None;
         self.ui_state.profile.gen_id = self.eval_token;
@@ -107,29 +141,20 @@ impl TerraApp {
             self.ui_state.quality = self.scheduler.quality;
         }
 
-        if self.gpu_engine.is_some() && self.renderer.is_some() {
-            self.run_eval_step();
-            self.last_refine = Instant::now();
-            // Incomplete/failed GPU present → ensure Draft CPU is running.
-            let needs_cpu = matches!(
-                self.ui_state.profile.path,
-                "GPU→async CPU" | "async CPU" | "GPU*" | ""
-            );
-            if needs_cpu && !self.worker_refine_pending {
-                let q = PreviewQuality::Draft;
-                self.scheduler.quality = q;
-                self.ui_state.quality = q;
-                self.enqueue_async_eval(q);
-            }
-        } else {
-            self.request_rebuild();
-            self.last_edit = Instant::now()
-                .checked_sub(Duration::from_secs(1))
-                .unwrap_or_else(Instant::now);
-        }
-        if let Some(w) = &self.window {
-            w.request_redraw();
-        }
+        let now = Instant::now();
+        let generation = EditGeneration::new(self.eval_token);
+        self.logical_frames.discard_stale_deadlines(generation);
+        self.logical_frames.schedule_deadline(
+            FrameDeadlineKind::InteractiveEvaluation,
+            generation,
+            now,
+        );
+        self.logical_frames.schedule_deadline(
+            FrameDeadlineKind::OptionalRefinement,
+            generation,
+            now + Duration::from_millis(super::POST_INPUT_REFINE_GRACE_MS),
+        );
+        self.request_app_frame(FrameRequestReason::RequiredEvaluation);
     }
 
     /// Submit the current Medium/Full snapshot to the CPU worker without blocking the UI.
@@ -440,10 +465,10 @@ impl TerraApp {
         self.ui_state.draft_displayed = matches!(target_quality, PreviewQuality::Medium);
         self.last_complete_generation = job.generation;
         self.last_accepted_evaluation_id = job.evaluation.get();
-        self.last_eval_fully_gpu = true;
+        self.last_eval_gpu_supported = true;
         self.pending_plan_invalidation = None;
         self.needs_height_upload = false;
-        self.last_refine = Instant::now();
+        self.note_refinement_activity();
         self.frame_trace.record_refinement(
             Instant::now(),
             FrameTraceEventKind::RefinementPublished,
@@ -1059,8 +1084,18 @@ impl TerraApp {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn run_eval_step(&mut self) {
         self.run_eval_step_with_intent(GpuEvaluationIntent::Complete);
+    }
+
+    /// Settle a globally coupled suffix at the quality already presented by the
+    /// local prefix. Downgrading here would replace a resident Full texture with
+    /// Draft immediately after the gesture, causing the viewport to disappear and
+    /// rebuild in coarse squares.
+    pub(crate) fn complete_deferred_full_field(&mut self) {
+        self.run_eval_step_with_intent(GpuEvaluationIntent::Complete);
+        self.note_refinement_activity();
     }
 
     pub(crate) fn run_eval_step_with_intent(&mut self, intent: GpuEvaluationIntent) {
@@ -1088,21 +1123,29 @@ impl TerraApp {
         let export = self.session.document.export_resolution;
         if self.force_draft {
             let full_resolution = PreviewQuality::Full.resolution(preview, export);
-            let selected_is_base = self.session.document.selected
+            let selected_is_bounded_sculpt = self
+                .session
+                .document
+                .selected
                 .and_then(|selected| self.session.document.stack.find(selected))
-                .is_some_and(|layer| matches!(layer.kind, LayerKind::SculptBase(_)));
+                .is_some_and(|layer| {
+                    matches!(
+                        layer.kind,
+                        LayerKind::SculptBase(_) | LayerKind::SculptStrokes(_)
+                    )
+                });
             let retained_full = self.renderer.as_ref().is_some_and(|renderer| {
                 renderer.heights.tex_size.0 == full_resolution
                     && renderer.heights.tex_size.1 == full_resolution
             });
-            self.scheduler.quality = if selected_is_base
+            self.scheduler.quality = if selected_is_bounded_sculpt
                 && self.pending_gpu_dirty_region.is_some()
-                && self.last_eval_fully_gpu
+                && self.last_eval_gpu_supported
                 && retained_full
             {
-                // A bounded Base edit can update the already-valid Full realization
-                // regionally. Keeping it resident avoids the Draft→Full allocation
-                // cliff and makes the required interactive result authoritative.
+                // Both Foundation and Shape Layer edits carry bounded footprints
+                // and can update the already-valid Full realization regionally.
+                // Keeping it resident avoids the Draft→Full allocation cliff.
                 PreviewQuality::Full
             } else {
                 PreviewQuality::Draft
@@ -1170,7 +1213,7 @@ impl TerraApp {
                         .map(ToString::to_string)
                         .unwrap_or_else(|| "unknown plan diagnostic".to_string())
                 );
-                self.last_eval_fully_gpu = false;
+                self.last_eval_gpu_supported = false;
                 self.ui_state.profile.path = "async CPU";
                 if !self.worker_refine_pending {
                     self.enqueue_async_eval(quality);
@@ -1366,7 +1409,12 @@ impl TerraApp {
                                     (pending.layer_name.clone(), pending.deferred_layers)
                                 })
                             };
-                            self.last_eval_fully_gpu = result.fully_gpu;
+                            // `fully_gpu` also encodes whether a globally coupled
+                            // suffix is already settled. A deferred suffix remains
+                            // GPU-capable, so keep the resident Full-quality local
+                            // path armed for rapid follow-up dabs.
+                            self.last_eval_gpu_supported =
+                                result.resume_cpu_from.is_none() && result.cpu_fallback.is_none();
                             if !full_field_deferred && result.cpu_fallback.is_none() {
                                 self.pending_plan_invalidation = None;
                             }
@@ -1496,7 +1544,7 @@ impl TerraApp {
                             ),
                         }
                         // GPU path failed — async CPU, keep last-good on screen.
-                        self.last_eval_fully_gpu = false;
+                        self.last_eval_gpu_supported = false;
                         self.ui_state.profile.path = "async CPU";
                         if !self.worker_refine_pending {
                             self.enqueue_async_eval(quality);
@@ -1802,7 +1850,7 @@ mod tests {
     use terra_core::layer::{
         FlatParams, Layer, LayerKind, LayerStack, SculptStrokeKind, StreamPowerParams,
     };
-    use terra_core::shape_history::ShapeTool;
+    use terra_core::shape_history::{create_shape_layer, ShapeTool};
     use terra_core::test_fixtures::{untitled6_document, Untitled6Variant};
     use terra_core::tiling::UvRect;
     use terra_gpu::{GpuEvaluationIntent, GpuTerrainEngine};
@@ -1866,7 +1914,7 @@ mod tests {
         app.gpu = Some(context);
         app.run_eval_step_with_intent(GpuEvaluationIntent::Complete);
         assert_eq!(app.ui_state.profile.path, "GPU");
-        assert!(app.last_eval_fully_gpu);
+        assert!(app.last_eval_gpu_supported);
         assert!(app.ui_state.profile.gpu_fallback.is_none());
         assert!(app.ui_state.evaluation_failure.is_none());
 
@@ -1892,7 +1940,7 @@ mod tests {
             app.run_eval_step_with_intent(GpuEvaluationIntent::InteractiveLocal);
 
             assert_eq!(app.ui_state.profile.path, "GPU");
-            assert!(app.last_eval_fully_gpu);
+            assert!(app.last_eval_gpu_supported);
             assert!(app.ui_state.profile.gpu_fallback.is_none());
             assert!(app.ui_state.evaluation_failure.is_none());
             let stats = app.gpu_engine.as_ref().unwrap().last_eval_stats();
@@ -1998,7 +2046,7 @@ mod tests {
             app.scheduler.quality = quality;
             app.run_eval_step_with_intent(GpuEvaluationIntent::Complete);
             assert_eq!(app.ui_state.profile.path, "GPU", "{quality:?}");
-            assert!(app.last_eval_fully_gpu, "{quality:?}");
+            assert!(app.last_eval_gpu_supported, "{quality:?}");
             assert!(app.ui_state.profile.gpu_fallback.is_none(), "{quality:?}");
             assert!(app.ui_state.evaluation_failure.is_none(), "{quality:?}");
             assert_eq!(app.eval_worker.stats(), worker_before, "{quality:?}");
@@ -2031,6 +2079,102 @@ mod tests {
         assert!(!stats.cold_execution);
         assert!(stats.dirty_texels < u64::from(stats.resolution).pow(2));
         assert_eq!(stats.readback_bytes, 0);
+    }
+
+    /// The normal Raise workflow targets a non-destructive Shape Layer, not the
+    /// Foundation raster. It must retain the Full texture across repeated complete
+    /// publications and across 8/16/32-stroke GPU buffer growth boundaries.
+    #[test]
+    fn rapid_raise_shape_layer_strokes_stay_full_across_publications() {
+        let Some(gpu) = terra_test_gpu::headless() else {
+            return;
+        };
+        let context = GpuContext {
+            device: gpu.device.clone(),
+            queue: gpu.queue.clone(),
+            surface_format: wgpu::TextureFormat::Rgba8Unorm,
+        };
+        let resolution = 128;
+        let shape = create_shape_layer("Raise strokes");
+        let shape_id = shape.id();
+        let mut stack = LayerStack::new();
+        stack.push(shape);
+
+        let mut app = TerraApp::default();
+        app.session.document.metrics =
+            HeightfieldMetrics::new(resolution, resolution, 1280.0, 1280.0);
+        app.session.document.preview_resolution = resolution;
+        app.session.document.stack = stack;
+        app.session.document.selected = Some(shape_id);
+        app.scheduler.quality = PreviewQuality::Full;
+        app.ui_state.quality = PreviewQuality::Full;
+        app.renderer = Some(TerrainRenderer::new_headless(
+            &context, resolution, resolution,
+        ));
+        app.gpu_engine = Some(GpuTerrainEngine::new(&context.device, resolution));
+        app.gpu = Some(context);
+
+        app.run_eval_step_with_intent(GpuEvaluationIntent::Complete);
+        assert_eq!(app.scheduler.quality, PreviewQuality::Full);
+        assert!(
+            app.last_eval_gpu_supported,
+            "initial Shape Layer stack did not stay GPU-capable: path={}, fallback={:?}, failure={:?}",
+            app.ui_state.profile.path,
+            app.ui_state.profile.gpu_fallback,
+            app.ui_state.evaluation_failure
+        );
+
+        for stroke in 0..40 {
+            let u = 0.35 + (stroke % 10) as f32 * 0.03;
+            let v = 0.40 + (stroke / 10) as f32 * 0.05;
+            app.last_paint_uv = None;
+            app.apply_actions(vec![PanelAction::PaintSculptStamp {
+                layer: shape_id,
+                u,
+                v,
+                radius: 0.04,
+                strength: 5.0,
+                stroke_kind: SculptStrokeKind::Raise,
+                target_height: 0.0,
+            }]);
+            app.run_eval_step_with_intent(GpuEvaluationIntent::InteractiveLocal);
+
+            assert_eq!(
+                app.scheduler.quality,
+                PreviewQuality::Full,
+                "rapid stroke {} demoted the resident texture",
+                stroke + 1
+            );
+            assert_eq!(
+                (app.ui_state.profile.tex_w, app.ui_state.profile.tex_h),
+                (resolution, resolution),
+                "rapid stroke {} changed evaluation resolution",
+                stroke + 1
+            );
+            assert!(
+                app.last_eval_gpu_supported,
+                "Shape Layer edits must remain on the GPU"
+            );
+            assert!(app.ui_state.profile.gpu_fallback.is_none());
+
+            // A background publication switches the renderer back to the engine's
+            // shared Full texture. The next regional stroke must retain Full and
+            // establish a renderer-local baseline without a Draft replacement.
+            if matches!(stroke, 7 | 15 | 31 | 39) {
+                app.run_eval_step_with_intent(GpuEvaluationIntent::Complete);
+                assert_eq!(
+                    app.scheduler.quality,
+                    PreviewQuality::Full,
+                    "complete publication after stroke {} demoted the resident texture",
+                    stroke + 1
+                );
+                assert_eq!(
+                    (app.ui_state.profile.tex_w, app.ui_state.profile.tex_h),
+                    (resolution, resolution)
+                );
+                assert!(app.last_eval_gpu_supported);
+            }
+        }
     }
 
     #[test]

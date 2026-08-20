@@ -9,38 +9,53 @@ use terra_core::layer::LayerKind;
 use terra_gui::{GuiContext, GuiInput};
 use winit::event::MouseButton;
 
+use super::frame_trace::FrameTraceEventKind;
 use super::helpers::{aux_maps_fingerprint, mask_field_fingerprint, vegetation_instance_params};
+use super::logical_frame::{EditGeneration, FrameRequestReason};
 use super::prefs::{save_editor_prefs, EditorPrefs};
 use super::{AppScreen, PendingProjectAction, TerraApp};
+
+pub(crate) struct PendingUiEffects {
+    ui_out: crate::ui::FrameUiOutput,
+    home_actions: Vec<crate::ui::ProjectHomeAction>,
+    discard_choice: Option<DiscardConfirmChoice>,
+    template_choice: Option<NewProjectTemplateChoice>,
+}
+
+impl PendingUiEffects {
+    fn has_application_work(&self, layout_dirty: bool) -> bool {
+        let out = &self.ui_out;
+        layout_dirty
+            || !out.actions.is_empty()
+            || !self.home_actions.is_empty()
+            || self.discard_choice.is_some()
+            || self.template_choice.is_some()
+            || out.request_undo
+            || out.request_redo
+            || out.request_save
+            || out.request_save_as
+            || out.request_load_path
+            || out.request_new_project
+            || out.request_close_project
+            || out.request_export_path
+            || out.request_start_export
+            || out.camera_reset
+            || out.camera_top_view
+            || out.camera_frame_selection
+            || out.request_cancel_build
+            || out.request_retry_evaluation
+            || out.request_full_build
+            || out.request_save_bookmark
+            || out.request_save_bookmark_slot.is_some()
+            || out.request_recall_bookmark.is_some()
+    }
+}
+
 impl TerraApp {
-    pub(crate) fn redraw(&mut self) {
-        if self.startup_failure.is_some() {
-            return;
-        }
-        let frame_t0 = Instant::now();
-        let Some(window) = self.window.clone() else {
-            return;
-        };
-
-        // Startup: the terrain renderer's pipelines are still compiling on a
-        // worker thread. Present an animated splash from the main-thread-held
-        // surface instead of the (nonexistent) terrain path.
-        if self.is_booting() {
-            self.draw_boot_splash();
-            return;
-        }
-
-        // Coalesce fast brush motion: many stamps per frame, one Draft present.
-        // Mask paint updates overlay only â€” never force a height eval mid-stroke.
-        if self.pending_eval
-            && (self.sculpt_stroke_active
-                || (self.mouse_pressed == Some(MouseButton::Left)
-                    && self.viewport_paint_active()
-                    && self.ui_state.editor_tool != crate::ui::EditorTool::PaintMask))
-        {
-            self.flush_live_paint_preview();
-        }
-
+    /// Perform bounded resource preparation during logical-frame work. The
+    /// subsequent `RedrawRequested` callback only acquires, renders, composes,
+    /// and presents the already-prepared last-complete state.
+    pub(crate) fn prepare_presentation(&mut self) {
         self.refresh_viewport_rect();
         self.refresh_2d_preview();
         if self.should_show_mask_overlay() {
@@ -69,11 +84,13 @@ impl TerraApp {
                     .into_iter()
                     .rev()
                     .find_map(|layer| match &layer.kind {
-                        LayerKind::Materials(p) if layer.common.enabled => Some(p.clone()),
+                        LayerKind::Materials(params) if layer.common.enabled => {
+                            Some(params.clone())
+                        }
                         _ => None,
                     });
-                if let Some(r) = self.renderer.as_mut() {
-                    r.upload_heightfield(&hf);
+                if let Some(renderer) = self.renderer.as_mut() {
+                    renderer.upload_heightfield(&hf);
                     let ocean_level = if self.ui_state.viewport_overlays.water_level {
                         self.session
                             .document
@@ -83,13 +100,12 @@ impl TerraApp {
                             .rev()
                             .find_map(|layer| {
                                 if !layer.common.enabled {
-                                    None
-                                } else {
-                                    match &layer.kind {
-                                        LayerKind::Island(p) => Some(p.sea_level),
-                                        LayerKind::Coastal(p) => Some(p.sea_level),
-                                        _ => None,
-                                    }
+                                    return None;
+                                }
+                                match &layer.kind {
+                                    LayerKind::Island(params) => Some(params.sea_level),
+                                    LayerKind::Coastal(params) => Some(params.sea_level),
+                                    _ => None,
                                 }
                             })
                     } else {
@@ -97,7 +113,7 @@ impl TerraApp {
                     };
                     let aux_fp = aux_maps_fingerprint(&self.scheduler.last_aux);
                     if aux_fp != self.aux_upload_fp {
-                        r.upload_aux_maps_ex(terra_render::AuxMaps {
+                        renderer.upload_aux_maps_ex(terra_render::AuxMaps {
                             materials: self.scheduler.last_aux.get("materials"),
                             wetness: self.scheduler.last_aux.get("wetness"),
                             vegetation: self.scheduler.last_aux.get("vegetation"),
@@ -110,8 +126,8 @@ impl TerraApp {
                         });
                         self.aux_upload_fp = aux_fp;
                     }
-                    r.upload_material_palette(material_palette.as_ref());
-                    r.set_ocean_level(ocean_level);
+                    renderer.upload_material_palette(material_palette.as_ref());
+                    renderer.set_ocean_level(ocean_level);
                     self.placement_tint_dirty = true;
                     let (veg_scale_min, veg_scale_max, veg_yaw) =
                         vegetation_instance_params(&self.session.document);
@@ -127,7 +143,7 @@ impl TerraApp {
                         ^ ((veg_scale_max.to_bits() as u64) << 17)
                         ^ (veg_yaw.to_bits() as u64).rotate_left(7);
                     if veg_fp != self.veg_upload_fp {
-                        r.sync_vegetation_instances(
+                        renderer.sync_vegetation_instances(
                             &hf,
                             self.scheduler.last_aux.get("vegetation"),
                             veg_scale_min,
@@ -136,7 +152,6 @@ impl TerraApp {
                         );
                         self.veg_upload_fp = veg_fp;
                     }
-                    // Phase J: dual-height overhang / cave roof proxy from aux maps.
                     let overhang_fp = self
                         .scheduler
                         .last_aux
@@ -159,21 +174,128 @@ impl TerraApp {
                                 let mesh = terra_core::volumetric::build_overhang_mesh(
                                     &hf, ceiling, mask, 0.12,
                                 );
-                                if mesh.is_empty() {
-                                    None
-                                } else {
-                                    Some(mesh)
-                                }
+                                (!mesh.is_empty()).then_some(mesh)
                             }
                             _ => None,
                         };
-                        r.sync_overhang_mesh(overhang_mesh.as_ref());
+                        renderer.sync_overhang_mesh(overhang_mesh.as_ref());
                         self.overhang_upload_fp = overhang_fp;
                     }
-                    self.ui_state.profile.upload_us = r.last_upload_us;
+                    self.ui_state.profile.upload_us = renderer.last_upload_us;
                 }
                 self.needs_height_upload = false;
             }
+        }
+        self.sync_renderer_presentation_state();
+        self.update_brush_gizmo();
+    }
+
+    /// Synchronize editor-owned render settings before requesting presentation.
+    /// This may invalidate progressive renderer state, so it belongs to logical
+    /// frame preparation rather than the bounded presentation callback.
+    fn sync_renderer_presentation_state(&mut self) {
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+
+        let preset = self.ui_state.lighting_preset;
+        let customized = self.ui_state.lighting_customized;
+        if !customized && (preset != self.last_lighting_preset || self.last_lighting_customized) {
+            renderer.notify_invalidation(terra_render::InvalidationReason::LightingChanged);
+            self.ui_state.viewport_render.mode = preset.suggested_renderer_mode();
+            let (preset_dir, preset_exposure, preset_clear) = preset.params();
+            let (az, el) =
+                crate::ui::sun_az_el_from_dir([preset_dir[0], preset_dir[1], preset_dir[2]]);
+            let vr = &mut self.ui_state.viewport_render;
+            vr.sun_azimuth_deg = az;
+            vr.sun_elevation_deg = el;
+            vr.sun_intensity = preset_dir[3];
+            vr.exposure = preset_exposure;
+            vr.sky_color = preset_clear;
+            vr.ambient_strength = 1.0;
+            vr.shadow_strength = 0.0;
+            vr.fog_strength = 1.0;
+        }
+        self.last_lighting_preset = preset;
+        self.last_lighting_customized = customized;
+
+        let (light_dir, exposure, clear) = if self.screen == AppScreen::Home {
+            ([-0.35, -0.90, -0.20, 1.00], 1.0, [0.071, 0.082, 0.102])
+        } else {
+            let vr = &self.ui_state.viewport_render;
+            let dir = crate::ui::sun_dir_from_az_el(vr.sun_azimuth_deg, vr.sun_elevation_deg);
+            (
+                [dir[0], dir[1], dir[2], vr.sun_intensity],
+                vr.exposure,
+                vr.sky_color,
+            )
+        };
+        renderer.lighting.light_dir = light_dir;
+        renderer.lighting.exposure = exposure;
+        renderer.lighting.clear = clear;
+        renderer.lighting.ambient_strength = self.ui_state.viewport_render.ambient_strength;
+        renderer.lighting.shadow_strength = self.ui_state.viewport_render.shadow_strength;
+        renderer.lighting.fog_strength = self.ui_state.viewport_render.fog_strength;
+
+        let vr = &mut self.ui_state.viewport_render;
+        renderer.set_renderer_mode(vr.mode);
+        let quality = renderer.quality_mut();
+        if quality.config.preset != vr.preset {
+            quality.set_preset(vr.preset);
+        }
+        quality.config.target_fps = vr.target_fps.clamp(15.0, 240.0);
+        quality.config.max_accumulated_spp = vr.max_spp.max(1);
+        quality.config.dynamic_resolution_enabled = vr.dynamic_resolution;
+        quality.config.denoise_enabled = vr.denoise;
+        quality.config.interactive_spp = vr.interactive_spp.max(1);
+        quality.config.settling_spp = vr.settling_spp.max(1);
+        quality.config.refining_spp = vr.refining_spp.max(1);
+        quality.config.max_bounces_interactive = vr.max_bounces_interactive.max(1);
+        quality.config.max_bounces_refining = vr.max_bounces_refining.max(1);
+        quality.config.min_internal_scale =
+            vr.min_internal_scale.clamp(0.25, vr.max_internal_scale);
+        quality.config.max_internal_scale = vr.max_internal_scale.clamp(0.25, 1.0);
+        quality.config.history_clamp_k = vr.history_clamp_k.max(0.1);
+        quality.config.converge_fraction = vr.converge_fraction.clamp(0.0, 1.0);
+        renderer.set_debug_viz_mode(vr.debug_viz_mode);
+        self.ui_state.progressive_renderer_active =
+            self.screen == AppScreen::Editor && vr.mode.uses_progressive_path_tracer();
+
+        let shading = if self.ui_state.is_mask_view() {
+            terra_render::ViewportShadingMode::Lit
+        } else {
+            match self.ui_state.preview_mode {
+                crate::ui::Preview2dMode::Height => terra_render::ViewportShadingMode::Height,
+                crate::ui::Preview2dMode::Slope => terra_render::ViewportShadingMode::Slope,
+                crate::ui::Preview2dMode::Flow => terra_render::ViewportShadingMode::Flow,
+                _ => terra_render::ViewportShadingMode::Lit,
+            }
+        };
+        let ov = &self.ui_state.viewport_overlays;
+        renderer.set_display_aids(terra_render::ViewportDisplayAids {
+            wireframe: ov.wireframe,
+            grid: ov.grid,
+            world_bounds: ov.world_bounds,
+            contours: ov.contours,
+            shading,
+        });
+    }
+
+    pub(crate) fn redraw(&mut self) {
+        if self.startup_failure.is_some() {
+            return;
+        }
+        let frame_t0 = Instant::now();
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+
+        // Startup: the terrain renderer's pipelines are still compiling on a
+        // worker thread. Present an animated splash from the main-thread-held
+        // surface instead of the (nonexistent) terrain path.
+        if self.is_booting() {
+            self.draw_boot_splash();
+            return;
         }
 
         let pointer = self.cursor_logical();
@@ -190,9 +312,6 @@ impl TerraApp {
         let secondary_released = std::mem::take(&mut self.gui_secondary_released);
         let pixels_per_point = window.scale_factor() as f32;
 
-        // Brush ring tracks the cursor on the height surface while sculpt/mask tools are armed.
-        self.update_brush_gizmo();
-
         let ui_out = {
             let Some(renderer) = self.renderer.as_mut() else {
                 return;
@@ -206,113 +325,6 @@ impl TerraApp {
 
             // Terrain pass — always draws last-good GPU textures (never waits on eval).
             let render_t0 = Instant::now();
-            {
-                // (Re)seed the editable lighting when a preset is selected: either a
-                // different preset, or the same one re-picked to clear a customized
-                // (blank) state. Editing any control sets `lighting_customized`, which
-                // blanks the preset field and suppresses re-seeding so the edit sticks.
-                let preset = self.ui_state.lighting_preset;
-                let customized = self.ui_state.lighting_customized;
-                if !customized
-                    && (preset != self.last_lighting_preset || self.last_lighting_customized)
-                {
-                    renderer.notify_invalidation(terra_render::InvalidationReason::LightingChanged);
-                    // Keep the render mode consistent with the chosen preset in both
-                    // directions: Progressive RT selects the path tracer, every other
-                    // preset returns to Raster.
-                    self.ui_state.viewport_render.mode = preset.suggested_renderer_mode();
-                    let (preset_dir, preset_exposure, preset_clear) = preset.params();
-                    let (az, el) = crate::ui::sun_az_el_from_dir([
-                        preset_dir[0],
-                        preset_dir[1],
-                        preset_dir[2],
-                    ]);
-                    let vr = &mut self.ui_state.viewport_render;
-                    vr.sun_azimuth_deg = az;
-                    vr.sun_elevation_deg = el;
-                    vr.sun_intensity = preset_dir[3];
-                    vr.exposure = preset_exposure;
-                    vr.sky_color = preset_clear;
-                    // Raster shading is not yet preset-defined; reset to neutral so a
-                    // preset restores a known, full lighting state.
-                    vr.ambient_strength = 1.0;
-                    vr.shadow_strength = 0.0;
-                    vr.fog_strength = 1.0;
-                }
-                self.last_lighting_preset = preset;
-                self.last_lighting_customized = customized;
-
-                // All viewport lighting is driven by the editable values (seeded from the
-                // preset above); the Home splash keeps its fixed look.
-                let (light_dir, exposure, clear) = if self.screen == AppScreen::Home {
-                    ([-0.35, -0.90, -0.20, 1.00], 1.0, [0.071, 0.082, 0.102])
-                } else {
-                    let vr = &self.ui_state.viewport_render;
-                    let dir =
-                        crate::ui::sun_dir_from_az_el(vr.sun_azimuth_deg, vr.sun_elevation_deg);
-                    (
-                        [dir[0], dir[1], dir[2], vr.sun_intensity],
-                        vr.exposure,
-                        vr.sky_color,
-                    )
-                };
-                renderer.lighting.light_dir = light_dir;
-                renderer.lighting.exposure = exposure;
-                renderer.lighting.clear = clear;
-                // Raster shading controls are independent of the preset (not seeded),
-                // so push them straight from the editable state every frame.
-                renderer.lighting.ambient_strength = self.ui_state.viewport_render.ambient_strength;
-                renderer.lighting.shadow_strength = self.ui_state.viewport_render.shadow_strength;
-                renderer.lighting.fog_strength = self.ui_state.viewport_render.fog_strength;
-
-                let vr = &mut self.ui_state.viewport_render;
-                renderer.set_renderer_mode(vr.mode);
-                let quality = renderer.quality_mut();
-                if quality.config.preset != vr.preset {
-                    quality.set_preset(vr.preset);
-                }
-                quality.config.target_fps = vr.target_fps.clamp(15.0, 240.0);
-                quality.config.max_accumulated_spp = vr.max_spp.max(1);
-                quality.config.dynamic_resolution_enabled = vr.dynamic_resolution;
-                quality.config.denoise_enabled = vr.denoise;
-                quality.config.interactive_spp = vr.interactive_spp.max(1);
-                quality.config.settling_spp = vr.settling_spp.max(1);
-                quality.config.refining_spp = vr.refining_spp.max(1);
-                quality.config.max_bounces_interactive = vr.max_bounces_interactive.max(1);
-                quality.config.max_bounces_refining = vr.max_bounces_refining.max(1);
-                quality.config.min_internal_scale =
-                    vr.min_internal_scale.clamp(0.25, vr.max_internal_scale);
-                quality.config.max_internal_scale = vr.max_internal_scale.clamp(0.25, 1.0);
-                quality.config.history_clamp_k = vr.history_clamp_k.max(0.1);
-                quality.config.converge_fraction = vr.converge_fraction.clamp(0.0, 1.0);
-                let debug_viz = vr.debug_viz_mode;
-                renderer.set_debug_viz_mode(debug_viz);
-                // Mode alone selects the presentation backend (no dual progressive flag).
-                let progressive_active =
-                    self.screen == AppScreen::Editor && vr.mode.uses_progressive_path_tracer();
-                self.ui_state.progressive_renderer_active = progressive_active;
-
-                let shading = if self.ui_state.is_mask_view() {
-                    terra_render::ViewportShadingMode::Lit
-                } else {
-                    match self.ui_state.preview_mode {
-                        crate::ui::Preview2dMode::Height => {
-                            terra_render::ViewportShadingMode::Height
-                        }
-                        crate::ui::Preview2dMode::Slope => terra_render::ViewportShadingMode::Slope,
-                        crate::ui::Preview2dMode::Flow => terra_render::ViewportShadingMode::Flow,
-                        _ => terra_render::ViewportShadingMode::Lit,
-                    }
-                };
-                let ov = &self.ui_state.viewport_overlays;
-                renderer.set_display_aids(terra_render::ViewportDisplayAids {
-                    wireframe: ov.wireframe,
-                    grid: ov.grid,
-                    world_bounds: ov.world_bounds,
-                    contours: ov.contours,
-                    shading,
-                });
-            }
             // Frame seam (see TerrainRenderer::render_terrain's contract): this
             // acquires + submits terrain and returns the un-presented frame. The
             // block below must keep that order — build the GUI view from *this*
@@ -336,13 +348,18 @@ impl TerraApp {
                             // Reconfigure and schedule the recovery frame — the
                             // on-demand loop won't repaint on its own.
                             log::warn!("render: {e}; reconfiguring surface");
-                            renderer.reconfigure();
-                            window.request_redraw();
+                            self.pending_surface_reconfigure = true;
+                            self.logical_frames.request(
+                                EditGeneration::new(self.eval_token),
+                                FrameRequestReason::SurfaceRecovery,
+                            );
+                            self.record_frame_event(FrameTraceEventKind::SurfaceRecoveryRequested);
                         }
                         wgpu::SurfaceError::OutOfMemory => {
                             // Unrecoverable; exit cleanly via about_to_wait.
                             log::error!("render: {e}; exiting");
-                            self.pending_exit = true;
+                            self.logical_frames
+                                .request_shutdown(EditGeneration::new(self.eval_token));
                         }
                         wgpu::SurfaceError::Other => {
                             log::warn!("render: {e}; frame skipped");
@@ -544,7 +561,8 @@ impl TerraApp {
                 window.set_maximized(!window.is_maximized());
             }
             if ui_out.request_window_close {
-                self.pending_exit = true;
+                self.logical_frames
+                    .request_shutdown(EditGeneration::new(self.eval_token));
             }
             if ui_out.request_window_drag {
                 let _ = window.drag_window();
@@ -566,116 +584,143 @@ impl TerraApp {
 
         self.ui_state.profile.frame_us = frame_t0.elapsed().as_micros() as u64;
 
-        if let Some(choice) = discard_choice {
-            match choice {
-                DiscardConfirmChoice::Discard => {
-                    if let Some(action) = self.pending_project_action.take() {
-                        self.perform_project_action(action);
+        let effects = PendingUiEffects {
+            ui_out,
+            home_actions,
+            discard_choice,
+            template_choice,
+        };
+        if effects.has_application_work(self.ui_state.layout_dirty) {
+            self.pending_ui_effects.push_back(effects);
+            self.logical_frames.request(
+                EditGeneration::new(self.eval_token),
+                FrameRequestReason::UiActions,
+            );
+            self.record_frame_event(FrameTraceEventKind::UiEffectsQueued);
+        }
+    }
+
+    /// Apply owned effects emitted by the previous presentation. This runs from
+    /// the logical frame's application-update phase, so UI drawing cannot become
+    /// a second document mutation or evaluation entry point.
+    pub(crate) fn apply_pending_ui_effects(&mut self) -> bool {
+        let mut applied = false;
+        while let Some(effects) = self.pending_ui_effects.pop_front() {
+            applied = true;
+            let PendingUiEffects {
+                ui_out,
+                home_actions,
+                discard_choice,
+                template_choice,
+            } = effects;
+
+            if let Some(choice) = discard_choice {
+                match choice {
+                    DiscardConfirmChoice::Discard => {
+                        if let Some(action) = self.pending_project_action.take() {
+                            self.perform_project_action(action);
+                        }
+                    }
+                    DiscardConfirmChoice::Cancel => self.pending_project_action = None,
+                }
+            }
+
+            if let Some(choice) = template_choice {
+                match choice {
+                    NewProjectTemplateChoice::Cancel => self.show_new_template_picker = false,
+                    NewProjectTemplateChoice::Create {
+                        template_id,
+                        world_size_m,
+                        sea_level,
+                    } => self.new_project_with_template(&template_id, world_size_m, sea_level),
+                }
+            }
+
+            self.handle_home_actions(home_actions);
+
+            if self.screen == AppScreen::Editor {
+                self.apply_actions(ui_out.actions);
+                if ui_out.request_undo {
+                    self.undo();
+                }
+                if ui_out.request_redo {
+                    self.redo();
+                }
+                if ui_out.request_save {
+                    self.save_current_project();
+                }
+                if ui_out.request_save_as {
+                    self.save_project_as();
+                }
+                if ui_out.request_load_path {
+                    self.request_project_action(PendingProjectAction::Open);
+                }
+                if ui_out.request_new_project {
+                    self.request_project_action(PendingProjectAction::New);
+                }
+                if ui_out.request_close_project {
+                    self.request_project_action(PendingProjectAction::Close);
+                }
+                if ui_out.request_export_path {
+                    self.choose_export_directory();
+                }
+                if ui_out.request_start_export {
+                    self.start_export();
+                }
+                if ui_out.camera_reset {
+                    self.frame_terrain();
+                }
+                if ui_out.camera_top_view {
+                    if let Some(renderer) = self.renderer.as_mut() {
+                        renderer.camera_top_view();
                     }
                 }
-                DiscardConfirmChoice::Cancel => {
-                    self.pending_project_action = None;
+                if ui_out.camera_frame_selection {
+                    if let Some(renderer) = self.renderer.as_mut() {
+                        renderer.frame_camera_to_selection();
+                    }
+                }
+                if ui_out.request_full_build {
+                    self.scheduler.quality = PreviewQuality::Full;
+                    self.ui_state.quality = PreviewQuality::Full;
+                    self.ui_state.profile.quality = "Full (EXPORT)";
+                    self.request_rebuild();
+                }
+                if ui_out.request_cancel_build {
+                    self.eval_token = self.eval_token.wrapping_add(1);
+                    self.eval_worker.set_token(self.eval_token);
+                    self.supersede_gpu_refinement();
+                    self.pending_eval = false;
+                    self.pending_eval_immediate = false;
+                    self.ui_state.refining = false;
+                    self.ui_state.build_progress = None;
+                    self.ui_state.refining_layer_name = None;
+                    self.ui_state.status = "Build cancelled".into();
+                }
+                if ui_out.request_retry_evaluation {
+                    self.worker_mark_all_dirty = true;
+                    self.worker_dirty_from = None;
+                    self.worker_dirty_region = None;
+                    self.request_rebuild();
+                }
+                if ui_out.request_save_bookmark {
+                    let slot = self
+                        .ui_state
+                        .bookmarks
+                        .iter()
+                        .position(|bookmark| bookmark.is_none())
+                        .unwrap_or(0);
+                    self.save_camera_bookmark(slot);
+                }
+                if let Some(slot) = ui_out.request_save_bookmark_slot {
+                    self.save_camera_bookmark(slot);
+                }
+                if let Some(slot) = ui_out.request_recall_bookmark {
+                    self.recall_camera_bookmark(slot);
                 }
             }
         }
 
-        if let Some(choice) = template_choice {
-            match choice {
-                NewProjectTemplateChoice::Cancel => {
-                    self.show_new_template_picker = false;
-                }
-                NewProjectTemplateChoice::Create {
-                    template_id,
-                    world_size_m,
-                    sea_level,
-                } => {
-                    self.new_project_with_template(&template_id, world_size_m, sea_level);
-                }
-            }
-        }
-
-        self.handle_home_actions(home_actions);
-
-        if self.screen == AppScreen::Editor {
-            self.apply_actions(ui_out.actions);
-            if ui_out.request_undo {
-                self.undo();
-            }
-            if ui_out.request_redo {
-                self.redo();
-            }
-            if ui_out.request_save {
-                self.save_current_project();
-            }
-            if ui_out.request_save_as {
-                self.save_project_as();
-            }
-            if ui_out.request_load_path {
-                self.request_project_action(PendingProjectAction::Open);
-            }
-            if ui_out.request_new_project {
-                self.request_project_action(PendingProjectAction::New);
-            }
-            if ui_out.request_close_project {
-                self.request_project_action(PendingProjectAction::Close);
-            }
-            if ui_out.request_export_path {
-                self.choose_export_directory();
-            }
-            if ui_out.request_start_export {
-                self.start_export();
-            }
-            if ui_out.camera_reset {
-                self.frame_terrain();
-            }
-            if ui_out.camera_top_view {
-                if let Some(r) = self.renderer.as_mut() {
-                    r.camera_top_view();
-                }
-            }
-            if ui_out.camera_frame_selection {
-                if let Some(r) = self.renderer.as_mut() {
-                    r.frame_camera_to_selection();
-                }
-            }
-            if ui_out.request_full_build {
-                self.scheduler.quality = PreviewQuality::Full;
-                self.ui_state.quality = PreviewQuality::Full;
-                self.ui_state.profile.quality = "Full (EXPORT)";
-                self.request_rebuild();
-            }
-            if ui_out.request_cancel_build {
-                // Bump the eval token so the worker discards the in-flight job.
-                self.eval_token = self.eval_token.wrapping_add(1);
-                self.eval_worker.set_token(self.eval_token);
-                self.supersede_gpu_refinement();
-                self.ui_state.refining = false;
-                self.ui_state.build_progress = None;
-                self.ui_state.refining_layer_name = None;
-                self.ui_state.status = "Build cancelled".into();
-            }
-            if ui_out.request_retry_evaluation {
-                self.worker_mark_all_dirty = true;
-                self.worker_dirty_from = None;
-                self.worker_dirty_region = None;
-                self.request_rebuild();
-            }
-            if ui_out.request_save_bookmark {
-                let slot = self
-                    .ui_state
-                    .bookmarks
-                    .iter()
-                    .position(|b| b.is_none())
-                    .unwrap_or(0);
-                self.save_camera_bookmark(slot);
-            }
-            if let Some(slot) = ui_out.request_save_bookmark_slot {
-                self.save_camera_bookmark(slot);
-            }
-            if let Some(slot) = ui_out.request_recall_bookmark {
-                self.recall_camera_bookmark(slot);
-            }
-        }
         if self.ui_state.layout_dirty {
             self.ui_state.layout.clamp_mut();
             let prefs = EditorPrefs {
@@ -687,13 +732,8 @@ impl TerraApp {
             save_editor_prefs(&prefs);
             self.ui_state.layout_dirty = false;
             self.refresh_viewport_rect();
+            applied = true;
         }
-
-        if self.gui_wants_pointer
-            || self.pending_project_action.is_some()
-            || self.show_new_template_picker
-        {
-            window.request_redraw();
-        }
+        applied
     }
 }

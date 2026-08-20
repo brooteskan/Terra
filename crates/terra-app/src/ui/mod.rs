@@ -1252,6 +1252,7 @@ pub struct FrameProfile {
     pub input_event_count: usize,
     pub pointer_sample_count: usize,
     pub input_frame_pending: bool,
+    pub trace_orphaned_events: u64,
     pub eval_us: u64,
     pub upload_us: u64,
     pub render_us: u64,

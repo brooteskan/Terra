@@ -64,7 +64,11 @@ impl ProcessorRegistry {
                 // this kind with the prefix-cached path (#123); this arm is the
                 // fallback for any other caller and the cold-cache reference.
                 let result = authoring::apply_sculpt_strokes(input, p);
-                Ok(publish_authoring_merge(ctx, result, &SCULPT_STROKE_AUX_KEYS))
+                Ok(publish_authoring_merge(
+                    ctx,
+                    result,
+                    &SCULPT_STROKE_AUX_KEYS,
+                ))
             }
             LayerKind::TerrainConstraints(p) => {
                 let result = authoring::apply_constraints(input, p);

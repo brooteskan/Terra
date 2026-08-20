@@ -919,22 +919,9 @@ pub fn draw_inspector_gui(
                                     if stroke.points.len() == 1 { "" } else { "s" },
                                 ),
                             );
-                            changed |= slider_f32(
-                                ui,
-                                "Strength",
-                                &mut stroke.strength,
-                                0.0,
-                                100.0,
-                            );
-                            changed |= slider_f32(
-                                ui,
-                                "Radius",
-                                &mut stroke.radius_m,
-                                1.0,
-                                500.0,
-                            );
-                            changed |=
-                                slider_f32(ui, "Falloff", &mut stroke.falloff, 0.1, 5.0);
+                            changed |= slider_f32(ui, "Strength", &mut stroke.strength, 0.0, 100.0);
+                            changed |= slider_f32(ui, "Radius", &mut stroke.radius_m, 1.0, 500.0);
+                            changed |= slider_f32(ui, "Falloff", &mut stroke.falloff, 0.1, 5.0);
                             changed |= slider_f32(
                                 ui,
                                 "Target Height",
@@ -942,8 +929,7 @@ pub fn draw_inspector_gui(
                                 -500.0,
                                 2000.0,
                             );
-                            changed |=
-                                checkbox(ui, "Enabled", &mut stroke.enabled);
+                            changed |= checkbox(ui, "Enabled", &mut stroke.enabled);
                         }
                     }
                 }

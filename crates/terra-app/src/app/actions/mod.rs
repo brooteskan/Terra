@@ -16,6 +16,7 @@ use terra_core::layer::LayerId;
 use terra_core::terrain_plan::{PlanDirtyScope, TerrainEditClass, TerrainOpKind};
 use terra_core::tiling::UvRect;
 
+use super::logical_frame::FrameDeadlineKind;
 use super::TerraApp;
 
 /// Shared mutation flags for a single apply_actions batch.
@@ -156,7 +157,8 @@ impl TerraApp {
                 None => region,
             });
             self.deferred_full_field = None;
-            self.full_field_refine_not_before = None;
+            self.logical_frames
+                .clear_deadline(FrameDeadlineKind::FullFieldRefinement);
         }
         if let Some(id) = dirty_from {
             // Suffix-only dirty â€” do not mark_all_dirty (preserves layer cache).

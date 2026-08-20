@@ -1,21 +1,8 @@
-use std::time::Instant;
-
 use crate::ui::PanelAction;
 use terra_core::layer::LayerKind;
-use terra_gpu::GpuEvaluationIntent;
 
 use super::{LayerPointDrag, LayerPointKind, TerraApp};
 impl TerraApp {
-    pub(crate) fn flush_live_paint_preview(&mut self) {
-        if !self.pending_eval {
-            return;
-        }
-        self.pending_eval = false;
-        self.force_draft = true;
-        self.run_eval_step_with_intent(GpuEvaluationIntent::InteractiveLocal);
-        self.last_refine = Instant::now();
-    }
-
     /// Click-select a nearby landform shape, or start dragging a control point.
     pub(crate) fn try_pick_shape_at_cursor(&mut self) -> bool {
         if self.ui_state.app_workspace != crate::ui::AppWorkspace::Landforms {

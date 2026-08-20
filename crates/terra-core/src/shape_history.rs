@@ -288,15 +288,7 @@ pub fn stamp_stroke(
     target_height: f32,
     continuing: bool,
 ) {
-    params.stamp_stroke(
-        kind,
-        u,
-        v,
-        radius_m,
-        strength,
-        target_height,
-        continuing,
-    );
+    params.stamp_stroke(kind, u, v, radius_m, strength, target_height, continuing);
 }
 
 #[cfg(test)]

@@ -1,6 +1,6 @@
 use bytemuck::{Pod, Zeroable};
-use std::collections::HashMap;
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use terra_core::ids::OutputId;
 use terra_core::layer::BlendMode;
 use terra_core::mask::{Distribution, MaskAsset, MaskCombine, MaskOp, MaskSource};
@@ -327,9 +327,10 @@ impl GpuPlanOperations {
         let region = normalized_region(key.width, key.height, region);
         {
             let mut scratch = self.mask_scratch.borrow_mut();
-            if scratch.as_ref().is_none_or(|scratch| {
-                scratch.width != key.width || scratch.height != key.height
-            }) {
+            if scratch
+                .as_ref()
+                .is_none_or(|scratch| scratch.width != key.width || scratch.height != key.height)
+            {
                 *scratch = Some(MaskScratchSet::new(device, key.width, key.height));
                 self.mask_scratch_allocations.set(4);
             } else {

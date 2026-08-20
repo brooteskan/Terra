@@ -9,8 +9,8 @@
 //! prefer fully GPU stacks, never present an incomplete prefix as finished Draft.
 
 use crate::compiled_plan::{
-    GpuGroupCompositeParams, GpuPlanOperationError, GpuPlanOperations, GpuPlanResourceCache,
-    GpuPlanResourceBuilder, GpuPlanResourceKey, GpuPlanResources,
+    GpuGroupCompositeParams, GpuPlanOperationError, GpuPlanOperations, GpuPlanResourceBuilder,
+    GpuPlanResourceCache, GpuPlanResourceKey, GpuPlanResources,
 };
 use crate::effect_filter::{effect_filter_gpu_spec, EffectFilterGpuPasses};
 use crate::evaluation_timing::{
@@ -5350,8 +5350,7 @@ impl GpuTerrainEngine {
                 input_fields: _,
                 output_mask,
             } => {
-                let result = if let Some(distribution) =
-                    plan_distribution(stack, operation.origin)
+                let result = if let Some(distribution) = plan_distribution(stack, operation.origin)
                 {
                     self.plan_operations.evaluate_distribution_resolved_region(
                         device,
@@ -5744,7 +5743,10 @@ impl GpuTerrainEngine {
             }
         }
 
-        let candidate = job.candidate.as_ref().expect("completed candidate resources");
+        let candidate = job
+            .candidate
+            .as_ref()
+            .expect("completed candidate resources");
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("compiled-terrain-refinement-unit"),
         });
@@ -5775,26 +5777,28 @@ impl GpuTerrainEngine {
                 );
                 return Err(GpuError::RequiresCpu(diagnostic.reason));
             }
-            let operation = job.plan.operation(operation_id).expect("selected operation");
+            let operation = job
+                .plan
+                .operation(operation_id)
+                .expect("selected operation");
             if matches!(operation.kind, TerrainOpKind::PublishOutput { .. }) {
-                self.last_eval_stats.operations_published = self
-                    .last_eval_stats
-                    .operations_published
-                    .saturating_add(1);
+                self.last_eval_stats.operations_published =
+                    self.last_eval_stats.operations_published.saturating_add(1);
             } else {
-                self.last_eval_stats.operations_dispatched = self
-                    .last_eval_stats
-                    .operations_dispatched
-                    .saturating_add(1);
-                self.last_eval_stats.plan_workgroups = self
-                    .last_eval_stats
-                    .plan_workgroups
-                    .saturating_add(u64::from(job.metrics.width.div_ceil(8))
-                        * u64::from(job.metrics.height.div_ceil(8)));
+                self.last_eval_stats.operations_dispatched =
+                    self.last_eval_stats.operations_dispatched.saturating_add(1);
+                self.last_eval_stats.plan_workgroups =
+                    self.last_eval_stats.plan_workgroups.saturating_add(
+                        u64::from(job.metrics.width.div_ceil(8))
+                            * u64::from(job.metrics.height.div_ceil(8)),
+                    );
             }
             for field in job.plan.analysis().outputs(operation_id) {
                 if job.plan.field(*field).is_some_and(|field| {
-                    matches!(field.kind, terra_core::terrain_plan::LogicalFieldKind::Height)
+                    matches!(
+                        field.kind,
+                        terra_core::terrain_plan::LogicalFieldKind::Height
+                    )
                 }) {
                     job.last_height = Some(*field);
                 }
@@ -5856,8 +5860,8 @@ impl GpuTerrainEngine {
         self.last_eval_stats.selected_operations = job.selected.len() as u32;
         self.last_eval_stats.resource_prepare_us = job.resource_prepare_us;
         self.last_eval_stats.command_encode_us = job.encode_us;
-        self.last_eval_stats.dirty_texels = u64::from(job.metrics.width)
-            .saturating_mul(u64::from(job.metrics.height));
+        self.last_eval_stats.dirty_texels =
+            u64::from(job.metrics.width).saturating_mul(u64::from(job.metrics.height));
         Ok(GpuEvalResult {
             width: job.metrics.width,
             height: job.metrics.height,
@@ -6432,19 +6436,13 @@ impl GpuTerrainEngine {
                 return Ok(plan_fallback_result(metrics, self.approx_range, diagnostic));
             }
             if matches!(operation.kind, TerrainOpKind::PublishOutput { .. }) {
-                self.last_eval_stats.operations_published = self
-                    .last_eval_stats
-                    .operations_published
-                    .saturating_add(1);
+                self.last_eval_stats.operations_published =
+                    self.last_eval_stats.operations_published.saturating_add(1);
             } else {
-                self.last_eval_stats.operations_dispatched = self
-                    .last_eval_stats
-                    .operations_dispatched
-                    .saturating_add(1);
-                self.last_eval_stats.plan_workgroups = self
-                    .last_eval_stats
-                    .plan_workgroups
-                    .saturating_add(
+                self.last_eval_stats.operations_dispatched =
+                    self.last_eval_stats.operations_dispatched.saturating_add(1);
+                self.last_eval_stats.plan_workgroups =
+                    self.last_eval_stats.plan_workgroups.saturating_add(
                         u64::from(region.2.div_ceil(8)) * u64::from(region.3.div_ceil(8)),
                     );
             }
@@ -6507,8 +6505,7 @@ impl GpuTerrainEngine {
         );
         let (mask_scratch_texture_allocations, mask_scratch_reuses) =
             self.plan_operations.mask_scratch_stats();
-        self.last_eval_stats.mask_scratch_texture_allocations =
-            mask_scratch_texture_allocations;
+        self.last_eval_stats.mask_scratch_texture_allocations = mask_scratch_texture_allocations;
         self.last_eval_stats.mask_scratch_reuses = mask_scratch_reuses;
         self.last_eval_stats.dirty_texels =
             u64::from(present_region.2).saturating_mul(u64::from(present_region.3));
@@ -6519,7 +6516,8 @@ impl GpuTerrainEngine {
         ) {
             timer.finish(&mut encoder, slot, context);
         }
-        self.last_eval_stats.command_encode_us = command_encode_started.elapsed().as_micros() as u64;
+        self.last_eval_stats.command_encode_us =
+            command_encode_started.elapsed().as_micros() as u64;
         let queue_submit_started = std::time::Instant::now();
         queue.submit(Some(encoder.finish()));
         self.last_eval_stats.queue_submit_us = queue_submit_started.elapsed().as_micros() as u64;
@@ -6562,7 +6560,10 @@ impl GpuTerrainEngine {
             .operations()
             .iter()
             .enumerate()
-            .filter(|(index, _)| plan.analysis().operation_is_live(PlanOpId::from_index(*index)))
+            .filter(|(index, _)| {
+                plan.analysis()
+                    .operation_is_live(PlanOpId::from_index(*index))
+            })
             .count() as u32;
         self.last_eval_stats.operations_skipped = live_operations.saturating_sub(
             self.last_eval_stats
@@ -6596,8 +6597,10 @@ impl GpuTerrainEngine {
                     dirty.map_or(merged_scope, |dirty| dirty.scope)
                 };
                 let disposition = if selected.contains(&operation)
-                    && matches!(plan.operations()[index].kind, TerrainOpKind::PublishOutput { .. })
-                {
+                    && matches!(
+                        plan.operations()[index].kind,
+                        TerrainOpKind::PublishOutput { .. }
+                    ) {
                     GpuPlanOperationDisposition::Published
                 } else if selected.contains(&operation) {
                     GpuPlanOperationDisposition::Dispatched
@@ -12228,8 +12231,7 @@ mod smoke_tests {
             (true, SculptStrokeKind::Raise),
             (true, SculptStrokeKind::Pinch),
         ] {
-            let (mut document, ids) =
-                untitled6_document(res, Untitled6Variant::ProductionTopology);
+            let (mut document, ids) = untitled6_document(res, Untitled6Variant::ProductionTopology);
             document.metrics.tile_size = 16;
             document.metrics.halo = 2;
             let target = if target_strokes {
@@ -12311,11 +12313,17 @@ mod smoke_tests {
 
             let plan_after = cache.stats().snapshot();
             assert_eq!(plan_after.plan_compiles, plan_before.plan_compiles);
-            assert_eq!(plan_after.authored_tree_walks, plan_before.authored_tree_walks);
+            assert_eq!(
+                plan_after.authored_tree_walks,
+                plan_before.authored_tree_walks
+            );
             assert_eq!(plan_after.dependency_builds, plan_before.dependency_builds);
             let stats = engine.last_eval_stats();
             assert!(stats.operations_dispatched > 0);
-            assert!(stats.operations_reused > 0, "Volcano contribution should be reused");
+            assert!(
+                stats.operations_reused > 0,
+                "Volcano contribution should be reused"
+            );
             assert_eq!(stats.operations_deferred, 0);
             assert_eq!(stats.readback_bytes, 0);
             assert!(stats.upload_bytes < u64::from(res * res * 4), "{stats:?}");
@@ -12439,7 +12447,10 @@ mod smoke_tests {
                 break;
             }
         }
-        assert!(job.final_copy_complete, "refinement did not reach its final fence");
+        assert!(
+            job.final_copy_complete,
+            "refinement did not reach its final fence"
+        );
         assert!(submitted > 1, "the plan should be split across submissions");
         assert_eq!(max_depth, 1, "refinement queue depth must remain bounded");
         assert!(resumable.plan_resources.current().is_none());
@@ -12525,8 +12536,7 @@ mod smoke_tests {
             return;
         };
         for res in [2048u32, 4096] {
-            let (mut document, ids) =
-                untitled6_document(res, Untitled6Variant::ProductionTopology);
+            let (mut document, ids) = untitled6_document(res, Untitled6Variant::ProductionTopology);
             let mut cache = TerrainPlanCache::new();
             let cold_invalidation = cache
                 .update(
@@ -12560,23 +12570,19 @@ mod smoke_tests {
             assert!(cold_result.cpu_fallback.is_none());
             assert_eq!(cold_stats.readback_bytes, 0);
 
-            document
-                .stack
-                .find_mut(ids.base)
-                .unwrap()
-                .apply_brush(
-                    SculptStrokeKind::Raise,
-                    BrushDab {
-                        u: 0.5,
-                        v: 0.5,
-                        radius_uv: 0.01,
-                        radius_m: 40.0,
-                        strength: 3.0,
-                        target_height: 0.0,
-                        falloff: 0.5,
-                        continuing: false,
-                    },
-                );
+            document.stack.find_mut(ids.base).unwrap().apply_brush(
+                SculptStrokeKind::Raise,
+                BrushDab {
+                    u: 0.5,
+                    v: 0.5,
+                    radius_uv: 0.01,
+                    radius_m: 40.0,
+                    strength: 3.0,
+                    target_height: 0.0,
+                    falloff: 0.5,
+                    continuing: false,
+                },
+            );
             let invalidation = cache
                 .update(
                     &document.stack,
@@ -12631,23 +12637,19 @@ mod smoke_tests {
                     .unwrap();
                 let _ = gpu.device.poll(wgpu::Maintain::Wait);
                 assert!(draft.fully_gpu);
-                document
-                    .stack
-                    .find_mut(ids.base)
-                    .unwrap()
-                    .apply_brush(
-                        SculptStrokeKind::Raise,
-                        BrushDab {
-                            u: 0.40 + sample as f32 * 0.002,
-                            v: 0.5,
-                            radius_uv: 0.01,
-                            radius_m: 40.0,
-                            strength: 0.25,
-                            target_height: 0.0,
-                            falloff: 0.5,
-                            continuing: false,
-                        },
-                    );
+                document.stack.find_mut(ids.base).unwrap().apply_brush(
+                    SculptStrokeKind::Raise,
+                    BrushDab {
+                        u: 0.40 + sample as f32 * 0.002,
+                        v: 0.5,
+                        radius_uv: 0.01,
+                        radius_m: 40.0,
+                        strength: 0.25,
+                        target_height: 0.0,
+                        falloff: 0.5,
+                        continuing: false,
+                    },
+                );
                 let transition_invalidation = cache
                     .update(
                         &document.stack,
@@ -12692,23 +12694,19 @@ mod smoke_tests {
 
             let mut full_ms = Vec::with_capacity(20);
             for sample in 0..20 {
-                document
-                    .stack
-                    .find_mut(ids.base)
-                    .unwrap()
-                    .apply_brush(
-                        SculptStrokeKind::Raise,
-                        BrushDab {
-                            u: 0.45 + sample as f32 * 0.002,
-                            v: 0.5,
-                            radius_uv: 0.01,
-                            radius_m: 40.0,
-                            strength: 0.25,
-                            target_height: 0.0,
-                            falloff: 0.5,
-                            continuing: false,
-                        },
-                    );
+                document.stack.find_mut(ids.base).unwrap().apply_brush(
+                    SculptStrokeKind::Raise,
+                    BrushDab {
+                        u: 0.45 + sample as f32 * 0.002,
+                        v: 0.5,
+                        radius_uv: 0.01,
+                        radius_m: 40.0,
+                        strength: 0.25,
+                        target_height: 0.0,
+                        falloff: 0.5,
+                        continuing: false,
+                    },
+                );
                 let full_invalidation = cache
                     .update(
                         &document.stack,

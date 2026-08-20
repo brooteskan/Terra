@@ -395,10 +395,42 @@ impl GpuTimestampTimer {
 }
 
 pub fn requested_timestamp_features(adapter: &wgpu::Adapter) -> wgpu::Features {
-    let available = adapter.features();
+    timestamp_features_from_available(adapter.features())
+}
+
+fn timestamp_features_from_available(available: wgpu::Features) -> wgpu::Features {
     let mut features = wgpu::Features::empty();
     if available.contains(wgpu::Features::TIMESTAMP_QUERY) {
         features |= wgpu::Features::TIMESTAMP_QUERY;
     }
+    if available
+        .contains(wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS)
+    {
+        features |= wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+    }
     features
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timestamp_feature_request_is_limited_to_adapter_capabilities() {
+        assert_eq!(
+            timestamp_features_from_available(wgpu::Features::empty()),
+            wgpu::Features::empty()
+        );
+        assert_eq!(
+            timestamp_features_from_available(wgpu::Features::TIMESTAMP_QUERY),
+            wgpu::Features::TIMESTAMP_QUERY
+        );
+        assert_eq!(
+            timestamp_features_from_available(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS),
+            wgpu::Features::empty()
+        );
+        let both =
+            wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+        assert_eq!(timestamp_features_from_available(both), both);
+    }
 }

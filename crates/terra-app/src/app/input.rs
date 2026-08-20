@@ -16,6 +16,7 @@ pub(crate) struct InputModifiers {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum PointerCancelReason {
     FocusLost,
+    CaptureLost,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -95,6 +96,10 @@ impl InputAccumulator {
         !self.pending.is_empty()
     }
 
+    pub(crate) fn clear(&mut self) {
+        self.pending.clear();
+    }
+
     pub(crate) fn seal(&mut self) -> InputSnapshot {
         InputSnapshot {
             events: std::mem::take(&mut self.pending),
@@ -116,6 +121,12 @@ impl InputSnapshot {
         self.events.len()
     }
 
+    /// Consume the sealed snapshot into its ordered events. Taking ownership is
+    /// the exactly-once boundary: a caller cannot replay the same snapshot.
+    pub(crate) fn into_events(self) -> Vec<StampedInputEvent> {
+        self.events
+    }
+
     pub(crate) fn pointer_sample_count(&self) -> usize {
         self.events
             .iter()
@@ -133,18 +144,6 @@ impl InputSnapshot {
                 }
             )
             .then_some(event.received_at)
-        })
-    }
-
-    pub(crate) fn has_primary_pointer_edge(&self) -> bool {
-        self.events.iter().any(|event| {
-            matches!(
-                event.event,
-                InputEvent::PointerButton {
-                    button: MouseButton::Left,
-                    ..
-                }
-            )
         })
     }
 }
@@ -259,6 +258,23 @@ mod tests {
         assert_eq!(
             snapshot.events()[2].event(),
             InputEvent::PointerCancelled(PointerCancelReason::FocusLost)
+        );
+    }
+
+    #[test]
+    fn capture_loss_remains_ordered_after_pointer_samples() {
+        let now = Instant::now();
+        let mut input = InputAccumulator::default();
+        input.record(moved(4.0), now);
+        input.record(
+            InputEvent::PointerCancelled(PointerCancelReason::CaptureLost),
+            now,
+        );
+        let snapshot = input.seal();
+        assert_eq!(snapshot.events()[0].sequence(), 1);
+        assert_eq!(
+            snapshot.events()[1].event(),
+            InputEvent::PointerCancelled(PointerCancelReason::CaptureLost)
         );
     }
 }

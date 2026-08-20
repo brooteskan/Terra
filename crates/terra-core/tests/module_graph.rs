@@ -432,7 +432,10 @@ const MODULE_DEPENDENCIES: &[(&str, &[&str])] = &[
         ],
     ),
     ("terrain_recipe", &["layer"]),
-    ("test_fixtures", &["document", "heightfield", "layer", "mask"]),
+    (
+        "test_fixtures",
+        &["document", "heightfield", "layer", "mask"],
+    ),
     ("tiling", &["heightfield", "invalidation", "layer"]),
     ("volumetric", &["heightfield", "mask_field", "noise"]),
     (

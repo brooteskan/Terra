@@ -2362,7 +2362,11 @@ mod tests {
         }
         let stroke = |u, v| SculptStroke {
             kind: SculptStrokeKind::Raise,
-            points: vec![SculptPoint { u, v, pressure: 1.0 }],
+            points: vec![SculptPoint {
+                u,
+                v,
+                pressure: 1.0,
+            }],
             radius_m: 200.0,
             strength: 6.0,
             target_height: 0.0,
@@ -2383,7 +2387,8 @@ mod tests {
         let mut eval = StackEvaluator::new();
         eval.mark_all_dirty(&stack);
         let mut ctx = EvalContext::new(m);
-        eval.rebuild_incremental(&stack, &mut ctx).expect("warm build");
+        eval.rebuild_incremental(&stack, &mut ctx)
+            .expect("warm build");
 
         // Append a stroke to the same layer, then rebuild whole-field again.
         if let Some(l) = stack.find_mut(strokes_id) {

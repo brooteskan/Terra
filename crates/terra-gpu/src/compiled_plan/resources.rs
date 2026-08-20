@@ -412,11 +412,8 @@ impl GpuPlanResourceBuilder {
         let Some(allocation) = self.layout.allocations().get(self.textures.len()) else {
             return true;
         };
-        self.textures.push(realize_scalar_texture(
-            device,
-            self.key,
-            allocation.id,
-        ));
+        self.textures
+            .push(realize_scalar_texture(device, self.key, allocation.id));
         self.is_complete()
     }
 

@@ -141,7 +141,8 @@ fn main() {
 
         // Append: one new large stroke resumes from the tail.
         let mut lcg = Lcg(0x1234_5678);
-        p.strokes.push(big_stroke(&mut lcg, 40, SculptStrokeKind::Raise));
+        p.strokes
+            .push(big_stroke(&mut lcg, 40, SculptStrokeKind::Raise));
         time_apply(&h, &p, &mut entry, "append");
 
         // Drag: grow the last stroke's polyline one vertex — resumes from pre-tail.

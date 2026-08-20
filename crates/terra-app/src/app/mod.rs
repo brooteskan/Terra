@@ -34,9 +34,9 @@ use terra_gui::{GuiRenderer, GuiState, Rect, WidgetLabState};
 use terra_io::{BackgroundExporter, BackgroundProjectIo};
 use terra_render::TerrainRenderer;
 use winit::event::MouseButton;
+use winit::event_loop::EventLoopProxy;
 use winit::window::Window;
 
-pub(crate) const EDIT_DEBOUNCE_MS: u128 = 40;
 pub(crate) const REFINE_INTERVAL_MS: u128 = 80;
 /// Required quiet time after input before optional Medium/Full work may start.
 pub(crate) const POST_INPUT_REFINE_GRACE_MS: u64 = 80;
@@ -45,6 +45,14 @@ pub(crate) const POST_INPUT_REFINE_GRACE_MS: u64 = 80;
 pub(crate) const LOGICAL_FRAME_HOST_BUDGET_MS: u64 = 8;
 pub(crate) const FULL_FIELD_SETTLE_MS: u64 = 75;
 pub(crate) const FULL_FIELD_REFINE_MS: u64 = 225;
+
+#[derive(Debug, Clone)]
+pub enum RuntimeEvent {
+    DeviceLost {
+        reason: wgpu::DeviceLostReason,
+        message: String,
+    },
+}
 
 /// GPU objects built off the main thread during startup, handed back through
 /// [`BootState::job`]. All three are `wgpu`-backed and therefore `Send`.
@@ -183,6 +191,7 @@ impl DeferredFullField {
 }
 
 pub struct TerraApp {
+    runtime_event_proxy: Option<EventLoopProxy<RuntimeEvent>>,
     window: Option<Arc<Window>>,
     /// Set only during startup while GPU pipelines compile on a worker thread;
     /// `None` once the renderer is installed. Drives the animated splash.
@@ -204,6 +213,14 @@ pub struct TerraApp {
     eval_token: u64,
     /// OS events accumulated until the next event-loop scheduling boundary.
     input: input::InputAccumulator,
+    /// Owned effects emitted by immediate-mode UI presentation. They are applied
+    /// during the next logical frame's application-update phase, never from the
+    /// `RedrawRequested` callback that produced them.
+    pending_ui_effects: VecDeque<redraw::PendingUiEffects>,
+    /// Latest OS surface size captured by `window_event`; repeated resize events
+    /// coalesce here until the next logical frame applies the final size.
+    pending_surface_resize: Option<winit::dpi::PhysicalSize<u32>>,
+    pending_surface_reconfigure: bool,
     /// Logical scheduling/diagnostic lifecycle; deliberately app-owned and non-global.
     logical_frames: logical_frame::LogicalFrameCoordinator,
     /// Bounded, frame/generation-correlated observability for the Base brush path.
@@ -264,11 +281,10 @@ pub struct TerraApp {
     needs_height_upload: bool,
     last_refine: Instant,
     last_edit: Instant,
-    /// Optional refinement cannot start before this input-anchored deadline.
-    optional_refine_not_before: Option<Instant>,
-    /// Generation for which the optional-refinement deadline was armed.
-    optional_refine_generation: u64,
     pending_eval: bool,
+    /// Required evaluation requested with no edit debounce. This is an explicit
+    /// work intent consumed only by the coordinator's interactive-work phase.
+    pending_eval_immediate: bool,
     /// When true, next eval starts from Draft even if already refining.
     force_draft: bool,
     /// Bounded edit scope waiting for the next GPU evaluation. UV is retained
@@ -276,16 +292,16 @@ pub struct TerraApp {
     pending_gpu_dirty_region: Option<UvRect>,
     /// Missing globally coupled suffix for the latest local edit generation.
     deferred_full_field: Option<DeferredFullField>,
-    /// Earliest instant Medium/Full refinement may follow an accepted Draft suffix.
-    full_field_refine_not_before: Option<Instant>,
     /// Wave C GPU layer preview engine (shares renderer device).
     gpu_engine: Option<GpuTerrainEngine>,
     /// Backend-neutral structural plan and pending semantic edit batch.
     terrain_plan_cache: terra_core::terrain_plan::TerrainPlanCache,
     pending_plan_edits: Vec<terra_core::terrain_plan::TerrainEditClass>,
     pending_plan_invalidation: Option<terra_core::terrain_plan::PlanInvalidation>,
-    /// Last interactive GPU eval covered the full height stack (no CPU resume).
-    last_eval_fully_gpu: bool,
+    /// The last interactive path can complete entirely on the GPU. A locally
+    /// truthful result may still have a deferred full-field GPU suffix; that is
+    /// distinct from requiring CPU fallback and must not demote the next dab.
+    last_eval_gpu_supported: bool,
     /// Progressive final-output tile atlas used by the LOD renderer migration.
     tile_atlas: Option<GpuTileAtlas>,
     /// (output revision, pyramid level, tile) awaiting a frame-budgeted GPU upload.
@@ -404,6 +420,7 @@ impl Default for TerraApp {
         jobs.register(|app| &mut app.project_io);
         jobs.register(|app| &mut app.tool_thumbs);
         Self {
+            runtime_event_proxy: None,
             window: None,
             boot: None,
             renderer: None,
@@ -416,6 +433,9 @@ impl Default for TerraApp {
             eval_worker: EvalWorker::spawn(),
             eval_token: 0,
             input: input::InputAccumulator::default(),
+            pending_ui_effects: VecDeque::new(),
+            pending_surface_resize: None,
+            pending_surface_reconfigure: false,
             logical_frames: logical_frame::LogicalFrameCoordinator::default(),
             frame_trace: frame_trace::FrameTraceRecorder::default(),
             refinement_job: None,
@@ -448,18 +468,16 @@ impl Default for TerraApp {
             needs_height_upload: false,
             last_refine: now,
             last_edit: now,
-            optional_refine_not_before: None,
-            optional_refine_generation: 0,
             pending_eval: false,
+            pending_eval_immediate: false,
             force_draft: false,
             pending_gpu_dirty_region: None,
             deferred_full_field: None,
-            full_field_refine_not_before: None,
             gpu_engine: None,
             terrain_plan_cache: terra_core::terrain_plan::TerrainPlanCache::new(),
             pending_plan_edits: vec![terra_core::terrain_plan::TerrainEditClass::Structure],
             pending_plan_invalidation: None,
-            last_eval_fully_gpu: false,
+            last_eval_gpu_supported: false,
             tile_atlas: None,
             pending_tile_uploads: VecDeque::new(),
             gui_renderer: None,
@@ -515,6 +533,12 @@ impl Default for TerraApp {
             last_mask_overlay_id: None,
             mask_paint_stroke_before: None,
         }
+    }
+}
+
+impl TerraApp {
+    pub fn set_runtime_event_proxy(&mut self, proxy: EventLoopProxy<RuntimeEvent>) {
+        self.runtime_event_proxy = Some(proxy);
     }
 }
 

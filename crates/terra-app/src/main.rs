@@ -2,7 +2,7 @@
 
 use std::process::ExitCode;
 
-use terra_app::app::TerraApp;
+use terra_app::app::{RuntimeEvent, TerraApp};
 use terra_app::startup::{self, StartupError};
 use winit::event_loop::{ControlFlow, EventLoop};
 
@@ -20,7 +20,7 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let event_loop = match EventLoop::new() {
+    let event_loop = match EventLoop::<RuntimeEvent>::with_user_event().build() {
         Ok(el) => el,
         Err(error) => {
             let error = StartupError::EventLoop(error);
@@ -31,6 +31,7 @@ fn main() -> ExitCode {
     event_loop.set_control_flow(ControlFlow::Wait);
 
     let mut app = TerraApp::default();
+    app.set_runtime_event_proxy(event_loop.create_proxy());
     let run_result = event_loop.run_app(&mut app);
 
     // Check for a startup failure stored by the ApplicationHandler (surfaces

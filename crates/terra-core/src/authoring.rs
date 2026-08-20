@@ -1136,10 +1136,16 @@ fn finish_stamp(
         }
     }
     AuthoringResult::new(out)
-        .field(keys::SCULPT_PROTECTION, MaskField::from_raw(m, &state.protect))
+        .field(
+            keys::SCULPT_PROTECTION,
+            MaskField::from_raw(m, &state.protect),
+        )
         .field(keys::UPLIFT_RATE, MaskField::from_raw(m, &state.uplift))
         .field(keys::HARDNESS, MaskField::from_raw(m, &state.hardness))
-        .field(keys::SEDIMENT_THICKNESS, MaskField::from_raw(m, &state.sediment))
+        .field(
+            keys::SEDIMENT_THICKNESS,
+            MaskField::from_raw(m, &state.sediment),
+        )
         .field(keys::EDIT_REGION, MaskField::from_raw(m, &state.edited))
 }
 
@@ -1317,17 +1323,13 @@ impl SculptPrefixEntry {
         if self.base.metrics != input.metrics {
             return false;
         }
-        self.base
-            .tiles()
-            .iter()
-            .zip(input.tiles())
-            .all(|(a, b)| {
-                a.data().len() == b.data().len()
-                    && a.data()
-                        .iter()
-                        .zip(b.data())
-                        .all(|(p, q)| p.to_bits() == q.to_bits())
-            })
+        self.base.tiles().iter().zip(input.tiles()).all(|(a, b)| {
+            a.data().len() == b.data().len()
+                && a.data()
+                    .iter()
+                    .zip(b.data())
+                    .all(|(p, q)| p.to_bits() == q.to_bits())
+        })
     }
 
     /// The deepest stored checkpoint at `k <= limit`, or `None` if only the seed
@@ -2297,8 +2299,15 @@ mod tests {
         let expect = stroke_footprint_uv(&small, &m)
             .unwrap()
             .union(stroke_footprint_uv(&big, &m).unwrap());
-        let grow = sculpt_edit_footprint(&mk_params(vec![small.clone()]), &mk_params(vec![big.clone()]), &m, 0.0).unwrap();
-        let shrink = sculpt_edit_footprint(&mk_params(vec![big]), &mk_params(vec![small]), &m, 0.0).unwrap();
+        let grow = sculpt_edit_footprint(
+            &mk_params(vec![small.clone()]),
+            &mk_params(vec![big.clone()]),
+            &m,
+            0.0,
+        )
+        .unwrap();
+        let shrink =
+            sculpt_edit_footprint(&mk_params(vec![big]), &mk_params(vec![small]), &m, 0.0).unwrap();
         assert_eq!(grow, expect, "grow unions old+new");
         assert_eq!(shrink, expect, "shrink is symmetric");
     }
@@ -2313,7 +2322,8 @@ mod tests {
 
         let mut off = target.clone();
         off.enabled = false;
-        let toggled = sculpt_edit_footprint(&a, &mk_params(vec![keep.clone(), off]), &m, 0.0).unwrap();
+        let toggled =
+            sculpt_edit_footprint(&a, &mk_params(vec![keep.clone(), off]), &m, 0.0).unwrap();
         assert_eq!(toggled, expect, "toggle isolates the toggled stroke's box");
 
         let deleted = sculpt_edit_footprint(&a, &mk_params(vec![keep]), &m, 0.0).unwrap();
@@ -2455,13 +2465,57 @@ mod tests {
             mk_params(s)
         };
 
-        assert_edit_contained(m, &h, &prev, &edited(&|s| s[0].strength += 6.0), "strength@0");
-        assert_edit_contained(m, &h, &prev, &edited(&|s| s[0].radius_m = 80.0), "radius-shrink@0");
-        assert_edit_contained(m, &h, &prev, &edited(&|s| s[0].radius_m = 180.0), "radius-grow@0");
-        assert_edit_contained(m, &h, &prev, &edited(&|s| s[1].enabled = false), "toggle-smooth@1");
-        assert_edit_contained(m, &h, &prev, &edited(&|s| { s.remove(1); }), "delete-smooth@1");
-        assert_edit_contained(m, &h, &prev, &edited(&|s| s[2].target_height = 40.0), "flatten-target@2");
-        assert_edit_contained(m, &h, &prev, &edited(&|s| s[2].strength += 3.0), "flatten-strength@2");
+        assert_edit_contained(
+            m,
+            &h,
+            &prev,
+            &edited(&|s| s[0].strength += 6.0),
+            "strength@0",
+        );
+        assert_edit_contained(
+            m,
+            &h,
+            &prev,
+            &edited(&|s| s[0].radius_m = 80.0),
+            "radius-shrink@0",
+        );
+        assert_edit_contained(
+            m,
+            &h,
+            &prev,
+            &edited(&|s| s[0].radius_m = 180.0),
+            "radius-grow@0",
+        );
+        assert_edit_contained(
+            m,
+            &h,
+            &prev,
+            &edited(&|s| s[1].enabled = false),
+            "toggle-smooth@1",
+        );
+        assert_edit_contained(
+            m,
+            &h,
+            &prev,
+            &edited(&|s| {
+                s.remove(1);
+            }),
+            "delete-smooth@1",
+        );
+        assert_edit_contained(
+            m,
+            &h,
+            &prev,
+            &edited(&|s| s[2].target_height = 40.0),
+            "flatten-target@2",
+        );
+        assert_edit_contained(
+            m,
+            &h,
+            &prev,
+            &edited(&|s| s[2].strength += 3.0),
+            "flatten-strength@2",
+        );
     }
 
     // ---- #122: whole-field bbox cull is bit-identical to an unculled stamp ----
@@ -2672,10 +2726,7 @@ mod tests {
                         | SculptStrokeKind::Valley
                         | SculptStrokeKind::ValleyStamp
                 ) {
-                    vec![
-                        spt(u, v),
-                        spt((u + 0.15).min(0.98), (v + 0.1).min(0.98)),
-                    ]
+                    vec![spt(u, v), spt((u + 0.15).min(0.98), (v + 0.1).min(0.98))]
                 } else {
                     vec![spt(u, v)]
                 };
@@ -2840,12 +2891,16 @@ mod tests {
             // Reconcile is post-checkpoint: changing it reuses the tail, stamps 0.
             p.reconcile = 0.35;
             let s = cached_step(&h, &p, &mut entry, m, "reconcile-only");
-            assert_eq!(s.restamped, 0, "reconcile change reuses the tail checkpoint");
+            assert_eq!(
+                s.restamped, 0,
+                "reconcile change reuses the tail checkpoint"
+            );
             p.reconcile = 0.2;
             cached_step(&h, &p, &mut entry, m, "reconcile-restore");
 
             // Append: resume from the previous tail, stamp exactly one stroke.
-            p.strokes.push(mk_stroke(SculptStrokeKind::Ridge, 0.7, 0.3, 100.0));
+            p.strokes
+                .push(mk_stroke(SculptStrokeKind::Ridge, 0.7, 0.3, 100.0));
             let s = cached_step(&h, &p, &mut entry, m, "append");
             assert_eq!(s.restamped, 1, "append restamps one stroke");
             assert_eq!(s.resumed_from, p.strokes.len() - 1);
@@ -2853,7 +2908,10 @@ mod tests {
             // Drag: grow the last stroke's polyline — resume from pre-tail, stamp 1.
             p.strokes.last_mut().unwrap().points.push(spt(0.72, 0.32));
             let s = cached_step(&h, &p, &mut entry, m, "drag");
-            assert_eq!(s.restamped, 1, "drag on the last stroke restamps one stroke");
+            assert_eq!(
+                s.restamped, 1,
+                "drag on the last stroke restamps one stroke"
+            );
 
             // Edit stroke 0: correct, and (no k<=0 checkpoint but the seed) resumes
             // cold — the early-edit case the acceptance calls out for correctness.
@@ -2921,7 +2979,11 @@ mod tests {
 
         // Different heights at identical metrics: the base bit-compare rejects it.
         let mut h2 = h1.clone();
-        h2.set(m.width / 2, m.height / 2, h1.get(m.width / 2, m.height / 2) + 5.0);
+        h2.set(
+            m.width / 2,
+            m.height / 2,
+            h1.get(m.width / 2, m.height / 2) + 5.0,
+        );
         let s = cached_step(&h2, &p, &mut entry, m, "changed-input");
         assert_eq!(s.resumed_from, 0, "a changed input forces a cold rebuild");
 
@@ -2952,7 +3014,10 @@ mod tests {
         // Re-eval with the NaN twice: both stay bit-identical and never resume past
         // the NaN stroke.
         let s = cached_step(&h, &p, &mut entry, m, "nan-1");
-        assert_eq!(s.resumed_from, 0, "the NaN stroke at index 0 blocks any resume");
+        assert_eq!(
+            s.resumed_from, 0,
+            "the NaN stroke at index 0 blocks any resume"
+        );
         cached_step(&h, &p, &mut entry, m, "nan-2");
     }
 

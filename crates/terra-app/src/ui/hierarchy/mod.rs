@@ -8,8 +8,7 @@ use crate::ui::hierarchy_view::{
     self, advanced_placement_id, biome_section_artist_label, biome_summary_meta,
     concept_for_category, concept_for_top_level, concept_row_id, mask_stack_row_id,
     sim_status_label, stroke_row_id, world_rule_entity_meta, world_rules_meta, ArtistConcept,
-    TERRAIN_ROOT,
-    TERRAIN_SCOPE_KEY,
+    TERRAIN_ROOT, TERRAIN_SCOPE_KEY,
 };
 use crate::ui::style::{
     self, FONT_SCALE, LAYER_ROW_H, LAYER_ROW_H_COMPACT, LAYER_THUMB_SZ, PAD, TYPE_BODY,
@@ -1438,11 +1437,8 @@ pub fn draw_layers_gui(
                 if row_data.role == TreeRole::Stroke {
                     if let Some((layer, index)) = row_data.stroke {
                         actions.push(PanelAction::SelectStroke { layer, index });
-                        state.context_menu = Some((
-                            ContextMenuTarget::Stroke { layer, index },
-                            px,
-                            py,
-                        ));
+                        state.context_menu =
+                            Some((ContextMenuTarget::Stroke { layer, index }, px, py));
                         state.add_menu_open = false;
                     }
                 } else if can_rename
@@ -1458,8 +1454,7 @@ pub fn draw_layers_gui(
                     if matches!(row_data.role, TreeRole::MaskAsset) {
                         actions.push(PanelAction::SelectMask(MaskId(row_data.id.0)));
                     }
-                    state.context_menu =
-                        Some((ContextMenuTarget::Entity(row_data.id), px, py));
+                    state.context_menu = Some((ContextMenuTarget::Entity(row_data.id), px, py));
                     state.add_menu_open = false;
                 }
             }
@@ -2061,18 +2056,17 @@ fn walk_node_flat(
                     "World",
                 );
             }
-            let stroke_children =
-                if let LayerKind::SculptStrokes(p) = &layer.kind {
-                    if p.strokes.is_empty() {
-                        None
-                    } else {
-                        row.child_count = p.strokes.len();
-                        row.collapsed = collapsed.contains(&layer.id());
-                        Some((layer.id(), &p.strokes))
-                    }
-                } else {
+            let stroke_children = if let LayerKind::SculptStrokes(p) = &layer.kind {
+                if p.strokes.is_empty() {
                     None
-                };
+                } else {
+                    row.child_count = p.strokes.len();
+                    row.collapsed = collapsed.contains(&layer.id());
+                    Some((layer.id(), &p.strokes))
+                }
+            } else {
+                None
+            };
             out.push(row);
             if let Some((layer_id, strokes)) = stroke_children {
                 if !collapsed.contains(&layer_id) {
@@ -2088,13 +2082,8 @@ fn walk_node_flat(
                             format!("{} {}", label, count)
                         };
                         let row_id = stroke_row_id(layer_id, si);
-                        let mut srow = blank_row(
-                            row_id,
-                            name,
-                            depth + 1,
-                            TreeRole::Stroke,
-                            root_idx,
-                        );
+                        let mut srow =
+                            blank_row(row_id, name, depth + 1, TreeRole::Stroke, root_idx);
                         srow.enabled = stroke.enabled;
                         srow.type_icon = Icon::Pencil;
                         srow.domain_role = Some(DomainRole::ShapeLayer);
@@ -2724,10 +2713,7 @@ fn draw_stroke_context_menu(
         })
         .unwrap_or(true);
     let items: Vec<(&str, &str)> = vec![
-        (
-            "enable",
-            if stroke_enabled { "Disable" } else { "Enable" },
-        ),
+        ("enable", if stroke_enabled { "Disable" } else { "Enable" }),
         ("del", "Delete"),
         ("close", "Close"),
     ];

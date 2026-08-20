@@ -41,6 +41,15 @@ required interactive work, a presentation request, and optional refinement.
 Logical frames are demand-driven scheduling and diagnostic lifecycles, not a
 fixed-timestep simulation and not a promise of a particular refresh rate.
 
+`LogicalFrameCoordinator` is the single owner of frame demand, generation-
+stamped evaluation/refinement deadlines, presentation demand, and the next
+`Wait`/`WaitUntil`/`Poll` decision. Window callbacks only capture bounded state:
+ordered input, the latest coalesced resize, lifecycle notifications, and UI
+output. UI output is applied during the next logical frame, before required
+terrain work. Surface preparation and renderer uploads also occur before the
+presentation request; `RedrawRequested` only composes and presents the already
+prepared terrain and UI.
+
 Logical frame IDs and terrain edit generations are intentionally distinct.
 Several logical frames may observe the same generation; an edit may advance the
 generation during application update and supersede work submitted by an older
@@ -53,6 +62,13 @@ budget hook decides only whether optional work may start; it does not cancel or
 preempt GPU commands after submission. With no input, animation, background
 completion, or scheduled terrain work, the winit loop returns to
 `ControlFlow::Wait`.
+
+Resize and recoverable surface errors become coalesced logical-frame work.
+Focus/capture loss appends cancellation to the ordered input stream. Device loss
+and shutdown invalidate CPU and GPU work, abandon the active frame, clear queued
+presentation and application work, and exit through the event-loop boundary.
+Every detailed trace phase must carry a real logical-frame identity; rejected
+orphan trace attempts are counted in the profiler diagnostics.
 
 The surface presentation path remains last-complete: pending or stale-generation
 terrain candidates do not replace the renderer's current complete textures.

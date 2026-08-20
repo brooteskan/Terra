@@ -9,6 +9,8 @@ use crate::ui::{
 use terra_core::document::EditorSession;
 use terra_io::{save_project, ProjectIoResult};
 
+use super::logical_frame::FrameDeadlineKind;
+use super::logical_frame::FrameRequestReason;
 use super::{
     default_terra_projects_dir, document_from_world_settings, prepare_project_path,
     project_name_from_path, save_project_prefs, AppScreen, PendingProjectAction, TerraApp,
@@ -44,9 +46,7 @@ impl TerraApp {
     pub(crate) fn drain_project_io(&mut self) {
         if let Some(status) = self.project_io.status() {
             self.ui_state.status = status.to_string();
-            if let Some(w) = &self.window {
-                w.request_redraw();
-            }
+            self.request_app_frame(FrameRequestReason::Completion);
         }
         let Some(result) = self.project_io.result.take() else {
             return;
@@ -80,9 +80,7 @@ impl TerraApp {
                 self.pending_enter_after_save = None;
                 log::error!("{} failed: {error}", path.display());
                 self.ui_state.status = format!("{} failed: {error}", path.display());
-                if let Some(w) = &self.window {
-                    w.request_redraw();
-                }
+                self.request_app_frame(FrameRequestReason::Completion);
             }
         }
     }
@@ -96,9 +94,7 @@ impl TerraApp {
         self.sync_lighting_to_document();
         self.project_io
             .start_save(self.session.document.clone(), path);
-        if let Some(w) = &self.window {
-            w.request_redraw();
-        }
+        self.request_app_frame(FrameRequestReason::Completion);
     }
 
     /// Copy the editable viewport lighting into the document so File > Save persists it.
@@ -218,9 +214,7 @@ impl TerraApp {
     pub(crate) fn request_project_action(&mut self, action: PendingProjectAction) {
         if self.screen == AppScreen::Editor && self.document_dirty {
             self.pending_project_action = Some(action);
-            if let Some(w) = &self.window {
-                w.request_redraw();
-            }
+            self.request_app_frame(FrameRequestReason::UiActions);
             return;
         }
         self.perform_project_action(action);
@@ -239,9 +233,7 @@ impl TerraApp {
         self.new_template_selected = "blank".into();
         self.new_world_settings = NewWorldSettings::default();
         self.show_new_template_picker = true;
-        if let Some(w) = &self.window {
-            w.request_redraw();
-        }
+        self.request_app_frame(FrameRequestReason::UiActions);
     }
 
     pub(crate) fn new_project_with_template(
@@ -258,9 +250,7 @@ impl TerraApp {
         let projects_root = default_terra_projects_dir();
         if let Err(error) = std::fs::create_dir_all(&projects_root) {
             self.ui_state.status = format!("Could not create projects folder: {error}");
-            if let Some(w) = &self.window {
-                w.request_redraw();
-            }
+            self.request_app_frame(FrameRequestReason::UiActions);
             return;
         }
 
@@ -278,9 +268,7 @@ impl TerraApp {
             Ok(path) => path,
             Err(error) => {
                 self.ui_state.status = format!("Could not create project folder: {error}");
-                if let Some(w) = &self.window {
-                    w.request_redraw();
-                }
+                self.request_app_frame(FrameRequestReason::UiActions);
                 return;
             }
         };
@@ -298,9 +286,7 @@ impl TerraApp {
             }
             Err(error) => {
                 self.ui_state.status = format!("Could not create project: {error}");
-                if let Some(w) = &self.window {
-                    w.request_redraw();
-                }
+                self.request_app_frame(FrameRequestReason::UiActions);
             }
         }
     }
@@ -324,9 +310,7 @@ impl TerraApp {
         }
         self.ui_state.status = "Loadingâ€¦".into();
         self.project_io.start_load(path);
-        if let Some(w) = &self.window {
-            w.request_redraw();
-        }
+        self.request_app_frame(FrameRequestReason::Completion);
     }
 
     pub(crate) fn enter_editor(
@@ -344,6 +328,7 @@ impl TerraApp {
         self.worker_refine_pending = false;
         self.force_draft = false;
         self.pending_eval = false;
+        self.pending_eval_immediate = false;
 
         // Fresh session (undo stacks, outdated sims, rebuild feedback) — same as a cold open.
         let world_size = (document.metrics.world_size_x, document.metrics.world_size_z);
@@ -372,13 +357,9 @@ impl TerraApp {
         self.inspector_gui.reset_expand_for_project();
 
         self.mark_all_layers_dirty();
-        self.request_rebuild();
-        self.pending_eval = false;
-        self.run_eval_step();
+        self.request_rebuild_immediate();
         self.refresh_window_title();
-        if let Some(w) = &self.window {
-            w.request_redraw();
-        }
+        self.request_app_frame(FrameRequestReason::RequiredEvaluation);
     }
 
     /// Drop GPU/CPU preview state so the next document cannot inherit the previous one.
@@ -406,7 +387,8 @@ impl TerraApp {
         self.worker_mark_all_dirty = true;
         self.pending_gpu_dirty_region = None;
         self.deferred_full_field = None;
-        self.full_field_refine_not_before = None;
+        self.logical_frames
+            .clear_deadline(FrameDeadlineKind::FullFieldRefinement);
         self.needs_height_upload = false;
         self.preview_dirty = true;
         self.ui_state.refining = false;
@@ -445,6 +427,7 @@ impl TerraApp {
         self.eval_token = self.eval_token.wrapping_add(1);
         self.eval_worker.set_token(self.eval_token);
         self.pending_eval = false;
+        self.pending_eval_immediate = false;
         self.worker_refine_pending = false;
         self.force_draft = false;
         self.session = EditorSession::new();
@@ -456,9 +439,7 @@ impl TerraApp {
         self.screen = AppScreen::Home;
         self.ui_state.status = String::new();
         self.refresh_window_title();
-        if let Some(w) = &self.window {
-            w.request_redraw();
-        }
+        self.request_app_frame(FrameRequestReason::UiActions);
     }
 
     pub(crate) fn handle_home_actions(&mut self, actions: Vec<ProjectHomeAction>) {
@@ -521,9 +502,7 @@ impl TerraApp {
                 self.ui_state.status = error;
             }
         }
-        if let Some(window) = &self.window {
-            window.request_redraw();
-        }
+        self.request_app_frame(FrameRequestReason::UiActions);
     }
 
     /// Folder picker: open a Terra project found inside the chosen directory.
@@ -564,9 +543,7 @@ impl TerraApp {
             dir.display()
         ));
         self.ui_state.status = format!("No project found in {}", dir.display());
-        if let Some(w) = &self.window {
-            w.request_redraw();
-        }
+        self.request_app_frame(FrameRequestReason::UiActions);
     }
 
     pub(crate) fn choose_export_directory(&mut self) {

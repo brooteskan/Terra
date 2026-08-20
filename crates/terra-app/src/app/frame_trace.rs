@@ -54,6 +54,14 @@ pub(crate) enum FrameTraceEventKind {
     RefinementPublished,
     RefinementFailed,
     HeartbeatOverBudget,
+    UiEffectsQueued,
+    UiEffectsApplied,
+    ResizeCaptured,
+    ResizeApplied,
+    SurfaceRecoveryRequested,
+    DeviceLost,
+    ShutdownRequested,
+    FrameAborted,
 }
 
 #[derive(Debug, Clone)]
@@ -92,6 +100,8 @@ pub(crate) struct FrameTraceRecorder {
     release_to_follow_up_press_us: VecDeque<u64>,
     pending_input_receipt: Option<(Instant, EditGeneration)>,
     pending_release: Option<(Instant, EditGeneration)>,
+    verbose: bool,
+    orphaned_events: u64,
 }
 
 impl Default for FrameTraceRecorder {
@@ -104,6 +114,10 @@ impl Default for FrameTraceRecorder {
             release_to_follow_up_press_us: VecDeque::with_capacity(SAMPLE_CAPACITY),
             pending_input_receipt: None,
             pending_release: None,
+            verbose: cfg!(test)
+                || std::env::var("TERRA_FRAME_TRACE")
+                    .is_ok_and(|value| value.eq_ignore_ascii_case("verbose")),
+            orphaned_events: 0,
         }
     }
 }
@@ -117,6 +131,16 @@ impl FrameTraceRecorder {
         EvaluationTraceId(self.next_evaluation)
     }
 
+    pub(crate) fn set_verbose(&mut self, verbose: bool) {
+        self.verbose = verbose
+            || std::env::var("TERRA_FRAME_TRACE")
+                .is_ok_and(|value| value.eq_ignore_ascii_case("verbose"));
+    }
+
+    pub(crate) const fn orphaned_events(&self) -> u64 {
+        self.orphaned_events
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn record(
         &mut self,
@@ -128,12 +152,15 @@ impl FrameTraceRecorder {
         quality: Option<PreviewQuality>,
         intent: Option<GpuEvaluationIntent>,
         duration: Option<Duration>,
-    ) {
-        let identity = identity.unwrap_or(FrameIdentity {
-            id: LogicalFrameId::default(),
-            generation_at_start: EditGeneration::default(),
-            generation: EditGeneration::default(),
-        });
+    ) -> bool {
+        let Some(identity) = identity else {
+            self.orphaned_events = self.orphaned_events.saturating_add(1);
+            log::error!(target: "terra_app::logical_frame", "orphaned frame trace event: {kind:?}");
+            return false;
+        };
+        if !self.verbose {
+            return false;
+        }
         push_bounded(
             &mut self.events,
             EVENT_CAPACITY,
@@ -154,6 +181,7 @@ impl FrameTraceRecorder {
                 refinement_submission_depth: 0,
             },
         );
+        true
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -171,7 +199,7 @@ impl FrameTraceRecorder {
         submission_depth: u8,
         duration: Option<Duration>,
     ) {
-        self.record(
+        if !self.record(
             now,
             kind,
             identity,
@@ -180,7 +208,9 @@ impl FrameTraceRecorder {
             Some(quality),
             Some(GpuEvaluationIntent::Complete),
             duration,
-        );
+        ) {
+            return;
+        }
         if let Some(event) = self.events.back_mut() {
             event.refinement_job = Some(job);
             event.completed_units = completed_units;
@@ -201,7 +231,7 @@ impl FrameTraceRecorder {
         duration: Duration,
         stats: terra_gpu::GpuEvalStats,
     ) {
-        self.record(
+        if !self.record(
             now,
             FrameTraceEventKind::QueueSubmitted,
             identity,
@@ -210,7 +240,9 @@ impl FrameTraceRecorder {
             Some(quality),
             Some(intent),
             Some(duration),
-        );
+        ) {
+            return;
+        }
         if let Some(event) = self.events.back_mut() {
             event.gpu_stats = Some(stats);
         }
@@ -327,11 +359,16 @@ mod tests {
     #[test]
     fn records_are_bounded() {
         let mut trace = FrameTraceRecorder::default();
+        let identity = FrameIdentity {
+            id: LogicalFrameId::new(1),
+            generation_at_start: EditGeneration::new(1),
+            generation: EditGeneration::new(1),
+        };
         for _ in 0..EVENT_CAPACITY + 7 {
             trace.record(
                 Instant::now(),
                 FrameTraceEventKind::OsInputReceipt,
-                None,
+                Some(identity),
                 None,
                 None,
                 None,
@@ -340,6 +377,61 @@ mod tests {
             );
         }
         assert_eq!(trace.events().len(), EVENT_CAPACITY);
+    }
+
+    #[test]
+    fn records_without_a_logical_frame_are_rejected_and_counted() {
+        let mut trace = FrameTraceRecorder::default();
+        trace.record(
+            Instant::now(),
+            FrameTraceEventKind::OsInputReceipt,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert!(trace.events().is_empty());
+        assert_eq!(trace.orphaned_events(), 1);
+    }
+
+    #[test]
+    fn disabled_verbose_wrappers_do_not_annotate_the_previous_event() {
+        let mut trace = FrameTraceRecorder::default();
+        let identity = FrameIdentity {
+            id: LogicalFrameId::new(2),
+            generation_at_start: EditGeneration::new(3),
+            generation: EditGeneration::new(3),
+        };
+        trace.record(
+            Instant::now(),
+            FrameTraceEventKind::OsInputReceipt,
+            Some(identity),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        trace.verbose = false;
+        trace.record_refinement(
+            Instant::now(),
+            FrameTraceEventKind::RefinementUnitProgress,
+            Some(identity),
+            None,
+            EvaluationTraceId::new(4),
+            PreviewQuality::Medium,
+            99,
+            1,
+            2,
+            1,
+            None,
+        );
+
+        assert_eq!(trace.events().len(), 1);
+        assert_eq!(trace.events().back().unwrap().refinement_job, None);
     }
 
     #[test]
