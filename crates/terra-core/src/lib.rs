@@ -55,6 +55,7 @@ pub mod sparse_paint;
 pub mod spatial_kernels;
 pub mod surface;
 pub mod terrain;
+pub mod terrain_plan;
 pub mod terrain_recipe;
 pub mod tiling;
 pub mod volumetric;

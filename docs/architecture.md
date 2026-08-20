@@ -51,7 +51,24 @@ composition behavior.
 
 **User-facing:** ordered layer stack (World Creator style). Groups nest; no node editor.
 
-**Internal:** each layer kind is evaluated by `ProcessorRegistry::evaluate` (a `match` on `LayerKind`), producing a height contribution blended onto the accumulator. Masks and aux maps (erosion, flow, wetness) are cacheable artifacts. Dirty propagation invalidates from the earliest edited layer upward.
+**Internal:** the authored `LayerStack` is projected into a backend-neutral
+`CompiledTerrainPlan`. The plan describes ordered operations, logical height/mask/aux
+fields, spatial reach, and stable authored provenance without owning layer payloads,
+CPU heightfields, or GPU resources. CPU and GPU backends realize that plan into their
+own physical resources and execution work. During the staged migration, the existing
+CPU evaluator and flat GPU planner remain active until their plan consumers land.
+
+The ownership boundary is deliberate:
+
+- `TerrainDocument` owns authored layers, masks, Base samples, and stroke history.
+- `CompiledTerrainPlan` owns runtime-derived semantic descriptors and provenance.
+- CPU/GPU evaluators own physical fields, caches, pipelines, and textures.
+- Per-frame scheduling owns transient execution state rather than authored identity.
+
+Plan-local operation and field IDs are valid only for one structural revision. Stable
+cross-plan identity comes from authored layer/group/output IDs. Content edits such as
+brush dabs advance output freshness and dirty regions without changing the plan's
+structural revision.
 
 ## Evaluation
 
@@ -64,7 +81,21 @@ for layer L in bottom→top:
   H_i = mix(H_{i-1}, blend(H_{i-1}, G), opacity * M)
 ```
 
-Phase 1 used full rebuilds. Incremental rebuild uses `LayerCache` + `mark_dirty_from`. Progressive preview walks `Draft → Medium → Full`: the app advances the quality ladder held on `EvalScheduler` (the interactive eval-session state) and runs each pass on the background `EvalWorker`.
+The target evaluation boundary is:
+
+```text
+LayerStack (authored source)
+    -> CompiledTerrainPlan (logical dataflow + provenance)
+    -> CPU/GPU backend realization
+    -> final height and auxiliary outputs
+```
+
+The plan IR is present first; tree compilation and GPU consumption land in subsequent
+phases. Until then, incremental CPU rebuild continues to use `LayerCache` +
+`mark_dirty_from`, and the existing GPU planner continues to serve flat stacks.
+Progressive preview walks `Draft → Medium → Full`: the app advances the quality ladder
+held on `EvalScheduler` and runs each authoritative CPU pass on the background
+`EvalWorker`.
 
 ## Tiles & ghosts
 
