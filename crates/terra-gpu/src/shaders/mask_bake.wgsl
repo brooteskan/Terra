@@ -64,6 +64,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let deg = atan(g) * 57.2957795;
             m = range_mask(deg, u.range_min, u.range_max, 1e-3);
         }
+        case 3u: {
+            m = clamp(sample_h(ii, jj), 0.0, 1.0);
+        }
         default: {
             m = 1.0;
         }

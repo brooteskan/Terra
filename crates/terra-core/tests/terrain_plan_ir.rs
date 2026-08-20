@@ -187,7 +187,6 @@ fn isolated_copy_input_plan_keeps_private_and_parent_fields_distinct() {
             mask: group_mask,
             output: group_output,
             mode: GroupCompositeMode::BiomeHeightDelta,
-            aux: Vec::new(),
         },
     });
     builder.add_operation(TerrainOp {

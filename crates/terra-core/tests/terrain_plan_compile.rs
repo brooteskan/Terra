@@ -2,8 +2,8 @@ use terra_core::deps::NodeRef;
 use terra_core::field_data::FieldId;
 use terra_core::ids::LayerId;
 use terra_core::layer::{
-    BiomesParams, FlatParams, GroupInputMode, Layer, LayerGroup, LayerKind, LayerStack,
-    NamedOutputDecl, StackNode, VolcanoParams,
+    BindingSource, BiomesParams, FlatParams, GroupInputMode, Layer, LayerGroup, LayerKind,
+    LayerStack, NamedOutputDecl, ParamBinding, StackNode, VolcanoParams,
 };
 use terra_core::mask::{DistNode, MaskAsset, MaskId, MaskRef, MaskSource};
 use terra_core::terrain_plan::{
@@ -36,6 +36,7 @@ fn shape(plan: &terra_core::terrain_plan::CompiledTerrainPlan) -> Vec<String> {
             TerrainOpKind::RunLayerKernel { type_id, .. } => format!("kernel:{type_id}"),
             TerrainOpKind::CompositeLayer { .. } => "layer-composite".into(),
             TerrainOpKind::CompositeGroup { mode, .. } => format!("group:{mode:?}"),
+            TerrainOpKind::CompositeAuxField { .. } => "aux-composite".into(),
             TerrainOpKind::PublishOutput { .. } => "publish".into(),
         })
         .collect()
@@ -242,15 +243,81 @@ fn isolated_auxiliary_outputs_cross_the_group_only_through_explicit_merges() {
         .operations()
         .iter()
         .find_map(|operation| match &operation.kind {
-            TerrainOpKind::CompositeGroup { aux, .. } => Some(aux),
+            TerrainOpKind::CompositeAuxField { composite, .. } => Some(composite),
             _ => None,
         })
         .expect("isolated group composite");
-    assert!(!aux.is_empty());
-    assert!(aux.iter().all(|field| field.parent.is_none()));
-    assert!(aux
+    assert!(aux.parent.is_none());
+    assert!(plan.provenance().producer_of(aux.output).is_some());
+    assert!(!plan.analysis().field_is_live(aux.output));
+}
+
+#[test]
+fn output_parameter_binding_is_an_explicit_kernel_input_and_dependency() {
+    let mut producer = flat(140, 0.5);
+    let declaration = NamedOutputDecl::new("Control", FieldId::Height);
+    let output = declaration.id;
+    producer.common.outputs.push(declaration);
+    let mut consumer = volcano(141);
+    consumer.common.param_bindings.push(ParamBinding::new(
+        "amplitude",
+        BindingSource::LayerOutput(output),
+    ));
+    let consumer_id = consumer.id();
+    let mut stack = LayerStack::new();
+    stack.push(producer);
+    stack.push(consumer);
+
+    let plan = compile_terrain_plan(&stack, &[], stamp()).expect("binding plan");
+    let published = plan
+        .provenance()
+        .field_for_output(output)
+        .expect("published slot");
+    let (operation_id, inputs) = plan
+        .operations()
         .iter()
-        .all(|field| plan.provenance().producer_of(field.output).is_some()));
+        .enumerate()
+        .find_map(|(index, operation)| match &operation.kind {
+            TerrainOpKind::RunLayerKernel {
+                layer,
+                input_fields,
+                ..
+            } if *layer == consumer_id => Some((
+                terra_core::terrain_plan::PlanOpId::from_index(index),
+                input_fields,
+            )),
+            _ => None,
+        })
+        .expect("consumer kernel");
+    assert!(inputs.contains(&published));
+    assert!(plan.provenance().dependencies().iter().any(|dependency| {
+        dependency.consumer == operation_id
+            && dependency.source == NodeRef::Output(output)
+            && dependency.kind == terra_core::deps::DepKind::ParamBinding
+    }));
+}
+
+#[test]
+fn disabled_publication_has_a_structured_diagnostic() {
+    let mut producer = flat(150, 1.0);
+    producer.common.enabled = false;
+    let declaration = NamedOutputDecl::new("Disabled", FieldId::Height);
+    let output = declaration.id;
+    producer.common.outputs.push(declaration);
+    let mut selected = LayerGroup::isolated("Consumer");
+    selected.id = LayerId::from_u128(151);
+    selected.input_mode =
+        GroupInputMode::SelectedField(terra_core::layer::SelectedGroupInput::Output(output));
+    let mut stack = LayerStack::new();
+    stack.push(producer);
+    stack.push_group(selected);
+
+    let diagnostics = compile_terrain_plan(&stack, &[], stamp()).expect_err("disabled output");
+    assert!(diagnostics.iter().any(|diagnostic| matches!(
+        diagnostic,
+        TerrainPlanDiagnostic::DisabledOutput { owner, output: candidate }
+            if *owner == NodeRef::Group(LayerId::from_u128(151)) && *candidate == output
+    )));
 }
 
 #[test]
@@ -450,7 +517,7 @@ fn solo_toggle_changes_selection_signature_even_when_operations_do_not() {
 }
 
 #[test]
-fn deferred_cross_edges_and_broken_nested_mask_refs_are_diagnostic() {
+fn selected_field_lowers_and_broken_nested_mask_refs_are_diagnostic() {
     let missing = MaskId::new();
     let mut layer = flat(120, 1.0);
     layer
@@ -471,9 +538,53 @@ fn deferred_cross_edges_and_broken_nested_mask_refs_are_diagnostic() {
         diagnostic,
         TerrainPlanDiagnostic::MissingMask { mask, .. } if *mask == missing
     )));
-    assert!(diagnostics.iter().any(|diagnostic| matches!(
-        diagnostic,
-        TerrainPlanDiagnostic::UnsupportedSelectedField { group }
-            if *group == LayerId::from_u128(121)
+    assert_eq!(diagnostics.len(), 1);
+}
+
+#[test]
+fn selected_named_output_lowers_to_explicit_seed_dependency() {
+    let mut producer = flat(130, 3.0);
+    let output = NamedOutputDecl::new("Published height", FieldId::Height);
+    let output_id = output.id;
+    producer.common.outputs.push(output);
+
+    let mut selected = LayerGroup::isolated("Selected");
+    selected.id = LayerId::from_u128(131);
+    selected.input_mode =
+        GroupInputMode::SelectedField(terra_core::layer::SelectedGroupInput::Output(output_id));
+    selected.children.push(StackNode::Layer(flat(132, 1.0)));
+
+    let mut stack = LayerStack::new();
+    stack.push(producer);
+    stack.push_group(selected);
+    let plan = compile_terrain_plan(&stack, &[], stamp()).expect("selected output plan");
+
+    let selected_seed = plan
+        .operations()
+        .iter()
+        .enumerate()
+        .find_map(|(index, operation)| match operation.kind {
+            TerrainOpKind::Seed {
+                source: SeedSource::Selected(source),
+                ..
+            } => Some((
+                terra_core::terrain_plan::PlanOpId::from_index(index),
+                source,
+            )),
+            _ => None,
+        });
+    let (seed_op, source) = selected_seed.expect("explicit selected seed");
+    assert!(plan.provenance().output(output_id).is_some());
+    assert!(plan
+        .provenance()
+        .dependencies()
+        .iter()
+        .any(|dependency| dependency.consumer == seed_op
+            && dependency.source == NodeRef::Output(output_id)
+            && dependency.kind == terra_core::deps::DepKind::GroupInput));
+    assert!(plan.operations().iter().any(|operation| matches!(
+        operation.kind,
+        TerrainOpKind::PublishOutput { output, source: published }
+            if output == output_id && published == source
     )));
 }

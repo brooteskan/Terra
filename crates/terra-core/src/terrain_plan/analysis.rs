@@ -301,7 +301,7 @@ fn validate_operation_kinds(
         } => {
             expect(*input_height, ExpectedFieldKind::Height)?;
             for field in input_fields {
-                expect(*field, ExpectedFieldKind::Auxiliary)?;
+                expect(*field, ExpectedFieldKind::HeightOrAuxiliary)?;
             }
             expect(*output_mask, ExpectedFieldKind::Mask)?;
         }
@@ -314,7 +314,7 @@ fn validate_operation_kinds(
         } => {
             expect(*input_height, ExpectedFieldKind::Height)?;
             for field in input_fields {
-                expect(*field, ExpectedFieldKind::Auxiliary)?;
+                expect(*field, ExpectedFieldKind::HeightOrAuxiliary)?;
             }
             expect(*output_candidate, ExpectedFieldKind::Height)?;
             for field in output_fields {
@@ -339,20 +339,22 @@ fn validate_operation_kinds(
             child_output,
             mask,
             output,
-            aux,
             ..
         } => {
             for field in [parent, private_seed, child_output, output] {
                 expect(*field, ExpectedFieldKind::Height)?;
             }
             expect(*mask, ExpectedFieldKind::Mask)?;
-            for merge in aux {
-                if let Some(parent) = merge.parent {
-                    expect(parent, ExpectedFieldKind::Auxiliary)?;
-                }
-                expect(merge.child, ExpectedFieldKind::Auxiliary)?;
-                expect(merge.output, ExpectedFieldKind::Auxiliary)?;
+        }
+        TerrainOpKind::CompositeAuxField {
+            mask, composite, ..
+        } => {
+            expect(*mask, ExpectedFieldKind::Mask)?;
+            if let Some(parent) = composite.parent {
+                expect(parent, ExpectedFieldKind::Auxiliary)?;
             }
+            expect(composite.child, ExpectedFieldKind::Auxiliary)?;
+            expect(composite.output, ExpectedFieldKind::Auxiliary)?;
         }
         TerrainOpKind::PublishOutput { source, .. } => {
             expect(*source, ExpectedFieldKind::HeightOrAuxiliary)?;

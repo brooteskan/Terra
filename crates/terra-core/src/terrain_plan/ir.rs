@@ -106,7 +106,14 @@ pub enum TerrainOpKind {
         mask: FieldSlot,
         output: FieldSlot,
         mode: GroupCompositeMode,
-        aux: Vec<GroupAuxComposite>,
+    },
+    /// Publish one private auxiliary field across an isolated group boundary.
+    /// Keeping this separate from the height composite lets liveness discard
+    /// unobserved private fields independently.
+    CompositeAuxField {
+        group: LayerId,
+        mask: FieldSlot,
+        composite: GroupAuxComposite,
     },
     PublishOutput {
         output: OutputId,
@@ -128,7 +135,11 @@ impl TerrainOpKind {
             } => {
                 let mut slots = Vec::with_capacity(1 + input_fields.len());
                 slots.push(*input_height);
-                slots.extend(input_fields.iter().copied());
+                for field in input_fields {
+                    if !slots.contains(field) {
+                        slots.push(*field);
+                    }
+                }
                 slots
             }
             Self::RunLayerKernel {
@@ -138,7 +149,11 @@ impl TerrainOpKind {
             } => {
                 let mut slots = Vec::with_capacity(1 + input_fields.len());
                 slots.push(*input_height);
-                slots.extend(input_fields.iter().copied());
+                for field in input_fields {
+                    if !slots.contains(field) {
+                        slots.push(*field);
+                    }
+                }
                 slots
             }
             Self::CompositeLayer {
@@ -152,17 +167,16 @@ impl TerrainOpKind {
                 private_seed,
                 child_output,
                 mask,
-                aux,
                 ..
+            } => vec![*parent, *private_seed, *child_output, *mask],
+            Self::CompositeAuxField {
+                mask, composite, ..
             } => {
-                let mut slots = Vec::with_capacity(4 + aux.len() * 2);
-                slots.extend([*parent, *private_seed, *child_output, *mask]);
-                for field in aux {
-                    if let Some(parent) = field.parent {
-                        slots.push(parent);
-                    }
-                    slots.push(field.child);
+                let mut slots = Vec::with_capacity(3);
+                if let Some(parent) = composite.parent {
+                    slots.push(parent);
                 }
+                slots.extend([composite.child, *mask]);
                 slots
             }
             Self::PublishOutput { source, .. } => vec![*source],
@@ -172,12 +186,8 @@ impl TerrainOpKind {
     pub(crate) fn output_slots(&self) -> Vec<FieldSlot> {
         match self {
             Self::Seed { output, .. } | Self::CompositeLayer { output, .. } => vec![*output],
-            Self::CompositeGroup { output, aux, .. } => {
-                let mut slots = Vec::with_capacity(1 + aux.len());
-                slots.push(*output);
-                slots.extend(aux.iter().map(|field| field.output));
-                slots
-            }
+            Self::CompositeGroup { output, .. } => vec![*output],
+            Self::CompositeAuxField { composite, .. } => vec![composite.output],
             Self::EvaluateMask { output_mask, .. } => vec![*output_mask],
             Self::RunLayerKernel {
                 output_candidate,
@@ -561,7 +571,6 @@ fn hash_operation_kind(kind: &TerrainOpKind, hasher: &mut impl Hasher) {
             mask,
             output,
             mode,
-            aux,
         } => {
             4_u8.hash(hasher);
             group.hash(hasher);
@@ -571,15 +580,22 @@ fn hash_operation_kind(kind: &TerrainOpKind, hasher: &mut impl Hasher) {
             mask.hash(hasher);
             output.hash(hasher);
             mode.hash(hasher);
-            for field in aux {
-                field.field.hash(hasher);
-                field.parent.hash(hasher);
-                field.child.hash(hasher);
-                field.output.hash(hasher);
-            }
+        }
+        TerrainOpKind::CompositeAuxField {
+            group,
+            mask,
+            composite,
+        } => {
+            5_u8.hash(hasher);
+            group.hash(hasher);
+            mask.hash(hasher);
+            composite.field.hash(hasher);
+            composite.parent.hash(hasher);
+            composite.child.hash(hasher);
+            composite.output.hash(hasher);
         }
         TerrainOpKind::PublishOutput { output, source } => {
-            5_u8.hash(hasher);
+            6_u8.hash(hasher);
             output.hash(hasher);
             source.hash(hasher);
         }

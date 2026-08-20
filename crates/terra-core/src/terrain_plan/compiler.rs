@@ -8,7 +8,7 @@ use crate::ids::{LayerId, OutputId};
 use crate::invalidation::{AuxReach, Reach};
 use crate::layer::{
     BindingSource, GroupInputMode, GroupKind, Layer, LayerGroup, LayerStack, NamedOutputDecl,
-    StackNode,
+    SelectedGroupInput, StackNode,
 };
 use crate::mask::{
     ClimateMaskChannel, DistNode, DistNodeKind, Distribution, MaskAsset, MaskId, MaskSource,
@@ -31,12 +31,12 @@ pub enum TerrainPlanDiagnostic {
     MissingMask { owner: NodeRef, mask: MaskId },
     #[error("{owner:?} references missing output {output:?}")]
     MissingOutput { owner: NodeRef, output: OutputId },
+    #[error("{owner:?} references disabled or excluded output {output:?}")]
+    DisabledOutput { owner: NodeRef, output: OutputId },
     #[error("{owner:?} cannot publish unavailable field {field:?}")]
     UnavailableField { owner: NodeRef, field: FieldId },
-    #[error("selected-field input for group {group:?} is deferred to cross-edge compilation")]
-    UnsupportedSelectedField { group: LayerId },
-    #[error("output binding on {owner:?} is deferred to cross-edge compilation")]
-    UnsupportedOutputBinding { owner: NodeRef },
+    #[error("{owner:?} references output {output:?} before it is available")]
+    UnavailableOutput { owner: NodeRef, output: OutputId },
     #[error("authored dependency cycle involves {nodes:?}")]
     DependencyCycle { nodes: Vec<NodeRef> },
     #[error(transparent)]
@@ -46,8 +46,7 @@ pub enum TerrainPlanDiagnostic {
 /// Compile one authored stack for a particular structural revision.
 ///
 /// The compiler reads payload metadata but stores no CPU fields or backend
-/// resources. Disabled and solo-excluded nodes emit no operations. Selected-field
-/// semantics fail explicitly until their dedicated compiler phase lands.
+/// resources. Disabled and solo-excluded nodes emit no operations.
 pub fn compile_terrain_plan(
     stack: &LayerStack,
     mask_assets: &[MaskAsset],
@@ -67,6 +66,7 @@ pub fn compile_terrain_plan(
         builder,
         mask_assets,
         selection: selection.into_iter().collect(),
+        published_outputs: HashMap::new(),
     };
     let root = compiler
         .builder
@@ -136,6 +136,9 @@ struct Compiler<'a> {
     builder: TerrainPlanBuilder,
     mask_assets: &'a [MaskAsset],
     selection: HashMap<NodeRef, PlanNodeSelection>,
+    /// Resolved publications in authored execution order. References are stable
+    /// by `OutputId`; the display name and sibling position are irrelevant.
+    published_outputs: HashMap<OutputId, FieldSlot>,
 }
 
 impl Compiler<'_> {
@@ -176,7 +179,7 @@ impl Compiler<'_> {
         let span_start = self.builder.operation_count();
         let origin = PlanOrigin::Authored(owner_ref);
         let base = state.height;
-        let input_fields = resolve_layer_inputs(layer, state);
+        let input_fields = self.resolve_layer_inputs(layer, state)?;
         let candidate = self.builder.add_field(LogicalFieldKind::Height, origin);
 
         let mut produced = Vec::new();
@@ -226,7 +229,8 @@ impl Compiler<'_> {
         }
 
         let mask = self.builder.add_field(LogicalFieldKind::Mask, origin);
-        let mask_inputs = resolve_distribution_inputs(&layer.common.masks, state, self.mask_assets);
+        let mask_inputs =
+            self.resolve_distribution_inputs(owner_ref, &layer.common.masks, state)?;
         let mask_op = self.builder.add_operation(TerrainOp {
             origin,
             reach: crate::mask::distribution_reach(&layer.common.masks, self.mask_assets),
@@ -284,7 +288,7 @@ impl Compiler<'_> {
         // Group distributions observe the parent context at the group boundary,
         // before private children mutate their isolated state.
         let mask = self.builder.add_field(LogicalFieldKind::Mask, origin);
-        let mask_inputs = resolve_distribution_inputs(&group.masks, &parent, self.mask_assets);
+        let mask_inputs = self.resolve_distribution_inputs(owner_ref, &group.masks, &parent)?;
         let mask_op = self.builder.add_operation(TerrainOp {
             origin,
             reach: crate::mask::distribution_reach(&group.masks, self.mask_assets),
@@ -298,14 +302,29 @@ impl Compiler<'_> {
         self.record_distribution_dependencies(mask_op, &group.masks);
 
         let private_seed = self.builder.add_field(LogicalFieldKind::Height, origin);
-        let source = match group.input_mode {
+        let source = match &group.input_mode {
             GroupInputMode::CopyInput => SeedSource::Copy(parent.height),
             GroupInputMode::EmptyHeight => SeedSource::Zero,
-            GroupInputMode::SelectedField(_) => {
-                return Err(TerrainPlanDiagnostic::UnsupportedSelectedField { group: group.id });
+            GroupInputMode::SelectedField(SelectedGroupInput::Field(field)) => {
+                let Some(slot) = parent.field(field) else {
+                    return Err(TerrainPlanDiagnostic::UnavailableField {
+                        owner: owner_ref,
+                        field: field.clone(),
+                    });
+                };
+                SeedSource::Selected(slot)
+            }
+            GroupInputMode::SelectedField(SelectedGroupInput::Output(output)) => {
+                let Some(slot) = self.published_outputs.get(output).copied() else {
+                    return Err(TerrainPlanDiagnostic::UnavailableOutput {
+                        owner: owner_ref,
+                        output: *output,
+                    });
+                };
+                SeedSource::Selected(slot)
             }
         };
-        self.builder.add_operation(TerrainOp {
+        let seed = self.builder.add_operation(TerrainOp {
             origin,
             reach: Reach::LOCAL,
             aux_reach: AuxReach::HeightOnly,
@@ -314,6 +333,14 @@ impl Compiler<'_> {
                 output: private_seed,
             },
         });
+        if let GroupInputMode::SelectedField(SelectedGroupInput::Output(output)) = &group.input_mode
+        {
+            self.builder.record_authored_dependency(
+                seed,
+                NodeRef::Output(*output),
+                crate::deps::DepKind::GroupInput,
+            );
+        }
 
         let mut private = parent.clone();
         private.height = private_seed;
@@ -360,9 +387,21 @@ impl Compiler<'_> {
                 mask,
                 output,
                 mode,
-                aux: aux.clone(),
             },
         });
+
+        for composite in &aux {
+            self.builder.add_operation(TerrainOp {
+                origin,
+                reach: Reach::LOCAL,
+                aux_reach: AuxReach::PerTexel,
+                kind: TerrainOpKind::CompositeAuxField {
+                    group: group.id,
+                    mask,
+                    composite: composite.clone(),
+                },
+            });
+        }
 
         state.height = output;
         state.aux = parent.aux;
@@ -401,8 +440,88 @@ impl Compiler<'_> {
                     source,
                 },
             });
+            self.published_outputs.insert(output.id, source);
         }
         Ok(())
+    }
+
+    fn resolve_layer_inputs(
+        &self,
+        layer: &Layer,
+        state: &PlanState,
+    ) -> Result<Vec<FieldSlot>, TerrainPlanDiagnostic> {
+        let owner = NodeRef::Layer(layer.id());
+        let mut slots = Vec::new();
+        let mut fields = layer.kind.required_fields();
+        fields.extend(layer.kind.optional_fields());
+        for field in fields {
+            if field != FieldId::Height {
+                if let Some(slot) = state.field(&field) {
+                    push_slot(&mut slots, slot);
+                }
+            }
+        }
+        for binding in &layer.common.param_bindings {
+            match &binding.source {
+                BindingSource::Field(field) => {
+                    let Some(slot) = state.field(field) else {
+                        return Err(TerrainPlanDiagnostic::UnavailableField {
+                            owner,
+                            field: field.clone(),
+                        });
+                    };
+                    push_slot(&mut slots, slot);
+                }
+                BindingSource::LayerOutput(output) | BindingSource::GroupOutput(output) => {
+                    let Some(slot) = self.published_outputs.get(output).copied() else {
+                        return Err(TerrainPlanDiagnostic::UnavailableOutput {
+                            owner,
+                            output: *output,
+                        });
+                    };
+                    push_slot(&mut slots, slot);
+                }
+                BindingSource::Mask(_) | BindingSource::Constant(_) => {}
+            }
+        }
+        Ok(slots)
+    }
+
+    fn resolve_distribution_inputs(
+        &self,
+        owner: NodeRef,
+        distribution: &Distribution,
+        state: &PlanState,
+    ) -> Result<Vec<FieldSlot>, TerrainPlanDiagnostic> {
+        let mut fields = Vec::new();
+        let mut outputs = Vec::new();
+        for node in &distribution.nodes {
+            collect_node_sources(node, self.mask_assets, &mut fields, &mut outputs);
+        }
+        for entry in distribution.iter() {
+            if let Some(asset) = self
+                .mask_assets
+                .iter()
+                .find(|asset| asset.id == entry.mask.id)
+            {
+                collect_mask_source(&asset.source, &mut fields, &mut outputs);
+            }
+        }
+        let mut slots = Vec::new();
+        for field in fields {
+            if let Some(slot) = state.field(&field) {
+                push_slot(&mut slots, slot);
+            }
+        }
+        for output in outputs {
+            // Missing identifiers are reported in preflight; an existing but not-yet
+            // published output is a deterministic availability error at the consumer.
+            let Some(slot) = self.published_outputs.get(&output).copied() else {
+                return Err(TerrainPlanDiagnostic::UnavailableOutput { owner, output });
+            };
+            push_slot(&mut slots, slot);
+        }
+        Ok(slots)
     }
 
     fn record_distribution_dependencies(
@@ -429,30 +548,6 @@ impl Compiler<'_> {
     }
 }
 
-fn resolve_layer_inputs(layer: &Layer, state: &PlanState) -> Vec<FieldSlot> {
-    let mut fields = layer.kind.required_fields();
-    fields.extend(layer.kind.optional_fields());
-    fields.extend(layer.common.param_bindings.iter().filter_map(|binding| {
-        if let BindingSource::Field(field) = &binding.source {
-            Some(field.clone())
-        } else {
-            None
-        }
-    }));
-    let mut slots = Vec::new();
-    for field in fields {
-        if field == FieldId::Height {
-            continue;
-        }
-        if let Some(slot) = state.field(&field) {
-            if !slots.contains(&slot) {
-                slots.push(slot);
-            }
-        }
-    }
-    slots
-}
-
 fn configured_layer_reach(layer: &Layer) -> Reach {
     if !layer.common.param_bindings.is_empty() {
         Reach::Full
@@ -461,32 +556,12 @@ fn configured_layer_reach(layer: &Layer) -> Reach {
     }
 }
 
-fn resolve_distribution_inputs(
-    distribution: &Distribution,
-    state: &PlanState,
+fn collect_node_sources(
+    node: &DistNode,
     mask_assets: &[MaskAsset],
-) -> Vec<FieldSlot> {
-    let mut fields = Vec::new();
-    for node in &distribution.nodes {
-        collect_node_fields(node, mask_assets, &mut fields);
-    }
-    for entry in distribution.iter() {
-        if let Some(asset) = mask_assets.iter().find(|asset| asset.id == entry.mask.id) {
-            collect_mask_source_field(&asset.source, &mut fields);
-        }
-    }
-    fields
-        .iter()
-        .filter_map(|field| state.field(field))
-        .fold(Vec::new(), |mut slots, slot| {
-            if !slots.contains(&slot) {
-                slots.push(slot);
-            }
-            slots
-        })
-}
-
-fn collect_node_fields(node: &DistNode, mask_assets: &[MaskAsset], fields: &mut Vec<FieldId>) {
+    fields: &mut Vec<FieldId>,
+    outputs: &mut Vec<OutputId>,
+) {
     match &node.kind {
         DistNodeKind::Flow { .. } => push_field(fields, FieldId::FlowAccumulation),
         DistNodeKind::Climate { channel } => push_field(
@@ -505,17 +580,21 @@ fn collect_node_fields(node: &DistNode, mask_assets: &[MaskAsset], fields: &mut 
         | DistNodeKind::ImportedMask { mask }
         | DistNodeKind::Distance { mask, .. } => {
             if let Some(asset) = mask_assets.iter().find(|asset| asset.id == mask.id) {
-                collect_mask_source_field(&asset.source, fields);
+                collect_mask_source(&asset.source, fields, outputs);
             }
         }
         _ => {}
     }
     for child in &node.children {
-        collect_node_fields(child, mask_assets, fields);
+        collect_node_sources(child, mask_assets, fields, outputs);
     }
 }
 
-fn collect_mask_source_field(source: &MaskSource, fields: &mut Vec<FieldId>) {
+fn collect_mask_source(
+    source: &MaskSource,
+    fields: &mut Vec<FieldId>,
+    outputs: &mut Vec<OutputId>,
+) {
     let field = match source {
         MaskSource::FlowDirection => Some(FieldId::FlowDirection),
         MaskSource::FlowAccumulation { .. } => Some(FieldId::FlowAccumulation),
@@ -531,10 +610,22 @@ fn collect_mask_source_field(source: &MaskSource, fields: &mut Vec<FieldId>) {
         MaskSource::SoilMoisture => Some(FieldId::SoilMoisture),
         MaskSource::WindExposure => Some(FieldId::WindExposure),
         MaskSource::Named(name) => Some(FieldId::Named(name.clone())),
+        MaskSource::LayerOutput { output_id } => {
+            if !outputs.contains(output_id) {
+                outputs.push(*output_id);
+            }
+            None
+        }
         _ => None,
     };
     if let Some(field) = field {
         push_field(fields, field);
+    }
+}
+
+fn push_slot(slots: &mut Vec<FieldSlot>, slot: FieldSlot) {
+    if !slots.contains(&slot) {
+        slots.push(slot);
     }
 }
 
@@ -615,6 +706,7 @@ fn preflight(stack: &LayerStack, mask_assets: &[MaskAsset]) -> Vec<TerrainPlanDi
     let known_masks: HashSet<_> = mask_assets.iter().map(|asset| asset.id).collect();
     let mut node_ids = HashSet::new();
     let mut output_ids = HashSet::new();
+    let mut active_output_ids = HashSet::new();
     let mut diagnostics = Vec::new();
     collect_id_diagnostics(
         &stack.nodes,
@@ -622,12 +714,58 @@ fn preflight(stack: &LayerStack, mask_assets: &[MaskAsset]) -> Vec<TerrainPlanDi
         &mut output_ids,
         &mut diagnostics,
     );
-    collect_reference_diagnostics(&stack.nodes, &known_masks, &output_ids, &mut diagnostics);
+    collect_active_outputs(&stack.nodes, true, &mut active_output_ids);
+    collect_reference_diagnostics(
+        &stack.nodes,
+        mask_assets,
+        &known_masks,
+        &output_ids,
+        &active_output_ids,
+        &mut diagnostics,
+    );
     let dependencies = crate::deps::DependencyGraph::build_from_document(stack, mask_assets);
     if let Err(crate::deps::DepError::Cycle(nodes)) = dependencies.detect_cycle() {
         diagnostics.push(TerrainPlanDiagnostic::DependencyCycle { nodes });
     }
     diagnostics
+}
+
+fn collect_active_outputs(
+    nodes: &[StackNode],
+    ancestor_enabled: bool,
+    active: &mut HashSet<OutputId>,
+) {
+    let soloing = ancestor_enabled && nodes.iter().any(StackNode::contains_solo);
+    for node in nodes {
+        let selected = ancestor_enabled && (!soloing || node.contains_solo());
+        match node {
+            StackNode::Layer(layer) => {
+                if selected && layer.common.enabled {
+                    active.extend(
+                        layer
+                            .common
+                            .outputs
+                            .iter()
+                            .filter(|output| output.enabled)
+                            .map(|output| output.id),
+                    );
+                }
+            }
+            StackNode::Group(group) => {
+                let enabled = selected && group.enabled;
+                if enabled {
+                    active.extend(
+                        group
+                            .outputs
+                            .iter()
+                            .filter(|output| output.enabled)
+                            .map(|output| output.id),
+                    );
+                }
+                collect_active_outputs(&group.children, enabled, active);
+            }
+        }
+    }
 }
 
 fn collect_id_diagnostics(
@@ -661,15 +799,25 @@ fn collect_id_diagnostics(
 
 fn collect_reference_diagnostics(
     nodes: &[StackNode],
+    mask_assets: &[MaskAsset],
     known_masks: &HashSet<MaskId>,
     known_outputs: &HashSet<OutputId>,
+    active_outputs: &HashSet<OutputId>,
     diagnostics: &mut Vec<TerrainPlanDiagnostic>,
 ) {
     for node in nodes {
         match node {
             StackNode::Layer(layer) if layer.common.enabled => {
                 let owner = NodeRef::Layer(layer.id());
-                validate_distribution(owner, &layer.common.masks, known_masks, diagnostics);
+                validate_distribution(
+                    owner,
+                    &layer.common.masks,
+                    mask_assets,
+                    known_masks,
+                    known_outputs,
+                    active_outputs,
+                    diagnostics,
+                );
                 for binding in &layer.common.param_bindings {
                     match binding.source {
                         BindingSource::Mask(mask) if !known_masks.contains(&mask) => {
@@ -679,10 +827,9 @@ fn collect_reference_diagnostics(
                             if !known_outputs.contains(&output) {
                                 diagnostics
                                     .push(TerrainPlanDiagnostic::MissingOutput { owner, output });
-                            } else {
-                                diagnostics.push(TerrainPlanDiagnostic::UnsupportedOutputBinding {
-                                    owner,
-                                });
+                            } else if !active_outputs.contains(&output) {
+                                diagnostics
+                                    .push(TerrainPlanDiagnostic::DisabledOutput { owner, output });
                             }
                         }
                         _ => {}
@@ -692,15 +839,30 @@ fn collect_reference_diagnostics(
             StackNode::Layer(_) => {}
             StackNode::Group(group) if group.enabled => {
                 let owner = NodeRef::Group(group.id);
-                validate_distribution(owner, &group.masks, known_masks, diagnostics);
-                if matches!(group.input_mode, GroupInputMode::SelectedField(_)) {
-                    diagnostics
-                        .push(TerrainPlanDiagnostic::UnsupportedSelectedField { group: group.id });
+                validate_distribution(
+                    owner,
+                    &group.masks,
+                    mask_assets,
+                    known_masks,
+                    known_outputs,
+                    active_outputs,
+                    diagnostics,
+                );
+                if let GroupInputMode::SelectedField(SelectedGroupInput::Output(output)) =
+                    group.input_mode
+                {
+                    if !known_outputs.contains(&output) {
+                        diagnostics.push(TerrainPlanDiagnostic::MissingOutput { owner, output });
+                    } else if !active_outputs.contains(&output) {
+                        diagnostics.push(TerrainPlanDiagnostic::DisabledOutput { owner, output });
+                    }
                 }
                 collect_reference_diagnostics(
                     &group.children,
+                    mask_assets,
                     known_masks,
                     known_outputs,
+                    active_outputs,
                     diagnostics,
                 );
             }
@@ -712,7 +874,10 @@ fn collect_reference_diagnostics(
 fn validate_distribution(
     owner: NodeRef,
     distribution: &Distribution,
+    mask_assets: &[MaskAsset],
     known_masks: &HashSet<MaskId>,
+    known_outputs: &HashSet<OutputId>,
+    active_outputs: &HashSet<OutputId>,
     diagnostics: &mut Vec<TerrainPlanDiagnostic>,
 ) {
     for entry in distribution.iter() {
@@ -725,6 +890,24 @@ fn validate_distribution(
     }
     for node in &distribution.nodes {
         validate_dist_node(owner, node, known_masks, diagnostics);
+    }
+    for mask in distribution_mask_ids(distribution) {
+        let Some(asset) = mask_assets.iter().find(|asset| asset.id == mask) else {
+            continue;
+        };
+        if let MaskSource::LayerOutput { output_id } = asset.source {
+            if !known_outputs.contains(&output_id) {
+                diagnostics.push(TerrainPlanDiagnostic::MissingOutput {
+                    owner,
+                    output: output_id,
+                });
+            } else if !active_outputs.contains(&output_id) {
+                diagnostics.push(TerrainPlanDiagnostic::DisabledOutput {
+                    owner,
+                    output: output_id,
+                });
+            }
+        }
     }
 }
 

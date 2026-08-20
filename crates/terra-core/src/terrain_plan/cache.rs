@@ -260,12 +260,11 @@ impl TerrainPlanCache {
                             crate::mask::distribution_reach(distribution, mask_assets);
                     }
                 }
-                TerrainOpKind::CompositeGroup { aux, .. } => {
-                    operation.aux_reach = if aux.is_empty() {
-                        AuxReach::HeightOnly
-                    } else {
-                        AuxReach::PerTexel
-                    };
+                TerrainOpKind::CompositeGroup { .. } => {
+                    operation.aux_reach = AuxReach::HeightOnly;
+                }
+                TerrainOpKind::CompositeAuxField { .. } => {
+                    operation.aux_reach = AuxReach::PerTexel;
                 }
                 _ => {}
             }

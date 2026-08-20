@@ -2,11 +2,12 @@ use std::collections::HashMap;
 
 use terra_core::deps::NodeRef;
 use terra_core::eval::{EvalContext, ProcessorRegistry, StackEvaluator};
+use terra_core::field_data::FieldId;
 use terra_core::heightfield::{Heightfield, HeightfieldMetrics};
 use terra_core::ids::LayerId;
 use terra_core::layer::{
     blend_heights, FlatParams, GroupInputMode, GroupKind, Layer, LayerGroup, LayerKind, LayerStack,
-    StackNode, VolcanoParams,
+    NamedOutputDecl, SelectedGroupInput, StackNode, VolcanoParams,
 };
 use terra_core::mask::{bake_distribution_with_context, DistBakeContext, DistNode, MaskField};
 use terra_core::terrain_plan::{
@@ -50,8 +51,9 @@ fn plan_interpret(
             TerrainOpKind::Seed { source, output } => {
                 let height = match source {
                     SeedSource::Zero => Heightfield::zeros(metrics),
-                    SeedSource::Copy(source) => heights[source].clone(),
-                    SeedSource::Selected(_) => panic!("selected fields are not in #141 plans"),
+                    SeedSource::Copy(source) | SeedSource::Selected(source) => {
+                        heights[source].clone()
+                    }
                 };
                 heights.insert(*output, height);
             }
@@ -145,9 +147,7 @@ fn plan_interpret(
                 mask,
                 output,
                 mode,
-                aux,
             } => {
-                assert!(aux.is_empty(), "height fixture unexpectedly merges aux");
                 let authored = stack.find_group(*group).expect("composite group exists");
                 let parent = &heights[parent];
                 let private_seed = &heights[private_seed];
@@ -180,6 +180,9 @@ fn plan_interpret(
                 }
                 composed.refresh_halos();
                 heights.insert(*output, composed);
+            }
+            TerrainOpKind::CompositeAuxField { .. } => {
+                panic!("height fixture unexpectedly merges aux")
             }
             TerrainOpKind::PublishOutput { .. } => {}
         }
@@ -334,4 +337,23 @@ fn disabled_solo_nodes_match_cpu_oracle() {
     disabled_group.push(flat(62, 100.0));
     disabled_group.push_group(group);
     assert_cpu_parity(disabled_group);
+}
+
+#[test]
+fn selected_named_output_plan_matches_cpu_oracle() {
+    let mut producer = flat(70, 25.0);
+    let declaration = NamedOutputDecl::new("Seed", FieldId::Height);
+    let output = declaration.id;
+    producer.common.outputs.push(declaration);
+    let mut selected = LayerGroup::isolated("Selected");
+    selected.id = LayerId::from_u128(71);
+    selected.input_mode = GroupInputMode::SelectedField(SelectedGroupInput::Output(output));
+    let mut delta = flat(72, 5.0);
+    delta.common.blend = terra_core::layer::BlendMode::Add;
+    selected.children.push(StackNode::Layer(delta));
+    let mut stack = LayerStack::new();
+    stack.push(producer);
+    stack.push(flat(73, 100.0));
+    stack.push_group(selected);
+    assert_cpu_parity(stack);
 }

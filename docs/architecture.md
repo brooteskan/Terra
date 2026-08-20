@@ -110,10 +110,11 @@ re-realize the compatible semantic plan rather than recompiling it. Execution ma
 recorded into a staged resource set and committed only after successful validation and
 submission; dropping a failed candidate leaves the active last-good textures intact.
 
-The field-addressable backend implements zero/copy seeds, supported Constant/Height/
-Slope distributions, standard group blends, biome CopyInput height-delta composition,
-and explicit masked auxiliary publication. Selected fields, distribution nodes, and
-cross-output/observed auxiliary mask inputs remain gated for their dedicated phase.
+The field-addressable backend implements zero/copy/selected seeds, supported Constant/
+Height/Slope and named-output distributions, standard group blends, biome CopyInput
+height-delta composition, and independently live masked auxiliary publication.
+Unsupported distribution nodes, field-backed masks whose producer has no GPU auxiliary
+publication, and dynamic parameter reductions fall back at their exact consumer.
 `GpuTerrainEngine` accepts a revision-matching compiled plan and dispatches these
 operations in plan order. Scoped groups no longer trigger a categorical tree fallback;
 unsupported layer configurations or not-yet-resident auxiliary dependencies report the
@@ -142,12 +143,13 @@ LayerStack (authored source)
 
 The plan IR and recursive `LayerStack` compiler are present. The compiler preserves
 bottom-to-top order, pass-through folders, private `CopyInput` / `EmptyHeight` group
-fields, group composites, point-of-use mask operations, explicit auxiliary merges,
-and authored provenance. Solo is compiled as a sibling-level tree selection: when a
+fields, selected field/output seeds, retained named publications, point-of-use mask
+operations, per-field auxiliary merges, parameter-binding edges, and authored
+provenance. Solo is compiled as a sibling-level tree selection: when a
 sibling list contains a solo descendant, only participating paths are lowered, while
-ancestor containers remain present and disabled participants emit no work. Selected
-and cross-tree fields remain explicit compile diagnostics until their dedicated compiler
-phase lands. Incremental GPU work is selected from plan invalidation and persistent
+ancestor containers remain present and disabled participants emit no work. Missing,
+disabled/excluded, unavailable, duplicate, and cyclic cross-references are explicit
+compile diagnostics. Incremental GPU work is selected from plan invalidation and persistent
 field checkpoints; incremental CPU rebuild continues to use `LayerCache` +
 `mark_dirty_from`.
 Progressive preview walks `Draft → Medium → Full`: the app advances the quality ladder

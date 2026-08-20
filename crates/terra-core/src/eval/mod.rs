@@ -634,12 +634,15 @@ impl StackEvaluator {
                     if pass_through {
                         // Organisational folder: children mutate the live context.
                         current = self.evaluate_nodes(&group.children, ctx, &current)?;
+                        publish_named_outputs(ctx, &group.outputs, &current);
                     } else {
                         // Isolated composite: private working height, then mix back.
                         let private_seed = match &group.input_mode {
                             GroupInputMode::CopyInput => current.clone(),
                             GroupInputMode::EmptyHeight => Heightfield::zeros(ctx.metrics),
-                            GroupInputMode::SelectedField(_) => current.clone(),
+                            GroupInputMode::SelectedField(selected) => {
+                                selected_group_seed(ctx, &current, selected)
+                            }
                         };
                         // Snapshot aux so child sims don't leak into the parent
                         // until after the group composite.
@@ -698,6 +701,7 @@ impl StackEvaluator {
                         };
                         // Merge child aux weighted by group mask (non-destructive leak fix).
                         merge_aux_masked(ctx, &child_aux, &mask, mix_opacity);
+                        publish_named_outputs(ctx, &group.outputs, &current);
                     }
                 }
             }
@@ -1510,7 +1514,15 @@ fn layer_with_world_scale(layer: &Layer, world_scale: f32) -> Layer {
 }
 
 fn publish_layer_outputs(ctx: &mut EvalContext, layer: &Layer, height: &Heightfield) {
-    for output in &layer.common.outputs {
+    publish_named_outputs(ctx, &layer.common.outputs, height);
+}
+
+fn publish_named_outputs(
+    ctx: &mut EvalContext,
+    outputs: &[crate::layer::NamedOutputDecl],
+    height: &Heightfield,
+) {
+    for output in outputs {
         if !output.enabled {
             continue;
         }
@@ -1525,6 +1537,32 @@ fn publish_layer_outputs(ctx: &mut EvalContext, layer: &Layer, height: &Heightfi
         };
         ctx.published_outputs.insert(output.id, field);
     }
+}
+
+fn selected_group_seed(
+    ctx: &EvalContext,
+    current: &Heightfield,
+    selected: &crate::layer::SelectedGroupInput,
+) -> Heightfield {
+    use crate::layer::SelectedGroupInput;
+    let source = match selected {
+        SelectedGroupInput::Field(crate::field_data::FieldId::Height) => return current.clone(),
+        SelectedGroupInput::Field(field) => ctx.aux_maps.get(&field.cache_key()),
+        SelectedGroupInput::Output(output) => ctx.published_outputs.get(output),
+    };
+    let Some(source) = source else {
+        // The compiled plan diagnoses unavailable sources. Keep the direct CPU
+        // evaluator deterministic for callers that bypass plan compilation.
+        return Heightfield::zeros(current.metrics);
+    };
+    let mut height = Heightfield::new(current.metrics);
+    for j in 0..current.metrics.height {
+        for i in 0..current.metrics.width {
+            height.set(i, j, source.get(i, j));
+        }
+    }
+    height.refresh_halos();
+    height
 }
 
 fn mix_heightfields(

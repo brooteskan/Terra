@@ -77,11 +77,9 @@ impl GpuPlanResourceLayout {
                     private_seed,
                     child_output,
                     output,
-                    aux,
                     ..
                 } => {
                     persistent.insert(*output);
-                    persistent.extend(aux.iter().map(|merge| merge.output));
 
                     let seed_operation = plan
                         .provenance()
@@ -95,7 +93,6 @@ impl GpuPlanResourceLayout {
                         if lifetime.first_operation.index() >= seed_operation
                             && lifetime.last_operation.index() <= operation_index
                             && field.slot != *output
-                            && !aux.iter().any(|merge| merge.output == field.slot)
                         {
                             private.insert(field.slot);
                         }
@@ -104,6 +101,9 @@ impl GpuPlanResourceLayout {
                     // it is scratch, but not part of the isolated private slice.
                     private.insert(*private_seed);
                     private.insert(*child_output);
+                }
+                TerrainOpKind::CompositeAuxField { composite, .. } => {
+                    persistent.insert(composite.output);
                 }
                 TerrainOpKind::PublishOutput { source, .. } => {
                     published.insert(*source);

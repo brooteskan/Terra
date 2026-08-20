@@ -278,13 +278,6 @@ fn plan_operation_fallback(error: CompiledDispatchError) -> GpuFallbackReason {
                 format!("blur radius {radius} exceeds the GPU limit"),
             )
         }
-        CompiledDispatchError::Plan(GpuPlanOperationError::UnsupportedSelectedField(_)) => {
-            GpuFallbackReason::new(
-                GpuFallbackCode::UnsupportedOptions,
-                "selected field",
-                "selected-field seeds are not GPU-resident",
-            )
-        }
         CompiledDispatchError::Plan(error) => GpuFallbackReason::new(
             GpuFallbackCode::InvalidConfiguration,
             "compiled operation",
@@ -5407,6 +5400,14 @@ impl GpuTerrainEngine {
         });
 
         let mut last_height = None;
+        let published_output_slots: HashMap<_, _> = plan
+            .operations()
+            .iter()
+            .filter_map(|operation| match operation.kind {
+                TerrainOpKind::PublishOutput { output, source } => Some((output, source)),
+                _ => None,
+            })
+            .collect();
         for operation_id in &selected {
             let operation = plan
                 .operation(*operation_id)
@@ -5427,15 +5428,13 @@ impl GpuTerrainEngine {
                     }
                     TerrainOpKind::EvaluateMask {
                         input_height,
-                        input_fields,
+                        input_fields: _,
                         output_mask,
                     } => {
-                        let result = if !input_fields.is_empty() {
-                            Err(GpuPlanOperationError::UnsupportedMaskNodes)
-                        } else if let Some(distribution) =
+                        let result = if let Some(distribution) =
                             plan_distribution(stack, operation.origin)
                         {
-                            self.plan_operations.evaluate_distribution_region(
+                            self.plan_operations.evaluate_distribution_resolved_region(
                                 device,
                                 &mut encoder,
                                 &candidate,
@@ -5443,6 +5442,7 @@ impl GpuTerrainEngine {
                                 *output_mask,
                                 distribution,
                                 mask_assets,
+                                &published_output_slots,
                                 metrics.dx(),
                                 metrics.dz(),
                                 Some(region),
@@ -5575,7 +5575,6 @@ impl GpuTerrainEngine {
                         mask,
                         output,
                         mode,
-                        aux,
                     } => {
                         let authored = stack.find_group(*group).expect("compiled group owner");
                         let opacity = if authored.group_kind == terra_core::layer::GroupKind::Biome
@@ -5600,21 +5599,31 @@ impl GpuTerrainEngine {
                             },
                             Some(region),
                         )?;
-                        for merge in aux {
-                            if plan.analysis().field_is_live(merge.output) {
-                                self.plan_operations.composite_aux_region(
-                                    device,
-                                    &mut encoder,
-                                    &candidate,
-                                    merge.parent,
-                                    merge.child,
-                                    *mask,
-                                    merge.output,
-                                    opacity,
-                                    Some(region),
-                                )?;
-                            }
-                        }
+                        Ok(())
+                    }
+                    TerrainOpKind::CompositeAuxField {
+                        group,
+                        mask,
+                        composite,
+                    } => {
+                        let authored = stack.find_group(*group).expect("compiled group owner");
+                        let opacity = if authored.group_kind == terra_core::layer::GroupKind::Biome
+                        {
+                            authored.opacity * authored.filter_blending
+                        } else {
+                            authored.opacity
+                        };
+                        self.plan_operations.composite_aux_region(
+                            device,
+                            &mut encoder,
+                            &candidate,
+                            composite.parent,
+                            composite.child,
+                            *mask,
+                            composite.output,
+                            opacity,
+                            Some(region),
+                        )?;
                         Ok(())
                     }
                     TerrainOpKind::PublishOutput { .. } => Ok(()),

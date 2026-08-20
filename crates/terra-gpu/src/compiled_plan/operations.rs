@@ -1,4 +1,6 @@
 use bytemuck::{Pod, Zeroable};
+use std::collections::HashMap;
+use terra_core::ids::OutputId;
 use terra_core::layer::BlendMode;
 use terra_core::mask::{Distribution, MaskAsset, MaskCombine, MaskOp, MaskSource};
 use terra_core::terrain_plan::{FieldSlot, GroupCompositeMode, SeedSource};
@@ -214,11 +216,8 @@ impl GpuPlanOperations {
             SeedSource::Zero => {
                 self.fill_field_region(device, encoder, resources, output, 0.0, region)
             }
-            SeedSource::Copy(source) => {
+            SeedSource::Copy(source) | SeedSource::Selected(source) => {
                 self.copy_field_region(device, encoder, resources, source, output, region)
-            }
-            SeedSource::Selected(source) => {
-                Err(GpuPlanOperationError::UnsupportedSelectedField(source))
             }
         }
     }
@@ -264,6 +263,36 @@ impl GpuPlanOperations {
         dz: f32,
         region: Option<(u32, u32, u32, u32)>,
     ) -> Result<(), GpuPlanOperationError> {
+        self.evaluate_distribution_resolved_region(
+            device,
+            encoder,
+            resources,
+            input_height,
+            output_mask,
+            distribution,
+            mask_assets,
+            &HashMap::new(),
+            dx,
+            dz,
+            region,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn evaluate_distribution_resolved_region(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        resources: &GpuPlanResources,
+        input_height: FieldSlot,
+        output_mask: FieldSlot,
+        distribution: &Distribution,
+        mask_assets: &[MaskAsset],
+        published_outputs: &HashMap<OutputId, FieldSlot>,
+        dx: f32,
+        dz: f32,
+        region: Option<(u32, u32, u32, u32)>,
+    ) -> Result<(), GpuPlanOperationError> {
         if !distribution.nodes.is_empty() {
             return Err(GpuPlanOperationError::UnsupportedMaskNodes);
         }
@@ -300,10 +329,18 @@ impl GpuPlanOperations {
                 .iter()
                 .find(|asset| asset.id == entry.mask.id)
                 .ok_or(GpuPlanOperationError::MissingMaskAsset(entry.mask.id))?;
-            let (mode, value, range_min, range_max) = match asset.source {
-                MaskSource::Constant(value) => (0, value, 0.0, 1.0),
-                MaskSource::Height { min, max } => (1, 0.0, min, max),
-                MaskSource::Slope { min_deg, max_deg } => (2, 0.0, min_deg, max_deg),
+            let (source_field, mode, value, range_min, range_max) = match asset.source {
+                MaskSource::Constant(value) => (input_height, 0, value, 0.0, 1.0),
+                MaskSource::Height { min, max } => (input_height, 1, 0.0, min, max),
+                MaskSource::Slope { min_deg, max_deg } => (input_height, 2, 0.0, min_deg, max_deg),
+                MaskSource::LayerOutput { output_id } => {
+                    let Some(source) = published_outputs.get(&output_id).copied() else {
+                        return Err(GpuPlanOperationError::UnsupportedMaskSource(format!(
+                            "unresolved LayerOutput({output_id:?})"
+                        )));
+                    };
+                    (source, 3, 0.0, 0.0, 1.0)
+                }
                 ref source => {
                     return Err(GpuPlanOperationError::UnsupportedMaskSource(format!(
                         "{source:?}"
@@ -313,7 +350,7 @@ impl GpuPlanOperations {
             self.record_mask_bake(
                 device,
                 encoder,
-                resources.view(input_height)?,
+                resources.view(source_field)?,
                 &work_a.view,
                 MaskBakeUniform {
                     width: key.width,
@@ -1060,7 +1097,7 @@ pub enum GpuPlanOperationError {
     UnsupportedBlend(BlendMode),
     #[error("compiled plan operation aliases input {input:?} with output {output:?}")]
     AliasedReadWrite { input: FieldSlot, output: FieldSlot },
-    #[error("compiled plan distribution nodes are not GPU-resident until #147")]
+    #[error("compiled plan distribution nodes are not GPU-resident")]
     UnsupportedMaskNodes,
     #[error("compiled plan mask asset {0:?} is missing")]
     MissingMaskAsset(terra_core::mask::MaskId),
@@ -1070,6 +1107,4 @@ pub enum GpuPlanOperationError {
     MaskBlurRadius(u32),
     #[error("compiled plan mask evaluation requires finite positive cell sizes")]
     InvalidCellSize,
-    #[error("selected-field seed {0:?} is not GPU-resident until #147")]
-    UnsupportedSelectedField(FieldSlot),
 }

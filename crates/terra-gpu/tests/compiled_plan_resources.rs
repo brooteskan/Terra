@@ -1,10 +1,11 @@
 use terra_core::deps::NodeRef;
 use terra_core::eval::{EvalContext, StackEvaluator};
+use terra_core::field_data::FieldId;
 use terra_core::heightfield::{Heightfield, HeightfieldMetrics};
 use terra_core::ids::LayerId;
 use terra_core::layer::{
     BlendMode, FlatParams, GroupInputMode, GroupKind, Layer, LayerGroup, LayerKind, LayerStack,
-    SculptStrokeParams, StackNode, ThermalErosionParams,
+    NamedOutputDecl, SculptStrokeParams, SelectedGroupInput, StackNode, ThermalErosionParams,
 };
 use terra_core::mask::{bake_mask_assets, MaskAsset, MaskId, MaskRef, MaskSource};
 use terra_core::terrain_plan::{
@@ -97,6 +98,171 @@ fn group_mask_is_evaluated_from_the_plan_input_field() {
     gpu.queue.submit(Some(encoder.finish()));
     let values = read_field(gpu, resources, output_mask);
     assert!(values.iter().all(|value| (*value - 0.3).abs() <= 1.0e-5));
+}
+
+#[test]
+fn selected_output_seed_copies_the_resolved_gpu_field() {
+    let gpu = terra_test_gpu::headless_required();
+    let mut producer = flat(44, 2.0);
+    let declaration = NamedOutputDecl::new("Seed", FieldId::Height);
+    let published = declaration.id;
+    producer.common.outputs.push(declaration);
+    let mut group = LayerGroup::isolated("Selected");
+    group.id = LayerId::from_u128(45);
+    group.input_mode = GroupInputMode::SelectedField(SelectedGroupInput::Output(published));
+    group.children.push(StackNode::Layer(flat(46, 1.0)));
+    let mut stack = LayerStack::new();
+    stack.push(producer);
+    stack.push_group(group);
+    let plan = compile(&stack);
+    let (source, output) = plan
+        .operations()
+        .iter()
+        .find_map(|operation| match operation.kind {
+            TerrainOpKind::Seed {
+                source: terra_core::terrain_plan::SeedSource::Selected(source),
+                output,
+            } => Some((source, output)),
+            _ => None,
+        })
+        .expect("selected seed");
+    let mut cache = GpuPlanResourceCache::default();
+    let resources = cache
+        .realize(&gpu.device, &plan, GpuPlanResourceKey::new(64, 4, 1))
+        .expect("resources");
+    let operations = GpuPlanOperations::new(&gpu.device);
+    let mut encoder = gpu
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("compiled-plan-selected-seed"),
+        });
+    operations
+        .fill_field(&gpu.device, &mut encoder, resources, source, 0.375)
+        .unwrap();
+    operations
+        .seed_field(
+            &gpu.device,
+            &mut encoder,
+            resources,
+            terra_core::terrain_plan::SeedSource::Selected(source),
+            output,
+        )
+        .unwrap();
+    gpu.queue.submit(Some(encoder.finish()));
+    assert!(read_field(gpu, resources, output)
+        .iter()
+        .all(|value| (*value - 0.375).abs() <= 1.0e-6));
+}
+
+#[test]
+fn selected_output_group_matches_the_cpu_oracle_on_gpu() {
+    let gpu = terra_test_gpu::headless_required();
+    let metrics = HeightfieldMetrics::new(64, 4, 640.0, 40.0);
+    let mut producer = flat(144, 12.0);
+    let declaration = NamedOutputDecl::new("Seed", FieldId::Height);
+    let published = declaration.id;
+    producer.common.outputs.push(declaration);
+    let mut group = LayerGroup::isolated("Selected");
+    group.id = LayerId::from_u128(145);
+    group.input_mode = GroupInputMode::SelectedField(SelectedGroupInput::Output(published));
+    let mut child = flat(146, 3.0);
+    child.common.blend = BlendMode::Add;
+    group.children.push(StackNode::Layer(child));
+    let mut stack = LayerStack::new();
+    stack.push(producer);
+    stack.push(flat(147, 80.0));
+    stack.push_group(group);
+
+    let plan = compile(&stack);
+    let gpu_height = execute_flat_plan(gpu, &stack, &plan, &[], metrics);
+    let mut context = EvalContext::new(metrics);
+    let cpu_height = StackEvaluator::new()
+        .evaluate_nodes(&stack.nodes, &mut context, &Heightfield::zeros(metrics))
+        .expect("CPU oracle");
+    let max_error = gpu_height
+        .to_dense()
+        .iter()
+        .zip(cpu_height.to_dense())
+        .map(|(actual, expected)| (actual - expected).abs())
+        .fold(0.0_f32, f32::max);
+    assert!(
+        max_error <= 1.0e-5,
+        "selected GPU/CPU max error: {max_error}"
+    );
+}
+
+#[test]
+fn output_backed_mask_reads_the_published_gpu_field() {
+    let gpu = terra_test_gpu::headless_required();
+    let mut producer = flat(47, 0.0);
+    let declaration = NamedOutputDecl::new("Control", FieldId::Height);
+    let published = declaration.id;
+    producer.common.outputs.push(declaration);
+    let asset = MaskAsset::new(
+        MaskId::new(),
+        "output mask",
+        MaskSource::LayerOutput {
+            output_id: published,
+        },
+    );
+    let mut consumer = flat(48, 1.0);
+    consumer.common.masks.push(MaskRef::new(asset.id));
+    let consumer_id = consumer.id();
+    let mut stack = LayerStack::new();
+    stack.push(producer);
+    stack.push(consumer);
+    let plan = compile_with_assets(&stack, std::slice::from_ref(&asset));
+    let source = plan
+        .provenance()
+        .field_for_output(published)
+        .expect("output slot");
+    let (input_height, output_mask) = plan
+        .operations()
+        .iter()
+        .find_map(|operation| match &operation.kind {
+            TerrainOpKind::EvaluateMask {
+                input_height,
+                output_mask,
+                ..
+            } if operation.origin == PlanOrigin::Authored(NodeRef::Layer(consumer_id)) => {
+                Some((*input_height, *output_mask))
+            }
+            _ => None,
+        })
+        .expect("consumer mask");
+    let mut cache = GpuPlanResourceCache::default();
+    let resources = cache
+        .realize(&gpu.device, &plan, GpuPlanResourceKey::new(64, 4, 1))
+        .expect("resources");
+    let operations = GpuPlanOperations::new(&gpu.device);
+    let mut encoder = gpu
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("compiled-plan-output-mask"),
+        });
+    operations
+        .fill_field(&gpu.device, &mut encoder, resources, source, 0.625)
+        .unwrap();
+    let resolved = std::collections::HashMap::from([(published, source)]);
+    operations
+        .evaluate_distribution_resolved_region(
+            &gpu.device,
+            &mut encoder,
+            resources,
+            input_height,
+            output_mask,
+            &stack.find(consumer_id).unwrap().common.masks,
+            std::slice::from_ref(&asset),
+            &resolved,
+            1.0,
+            1.0,
+            None,
+        )
+        .unwrap();
+    gpu.queue.submit(Some(encoder.finish()));
+    assert!(read_field(gpu, resources, output_mask)
+        .iter()
+        .all(|value| (*value - 0.625).abs() <= 1.0e-6));
 }
 
 #[test]
@@ -264,9 +430,7 @@ fn execute_flat_plan(
                 mask,
                 output,
                 mode,
-                aux,
             } => {
-                assert!(aux.is_empty(), "height fixture has no aux outputs");
                 let authored = stack.find_group(*group).expect("composite group");
                 let opacity = if authored.group_kind == GroupKind::Biome {
                     authored.opacity * authored.filter_blending
@@ -290,6 +454,9 @@ fn execute_flat_plan(
                         },
                     )
                     .unwrap();
+            }
+            TerrainOpKind::CompositeAuxField { .. } => {
+                panic!("height fixture has no aux outputs")
             }
             TerrainOpKind::PublishOutput { .. } => {}
         }
@@ -654,12 +821,13 @@ fn group_aux_composite_merges_only_declared_fields() {
         .operations()
         .iter()
         .find_map(|operation| match &operation.kind {
-            TerrainOpKind::CompositeGroup {
-                group, mask, aux, ..
-            } if *group == group_id => aux
-                .iter()
-                .find(|merge| plan.analysis().field_is_live(merge.output))
-                .map(|merge| (merge.parent, merge.child, *mask, merge.output)),
+            TerrainOpKind::CompositeAuxField {
+                group,
+                mask,
+                composite,
+            } if *group == group_id && plan.analysis().field_is_live(composite.output) => {
+                Some((composite.parent, composite.child, *mask, composite.output))
+            }
             _ => None,
         })
         .expect("group aux merge");
