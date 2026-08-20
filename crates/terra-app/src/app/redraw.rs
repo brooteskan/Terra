@@ -648,6 +648,7 @@ impl TerraApp {
                 // Bump the eval token so the worker discards the in-flight job.
                 self.eval_token = self.eval_token.wrapping_add(1);
                 self.eval_worker.set_token(self.eval_token);
+                self.supersede_gpu_refinement();
                 self.ui_state.refining = false;
                 self.ui_state.build_progress = None;
                 self.ui_state.refining_layer_name = None;

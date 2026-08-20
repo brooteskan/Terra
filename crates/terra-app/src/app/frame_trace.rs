@@ -45,6 +45,14 @@ pub(crate) enum FrameTraceEventKind {
     SurfacePresented,
     GpuEvaluationResolved,
     GpuPresentationResolved,
+    RefinementJobCreated,
+    RefinementUnitProgress,
+    RefinementSubmissionQueued,
+    RefinementSubmissionCompleted,
+    RefinementSuperseded,
+    RefinementCandidateCompleted,
+    RefinementPublished,
+    RefinementFailed,
     HeartbeatOverBudget,
 }
 
@@ -61,6 +69,10 @@ pub(crate) struct FrameTraceEvent {
     pub(crate) intent: Option<GpuEvaluationIntent>,
     pub(crate) duration: Option<Duration>,
     pub(crate) gpu_stats: Option<terra_gpu::GpuEvalStats>,
+    pub(crate) refinement_job: Option<u64>,
+    pub(crate) completed_units: usize,
+    pub(crate) total_units: usize,
+    pub(crate) refinement_submission_depth: u8,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -136,8 +148,45 @@ impl FrameTraceRecorder {
                 intent,
                 duration,
                 gpu_stats: None,
+                refinement_job: None,
+                completed_units: 0,
+                total_units: 0,
+                refinement_submission_depth: 0,
             },
         );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_refinement(
+        &mut self,
+        now: Instant,
+        kind: FrameTraceEventKind,
+        identity: Option<FrameIdentity>,
+        phase: Option<FramePhase>,
+        evaluation: EvaluationTraceId,
+        quality: PreviewQuality,
+        job: u64,
+        completed_units: usize,
+        total_units: usize,
+        submission_depth: u8,
+        duration: Option<Duration>,
+    ) {
+        self.record(
+            now,
+            kind,
+            identity,
+            phase,
+            Some(evaluation),
+            Some(quality),
+            Some(GpuEvaluationIntent::Complete),
+            duration,
+        );
+        if let Some(event) = self.events.back_mut() {
+            event.refinement_job = Some(job);
+            event.completed_units = completed_units;
+            event.total_units = total_units;
+            event.refinement_submission_depth = submission_depth;
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -291,6 +340,40 @@ mod tests {
             );
         }
         assert_eq!(trace.events().len(), EVENT_CAPACITY);
+    }
+
+    #[test]
+    fn refinement_events_preserve_frame_generation_progress_and_depth() {
+        let mut trace = FrameTraceRecorder::default();
+        let identity = FrameIdentity {
+            id: LogicalFrameId::new(12),
+            generation_at_start: EditGeneration::new(8),
+            generation: EditGeneration::new(9),
+        };
+        let evaluation = trace.next_evaluation_id();
+        trace.record_refinement(
+            Instant::now(),
+            FrameTraceEventKind::RefinementSubmissionQueued,
+            Some(identity),
+            Some(FramePhase::OptionalRefinement),
+            evaluation,
+            PreviewQuality::Full,
+            41,
+            7,
+            19,
+            1,
+            None,
+        );
+
+        let event = trace.events().back().expect("refinement event");
+        assert_eq!(event.frame, identity.id);
+        assert_eq!(event.generation, identity.generation);
+        assert_eq!(event.evaluation, Some(evaluation));
+        assert_eq!(event.quality, Some(PreviewQuality::Full));
+        assert_eq!(event.refinement_job, Some(41));
+        assert_eq!(event.completed_units, 7);
+        assert_eq!(event.total_units, 19);
+        assert_eq!(event.refinement_submission_depth, 1);
     }
 
     #[test]

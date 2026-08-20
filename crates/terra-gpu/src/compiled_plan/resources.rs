@@ -367,62 +367,83 @@ pub struct GpuPlanResources {
     textures: Vec<ScalarTexture>,
 }
 
+/// Incremental realization of one isolated compiled-plan resource set.
+///
+/// Each call to [`Self::advance`] creates at most one physical texture, exposing
+/// the allocation boundary to the logical-frame refinement scheduler without
+/// changing field layout or aliasing semantics.
+pub struct GpuPlanResourceBuilder {
+    key: GpuPlanResourceKey,
+    layout: GpuPlanResourceLayout,
+    textures: Vec<ScalarTexture>,
+}
+
+impl GpuPlanResourceBuilder {
+    fn new(
+        device: &wgpu::Device,
+        plan: &CompiledTerrainPlan,
+        key: GpuPlanResourceKey,
+    ) -> Result<Self, GpuPlanResourceError> {
+        validate_resource_key(device, key)?;
+        Ok(Self {
+            key,
+            layout: GpuPlanResourceLayout::build(plan)?,
+            textures: Vec::new(),
+        })
+    }
+
+    pub fn completed_allocations(&self) -> usize {
+        self.textures.len()
+    }
+
+    pub fn total_allocations(&self) -> usize {
+        self.layout.allocations().len()
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.completed_allocations() == self.total_allocations()
+    }
+
+    pub fn layout(&self) -> &GpuPlanResourceLayout {
+        &self.layout
+    }
+
+    pub fn advance(&mut self, device: &wgpu::Device) -> bool {
+        let Some(allocation) = self.layout.allocations().get(self.textures.len()) else {
+            return true;
+        };
+        self.textures.push(realize_scalar_texture(
+            device,
+            self.key,
+            allocation.id,
+        ));
+        self.is_complete()
+    }
+
+    pub fn finish(self) -> Result<GpuPlanResources, GpuPlanResourceError> {
+        if !self.is_complete() {
+            return Err(GpuPlanResourceError::IncompleteRealization {
+                completed: self.completed_allocations(),
+                total: self.total_allocations(),
+            });
+        }
+        Ok(GpuPlanResources {
+            key: self.key,
+            layout: self.layout,
+            textures: self.textures,
+        })
+    }
+}
+
 impl GpuPlanResources {
     fn realize(
         device: &wgpu::Device,
         plan: &CompiledTerrainPlan,
         key: GpuPlanResourceKey,
     ) -> Result<Self, GpuPlanResourceError> {
-        if key.width == 0 || key.height == 0 {
-            return Err(GpuPlanResourceError::EmptyExtent);
-        }
-        if key.format != wgpu::TextureFormat::R32Float {
-            return Err(GpuPlanResourceError::UnsupportedFormat(key.format));
-        }
-        let max = device.limits().max_texture_dimension_2d;
-        if key.width > max || key.height > max {
-            return Err(GpuPlanResourceError::ExtentExceedsDevice {
-                width: key.width,
-                height: key.height,
-                limit: max,
-            });
-        }
-        let _bytes = u64::from(key.width)
-            .checked_mul(u64::from(key.height))
-            .and_then(|texels| texels.checked_mul(4))
-            .ok_or(GpuPlanResourceError::SizeOverflow)?;
-        let layout = GpuPlanResourceLayout::build(plan)?;
-        let textures = layout
-            .allocations()
-            .iter()
-            .map(|allocation| {
-                let label = format!("compiled-plan-field-{}", allocation.id.index());
-                let texture = device.create_texture(&wgpu::TextureDescriptor {
-                    label: Some(&label),
-                    size: wgpu::Extent3d {
-                        width: key.width,
-                        height: key.height,
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: key.format,
-                    usage: wgpu::TextureUsages::STORAGE_BINDING
-                        | wgpu::TextureUsages::TEXTURE_BINDING
-                        | wgpu::TextureUsages::COPY_SRC
-                        | wgpu::TextureUsages::COPY_DST,
-                    view_formats: &[],
-                });
-                let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-                ScalarTexture { texture, view }
-            })
-            .collect();
-        Ok(Self {
-            key,
-            layout,
-            textures,
-        })
+        let mut builder = GpuPlanResourceBuilder::new(device, plan, key)?;
+        while !builder.advance(device) {}
+        builder.finish()
     }
 
     pub const fn key(&self) -> GpuPlanResourceKey {
@@ -468,6 +489,24 @@ pub struct GpuPlanResourceCache {
 }
 
 impl GpuPlanResourceCache {
+    pub fn begin_candidate(
+        &mut self,
+        device: &wgpu::Device,
+        plan: &CompiledTerrainPlan,
+        key: GpuPlanResourceKey,
+    ) -> Result<GpuPlanResourceBuilder, GpuPlanResourceError> {
+        match GpuPlanResourceBuilder::new(device, plan, key) {
+            Ok(builder) => {
+                self.stats.staged_candidates += 1;
+                Ok(builder)
+            }
+            Err(error) => {
+                self.stats.failed_realizations += 1;
+                Err(error)
+            }
+        }
+    }
+
     pub fn realize(
         &mut self,
         device: &wgpu::Device,
@@ -561,6 +600,60 @@ pub enum GpuPlanResourceError {
     SizeOverflow,
     #[error("compiled plan scalar field format {0:?} is unsupported")]
     UnsupportedFormat(wgpu::TextureFormat),
+    #[error("compiled plan resource realization is incomplete ({completed}/{total})")]
+    IncompleteRealization { completed: usize, total: usize },
+}
+
+fn validate_resource_key(
+    device: &wgpu::Device,
+    key: GpuPlanResourceKey,
+) -> Result<(), GpuPlanResourceError> {
+    if key.width == 0 || key.height == 0 {
+        return Err(GpuPlanResourceError::EmptyExtent);
+    }
+    if key.format != wgpu::TextureFormat::R32Float {
+        return Err(GpuPlanResourceError::UnsupportedFormat(key.format));
+    }
+    let max = device.limits().max_texture_dimension_2d;
+    if key.width > max || key.height > max {
+        return Err(GpuPlanResourceError::ExtentExceedsDevice {
+            width: key.width,
+            height: key.height,
+            limit: max,
+        });
+    }
+    u64::from(key.width)
+        .checked_mul(u64::from(key.height))
+        .and_then(|texels| texels.checked_mul(4))
+        .ok_or(GpuPlanResourceError::SizeOverflow)?;
+    Ok(())
+}
+
+fn realize_scalar_texture(
+    device: &wgpu::Device,
+    key: GpuPlanResourceKey,
+    id: GpuPhysicalFieldId,
+) -> ScalarTexture {
+    let label = format!("compiled-plan-field-{}", id.index());
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(&label),
+        size: wgpu::Extent3d {
+            width: key.width,
+            height: key.height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: key.format,
+        usage: wgpu::TextureUsages::STORAGE_BINDING
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    ScalarTexture { texture, view }
 }
 
 #[cfg(test)]

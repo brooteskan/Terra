@@ -176,9 +176,23 @@ disabled/excluded, unavailable, duplicate, and cyclic cross-references are expli
 compile diagnostics. Incremental GPU work is selected from plan invalidation and persistent
 field checkpoints; incremental CPU rebuild continues to use `LayerCache` +
 `mark_dirty_from`.
-Progressive preview walks `Draft → Medium → Full`: the app advances the quality ladder
-held on `EvalScheduler` and runs each authoritative CPU pass on the background
-`EvalWorker`.
+Progressive preview walks `Draft → Medium → Full`. Required interactive Draft work
+keeps the immediate evaluator path. Supported optional Medium/Full work is represented
+by an app-owned, generation-stamped refinement job and advances after required work by
+one existing safe boundary per logical frame: one resource allocation, one compiled
+plan operation submission, or the final presentation copy. Unsupported work retains
+the authoritative background `EvalWorker` fallback.
+
+Refinement realizes an isolated candidate resource set. The scheduler checks generation
+freshness before every unit and immediately before publication; supersession drops all
+unsubmitted cursor work. Submitted GPU work cannot be cancelled, so the engine retains
+its completion fence even after the owning job is abandoned. No later refinement unit
+may submit until that fence resolves, bounding optional submission depth globally at
+one while leaving required Draft submissions free to enter the queue. The last complete
+renderer texture remains visible until the candidate's final fence resolves and the
+current generation atomically commits resources, graph metadata, quality, and
+presentation. Frame traces correlate job lifecycle, progress, submission depth,
+supersession, completion, and publication with frame, generation, and evaluation IDs.
 
 ## Tiles & ghosts
 

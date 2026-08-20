@@ -10,7 +10,7 @@
 
 use crate::compiled_plan::{
     GpuGroupCompositeParams, GpuPlanOperationError, GpuPlanOperations, GpuPlanResourceCache,
-    GpuPlanResourceKey,
+    GpuPlanResourceBuilder, GpuPlanResourceKey, GpuPlanResources,
 };
 use crate::effect_filter::{effect_filter_gpu_spec, EffectFilterGpuPasses};
 use crate::evaluation_timing::{
@@ -25,7 +25,8 @@ use crate::{readback_f32, GpuError};
 use bytemuck::{Pod, Zeroable};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::sync::mpsc::{self, TryRecvError};
+use std::time::{Instant, SystemTime};
 use terra_core::analyze::{
     amplify_sim_levels, apply_transport_model, clamp_timestep_cfl, default_sim_levels,
     draft_sim_levels, LevelStepSettings,
@@ -1482,6 +1483,107 @@ pub enum GpuEvaluationIntent {
     Complete,
 }
 
+/// Observable phase of an optional, resumable compiled-plan refinement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuRefinementPhase {
+    PreparingResources,
+    Encoding,
+    SubmissionInFlight,
+    ReadyToPublish,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GpuRefinementProgress {
+    pub phase: GpuRefinementPhase,
+    pub completed_units: usize,
+    pub total_units: usize,
+    pub submissions_issued: u32,
+    pub submissions_completed: u32,
+    pub submissions_in_flight: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuRefinementStep {
+    Progressed,
+    Submitted { ordinal: u32 },
+    AwaitingGpu,
+    ReadyToPublish,
+}
+
+/// Isolated candidate and execution cursor for optional Medium/Full work.
+/// Authored inputs are cloned at creation, so later edits can supersede the job
+/// by dropping it without changing the last committed plan resources.
+pub struct GpuRefinementJob {
+    stack: LayerStack,
+    masks: Vec<MaskAsset>,
+    graph: GpuComputeGraph,
+    plan: CompiledTerrainPlan,
+    expected_revision: PlanStructureRevision,
+    invalidation: PlanInvalidation,
+    metrics: HeightfieldMetrics,
+    quality: PreviewQuality,
+    builder: Option<GpuPlanResourceBuilder>,
+    candidate: Option<GpuPlanResources>,
+    selected: Vec<PlanOpId>,
+    kernels: HashMap<PlanOpId, GpuLayerPlan>,
+    published_output_slots: HashMap<terra_core::ids::OutputId, terra_core::terrain_plan::FieldSlot>,
+    cursor: usize,
+    last_height: Option<terra_core::terrain_plan::FieldSlot>,
+    completion: Option<mpsc::Receiver<()>>,
+    final_copy_submitted: bool,
+    final_copy_complete: bool,
+    submissions_issued: u32,
+    submissions_completed: u32,
+    resource_prepare_us: u64,
+    encode_us: u64,
+    range_before: (f32, f32),
+}
+
+impl GpuRefinementJob {
+    pub fn quality(&self) -> PreviewQuality {
+        self.quality
+    }
+
+    pub fn progress(&self) -> GpuRefinementProgress {
+        let allocations = self.builder.as_ref().map_or_else(
+            || self.candidate.as_ref().map_or(0, |_| self.resource_units()),
+            |b| b.completed_allocations(),
+        );
+        let completed = allocations
+            .saturating_add(self.cursor)
+            .saturating_add(usize::from(self.final_copy_complete));
+        let phase = if self.final_copy_complete {
+            GpuRefinementPhase::ReadyToPublish
+        } else if self.completion.is_some() {
+            GpuRefinementPhase::SubmissionInFlight
+        } else if self.builder.is_some() {
+            GpuRefinementPhase::PreparingResources
+        } else {
+            GpuRefinementPhase::Encoding
+        };
+        GpuRefinementProgress {
+            phase,
+            completed_units: completed,
+            total_units: self.resource_units() + self.selected.len() + 1,
+            submissions_issued: self.submissions_issued,
+            submissions_completed: self.submissions_completed,
+            submissions_in_flight: u8::from(self.completion.is_some()),
+        }
+    }
+
+    fn resource_units(&self) -> usize {
+        self.builder
+            .as_ref()
+            .map(GpuPlanResourceBuilder::total_allocations)
+            .or_else(|| {
+                self.candidate
+                    .as_ref()
+                    .map(|candidate| candidate.layout().allocations().len())
+            })
+            .unwrap_or(0)
+    }
+}
+
 /// GPU stack evaluator for interactive preview.
 pub struct GpuTerrainEngine {
     plan_operations: GpuPlanOperations,
@@ -1587,6 +1689,10 @@ pub struct GpuTerrainEngine {
     last_plan_operation_trace: Vec<GpuPlanOperationTrace>,
     evaluation_timer: Option<GpuEvaluationTimer>,
     pending_evaluation_trace: Option<GpuEvaluationTraceContext>,
+    /// Completion fences retained from superseded jobs. They prevent a later
+    /// generation from building a second refinement backlog behind an
+    /// unavoidably non-cancellable stale submission.
+    retired_refinement_completions: Vec<mpsc::Receiver<()>>,
     #[cfg(test)]
     executed_plan_operations: Vec<PlanOpId>,
 }
@@ -2129,6 +2235,7 @@ impl GpuTerrainEngine {
             last_plan_operation_trace: Vec::new(),
             evaluation_timer: GpuEvaluationTimer::try_new(device),
             pending_evaluation_trace: None,
+            retired_refinement_completions: Vec::new(),
             #[cfg(test)]
             executed_plan_operations: Vec::new(),
         }
@@ -5200,6 +5307,584 @@ impl GpuTerrainEngine {
             }
         }
         result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_compiled_operation(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        stack: &LayerStack,
+        mask_assets: &[MaskAsset],
+        plan: &CompiledTerrainPlan,
+        candidate: &GpuPlanResources,
+        operation_id: PlanOpId,
+        kernel: Option<GpuLayerPlan>,
+        quality: PreviewQuality,
+        scope: PropagatedDirtyScope,
+        cold: bool,
+        invalidation: &PlanInvalidation,
+        published_output_slots: &HashMap<
+            terra_core::ids::OutputId,
+            terra_core::terrain_plan::FieldSlot,
+        >,
+    ) -> Result<(), CompiledDispatchError> {
+        let operation = plan
+            .operation(operation_id)
+            .expect("selected operation belongs to plan");
+        let region = plan_scope_region(scope, self.metrics);
+        match &operation.kind {
+            TerrainOpKind::Seed { source, output } => {
+                self.plan_operations.seed_field_region(
+                    device,
+                    encoder,
+                    candidate,
+                    *source,
+                    *output,
+                    Some(region),
+                )?;
+            }
+            TerrainOpKind::EvaluateMask {
+                input_height,
+                input_fields: _,
+                output_mask,
+            } => {
+                let result = if let Some(distribution) =
+                    plan_distribution(stack, operation.origin)
+                {
+                    self.plan_operations.evaluate_distribution_resolved_region(
+                        device,
+                        encoder,
+                        candidate,
+                        *input_height,
+                        *output_mask,
+                        distribution,
+                        mask_assets,
+                        published_output_slots,
+                        self.metrics.dx(),
+                        self.metrics.dz(),
+                        Some(region),
+                    )
+                } else {
+                    Err(GpuPlanOperationError::UnsupportedMaskNodes)
+                };
+                result?;
+            }
+            TerrainOpKind::RunLayerKernel {
+                layer,
+                input_height,
+                output_candidate,
+                ..
+            } => {
+                let authored = stack.find(*layer).ok_or_else(|| {
+                    CompiledDispatchError::Gpu(cpu_required(
+                        GpuFallbackCode::UnsupportedOptions,
+                        "terrain plan",
+                        "compiled layer owner is missing from the authored document",
+                    ))
+                })?;
+                let kernel = kernel.ok_or_else(|| {
+                    CompiledDispatchError::Gpu(cpu_required(
+                        GpuFallbackCode::UnsupportedOptions,
+                        "GPU capability graph",
+                        "layer has no executable GPU kernel choice",
+                    ))
+                })?;
+                record_copy_views_region(
+                    device,
+                    encoder,
+                    &self.copy,
+                    candidate
+                        .view(*input_height)
+                        .map_err(GpuPlanOperationError::from)?,
+                    &self.ping.view,
+                    self.metrics.width,
+                    self.metrics.height,
+                    region,
+                );
+                self.current = 0;
+                self.last_dirty_rect = (!scope.is_full()).then_some(region);
+                let runs_in_place = kernel_runs_in_place(kernel.kernel);
+                if runs_in_place {
+                    record_copy_views_region(
+                        device,
+                        encoder,
+                        &self.copy,
+                        &self.ping.view,
+                        &self.layer_tex.view,
+                        self.metrics.width,
+                        self.metrics.height,
+                        region,
+                    );
+                }
+                if let LayerKind::SculptBase(params) = &authored.kind {
+                    let patch_region = (!cold
+                        && invalidation.patched_operations.contains(&operation_id)
+                        && !scope.is_full())
+                    .then_some(region);
+                    self.record_sculpt_to_layer(device, encoder, params, patch_region);
+                }
+                let mut candidate_layer = authored.clone();
+                candidate_layer.common.opacity = 1.0;
+                candidate_layer.common.blend = BlendMode::Replace;
+                candidate_layer.common.masks = Distribution::default();
+                self.eval_layer(
+                    device,
+                    queue,
+                    encoder,
+                    &candidate_layer,
+                    kernel.kernel,
+                    quality,
+                )?;
+                let source = if runs_in_place {
+                    if self.current == 0 {
+                        &self.ping.view
+                    } else {
+                        &self.pong.view
+                    }
+                } else {
+                    &self.layer_tex.view
+                };
+                record_copy_views_region(
+                    device,
+                    encoder,
+                    &self.copy,
+                    source,
+                    candidate
+                        .view(*output_candidate)
+                        .map_err(GpuPlanOperationError::from)?,
+                    self.metrics.width,
+                    self.metrics.height,
+                    region,
+                );
+            }
+            TerrainOpKind::CompositeLayer {
+                layer,
+                base,
+                candidate: layer_candidate,
+                mask,
+                output,
+            } => {
+                let authored = stack.find(*layer).expect("compiled layer owner");
+                self.plan_operations.composite_group_region(
+                    device,
+                    encoder,
+                    candidate,
+                    *base,
+                    *base,
+                    *layer_candidate,
+                    *mask,
+                    *output,
+                    GpuGroupCompositeParams {
+                        blend: authored.common.blend,
+                        opacity: authored.common.opacity,
+                        mode: GroupCompositeMode::Standard,
+                    },
+                    Some(region),
+                )?;
+            }
+            TerrainOpKind::CompositeGroup {
+                group,
+                parent,
+                private_seed,
+                child_output,
+                mask,
+                output,
+                mode,
+            } => {
+                let authored = stack.find_group(*group).expect("compiled group owner");
+                let opacity = if authored.group_kind == terra_core::layer::GroupKind::Biome {
+                    authored.opacity * authored.filter_blending
+                } else {
+                    authored.opacity
+                };
+                self.plan_operations.composite_group_region(
+                    device,
+                    encoder,
+                    candidate,
+                    *parent,
+                    *private_seed,
+                    *child_output,
+                    *mask,
+                    *output,
+                    GpuGroupCompositeParams {
+                        blend: authored.blend,
+                        opacity,
+                        mode: *mode,
+                    },
+                    Some(region),
+                )?;
+            }
+            TerrainOpKind::CompositeAuxField {
+                group,
+                mask,
+                composite,
+            } => {
+                let authored = stack.find_group(*group).expect("compiled group owner");
+                let opacity = if authored.group_kind == terra_core::layer::GroupKind::Biome {
+                    authored.opacity * authored.filter_blending
+                } else {
+                    authored.opacity
+                };
+                self.plan_operations.composite_aux_region(
+                    device,
+                    encoder,
+                    candidate,
+                    composite.parent,
+                    composite.child,
+                    *mask,
+                    composite.output,
+                    opacity,
+                    Some(region),
+                )?;
+            }
+            TerrainOpKind::PublishOutput { .. } => {}
+        }
+        Ok(())
+    }
+
+    /// Start an isolated, resumable Complete-quality evaluation. This API is
+    /// intentionally separate from the required interactive evaluator: it
+    /// always recomputes into staged resources and never exposes a partial
+    /// candidate through `plan_resources.current()`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin_compiled_refinement(
+        &mut self,
+        device: &wgpu::Device,
+        stack: &LayerStack,
+        mask_assets: &[MaskAsset],
+        plan: &CompiledTerrainPlan,
+        expected_revision: PlanStructureRevision,
+        invalidation: &PlanInvalidation,
+        metrics: HeightfieldMetrics,
+        quality: PreviewQuality,
+    ) -> Result<GpuRefinementJob, GpuError> {
+        if !plan.matches_structure_revision(expected_revision) {
+            return Err(GpuError::StalePlan {
+                plan_revision: plan.stamp().structure_revision.get(),
+                expected_revision: expected_revision.get(),
+            });
+        }
+        if !matches!(quality, PreviewQuality::Medium | PreviewQuality::Full) {
+            return Err(GpuError::Wgpu(
+                "resumable refinement only accepts Medium or Full quality".into(),
+            ));
+        }
+
+        self.ensure_size(device, metrics);
+        self.uniform_pool.reset();
+        self.plan_operations.begin_evaluation();
+        self.last_plan_operation_trace.clear();
+        self.last_eval_stats = GpuEvalStats {
+            resolution: metrics.width.max(metrics.height),
+            cold_execution: true,
+            ..GpuEvalStats::default()
+        };
+
+        let selected: Vec<_> = plan
+            .operations()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, _)| {
+                let id = PlanOpId::from_index(index);
+                plan.analysis().operation_is_live(id).then_some(id)
+            })
+            .collect();
+        let graph = compile_gpu_graph(stack, mask_assets);
+        let flat_layers = stack.flatten_layers();
+        let decisions: HashMap<LayerId, (Option<GpuLayerPlan>, Option<GpuFallbackReason>)> =
+            flat_layers
+                .iter()
+                .enumerate()
+                .map(|(index, layer)| {
+                    (
+                        layer.id(),
+                        (
+                            graph.plans.get(index).copied().flatten(),
+                            graph.fallback_reasons.get(index).cloned().flatten(),
+                        ),
+                    )
+                })
+                .collect();
+        let mut kernels = HashMap::new();
+        for operation_id in &selected {
+            let operation = plan.operation(*operation_id).expect("live plan operation");
+            if let TerrainOpKind::RunLayerKernel {
+                layer,
+                output_fields,
+                ..
+            } = &operation.kind
+            {
+                if output_fields.iter().any(|field| {
+                    plan.analysis().field_is_live(*field)
+                        && plan.analysis().consumers(*field).iter().any(|consumer| {
+                            !plan.operation(*consumer).is_some_and(|operation| {
+                                matches!(operation.kind, TerrainOpKind::PublishOutput { .. })
+                            })
+                        })
+                }) {
+                    return Err(cpu_required(
+                        GpuFallbackCode::AuxiliaryDependency,
+                        "auxiliary field",
+                        "the GPU kernel does not yet publish a live auxiliary output",
+                    ));
+                }
+                match decisions.get(layer) {
+                    Some((Some(kernel), _)) => {
+                        kernels.insert(*operation_id, *kernel);
+                    }
+                    decision => {
+                        let reason = decision
+                            .and_then(|(_, reason)| reason.clone())
+                            .unwrap_or_else(|| {
+                                GpuFallbackReason::new(
+                                    GpuFallbackCode::UnsupportedOptions,
+                                    "GPU capability graph",
+                                    "layer has no executable GPU kernel choice",
+                                )
+                            });
+                        return Err(GpuError::RequiresCpu(reason));
+                    }
+                }
+            }
+        }
+        let key = GpuPlanResourceKey::new(metrics.width, metrics.height, self.device_generation);
+        let builder = self
+            .plan_resources
+            .begin_candidate(device, plan, key)
+            .map_err(|error| GpuError::Wgpu(error.to_string()))?;
+        let published_output_slots = plan
+            .operations()
+            .iter()
+            .filter_map(|operation| match operation.kind {
+                TerrainOpKind::PublishOutput { output, source } => Some((output, source)),
+                _ => None,
+            })
+            .collect();
+
+        Ok(GpuRefinementJob {
+            stack: stack.clone(),
+            masks: mask_assets.to_vec(),
+            graph,
+            plan: plan.clone(),
+            expected_revision,
+            invalidation: invalidation.clone(),
+            metrics,
+            quality,
+            builder: Some(builder),
+            candidate: None,
+            selected,
+            kernels,
+            published_output_slots,
+            cursor: 0,
+            last_height: None,
+            completion: None,
+            final_copy_submitted: false,
+            final_copy_complete: false,
+            submissions_issued: 0,
+            submissions_completed: 0,
+            resource_prepare_us: 0,
+            encode_us: 0,
+            range_before: self.approx_range,
+        })
+    }
+
+    /// Advance by one allocation or one GPU submission. A job never has more
+    /// than one refinement submission outstanding; required interactive work is
+    /// free to submit behind that single unavoidable command buffer.
+    pub fn advance_compiled_refinement(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        job: &mut GpuRefinementJob,
+    ) -> Result<GpuRefinementStep, GpuError> {
+        if job.final_copy_complete {
+            return Ok(GpuRefinementStep::ReadyToPublish);
+        }
+        if let Some(completion) = job.completion.as_ref() {
+            let _ = device.poll(wgpu::Maintain::Poll);
+            match completion.try_recv() {
+                Ok(()) | Err(TryRecvError::Disconnected) => {
+                    job.completion = None;
+                    job.submissions_completed = job.submissions_completed.saturating_add(1);
+                    if job.final_copy_submitted && job.cursor == job.selected.len() {
+                        job.final_copy_complete = true;
+                        return Ok(GpuRefinementStep::ReadyToPublish);
+                    }
+                    return Ok(GpuRefinementStep::Progressed);
+                }
+                Err(TryRecvError::Empty) => return Ok(GpuRefinementStep::AwaitingGpu),
+            }
+        }
+
+        if let Some(builder) = job.builder.as_mut() {
+            let started = Instant::now();
+            let complete = builder.advance(device);
+            job.resource_prepare_us = job
+                .resource_prepare_us
+                .saturating_add(started.elapsed().as_micros() as u64);
+            if complete {
+                let builder = job.builder.take().expect("builder exists");
+                job.candidate = Some(
+                    builder
+                        .finish()
+                        .map_err(|error| GpuError::Wgpu(error.to_string()))?,
+                );
+            }
+            return Ok(GpuRefinementStep::Progressed);
+        }
+
+        if !self.retired_refinement_completions.is_empty() {
+            let _ = device.poll(wgpu::Maintain::Poll);
+            self.retired_refinement_completions
+                .retain_mut(|completion| matches!(completion.try_recv(), Err(TryRecvError::Empty)));
+            if !self.retired_refinement_completions.is_empty() {
+                return Ok(GpuRefinementStep::AwaitingGpu);
+            }
+        }
+
+        let candidate = job.candidate.as_ref().expect("completed candidate resources");
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("compiled-terrain-refinement-unit"),
+        });
+        let encode_started = Instant::now();
+        if let Some(operation_id) = job.selected.get(job.cursor).copied() {
+            let scope = PropagatedDirtyScope::new(PlanDirtyScope::FullField);
+            if let Err(error) = self.record_compiled_operation(
+                device,
+                queue,
+                &mut encoder,
+                &job.stack,
+                &job.masks,
+                &job.plan,
+                candidate,
+                operation_id,
+                job.kernels.get(&operation_id).copied(),
+                job.quality,
+                scope,
+                true,
+                &job.invalidation,
+                &job.published_output_slots,
+            ) {
+                let diagnostic = plan_fallback_diagnostic(
+                    &job.plan,
+                    &job.stack,
+                    operation_id,
+                    plan_operation_fallback(error),
+                );
+                return Err(GpuError::RequiresCpu(diagnostic.reason));
+            }
+            let operation = job.plan.operation(operation_id).expect("selected operation");
+            if matches!(operation.kind, TerrainOpKind::PublishOutput { .. }) {
+                self.last_eval_stats.operations_published = self
+                    .last_eval_stats
+                    .operations_published
+                    .saturating_add(1);
+            } else {
+                self.last_eval_stats.operations_dispatched = self
+                    .last_eval_stats
+                    .operations_dispatched
+                    .saturating_add(1);
+                self.last_eval_stats.plan_workgroups = self
+                    .last_eval_stats
+                    .plan_workgroups
+                    .saturating_add(u64::from(job.metrics.width.div_ceil(8))
+                        * u64::from(job.metrics.height.div_ceil(8)));
+            }
+            for field in job.plan.analysis().outputs(operation_id) {
+                if job.plan.field(*field).is_some_and(|field| {
+                    matches!(field.kind, terra_core::terrain_plan::LogicalFieldKind::Height)
+                }) {
+                    job.last_height = Some(*field);
+                }
+            }
+            job.cursor += 1;
+        } else {
+            let presentation = candidate
+                .view(job.plan.final_height())
+                .map_err(|error| GpuError::Wgpu(error.to_string()))?;
+            record_copy_views_region(
+                device,
+                &mut encoder,
+                &self.copy,
+                presentation,
+                &self.ping.view,
+                job.metrics.width,
+                job.metrics.height,
+                (0, 0, job.metrics.width, job.metrics.height),
+            );
+            job.final_copy_submitted = true;
+        }
+        job.encode_us = job
+            .encode_us
+            .saturating_add(encode_started.elapsed().as_micros() as u64);
+        let submit_started = Instant::now();
+        queue.submit(Some(encoder.finish()));
+        self.last_eval_stats.queue_submit_us = self
+            .last_eval_stats
+            .queue_submit_us
+            .saturating_add(submit_started.elapsed().as_micros() as u64);
+        job.submissions_issued = job.submissions_issued.saturating_add(1);
+        let ordinal = job.submissions_issued;
+        let (sender, receiver) = mpsc::channel();
+        queue.on_submitted_work_done(move || {
+            let _ = sender.send(());
+        });
+        job.completion = Some(receiver);
+        Ok(GpuRefinementStep::Submitted { ordinal })
+    }
+
+    pub fn publish_compiled_refinement(
+        &mut self,
+        mut job: GpuRefinementJob,
+    ) -> Result<GpuEvalResult, GpuError> {
+        if !job.final_copy_complete {
+            return Err(GpuError::Wgpu(
+                "refinement candidate published before GPU completion".into(),
+            ));
+        }
+        let candidate = job.candidate.take().expect("completed candidate");
+        self.plan_resources.commit_candidate(candidate);
+        self.last_graph = job.graph;
+        self.active_plan_revision = Some(job.expected_revision);
+        self.deferred_plan_resume = None;
+        self.last_quality = Some(job.quality);
+        self.current = 0;
+        self.last_dirty_rect = None;
+        self.mark_all_tiles_dirty();
+        self.last_eval_stats.selected_operations = job.selected.len() as u32;
+        self.last_eval_stats.resource_prepare_us = job.resource_prepare_us;
+        self.last_eval_stats.command_encode_us = job.encode_us;
+        self.last_eval_stats.dirty_texels = u64::from(job.metrics.width)
+            .saturating_mul(u64::from(job.metrics.height));
+        Ok(GpuEvalResult {
+            width: job.metrics.width,
+            height: job.metrics.height,
+            world_size: (job.metrics.world_size_x, job.metrics.world_size_z),
+            height_range: self.approx_range,
+            fully_gpu: true,
+            freshness: GpuPreviewFreshness::Current,
+            cpu: None,
+            resume_cpu_from: None,
+            cpu_fallback: None,
+            did_eval: !job.selected.is_empty(),
+        })
+    }
+
+    pub fn abandon_compiled_refinement(&mut self, job: GpuRefinementJob) {
+        if let Some(completion) = job.completion {
+            self.retired_refinement_completions.push(completion);
+        }
+        self.approx_range = job.range_before;
+        self.last_dirty_rect = None;
+        self.pending_evaluation_trace = None;
+    }
+
+    /// Global refinement queue depth, including a fence retained from a
+    /// superseded generation. Required interactive submissions are not counted.
+    pub fn refinement_submissions_in_flight(&self, job: &GpuRefinementJob) -> usize {
+        self.retired_refinement_completions.len() + usize::from(job.completion.is_some())
     }
 
     /// Execute a validated terrain plan. Operation order, field wiring, dirty
@@ -11675,6 +12360,160 @@ mod smoke_tests {
                 crate::parity::UNTITLED6_INTERACTION,
             );
         }
+    }
+
+    /// #154: optional refinement is split into fenced units, keeps its plan
+    /// resources private until publication, and produces the same field as the
+    /// existing complete evaluator.
+    #[test]
+    fn resumable_refinement_is_depth_one_transactional_and_matches_complete_eval() {
+        let Some(gpu) = terra_test_gpu::headless() else {
+            return;
+        };
+        let res = 64u32;
+        let (document, _) = untitled6_document(res, Untitled6Variant::ProductionTopology);
+        let mut cache = TerrainPlanCache::new();
+        let invalidation = cache
+            .update(
+                &document.stack,
+                &document.masks,
+                &[TerrainEditClass::Structure],
+            )
+            .expect("compile fixture");
+        let plan = cache.current_plan().expect("compiled plan");
+        let revision = cache.structure_revision();
+
+        let mut complete = GpuTerrainEngine::new(&gpu.device, res);
+        complete
+            .evaluate_compiled_with_intent(
+                &gpu.device,
+                &gpu.queue,
+                &document.stack,
+                &document.masks,
+                plan,
+                revision,
+                &invalidation,
+                document.metrics,
+                PreviewQuality::Medium,
+                false,
+                GpuEvaluationIntent::Complete,
+            )
+            .expect("complete Medium evaluation");
+        let expected = complete
+            .readback_current(&gpu.device, &gpu.queue)
+            .expect("complete readback");
+
+        let mut resumable = GpuTerrainEngine::new(&gpu.device, res);
+        let committed_before = resumable.plan_resources.stats().committed_candidates;
+        let mut job = resumable
+            .begin_compiled_refinement(
+                &gpu.device,
+                &document.stack,
+                &document.masks,
+                plan,
+                revision,
+                &invalidation,
+                document.metrics,
+                PreviewQuality::Medium,
+            )
+            .expect("begin resumable Medium evaluation");
+        assert!(resumable.plan_resources.current().is_none());
+        assert!(resumable.last_graph.plans.is_empty());
+
+        let mut submitted = 0u32;
+        let mut max_depth = 0u8;
+        for _ in 0..10_000 {
+            let step = resumable
+                .advance_compiled_refinement(&gpu.device, &gpu.queue, &mut job)
+                .expect("advance resumable evaluation");
+            let progress = job.progress();
+            max_depth = max_depth.max(progress.submissions_in_flight);
+            if matches!(step, GpuRefinementStep::Submitted { .. }) {
+                submitted += 1;
+                let _ = gpu.device.poll(wgpu::Maintain::Wait);
+            }
+            if matches!(step, GpuRefinementStep::AwaitingGpu) {
+                let _ = gpu.device.poll(wgpu::Maintain::Wait);
+            }
+            if matches!(step, GpuRefinementStep::ReadyToPublish) {
+                break;
+            }
+        }
+        assert!(job.final_copy_complete, "refinement did not reach its final fence");
+        assert!(submitted > 1, "the plan should be split across submissions");
+        assert_eq!(max_depth, 1, "refinement queue depth must remain bounded");
+        assert!(resumable.plan_resources.current().is_none());
+        assert_eq!(
+            resumable.plan_resources.stats().committed_candidates,
+            committed_before,
+            "candidate resources must not become canonical before publication"
+        );
+
+        let result = resumable
+            .publish_compiled_refinement(job)
+            .expect("publish fenced candidate");
+        assert!(result.fully_gpu);
+        assert_eq!(result.freshness, GpuPreviewFreshness::Current);
+        assert!(resumable.plan_resources.current().is_some());
+        assert!(!resumable.last_graph.plans.is_empty());
+        assert_eq!(
+            resumable.plan_resources.stats().committed_candidates,
+            committed_before + 1
+        );
+        let actual = resumable
+            .readback_current(&gpu.device, &gpu.queue)
+            .expect("resumable readback");
+        crate::parity::assert_field_parity(
+            "resumable Medium vs complete Medium",
+            &actual,
+            &expected,
+            crate::parity::UNTITLED6_INTERACTION,
+        );
+
+        // A stroke arriving after submission abandons the cursor but cannot
+        // cancel that submission. Its fence must constrain the next generation.
+        let mut stale = resumable
+            .begin_compiled_refinement(
+                &gpu.device,
+                &document.stack,
+                &document.masks,
+                plan,
+                revision,
+                &invalidation,
+                document.metrics,
+                PreviewQuality::Full,
+            )
+            .expect("begin stale Full generation");
+        loop {
+            if matches!(
+                resumable
+                    .advance_compiled_refinement(&gpu.device, &gpu.queue, &mut stale)
+                    .expect("advance stale generation"),
+                GpuRefinementStep::Submitted { .. }
+            ) {
+                break;
+            }
+        }
+        resumable.abandon_compiled_refinement(stale);
+        let fresh = resumable
+            .begin_compiled_refinement(
+                &gpu.device,
+                &document.stack,
+                &document.masks,
+                plan,
+                revision,
+                &invalidation,
+                document.metrics,
+                PreviewQuality::Medium,
+            )
+            .expect("begin replacement generation");
+        assert_eq!(
+            resumable.refinement_submissions_in_flight(&fresh),
+            1,
+            "the abandoned submission fence must remain in the global depth bound"
+        );
+        resumable.abandon_compiled_refinement(fresh);
+        let _ = gpu.device.poll(wgpu::Maintain::Wait);
     }
 
     /// Manual release probe for the acceptance resolutions. Adapter timing is

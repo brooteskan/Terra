@@ -11,6 +11,7 @@ mod paint;
 pub mod prefs;
 mod project;
 mod redraw;
+mod refinement_job;
 mod shapes;
 
 use std::collections::VecDeque;
@@ -207,6 +208,10 @@ pub struct TerraApp {
     logical_frames: logical_frame::LogicalFrameCoordinator,
     /// Bounded, frame/generation-correlated observability for the Base brush path.
     frame_trace: frame_trace::FrameTraceRecorder,
+    /// Optional Medium/Full GPU work, resumable only at safe allocation and
+    /// compiled-operation submission boundaries.
+    refinement_job: Option<refinement_job::RefinementJob>,
+    next_refinement_job_id: u64,
     /// Most recent complete terrain generation made available for presentation.
     last_complete_generation: logical_frame::EditGeneration,
     last_accepted_evaluation_id: u64,
@@ -413,6 +418,8 @@ impl Default for TerraApp {
             input: input::InputAccumulator::default(),
             logical_frames: logical_frame::LogicalFrameCoordinator::default(),
             frame_trace: frame_trace::FrameTraceRecorder::default(),
+            refinement_job: None,
+            next_refinement_job_id: 0,
             last_complete_generation: logical_frame::EditGeneration::default(),
             last_accepted_evaluation_id: 0,
             last_reported_presentation_timing_frame: 0,

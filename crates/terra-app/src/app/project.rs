@@ -388,6 +388,7 @@ impl TerraApp {
         world_size: (f32, f32),
         ocean_level: Option<f32>,
     ) {
+        self.supersede_gpu_refinement();
         self.last_height = None;
         self.scheduler.last_good = None;
         self.scheduler.last_aux.clear();

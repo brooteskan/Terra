@@ -16,6 +16,10 @@ Rules that must hold on every shipping build. Violations are release blockers.
 - NEVER mark basin-coupled edits (SPE, amplify, river network) as strictly local invalidation.
 - NEVER couple terrain `PreviewQuality` and path-tracing sample budgets in a single knob.
 - NEVER `Maintain::Wait` on GPU timestamp readback on the interactive path.
+- NEVER publish a Medium/Full candidate before its final submission fence resolves
+  and its edit generation is revalidated.
+- NEVER allow more than one optional refinement submission to remain in flight,
+  including a fence retained from a superseded job.
 
 ## ALWAYS
 
@@ -35,3 +39,7 @@ Rules that must hold on every shipping build. Violations are release blockers.
   resident baseline on document reset; existing size checks restore the next project dimensions.
 - ALWAYS document measured GPU pass timings in profiling reports before claiming performance targets.
 - ALWAYS fall back to the monolithic height texture on tile-stream page misses.
+- ALWAYS abandon unsubmitted refinement work when input advances the edit generation;
+  an already-submitted unit is non-cancellable and its fence remains tracked.
+- ALWAYS advance optional GPU refinement by one safe unit only after required Draft
+  work and the logical-frame optional-work budget gate.

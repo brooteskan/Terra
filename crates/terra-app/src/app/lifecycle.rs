@@ -169,6 +169,7 @@ impl TerraApp {
         }
         let known_work = self.pending_eval
             || self.worker_refine_pending
+            || self.refinement_job.is_some()
             || self.ui_state.refining
             || self.deferred_full_field.is_some()
             || !self.pending_tile_uploads.is_empty();
@@ -1213,10 +1214,21 @@ impl ApplicationHandler for TerraApp {
             self.logical_frames
                 .transition(FramePhase::OptionalRefinement);
 
-            // Progressive refine — one quality step per interval, never while interacting.
-            // WC path: stay GPU-resident when the last Draft/Medium was fully_gpu.
-            // CPU worker is only for unsupported suffixes / export oracle.
-            if !stall_refine
+            // Existing optional GPU jobs advance only after required work and at
+            // safe allocation/submission boundaries. Input/generation checks are
+            // repeated inside `advance_gpu_refinement` before publication.
+            if self.refinement_job.is_some()
+                && !stall_refine
+                && self.logical_frames.can_start_optional(Instant::now())
+                && !self.input.has_pending()
+            {
+                did_eval |= self.advance_gpu_refinement();
+            }
+
+            // Create the next quality job only after the established idle grace.
+            // CPU fallback retains the latest-wins worker path.
+            if self.refinement_job.is_none()
+                && !stall_refine
                 && self.logical_frames.can_start_optional(Instant::now())
                 && !self.input.has_pending()
                 && self.optional_refine_generation == self.eval_token
@@ -1234,15 +1246,15 @@ impl ApplicationHandler for TerraApp {
             {
                 self.optional_refine_not_before = None;
                 self.full_field_refine_not_before = None;
-                if self.scheduler.advance_quality() {
+                if let Some(mut target_quality) = self.scheduler.quality.next_refine() {
                     // HD preview: skip Medium so Camera/Zone sees Full carve sooner.
                     if !matches!(
                         self.session.document.level_steps.high_detail,
                         terra_core::analyze::HighDetailMode::None
-                    ) && matches!(self.scheduler.quality, PreviewQuality::Medium)
+                    ) && matches!(target_quality, PreviewQuality::Medium)
                     {
-                        if let Some(next) = self.scheduler.quality.next_refine() {
-                            self.scheduler.quality = next;
+                        if let Some(next) = target_quality.next_refine() {
+                            target_quality = next;
                         }
                     }
                     // Keep Zone rect synced under the camera for Camera HD mode.
@@ -1264,19 +1276,20 @@ impl ApplicationHandler for TerraApp {
                             ];
                         }
                     }
-                    self.ui_state.quality = self.scheduler.quality;
-                    // Always prefer GPU-resident refine when an engine exists. Hybrid stacks
-                    // still present Draft/Medium on GPU; run_eval_step enqueues CPU only for
-                    // unsupported bake correction — never block the viewport on the worker.
-                    if self.gpu_engine.is_some() {
-                        self.run_eval_step();
+                    if self.gpu_engine.is_some()
+                        && self.begin_gpu_refinement(target_quality)
+                    {
+                        did_eval = true;
                     } else {
+                        self.scheduler.quality = target_quality;
+                        self.ui_state.quality = target_quality;
                         self.enqueue_refine_job();
+                        self.ui_state.build_progress = Some(quality_in_flight_progress(
+                            target_quality,
+                            0.0,
+                        ));
+                        did_eval = true;
                     }
-                    // Show in-flight progress toward the queued quality (not frozen at prior stage).
-                    self.ui_state.build_progress =
-                        Some(quality_in_flight_progress(self.scheduler.quality, 0.0));
-                    did_eval = true;
                 } else {
                     self.ui_state.refining = false;
                     self.ui_state.quality = PreviewQuality::Full;
@@ -1299,6 +1312,7 @@ impl ApplicationHandler for TerraApp {
 
             work_pending = self.pending_eval
                 || self.worker_refine_pending
+                || self.refinement_job.is_some()
                 || self.ui_state.refining
                 || self.deferred_full_field.is_some()
                 || self.full_field_refine_not_before.is_some()
@@ -1313,7 +1327,7 @@ impl ApplicationHandler for TerraApp {
         } else if camera_flying {
             // Smooth WASD fly while keys are held.
             event_loop.set_control_flow(ControlFlow::Poll);
-        } else if self.worker_refine_pending || jobs.animate {
+        } else if self.worker_refine_pending || self.refinement_job.is_some() || jobs.animate {
             // Wake often enough to animate progress and pick up the worker result.
             event_loop.set_control_flow(ControlFlow::WaitUntil(
                 Instant::now() + Duration::from_millis(16),

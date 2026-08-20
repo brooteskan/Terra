@@ -14,7 +14,8 @@ pub mod tile_cache;
 
 pub use derivatives::{cpu_slope_oracle, run_derivative_gpu, GpuDerivativeMode};
 pub use engine::{
-    GpuEvalResult, GpuEvalStats, GpuEvaluationIntent, GpuPreviewFreshness, GpuTerrainEngine,
+    GpuEvalResult, GpuEvalStats, GpuEvaluationIntent, GpuPreviewFreshness, GpuRefinementJob,
+    GpuRefinementPhase, GpuRefinementProgress, GpuRefinementStep, GpuTerrainEngine,
 };
 pub use evaluation_timing::{GpuEvaluationTiming, GpuEvaluationTraceContext};
 pub use graph::{

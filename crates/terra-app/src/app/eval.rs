@@ -6,9 +6,10 @@ use terra_core::eval::{EvalWorkRequest, PreviewQuality};
 use terra_core::layer::{LayerId, LayerKind};
 use terra_core::mask::bake_mask_assets;
 use terra_core::tiling::UvRect;
-use terra_gpu::{GpuError, GpuEvaluationIntent, GpuPreviewFreshness};
+use terra_gpu::{GpuError, GpuEvaluationIntent, GpuPreviewFreshness, GpuRefinementStep};
 
 use super::frame_trace::FrameTraceEventKind;
+use super::refinement_job::{RefinementJob, RefinementPublicationState};
 use super::{quality_stage_progress, DeferredFullField, TerraApp};
 
 /// Interactive Full preview ceiling — same 1 m footing as WC (world metres ≈ samples),
@@ -39,6 +40,7 @@ impl TerraApp {
     pub(crate) fn request_rebuild(&mut self) {
         self.eval_token = self.scheduler.request_rebuild();
         self.eval_worker.set_token(self.eval_token);
+        self.supersede_gpu_refinement();
         self.worker_refine_pending = false;
         self.deferred_full_field = None;
         self.full_field_refine_not_before = None;
@@ -74,6 +76,7 @@ impl TerraApp {
         self.eval_token = self.eval_token.wrapping_add(1);
         self.scheduler.current_token = self.eval_token;
         self.eval_worker.set_token(self.eval_token);
+        self.supersede_gpu_refinement();
         self.worker_refine_pending = false;
         self.deferred_full_field = None;
         self.full_field_refine_not_before = None;
@@ -132,6 +135,352 @@ impl TerraApp {
     /// Submit the current Medium/Full snapshot to the CPU worker without blocking the UI.
     pub(crate) fn enqueue_refine_job(&mut self) {
         self.enqueue_async_eval(self.scheduler.quality);
+    }
+
+    /// Create an isolated GPU job for optional Medium/Full work. Required
+    /// interactive evaluation continues to use `run_eval_step_with_intent`.
+    pub(crate) fn begin_gpu_refinement(&mut self, quality: PreviewQuality) -> bool {
+        if self.refinement_job.is_some()
+            || !matches!(quality, PreviewQuality::Medium | PreviewQuality::Full)
+        {
+            return false;
+        }
+        let Some(gpu) = self.gpu.as_ref() else {
+            return false;
+        };
+        let preview_stack = self.session.document.preview_eval_stack();
+        let plan = match self
+            .terrain_plan_cache
+            .acquire(&preview_stack, &self.session.document.masks)
+        {
+            Ok(plan) => plan.clone(),
+            Err(_) => return false,
+        };
+        let invalidation = self.pending_plan_invalidation.clone().unwrap_or_default();
+        let revision = self.terrain_plan_cache.structure_revision();
+        let preview = self
+            .session
+            .document
+            .preview_resolution
+            .min(INTERACTIVE_PREVIEW_CAP);
+        let resolution = quality.resolution(preview, self.session.document.export_resolution);
+        let Ok(metrics) = self.session.document.metrics.at_resolution(resolution) else {
+            return false;
+        };
+
+        // A full-field present may currently share the engine's ping texture.
+        // Snapshot it into the renderer's local double buffer before resumable
+        // encoding mutates engine scratch across logical frames.
+        if let (Some(engine), Some(renderer)) = (self.gpu_engine.as_ref(), self.renderer.as_mut()) {
+            let (width, height) = renderer.heights.tex_size;
+            if width > 0 && height > 0 {
+                let current_metrics = self
+                    .session
+                    .document
+                    .metrics
+                    .at_resolution(width)
+                    .unwrap_or(self.session.document.metrics);
+                renderer.present_gpu_height_region(
+                    engine.output_texture(),
+                    terra_render::HeightPresentGeom {
+                        width,
+                        height,
+                        world_size: renderer.heights.world_size,
+                        height_range: renderer.heights.height_range,
+                        dx: current_metrics.dx(),
+                        dz: current_metrics.dz(),
+                    },
+                    None,
+                );
+            }
+        }
+
+        let Some(engine) = self.gpu_engine.as_mut() else {
+            return false;
+        };
+        let engine_job = match engine.begin_compiled_refinement(
+            &gpu.device,
+            &preview_stack,
+            &self.session.document.masks,
+            &plan,
+            revision,
+            &invalidation,
+            metrics,
+            quality,
+        ) {
+            Ok(job) => job,
+            Err(error) => {
+                log::debug!(
+                    target: "terra_app::evaluation",
+                    "resumable GPU refinement unavailable: {error}"
+                );
+                return false;
+            }
+        };
+        self.next_refinement_job_id = self.next_refinement_job_id.wrapping_add(1).max(1);
+        let origin = self.logical_frames.active_identity().unwrap_or_default();
+        let evaluation = self.frame_trace.next_evaluation_id();
+        let job = RefinementJob {
+            id: self.next_refinement_job_id,
+            origin,
+            generation: super::logical_frame::EditGeneration::new(self.eval_token),
+            target_quality: quality,
+            evaluation,
+            engine: engine_job,
+            publication: RefinementPublicationState::Preparing,
+            started_at: Instant::now(),
+        };
+        let progress = job.engine.progress();
+        let submission_depth = self
+            .gpu_engine
+            .as_ref()
+            .map_or(usize::from(progress.submissions_in_flight), |engine| {
+                engine.refinement_submissions_in_flight(&job.engine)
+            })
+            .min(u8::MAX as usize) as u8;
+        self.frame_trace.record_refinement(
+            Instant::now(),
+            FrameTraceEventKind::RefinementJobCreated,
+            Some(origin),
+            self.logical_frames.active_phase(),
+            evaluation,
+            quality,
+            job.id,
+            progress.completed_units,
+            progress.total_units,
+            submission_depth,
+            None,
+        );
+        self.refinement_job = Some(job);
+        self.ui_state.refining = true;
+        self.ui_state.quality = quality;
+        self.ui_state.build_progress = Some(super::quality_in_flight_progress(quality, 0.0));
+        true
+    }
+
+    /// Advance at most one safe unit. The engine itself enforces a depth-one
+    /// refinement queue; this method supplies generation and publication gates.
+    pub(crate) fn advance_gpu_refinement(&mut self) -> bool {
+        let Some(mut job) = self.refinement_job.take() else {
+            return false;
+        };
+        if !job.is_fresh(self.eval_token) || self.input.has_pending() || self.pending_eval {
+            let progress = job.engine.progress();
+            if let Some(engine) = self.gpu_engine.as_mut() {
+                engine.abandon_compiled_refinement(job.engine);
+            }
+            self.frame_trace.record_refinement(
+                Instant::now(),
+                FrameTraceEventKind::RefinementSuperseded,
+                Some(job.origin),
+                self.logical_frames.active_phase(),
+                job.evaluation,
+                job.target_quality,
+                job.id,
+                progress.completed_units,
+                progress.total_units,
+                progress.submissions_in_flight,
+                Some(job.started_at.elapsed()),
+            );
+            return false;
+        }
+        let Some(gpu) = self.gpu.as_ref() else {
+            return false;
+        };
+        let progress_before = job.engine.progress();
+        let unit_started = Instant::now();
+        let step = match self.gpu_engine.as_mut().map(|engine| {
+            engine.advance_compiled_refinement(&gpu.device, &gpu.queue, &mut job.engine)
+        }) {
+            Some(Ok(step)) => step,
+            Some(Err(error)) => {
+                let progress = job.engine.progress();
+                if let Some(engine) = self.gpu_engine.as_mut() {
+                    engine.abandon_compiled_refinement(job.engine);
+                }
+                self.frame_trace.record_refinement(
+                    Instant::now(),
+                    FrameTraceEventKind::RefinementFailed,
+                    Some(job.origin),
+                    self.logical_frames.active_phase(),
+                    job.evaluation,
+                    job.target_quality,
+                    job.id,
+                    progress.completed_units,
+                    progress.total_units,
+                    progress.submissions_in_flight,
+                    Some(job.started_at.elapsed()),
+                );
+                log::warn!(target: "terra_app::evaluation", "GPU refinement failed: {error}");
+                if !self.worker_refine_pending {
+                    self.enqueue_async_eval(job.target_quality);
+                }
+                return false;
+            }
+            None => return false,
+        };
+        let progress = job.engine.progress();
+        let submission_depth = self
+            .gpu_engine
+            .as_ref()
+            .map_or(usize::from(progress.submissions_in_flight), |engine| {
+                engine.refinement_submissions_in_flight(&job.engine)
+            })
+            .min(u8::MAX as usize) as u8;
+        let kind = match step {
+            GpuRefinementStep::Submitted { .. } => {
+                job.publication = RefinementPublicationState::SubmissionInFlight;
+                FrameTraceEventKind::RefinementSubmissionQueued
+            }
+            GpuRefinementStep::ReadyToPublish => {
+                job.publication = RefinementPublicationState::ReadyToPublish;
+                FrameTraceEventKind::RefinementCandidateCompleted
+            }
+            GpuRefinementStep::Progressed
+                if progress_before.submissions_in_flight == 1
+                    && progress.submissions_in_flight == 0 =>
+            {
+                job.publication = RefinementPublicationState::Preparing;
+                FrameTraceEventKind::RefinementSubmissionCompleted
+            }
+            GpuRefinementStep::Progressed | GpuRefinementStep::AwaitingGpu => {
+                job.publication = if progress.submissions_in_flight == 0 {
+                    RefinementPublicationState::Preparing
+                } else {
+                    RefinementPublicationState::SubmissionInFlight
+                };
+                FrameTraceEventKind::RefinementUnitProgress
+            }
+        };
+        self.frame_trace.record_refinement(
+            Instant::now(),
+            kind,
+            Some(job.origin),
+            self.logical_frames.active_phase(),
+            job.evaluation,
+            job.target_quality,
+            job.id,
+            progress.completed_units,
+            progress.total_units,
+            submission_depth,
+            Some(unit_started.elapsed()),
+        );
+
+        if !matches!(step, GpuRefinementStep::ReadyToPublish) {
+            let elapsed = job.started_at.elapsed().as_secs_f32();
+            self.ui_state.build_progress = Some(super::quality_in_flight_progress(
+                job.target_quality,
+                elapsed,
+            ));
+            self.refinement_job = Some(job);
+            return !matches!(step, GpuRefinementStep::AwaitingGpu);
+        }
+
+        // No input can interleave with this event-loop turn. Recheck the token
+        // immediately before consuming and publishing the candidate.
+        if !job.is_fresh(self.eval_token) || self.input.has_pending() {
+            if let Some(engine) = self.gpu_engine.as_mut() {
+                engine.abandon_compiled_refinement(job.engine);
+            }
+            return false;
+        }
+        let target_quality = job.target_quality;
+        let result = {
+            let Some(engine) = self.gpu_engine.as_mut() else {
+                return false;
+            };
+            match engine.publish_compiled_refinement(job.engine) {
+                Ok(result) => result,
+                Err(error) => {
+                    log::warn!(target: "terra_app::evaluation", "refinement publication failed: {error}");
+                    return false;
+                }
+            }
+        };
+        if let (Some(engine), Some(renderer)) = (self.gpu_engine.as_ref(), self.renderer.as_mut()) {
+            let result_metrics = self
+                .session
+                .document
+                .metrics
+                .at_resolution(result.width)
+                .unwrap_or(self.session.document.metrics);
+            let dx = result_metrics.dx();
+            let dz = result_metrics.dz();
+            renderer.present_gpu_height_shared(
+                engine.output_texture(),
+                engine.output_texture_view(),
+                terra_render::HeightPresentGeom {
+                    width: result.width,
+                    height: result.height,
+                    world_size: result.world_size,
+                    height_range: result.height_range,
+                    dx,
+                    dz,
+                },
+                None,
+            );
+        }
+        self.scheduler.quality = target_quality;
+        self.ui_state.quality = target_quality;
+        self.ui_state.profile.quality = match target_quality {
+            PreviewQuality::Medium => "Medium",
+            PreviewQuality::Full => "Final (viewport)",
+            _ => unreachable!("refinement target is Medium or Full"),
+        };
+        self.ui_state.profile.gpu = self
+            .gpu_engine
+            .as_ref()
+            .map(|engine| engine.last_eval_stats())
+            .unwrap_or_default();
+        self.ui_state.refining = target_quality.next_refine().is_some();
+        self.ui_state.build_progress = self
+            .ui_state
+            .refining
+            .then_some(quality_stage_progress(target_quality));
+        self.ui_state.draft_displayed = matches!(target_quality, PreviewQuality::Medium);
+        self.last_complete_generation = job.generation;
+        self.last_accepted_evaluation_id = job.evaluation.get();
+        self.last_eval_fully_gpu = true;
+        self.pending_plan_invalidation = None;
+        self.needs_height_upload = false;
+        self.last_refine = Instant::now();
+        self.frame_trace.record_refinement(
+            Instant::now(),
+            FrameTraceEventKind::RefinementPublished,
+            Some(job.origin),
+            self.logical_frames.active_phase(),
+            job.evaluation,
+            target_quality,
+            job.id,
+            progress.total_units,
+            progress.total_units,
+            0,
+            Some(job.started_at.elapsed()),
+        );
+        true
+    }
+
+    pub(crate) fn supersede_gpu_refinement(&mut self) {
+        let Some(job) = self.refinement_job.take() else {
+            return;
+        };
+        let progress = job.engine.progress();
+        if let Some(engine) = self.gpu_engine.as_mut() {
+            engine.abandon_compiled_refinement(job.engine);
+        }
+        self.frame_trace.record_refinement(
+            Instant::now(),
+            FrameTraceEventKind::RefinementSuperseded,
+            Some(job.origin),
+            self.logical_frames.active_phase(),
+            job.evaluation,
+            job.target_quality,
+            job.id,
+            progress.completed_units,
+            progress.total_units,
+            progress.submissions_in_flight,
+            Some(job.started_at.elapsed()),
+        );
     }
 
     /// Offload CPU stack eval to the worker — never block the UI thread.

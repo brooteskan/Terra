@@ -12,5 +12,5 @@ pub use operations::{GpuGroupCompositeParams, GpuPlanOperationError, GpuPlanOper
 pub use resources::{
     GpuFieldBinding, GpuFieldResidency, GpuPhysicalFieldId, GpuPlanAllocation,
     GpuPlanResourceCache, GpuPlanResourceCacheStats, GpuPlanResourceError, GpuPlanResourceKey,
-    GpuPlanResourceLayout, GpuPlanResources,
+    GpuPlanResourceBuilder, GpuPlanResourceLayout, GpuPlanResources,
 };
