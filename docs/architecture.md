@@ -90,9 +90,14 @@ LayerStack (authored source)
     -> final height and auxiliary outputs
 ```
 
-The plan IR is present first; tree compilation and GPU consumption land in subsequent
-phases. Until then, incremental CPU rebuild continues to use `LayerCache` +
-`mark_dirty_from`, and the existing GPU planner continues to serve flat stacks.
+The plan IR and recursive `LayerStack` compiler are present. The compiler preserves
+bottom-to-top order, pass-through folders, private `CopyInput` / `EmptyHeight` group
+fields, group composites, point-of-use mask operations, explicit auxiliary merges,
+and authored provenance. Solo filtering and selected/cross-tree fields remain explicit
+compile diagnostics until their dedicated compiler phases land. Production GPU
+realization and consumption land in subsequent phases. Until then, incremental CPU
+rebuild continues to use `LayerCache` + `mark_dirty_from`, and the existing GPU planner
+continues to serve flat stacks.
 Progressive preview walks `Draft → Medium → Full`: the app advances the quality ladder
 held on `EvalScheduler` and runs each authoritative CPU pass on the background
 `EvalWorker`.

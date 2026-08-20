@@ -51,6 +51,7 @@ fn flat_plan(revision: u64) -> (CompiledTerrainPlan, LayerId) {
         reach: Reach::LOCAL,
         kind: TerrainOpKind::EvaluateMask {
             input_height: root,
+            input_fields: Vec::new(),
             output_mask: mask,
         },
     });
@@ -140,6 +141,7 @@ fn isolated_copy_input_plan_keeps_private_and_parent_fields_distinct() {
         reach: Reach::LOCAL,
         kind: TerrainOpKind::EvaluateMask {
             input_height: private_seed,
+            input_fields: Vec::new(),
             output_mask: child_mask,
         },
     });
@@ -159,6 +161,7 @@ fn isolated_copy_input_plan_keeps_private_and_parent_fields_distinct() {
         reach: Reach::LOCAL,
         kind: TerrainOpKind::EvaluateMask {
             input_height: parent,
+            input_fields: Vec::new(),
             output_mask: group_mask,
         },
     });
@@ -173,6 +176,7 @@ fn isolated_copy_input_plan_keeps_private_and_parent_fields_distinct() {
             mask: group_mask,
             output: group_output,
             mode: GroupCompositeMode::BiomeHeightDelta,
+            aux: Vec::new(),
         },
     });
     builder.add_operation(TerrainOp {

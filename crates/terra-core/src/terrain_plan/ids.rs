@@ -38,6 +38,23 @@ impl TerrainPlanStamp {
     }
 }
 
+/// Deterministic signature of a plan's logical fields and ordered operations.
+///
+/// Numeric authored parameters and the source revision are intentionally absent:
+/// they can change while the compiled operation/resource shape remains reusable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct PlanStructureSignature(u64);
+
+impl PlanStructureSignature {
+    pub(crate) const fn from_hash(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
 /// Index of one operation within a particular compiled plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PlanOpId(u32);

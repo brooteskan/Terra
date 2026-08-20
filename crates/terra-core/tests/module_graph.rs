@@ -412,7 +412,15 @@ const MODULE_DEPENDENCIES: &[(&str, &[&str])] = &[
     ("terrain", &["field_data", "heightfield", "layer"]),
     (
         "terrain_plan",
-        &["deps", "field_data", "ids", "invalidation", "tiling"],
+        &[
+            "deps",
+            "field_data",
+            "ids",
+            "invalidation",
+            "layer",
+            "mask",
+            "tiling",
+        ],
     ),
     ("terrain_recipe", &["layer"]),
     ("tiling", &["heightfield", "invalidation", "layer"]),

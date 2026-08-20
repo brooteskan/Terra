@@ -11,15 +11,19 @@
 //! from [`crate::deps::NodeRef`], [`crate::ids::LayerId`], and
 //! [`crate::ids::OutputId`].
 
+mod compiler;
 mod ids;
 mod impact;
 mod ir;
 mod provenance;
 
-pub use ids::{FieldSlot, PlanOpId, PlanStructureRevision, TerrainPlanStamp};
+pub use compiler::{compile_terrain_plan, TerrainPlanDiagnostic};
+pub use ids::{
+    FieldSlot, PlanOpId, PlanStructureRevision, PlanStructureSignature, TerrainPlanStamp,
+};
 pub use impact::{PlanDirtyScope, TerrainEditClass, TerrainPlanWork};
 pub use ir::{
-    CompiledTerrainPlan, GroupCompositeMode, LogicalField, LogicalFieldKind, PlanBuildError,
-    PlanOrigin, SeedSource, TerrainOp, TerrainOpKind, TerrainPlanBuilder,
+    CompiledTerrainPlan, GroupAuxComposite, GroupCompositeMode, LogicalField, LogicalFieldKind,
+    PlanBuildError, PlanOrigin, SeedSource, TerrainOp, TerrainOpKind, TerrainPlanBuilder,
 };
 pub use provenance::PlanProvenance;

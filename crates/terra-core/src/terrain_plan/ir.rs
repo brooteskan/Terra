@@ -1,6 +1,11 @@
 //! Logical fields, operations, and construction of a compiled terrain plan.
 
-use super::{FieldSlot, PlanOpId, PlanProvenance, PlanStructureRevision, TerrainPlanStamp};
+use std::hash::{Hash, Hasher};
+
+use super::{
+    FieldSlot, PlanOpId, PlanProvenance, PlanStructureRevision, PlanStructureSignature,
+    TerrainPlanStamp,
+};
 use crate::deps::NodeRef;
 use crate::field_data::FieldId;
 use crate::ids::{LayerId, OutputId};
@@ -39,7 +44,7 @@ pub struct LogicalField {
 }
 
 /// Source used to initialize a working heightfield.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SeedSource {
     Zero,
     Copy(FieldSlot),
@@ -47,10 +52,22 @@ pub enum SeedSource {
 }
 
 /// Height-composition equation selected by authored group semantics.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GroupCompositeMode {
     Standard,
     BiomeHeightDelta,
+}
+
+/// One auxiliary field crossing an isolated-group boundary.
+///
+/// `parent` is absent when the field is first produced inside the group; backends
+/// treat that case as a zero-valued parent field before applying the group mask.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupAuxComposite {
+    pub field: FieldId,
+    pub parent: Option<FieldSlot>,
+    pub child: FieldSlot,
+    pub output: FieldSlot,
 }
 
 /// One operation in the backend-neutral ordered execution plan.
@@ -62,6 +79,7 @@ pub enum TerrainOpKind {
     },
     EvaluateMask {
         input_height: FieldSlot,
+        input_fields: Vec<FieldSlot>,
         output_mask: FieldSlot,
     },
     RunLayerKernel {
@@ -87,6 +105,7 @@ pub enum TerrainOpKind {
         mask: FieldSlot,
         output: FieldSlot,
         mode: GroupCompositeMode,
+        aux: Vec<GroupAuxComposite>,
     },
     PublishOutput {
         output: OutputId,
@@ -101,7 +120,16 @@ impl TerrainOpKind {
                 SeedSource::Zero => Vec::new(),
                 SeedSource::Copy(slot) | SeedSource::Selected(slot) => vec![*slot],
             },
-            Self::EvaluateMask { input_height, .. } => vec![*input_height],
+            Self::EvaluateMask {
+                input_height,
+                input_fields,
+                ..
+            } => {
+                let mut slots = Vec::with_capacity(1 + input_fields.len());
+                slots.push(*input_height);
+                slots.extend(input_fields.iter().copied());
+                slots
+            }
             Self::RunLayerKernel {
                 input_height,
                 input_fields,
@@ -123,17 +151,32 @@ impl TerrainOpKind {
                 private_seed,
                 child_output,
                 mask,
+                aux,
                 ..
-            } => vec![*parent, *private_seed, *child_output, *mask],
+            } => {
+                let mut slots = Vec::with_capacity(4 + aux.len() * 2);
+                slots.extend([*parent, *private_seed, *child_output, *mask]);
+                for field in aux {
+                    if let Some(parent) = field.parent {
+                        slots.push(parent);
+                    }
+                    slots.push(field.child);
+                }
+                slots
+            }
             Self::PublishOutput { source, .. } => vec![*source],
         }
     }
 
     fn output_slots(&self) -> Vec<FieldSlot> {
         match self {
-            Self::Seed { output, .. }
-            | Self::CompositeLayer { output, .. }
-            | Self::CompositeGroup { output, .. } => vec![*output],
+            Self::Seed { output, .. } | Self::CompositeLayer { output, .. } => vec![*output],
+            Self::CompositeGroup { output, aux, .. } => {
+                let mut slots = Vec::with_capacity(1 + aux.len());
+                slots.push(*output);
+                slots.extend(aux.iter().map(|field| field.output));
+                slots
+            }
             Self::EvaluateMask { output_mask, .. } => vec![*output_mask],
             Self::RunLayerKernel {
                 output_candidate,
@@ -162,6 +205,7 @@ pub struct TerrainOp {
 #[derive(Debug, Clone)]
 pub struct CompiledTerrainPlan {
     stamp: TerrainPlanStamp,
+    structure_signature: PlanStructureSignature,
     fields: Vec<LogicalField>,
     operations: Vec<TerrainOp>,
     provenance: PlanProvenance,
@@ -171,6 +215,10 @@ pub struct CompiledTerrainPlan {
 impl CompiledTerrainPlan {
     pub const fn stamp(&self) -> TerrainPlanStamp {
         self.stamp
+    }
+
+    pub const fn structure_signature(&self) -> PlanStructureSignature {
+        self.structure_signature
     }
 
     pub fn matches_structure_revision(&self, revision: PlanStructureRevision) -> bool {
@@ -272,13 +320,138 @@ impl TerrainPlanBuilder {
             }
         }
 
+        let structure_signature = structure_signature(&self.fields, &self.operations, final_height);
         Ok(CompiledTerrainPlan {
             stamp: self.stamp,
+            structure_signature,
             fields: self.fields,
             operations: self.operations,
             provenance,
             final_height,
         })
+    }
+}
+
+fn structure_signature(
+    fields: &[LogicalField],
+    operations: &[TerrainOp],
+    final_height: FieldSlot,
+) -> PlanStructureSignature {
+    let mut hasher = StablePlanHasher::default();
+    fields.len().hash(&mut hasher);
+    for field in fields {
+        field.slot.hash(&mut hasher);
+        field.kind.hash(&mut hasher);
+        field.origin.hash(&mut hasher);
+    }
+    operations.len().hash(&mut hasher);
+    for operation in operations {
+        operation.origin.hash(&mut hasher);
+        hash_operation_kind(&operation.kind, &mut hasher);
+    }
+    final_height.hash(&mut hasher);
+    PlanStructureSignature::from_hash(hasher.finish())
+}
+
+fn hash_operation_kind(kind: &TerrainOpKind, hasher: &mut impl Hasher) {
+    match kind {
+        TerrainOpKind::Seed { source, output } => {
+            0_u8.hash(hasher);
+            source.hash(hasher);
+            output.hash(hasher);
+        }
+        TerrainOpKind::EvaluateMask {
+            input_height,
+            input_fields,
+            output_mask,
+        } => {
+            1_u8.hash(hasher);
+            input_height.hash(hasher);
+            input_fields.hash(hasher);
+            output_mask.hash(hasher);
+        }
+        TerrainOpKind::RunLayerKernel {
+            layer,
+            type_id,
+            input_height,
+            input_fields,
+            output_candidate,
+            output_fields,
+        } => {
+            2_u8.hash(hasher);
+            layer.hash(hasher);
+            type_id.hash(hasher);
+            input_height.hash(hasher);
+            input_fields.hash(hasher);
+            output_candidate.hash(hasher);
+            output_fields.hash(hasher);
+        }
+        TerrainOpKind::CompositeLayer {
+            layer,
+            base,
+            candidate,
+            mask,
+            output,
+        } => {
+            3_u8.hash(hasher);
+            layer.hash(hasher);
+            base.hash(hasher);
+            candidate.hash(hasher);
+            mask.hash(hasher);
+            output.hash(hasher);
+        }
+        TerrainOpKind::CompositeGroup {
+            group,
+            parent,
+            private_seed,
+            child_output,
+            mask,
+            output,
+            mode,
+            aux,
+        } => {
+            4_u8.hash(hasher);
+            group.hash(hasher);
+            parent.hash(hasher);
+            private_seed.hash(hasher);
+            child_output.hash(hasher);
+            mask.hash(hasher);
+            output.hash(hasher);
+            mode.hash(hasher);
+            for field in aux {
+                field.field.hash(hasher);
+                field.parent.hash(hasher);
+                field.child.hash(hasher);
+                field.output.hash(hasher);
+            }
+        }
+        TerrainOpKind::PublishOutput { output, source } => {
+            5_u8.hash(hasher);
+            output.hash(hasher);
+            source.hash(hasher);
+        }
+    }
+}
+
+/// Fixed FNV-1a rather than `DefaultHasher`, whose algorithm is not a stability contract.
+struct StablePlanHasher(u64);
+
+impl Default for StablePlanHasher {
+    fn default() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
+}
+
+impl Hasher for StablePlanHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 ^= u64::from(*byte);
+            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+        }
     }
 }
 
