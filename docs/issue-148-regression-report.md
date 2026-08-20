@@ -1,51 +1,60 @@
-# Issue #148 — Untitled6 tree-aware GPU brushing
+# Issues #148 and #150 — Untitled6 tree-aware GPU brushing
 
-## Regression fixture
+## Production-shaped regression fixture
 
-The shared `terra_core::test_fixtures::untitled6_document` builder owns the
-representative document and stable handles used across the core, GPU, and app
-tests:
+The shared `terra_core::test_fixtures::untitled6_document` builder now models
+the saved document topology that exposed #150:
 
-- `Base` (`SculptBase`)
-- `Terrain / Semantic Sculpt / SculptStrokes`
-- `Biomes / Default biome` (isolated `CopyInput`) `/ Filters / Volcano`
+- `Base` is a `SculptBase` with a 512x512 embedded sample payload, independent
+  of the requested evaluation resolution.
+- `Terrain / Semantic Sculpt` is a direct `SculptStrokes` layer.
+- `Biomes` contains the isolated `Default biome / Filters / Volcano` tree,
+  followed by empty isolated `Water`, `Beach`, `Grassland`, and `Rock` biome
+  siblings.
 
-It also exposes empty-isolated and masked/non-default-composite variants. All
-three variants compile through the same structural-plan authority.
+Each empty biome's compiled `CompositeGroup` intentionally reads its seed twice
+(`private_seed == child_output`). The resource validator permits this read/read
+alias while continuing to reject read/write and write/write aliases.
 
 ## Automated acceptance coverage
 
-- Raise and Pinch on Base and the existing SculptStrokes layer.
-- Three rapidly appended dabs evaluated as one warm generation.
-- Visible app presentation during the interactive-local evaluation.
-- No structural-plan compile, authored tree walk, dependency build, CPU job
-  submission, or GPU readback caused by the supported tree.
-- Per-operation incoming/output scope and concrete texel region, with
-  dispatched/skipped/reused/deferred disposition.
-- Bounded upload and logical-workgroup counts, including reuse of the
-  input-independent Volcano contribution.
-- Full-field settled GPU result against a fresh CPU oracle under the named
-  `UNTITLED6_INTERACTION` tolerance (0.02 m maximum absolute error and 1e-5
-  normalized RMSE).
-- Existing latest-generation-wins and deferred-FullField tests remain the
-  mouse-up/stale-publication and downstream-global-policy ratchets.
-
-The profiler overlay reports generation/path and precise fallback diagnostic,
-first-visible and settled latency, cumulative plan compile time/count, authored
-walk/dependency counts, GPU operation disposition/workgroups/upload/readback,
-and CPU submit/cancel/complete/publish counters.
+- Focused validator tests cover the allowed read/read case and both rejected
+  write hazards.
+- A compiled-plan resource test builds the production topology, verifies all
+  four empty-biome duplicate inputs, and verifies their output allocation is
+  distinct.
+- Raise and Pinch gestures run against both Base and Semantic Sculpt through the
+  production-shaped tree.
+- Three rapidly appended Draft dabs remain on the bounded compiled GPU plan,
+  with no fallback, deferred operation, or readback.
+- Medium and Full refinement complete on the GPU after the Draft gesture.
+- Full-quality settled results are checked against a fresh CPU oracle under the
+  named `UNTITLED6_INTERACTION` tolerance (0.02 m maximum absolute error and
+  1e-5 normalized RMSE).
+- The app regression resolves the selected Base through
+  `ensure_shape_history_target`, sends actual `PanelAction::PaintSculptStamp`
+  actions through `apply_actions`, and presents via the renderer.
+- The app worker snapshot confirms no CPU job was submitted, started, completed,
+  cancelled, failed, or published during Draft, Medium, or Full evaluation.
+- Warm dabs do not recompile the structural plan, rebuild dependencies, or walk
+  the authored tree.
 
 ## Release timing record
 
 Measured 2026-08-20 with the ignored release test
 `engine::smoke_tests::untitled6_release_timing_probe_2048_4096`.
 
-Adapter: AMD Radeon RX 7900 XTX, DX12, vendor 4098, device 29772.
+Adapter: AMD Radeon RX 7900 XTX, DX12, driver 32.0.31035.1003, vendor 4098,
+device 29772.
 
-| Resolution | Cold complete | Warm interactive | Upload | Logical workgroups | Dispatch | Publish | Skip | Reuse | Defer | Readback |
-|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 2048² | 144.032 ms | 8.083 ms | 7,104 B | 432 | 12 | 5 | 0 | 1 | 0 | 0 B |
-| 4096² | 490.371 ms | 20.474 ms | 26,944 B | 1,452 | 12 | 5 | 0 | 1 | 0 | 0 B |
+| Resolution | Cold complete | Warm interactive | Warm upload | Warm logical workgroups | Warm dispatch | Publish | Reuse | Defer | Readback |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 2048² | 134.086 ms | 3.503 ms | 7,056 B | 864 | 24 | 5 | 1 | 0 | 0 B |
+| 4096² | 477.886 ms | 4.745 ms | 26,896 B | 2,904 | 24 | 5 | 1 | 0 | 0 B |
 
-These are adapter-specific wall times after waiting for submitted GPU work.
-They are recorded for comparison and are not asserted in CI.
+The cold evaluations also completed fully on the GPU with zero readback. Cold
+plan compile times were 230 us at 2048² and 155 us at 4096². Each warm edit was
+a cache hit with two patched operations and no additional plan compile,
+authored-tree walk, or dependency build. These adapter-specific wall times wait
+for submitted GPU work and are recorded for comparison rather than asserted in
+CI.

@@ -266,29 +266,67 @@ impl GpuPlanResourceLayout {
             if !plan.analysis().operation_is_live(operation) {
                 continue;
             }
-            let mut used = HashSet::new();
-            for field in plan
+            let inputs = plan
                 .analysis()
                 .inputs(operation)
                 .iter()
-                .chain(plan.analysis().outputs(operation))
-            {
-                if !plan.analysis().field_is_live(*field) {
-                    continue;
-                }
-                let binding = self
-                    .binding(*field)
-                    .ok_or(GpuPlanResourceError::MissingBinding(*field))?;
-                if !used.insert(binding.physical) {
-                    return Err(GpuPlanResourceError::AliasingHazard {
-                        operation: operation_index,
-                        field: *field,
-                    });
-                }
+                .copied()
+                .filter(|field| plan.analysis().field_is_live(*field))
+                .map(|field| {
+                    self.binding(field)
+                        .map(|binding| (field, binding.physical))
+                        .ok_or(GpuPlanResourceError::MissingBinding(field))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let outputs = plan
+                .analysis()
+                .outputs(operation)
+                .iter()
+                .copied()
+                .filter(|field| plan.analysis().field_is_live(*field))
+                .map(|field| {
+                    self.binding(field)
+                        .map(|binding| (field, binding.physical))
+                        .ok_or(GpuPlanResourceError::MissingBinding(field))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let input_physical: Vec<_> = inputs.iter().map(|(_, physical)| *physical).collect();
+            let output_physical: Vec<_> = outputs.iter().map(|(_, physical)| *physical).collect();
+            if let Some(hazard) = operation_alias_hazard(&input_physical, &output_physical) {
+                let field = match hazard {
+                    OperationAliasHazard::ReadWrite { input } => inputs[input].0,
+                    OperationAliasHazard::WriteWrite { output } => outputs[output].0,
+                };
+                return Err(GpuPlanResourceError::AliasingHazard {
+                    operation: operation_index,
+                    field,
+                });
             }
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OperationAliasHazard {
+    ReadWrite { input: usize },
+    WriteWrite { output: usize },
+}
+
+fn operation_alias_hazard(
+    inputs: &[GpuPhysicalFieldId],
+    outputs: &[GpuPhysicalFieldId],
+) -> Option<OperationAliasHazard> {
+    let mut written = HashSet::new();
+    for (output, physical) in outputs.iter().copied().enumerate() {
+        if !written.insert(physical) {
+            return Some(OperationAliasHazard::WriteWrite { output });
+        }
+    }
+    inputs
+        .iter()
+        .position(|physical| written.contains(physical))
+        .map(|input| OperationAliasHazard::ReadWrite { input })
 }
 
 /// Resource compatibility key. A new engine owns a new device generation, so
@@ -523,4 +561,42 @@ pub enum GpuPlanResourceError {
     SizeOverflow,
     #[error("compiled plan scalar field format {0:?} is unsupported")]
     UnsupportedFormat(wgpu::TextureFormat),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{operation_alias_hazard, GpuPhysicalFieldId, OperationAliasHazard};
+
+    #[test]
+    fn duplicate_read_only_allocations_are_valid() {
+        assert_eq!(
+            operation_alias_hazard(
+                &[GpuPhysicalFieldId(3), GpuPhysicalFieldId(3)],
+                &[GpuPhysicalFieldId(4)],
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn read_write_allocation_alias_is_rejected() {
+        assert_eq!(
+            operation_alias_hazard(
+                &[GpuPhysicalFieldId(3), GpuPhysicalFieldId(4)],
+                &[GpuPhysicalFieldId(4)],
+            ),
+            Some(OperationAliasHazard::ReadWrite { input: 1 })
+        );
+    }
+
+    #[test]
+    fn write_write_allocation_alias_is_rejected() {
+        assert_eq!(
+            operation_alias_hazard(
+                &[GpuPhysicalFieldId(2)],
+                &[GpuPhysicalFieldId(3), GpuPhysicalFieldId(3)],
+            ),
+            Some(OperationAliasHazard::WriteWrite { output: 1 })
+        );
+    }
 }

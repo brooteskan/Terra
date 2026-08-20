@@ -1345,15 +1345,16 @@ mod tests {
 
     use terra_core::eval::PreviewQuality;
     use terra_core::heightfield::{Heightfield, HeightfieldMetrics};
-    use terra_core::layer::{FlatParams, Layer, LayerKind, LayerStack, StreamPowerParams};
+    use terra_core::layer::{
+        FlatParams, Layer, LayerKind, LayerStack, SculptStrokeKind, StreamPowerParams,
+    };
+    use terra_core::shape_history::ShapeTool;
     use terra_core::tiling::UvRect;
-    use terra_core::deps::NodeRef;
-    use terra_core::field_data::FieldId;
-    use terra_core::layer::{BrushDab, BrushEditable, SculptStrokeKind};
-    use terra_core::terrain_plan::{PlanDirtyScope, TerrainEditClass};
     use terra_core::test_fixtures::{untitled6_document, Untitled6Variant};
     use terra_gpu::{GpuEvaluationIntent, GpuTerrainEngine};
     use terra_render::{GpuContext, TerrainRenderer};
+
+    use crate::ui::PanelAction;
 
     use super::{uv_to_texel_rect, DeferredFullField, TerraApp};
 
@@ -1389,8 +1390,8 @@ mod tests {
         assert_eq!(uv_to_texel_rect(region, 512, 256), (0, 0, 512, 256));
     }
 
-    /// #148 app-path ratchet: a mouse-down tree gesture presents through the
-    /// renderer without submitting a CPU tree job or recompiling the plan.
+    /// #150 app-path ratchet: the production-shaped document resolves the real
+    /// shape target and applies the real panel action without CPU fallback.
     #[test]
     fn untitled6_mouse_down_preview_is_gpu_only_and_visible() {
         let Some(gpu) = terra_test_gpu::headless() else {
@@ -1401,46 +1402,50 @@ mod tests {
             queue: gpu.queue.clone(),
             surface_format: wgpu::TextureFormat::Rgba8Unorm,
         };
-        let (document, ids) = untitled6_document(96, Untitled6Variant::SupportedTree);
+        let (document, ids) = untitled6_document(96, Untitled6Variant::ProductionTopology);
         let mut app = TerraApp::default();
         app.session.document = document;
+        app.session.document.selected = Some(ids.base);
         app.scheduler.quality = PreviewQuality::Draft;
         app.renderer = Some(TerrainRenderer::new_headless(&context, 96, 96));
         app.gpu_engine = Some(GpuTerrainEngine::new(&context.device, 96));
         app.gpu = Some(context);
         app.run_eval_step_with_intent(GpuEvaluationIntent::Complete);
         assert_eq!(app.ui_state.profile.path, "GPU");
+        assert!(app.last_eval_fully_gpu);
+        assert!(app.ui_state.profile.gpu_fallback.is_none());
+        assert!(app.ui_state.evaluation_failure.is_none());
 
         let plan_before = app.terrain_plan_cache.stats().snapshot();
         let worker_before = app.eval_worker.stats();
-        app.session
-            .document
-            .stack
-            .find_mut(ids.base)
-            .expect("Base")
-            .apply_brush(
-                SculptStrokeKind::Raise,
-                BrushDab {
-                    u: 0.5,
-                    v: 0.5,
-                    radius_uv: 0.04,
-                    radius_m: 80.0,
-                    strength: 5.0,
-                    target_height: 0.0,
-                    falloff: 0.5,
-                    continuing: false,
-                },
-            );
-        let region = UvRect::from_center_radius(0.5, 0.5, 0.04);
-        app.pending_gpu_dirty_region = Some(region);
-        app.pending_plan_edits.push(TerrainEditClass::Content {
-            owner: NodeRef::Layer(ids.base),
-            fields: vec![FieldId::Height],
-            scope: PlanDirtyScope::Region(region),
-        });
-        app.eval_token = app.eval_token.saturating_add(1);
-        app.eval_worker.set_token(app.eval_token);
-        app.run_eval_step_with_intent(GpuEvaluationIntent::InteractiveLocal);
+        let cpu_published_before = app.ui_state.profile.cpu_published;
+        let target = app
+            .ensure_shape_history_target(ShapeTool::Raise)
+            .expect("resolve the selected Base sculpt target");
+        assert_eq!(target, ids.base);
+
+        for u in [0.47, 0.50, 0.53] {
+            app.apply_actions(vec![PanelAction::PaintSculptStamp {
+                layer: target,
+                u,
+                v: 0.5,
+                radius: 0.04,
+                strength: 5.0,
+                stroke_kind: SculptStrokeKind::Raise,
+                target_height: 0.0,
+            }]);
+            app.last_paint_uv = Some((u, 0.5));
+            app.run_eval_step_with_intent(GpuEvaluationIntent::InteractiveLocal);
+
+            assert_eq!(app.ui_state.profile.path, "GPU");
+            assert!(app.last_eval_fully_gpu);
+            assert!(app.ui_state.profile.gpu_fallback.is_none());
+            assert!(app.ui_state.evaluation_failure.is_none());
+            let stats = app.gpu_engine.as_ref().unwrap().last_eval_stats();
+            assert_eq!(stats.readback_bytes, 0);
+            assert_eq!(stats.operations_deferred, 0);
+            assert!(stats.operations_dispatched > 0);
+        }
 
         let plan_after = app.terrain_plan_cache.stats().snapshot();
         let worker_after = app.eval_worker.stats();
@@ -1453,11 +1458,25 @@ mod tests {
         assert_eq!(plan_after.plan_compiles, plan_before.plan_compiles);
         assert_eq!(plan_after.authored_tree_walks, plan_before.authored_tree_walks);
         assert_eq!(plan_after.dependency_builds, plan_before.dependency_builds);
-        assert_eq!(worker_after.submitted, worker_before.submitted);
-        let stats = app.gpu_engine.as_ref().unwrap().last_eval_stats();
-        assert_eq!(stats.readback_bytes, 0);
-        assert_eq!(stats.operations_deferred, 0);
-        assert!(stats.operations_dispatched > 0);
+        assert_eq!(worker_after, worker_before);
+        assert_eq!(app.ui_state.profile.cpu_published, cpu_published_before);
+
+        for quality in [PreviewQuality::Medium, PreviewQuality::Full] {
+            app.scheduler.quality = quality;
+            app.run_eval_step_with_intent(GpuEvaluationIntent::Complete);
+            assert_eq!(app.ui_state.profile.path, "GPU", "{quality:?}");
+            assert!(app.last_eval_fully_gpu, "{quality:?}");
+            assert!(app.ui_state.profile.gpu_fallback.is_none(), "{quality:?}");
+            assert!(app.ui_state.evaluation_failure.is_none(), "{quality:?}");
+            assert_eq!(app.eval_worker.stats(), worker_before, "{quality:?}");
+            assert_eq!(
+                app.ui_state.profile.cpu_published, cpu_published_before,
+                "{quality:?}"
+            );
+            let stats = app.gpu_engine.as_ref().unwrap().last_eval_stats();
+            assert_eq!(stats.readback_bytes, 0, "{quality:?}");
+            assert_eq!(stats.operations_deferred, 0, "{quality:?}");
+        }
     }
 
     #[test]

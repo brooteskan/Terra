@@ -8606,7 +8606,7 @@ mod smoke_tests {
         bake_mask_assets, DistributionEntry, MaskAsset, MaskCombine, MaskId, MaskOp, MaskRef,
         MaskSource,
     };
-    use terra_core::terrain_plan::TerrainPlanCache;
+    use terra_core::terrain_plan::{PlanInvalidation, TerrainPlanCache};
     use terra_core::test_fixtures::{untitled6_document, Untitled6Variant};
     use terra_core::tiling::UvRect;
 
@@ -11457,11 +11457,11 @@ mod smoke_tests {
             (true, SculptStrokeKind::Pinch),
         ] {
             let (mut document, ids) =
-                untitled6_document(res, Untitled6Variant::SupportedTree);
+                untitled6_document(res, Untitled6Variant::ProductionTopology);
             document.metrics.tile_size = 16;
             document.metrics.halo = 2;
             let target = if target_strokes {
-                ids.sculpt_strokes
+                ids.semantic_sculpt
             } else {
                 ids.base
             };
@@ -11553,6 +11553,30 @@ mod smoke_tests {
                     && operation.output_region.3 < res
             }));
 
+            for quality in [PreviewQuality::Medium, PreviewQuality::Full] {
+                let result = engine
+                    .evaluate_compiled_with_intent(
+                        &gpu.device,
+                        &gpu.queue,
+                        &document.stack,
+                        &document.masks,
+                        cache.current_plan().unwrap(),
+                        cache.structure_revision(),
+                        &PlanInvalidation::default(),
+                        document.metrics,
+                        quality,
+                        false,
+                        GpuEvaluationIntent::Complete,
+                    )
+                    .unwrap_or_else(|error| panic!("{quality:?} refinement failed: {error}"));
+                assert!(result.fully_gpu, "{target_strokes}/{brush:?}/{quality:?}");
+                assert_eq!(result.freshness, GpuPreviewFreshness::Current);
+                assert!(result.cpu_fallback.is_none(), "{quality:?}");
+                let stats = engine.last_eval_stats();
+                assert_eq!(stats.operations_deferred, 0, "{quality:?}");
+                assert_eq!(stats.readback_bytes, 0, "{quality:?}");
+            }
+
             let settled = engine
                 .readback_current(&gpu.device, &gpu.queue)
                 .expect("settled preview");
@@ -11569,14 +11593,14 @@ mod smoke_tests {
     /// Manual release probe for the acceptance resolutions. Adapter timing is
     /// reported, not asserted, because CI hardware is intentionally variable.
     #[test]
-    #[ignore = "run in release mode to record #148 adapter timings"]
+    #[ignore = "run in release mode to record #150 adapter timings"]
     fn untitled6_release_timing_probe_2048_4096() {
         let Some(gpu) = terra_test_gpu::headless() else {
             return;
         };
         for res in [2048u32, 4096] {
             let (mut document, ids) =
-                untitled6_document(res, Untitled6Variant::SupportedTree);
+                untitled6_document(res, Untitled6Variant::ProductionTopology);
             let mut cache = TerrainPlanCache::new();
             let cold_invalidation = cache
                 .update(
@@ -11587,7 +11611,7 @@ mod smoke_tests {
                 .unwrap();
             let mut engine = GpuTerrainEngine::new(&gpu.device, res);
             let cold_started = std::time::Instant::now();
-            engine
+            let cold_result = engine
                 .evaluate_compiled_with_intent(
                     &gpu.device,
                     &gpu.queue,
@@ -11604,6 +11628,11 @@ mod smoke_tests {
                 .unwrap();
             let _ = gpu.device.poll(wgpu::Maintain::Wait);
             let cold_ms = cold_started.elapsed().as_secs_f64() * 1000.0;
+            let cold_stats = engine.last_eval_stats();
+            let cold_plan_stats = cache.stats().snapshot();
+            assert!(cold_result.fully_gpu);
+            assert!(cold_result.cpu_fallback.is_none());
+            assert_eq!(cold_stats.readback_bytes, 0);
 
             document
                 .stack
@@ -11634,7 +11663,7 @@ mod smoke_tests {
                 )
                 .unwrap();
             let warm_started = std::time::Instant::now();
-            engine
+            let warm_result = engine
                 .evaluate_compiled_with_intent(
                     &gpu.device,
                     &gpu.queue,
@@ -11650,11 +11679,15 @@ mod smoke_tests {
                 )
                 .unwrap();
             let _ = gpu.device.poll(wgpu::Maintain::Wait);
+            let warm_ms = warm_started.elapsed().as_secs_f64() * 1000.0;
+            let warm_stats = engine.last_eval_stats();
+            let warm_plan_stats = cache.stats().snapshot();
+            assert!(warm_result.fully_gpu);
+            assert!(warm_result.cpu_fallback.is_none());
+            assert_eq!(warm_stats.readback_bytes, 0);
             println!(
-                "issue148 resolution={res} adapter={:?} cold_ms={cold_ms:.3} warm_ms={:.3} stats={:?}",
+                "issue150 resolution={res} adapter={:?} cold_ms={cold_ms:.3} warm_ms={warm_ms:.3} cold_stats={cold_stats:?} warm_stats={warm_stats:?} cold_plan_stats={cold_plan_stats:?} warm_plan_stats={warm_plan_stats:?}",
                 gpu.adapter_info,
-                warm_started.elapsed().as_secs_f64() * 1000.0,
-                engine.last_eval_stats()
             );
         }
     }

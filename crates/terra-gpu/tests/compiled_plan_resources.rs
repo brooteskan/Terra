@@ -12,6 +12,7 @@ use terra_core::terrain_plan::{
     compile_terrain_plan, CompiledTerrainPlan, GroupCompositeMode, PlanOpId, PlanOrigin,
     PlanStructureRevision, TerrainOpKind, TerrainPlanStamp,
 };
+use terra_core::test_fixtures::{untitled6_document, Untitled6Variant};
 use terra_gpu::compiled_plan::{
     GpuFieldResidency, GpuGroupCompositeParams, GpuPlanOperations, GpuPlanResourceCache,
     GpuPlanResourceKey, GpuPlanResourceLayout,
@@ -545,7 +546,7 @@ fn nested_private_fields_with_overlapping_lifetimes_do_not_alias() {
 }
 
 #[test]
-fn every_live_operation_has_distinct_input_and_output_allocations() {
+fn every_live_operation_has_distinct_outputs_and_no_read_write_alias() {
     let (stack, _, _) = sibling_groups();
     let plan = compile(&stack);
     let layout = GpuPlanResourceLayout::build(&plan).expect("resource layout");
@@ -554,20 +555,62 @@ fn every_live_operation_has_distinct_input_and_output_allocations() {
         if !plan.analysis().operation_is_live(operation) {
             continue;
         }
-        let mut physical = Vec::new();
-        for field in plan
-            .analysis()
-            .inputs(operation)
-            .iter()
-            .chain(plan.analysis().outputs(operation))
-        {
+        let mut outputs = Vec::new();
+        for field in plan.analysis().outputs(operation) {
+            if !plan.analysis().field_is_live(*field) {
+                continue;
+            }
             let id = layout.binding(*field).expect("live binding").physical;
             assert!(
-                !physical.contains(&id),
-                "operation {operation_index} aliases field {field:?}"
+                !outputs.contains(&id),
+                "operation {operation_index} has aliased outputs at field {field:?}"
             );
-            physical.push(id);
+            outputs.push(id);
         }
+        for field in plan.analysis().inputs(operation) {
+            if !plan.analysis().field_is_live(*field) {
+                continue;
+            }
+            let id = layout.binding(*field).expect("live binding").physical;
+            assert!(
+                !outputs.contains(&id),
+                "operation {operation_index} aliases input {field:?} with an output"
+            );
+        }
+    }
+}
+
+#[test]
+fn production_untitled6_empty_biomes_share_read_only_seed_resources() {
+    let (document, ids) = untitled6_document(64, Untitled6Variant::ProductionTopology);
+    let plan = compile(&document.stack);
+    let layout = GpuPlanResourceLayout::build(&plan).expect("production resource layout");
+
+    assert_eq!(ids.empty_biomes.len(), 4);
+    for group_id in ids.empty_biomes {
+        let (private_seed, child_output, output) = plan
+            .operations()
+            .iter()
+            .find_map(|operation| match operation.kind {
+                TerrainOpKind::CompositeGroup {
+                    group,
+                    private_seed,
+                    child_output,
+                    output,
+                    ..
+                } if group == group_id => Some((private_seed, child_output, output)),
+                _ => None,
+            })
+            .expect("empty biome composite");
+        assert_eq!(
+            private_seed, child_output,
+            "empty biome must keep its intentional duplicate read-only input"
+        );
+        assert_ne!(
+            layout.binding(private_seed).unwrap().physical,
+            layout.binding(output).unwrap().physical,
+            "empty biome composite must still keep its write target distinct"
+        );
     }
 }
 
