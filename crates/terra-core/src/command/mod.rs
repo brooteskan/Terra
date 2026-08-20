@@ -388,6 +388,68 @@ fn swap_raster_source(
 }
 
 impl EditorCommand {
+    /// Classify this undoable edit at the authored-tree/compiled-plan boundary.
+    /// Numeric changes inside the same layer operation shape remain patchable;
+    /// topology, dependency, and operation-I/O changes advance plan structure.
+    pub fn terrain_edit_class(&self, stack: &LayerStack) -> crate::terrain_plan::TerrainEditClass {
+        use crate::deps::NodeRef;
+        use crate::field_data::FieldId;
+        use crate::terrain_plan::{PlanDirtyScope, TerrainEditClass};
+
+        match self {
+            Self::AddLayer { .. }
+            | Self::RemoveLayer { .. }
+            | Self::Reorder { .. }
+            | Self::Duplicate { .. }
+            | Self::AddGroup { .. }
+            | Self::SetEnabled { .. }
+            | Self::SetSolo { .. }
+            | Self::SetOperationPlacement { .. } => TerrainEditClass::Structure,
+            Self::SetKind { id, kind, previous } => {
+                if layer_kind_plan_shape(kind) == layer_kind_plan_shape(previous) {
+                    TerrainEditClass::Parameters {
+                        owner: NodeRef::Layer(*id),
+                    }
+                } else {
+                    TerrainEditClass::Structure
+                }
+            }
+            Self::SetOpacity { id, .. } | Self::SetBlend { id, .. } => {
+                let owner = if stack.find_group(*id).is_some() {
+                    NodeRef::Group(*id)
+                } else {
+                    NodeRef::Layer(*id)
+                };
+                TerrainEditClass::Parameters { owner }
+            }
+            Self::ResizeRasterSource { target, .. } => {
+                let (owner, fields) = match target {
+                    OwnedRasterTarget::SculptBase(id) => {
+                        (NodeRef::Layer(*id), vec![FieldId::Height])
+                    }
+                    OwnedRasterTarget::PaintedMask(id) => (NodeRef::Mask(*id), Vec::new()),
+                };
+                TerrainEditClass::Content {
+                    owner,
+                    fields,
+                    scope: PlanDirtyScope::FullField,
+                }
+            }
+            Self::SetStrokeEnabled { id, .. } | Self::RemoveStroke { id, .. } => {
+                TerrainEditClass::Content {
+                    owner: NodeRef::Layer(*id),
+                    fields: vec![FieldId::Height],
+                    scope: PlanDirtyScope::FullField,
+                }
+            }
+            Self::SetCached { .. } => TerrainEditClass::Resources,
+            Self::Rename { .. }
+            | Self::SetLocked { .. }
+            | Self::SetColorTag { .. }
+            | Self::Annotate { .. } => TerrainEditClass::ViewOnly,
+        }
+    }
+
     fn raster_payload_bytes(&self) -> usize {
         match self {
             Self::ResizeRasterSource {
@@ -459,6 +521,22 @@ impl EditorCommand {
             }
         }
     }
+}
+
+fn layer_kind_plan_shape(
+    kind: &LayerKind,
+) -> (
+    String,
+    Vec<crate::field_data::FieldId>,
+    Vec<crate::field_data::FieldId>,
+    Vec<crate::field_data::FieldId>,
+) {
+    (
+        kind.type_id().into(),
+        kind.required_fields(),
+        kind.optional_fields(),
+        kind.produced_fields(),
+    )
 }
 
 pub fn apply(cmd: &EditorCommand, stack: &mut LayerStack) -> Option<LayerId> {
@@ -715,7 +793,10 @@ fn invert(cmd: &EditorCommand, stack: &mut LayerStack) -> Option<LayerId> {
         }
         EditorCommand::ResizeRasterSource { .. } => None,
         EditorCommand::SetStrokeEnabled {
-            id, index, previous, ..
+            id,
+            index,
+            previous,
+            ..
         } => {
             if let Some(l) = stack.find_mut(*id) {
                 if let LayerKind::SculptStrokes(p) = &mut l.kind {

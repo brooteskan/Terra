@@ -11,19 +11,30 @@
 //! from [`crate::deps::NodeRef`], [`crate::ids::LayerId`], and
 //! [`crate::ids::OutputId`].
 
+mod analysis;
+mod cache;
 mod compiler;
+mod dirty;
 mod ids;
 mod impact;
 mod ir;
 mod provenance;
 
+pub use analysis::{ExpectedFieldKind, PlanAnalysis, PlanFieldLifetime};
+pub use cache::{PlanCacheStats, PlanCacheStatsSnapshot, PlanRevisionError, TerrainPlanCache};
 pub use compiler::{compile_terrain_plan, TerrainPlanDiagnostic};
+pub use dirty::{
+    propagate_plan_edits, FullFieldEscalation, FullFieldReason, PlanDirtyOperation,
+    PlanInvalidation,
+};
 pub use ids::{
     FieldSlot, PlanOpId, PlanStructureRevision, PlanStructureSignature, TerrainPlanStamp,
 };
-pub use impact::{PlanDirtyScope, TerrainEditClass, TerrainPlanWork};
+pub use impact::{
+    PlanDirtyScope, PropagatedDirtyScope, TerrainEditClass, TerrainPlanPatch, TerrainPlanWork,
+};
 pub use ir::{
     CompiledTerrainPlan, GroupAuxComposite, GroupCompositeMode, LogicalField, LogicalFieldKind,
     PlanBuildError, PlanOrigin, SeedSource, TerrainOp, TerrainOpKind, TerrainPlanBuilder,
 };
-pub use provenance::PlanProvenance;
+pub use provenance::{OutputProvenance, PlanAuthoredDependency, PlanOpSpan, PlanProvenance};

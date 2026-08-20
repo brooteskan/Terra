@@ -18,6 +18,16 @@ impl PlanStructureRevision {
     pub const fn get(self) -> u64 {
         self.0
     }
+
+    /// Advance to a new authored-structure generation.
+    ///
+    /// Revision zero is not special after construction, so wrapping is both
+    /// deterministic and consistent with the output-revision counters used by
+    /// the terrain runtime.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        Self(self.0.wrapping_add(1))
+    }
 }
 
 impl Default for PlanStructureRevision {

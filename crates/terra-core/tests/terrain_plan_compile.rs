@@ -1,9 +1,11 @@
+use terra_core::deps::NodeRef;
+use terra_core::field_data::FieldId;
 use terra_core::ids::LayerId;
 use terra_core::layer::{
-    BiomesParams, FlatParams, GroupInputMode, Layer, LayerGroup, LayerKind, LayerStack, StackNode,
-    VolcanoParams,
+    BiomesParams, FlatParams, GroupInputMode, Layer, LayerGroup, LayerKind, LayerStack,
+    NamedOutputDecl, StackNode, VolcanoParams,
 };
-use terra_core::mask::{DistNode, MaskId, MaskRef};
+use terra_core::mask::{DistNode, MaskAsset, MaskId, MaskRef, MaskSource};
 use terra_core::terrain_plan::{
     compile_terrain_plan, GroupCompositeMode, PlanStructureRevision, SeedSource, TerrainOpKind,
     TerrainPlanDiagnostic, TerrainPlanStamp,
@@ -78,6 +80,55 @@ fn pass_through_folder_allocates_no_private_group_work() {
         .operations()
         .iter()
         .all(|operation| !matches!(operation.kind, TerrainOpKind::CompositeGroup { .. })));
+}
+
+#[test]
+fn pass_through_group_and_named_output_have_complete_provenance() {
+    let mut child = flat(82, 5.0);
+    let declaration = NamedOutputDecl::new("Height", FieldId::Height);
+    let output = declaration.id;
+    child.common.outputs.push(declaration);
+    let mut group = LayerGroup::new("Folder");
+    group.id = LayerId::from_u128(81);
+    group.children.push(StackNode::Layer(child));
+    let mut stack = LayerStack::new();
+    stack.push_group(group);
+
+    let plan = compile_terrain_plan(&stack, &[], stamp()).expect("pass-through plan");
+    let group_owner = NodeRef::Group(LayerId::from_u128(81));
+    assert!(!plan.provenance().spans_for(group_owner).is_empty());
+    assert!(!plan.provenance().fields_for(group_owner).is_empty());
+    let output = plan.provenance().output(output).expect("published output");
+    assert_eq!(output.owner, Some(NodeRef::Layer(LayerId::from_u128(82))));
+    assert!(matches!(
+        plan.operation(output.publisher).unwrap().kind,
+        TerrainOpKind::PublishOutput { .. }
+    ));
+}
+
+#[test]
+fn output_mask_dependency_cycles_are_structured_diagnostics() {
+    let mask = MaskId::new();
+    let mut layer = flat(90, 1.0);
+    let declaration = NamedOutputDecl::new("Height", FieldId::Height);
+    let output = declaration.id;
+    layer.common.outputs.push(declaration);
+    layer.common.masks.push(MaskRef::new(mask));
+    let mut stack = LayerStack::new();
+    stack.push(layer);
+    let asset = MaskAsset::new(
+        mask,
+        "Feedback",
+        MaskSource::LayerOutput { output_id: output },
+    );
+
+    let diagnostics = compile_terrain_plan(&stack, &[asset], stamp()).expect_err("cycle");
+    assert!(diagnostics.iter().any(|diagnostic| matches!(
+        diagnostic,
+        TerrainPlanDiagnostic::DependencyCycle { nodes }
+            if nodes.contains(&NodeRef::Output(output))
+                && nodes.contains(&NodeRef::Mask(mask))
+    )));
 }
 
 #[test]

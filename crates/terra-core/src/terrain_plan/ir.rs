@@ -3,13 +3,14 @@
 use std::hash::{Hash, Hasher};
 
 use super::{
-    FieldSlot, PlanOpId, PlanProvenance, PlanStructureRevision, PlanStructureSignature,
-    TerrainPlanStamp,
+    analysis::validate_and_analyze, ExpectedFieldKind, FieldSlot, PlanAnalysis,
+    PlanAuthoredDependency, PlanOpId, PlanOpSpan, PlanProvenance, PlanStructureRevision,
+    PlanStructureSignature, TerrainPlanStamp,
 };
-use crate::deps::NodeRef;
+use crate::deps::{DepKind, NodeRef};
 use crate::field_data::FieldId;
 use crate::ids::{LayerId, OutputId};
-use crate::invalidation::Reach;
+use crate::invalidation::{AuxReach, Reach};
 
 /// Semantic kind of one logical field. Physical representation belongs to a backend.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -114,7 +115,7 @@ pub enum TerrainOpKind {
 }
 
 impl TerrainOpKind {
-    fn input_slots(&self) -> Vec<FieldSlot> {
+    pub(crate) fn input_slots(&self) -> Vec<FieldSlot> {
         match self {
             Self::Seed { source, .. } => match source {
                 SeedSource::Zero => Vec::new(),
@@ -168,7 +169,7 @@ impl TerrainOpKind {
         }
     }
 
-    fn output_slots(&self) -> Vec<FieldSlot> {
+    pub(crate) fn output_slots(&self) -> Vec<FieldSlot> {
         match self {
             Self::Seed { output, .. } | Self::CompositeLayer { output, .. } => vec![*output],
             Self::CompositeGroup { output, aux, .. } => {
@@ -198,6 +199,9 @@ impl TerrainOpKind {
 pub struct TerrainOp {
     pub origin: PlanOrigin,
     pub reach: Reach,
+    /// Reach of auxiliary outputs, independently of the height result.
+    /// Ignored for operations that do not produce auxiliary fields.
+    pub aux_reach: AuxReach,
     pub kind: TerrainOpKind,
 }
 
@@ -209,6 +213,7 @@ pub struct CompiledTerrainPlan {
     fields: Vec<LogicalField>,
     operations: Vec<TerrainOp>,
     provenance: PlanProvenance,
+    pub(crate) analysis: PlanAnalysis,
     final_height: FieldSlot,
 }
 
@@ -241,6 +246,10 @@ impl CompiledTerrainPlan {
         self.operations.get(id.index())
     }
 
+    pub(crate) fn operation_mut(&mut self, id: PlanOpId) -> Option<&mut TerrainOp> {
+        self.operations.get_mut(id.index())
+    }
+
     pub const fn final_height(&self) -> FieldSlot {
         self.final_height
     }
@@ -258,6 +267,39 @@ pub enum PlanBuildError {
     MultipleFieldProducers { slot: usize },
     #[error("published output {output:?} is declared more than once")]
     DuplicatePublishedOutput { output: OutputId },
+    #[error("logical field slot {slot} has no producer")]
+    UnproducedField { slot: usize, owner: Option<NodeRef> },
+    #[error("operation {operation:?} reads unproduced field slot {slot}")]
+    UnproducedFieldInput {
+        operation: PlanOpId,
+        owner: Option<NodeRef>,
+        slot: usize,
+    },
+    #[error("operation {consumer:?} reads field {field:?} before producer {producer:?} executes")]
+    UseBeforeProduce {
+        field: FieldSlot,
+        producer: PlanOpId,
+        consumer: PlanOpId,
+        owner: Option<NodeRef>,
+    },
+    #[error("terrain plan dependency cycle involves operations {operations:?}")]
+    DependencyCycle {
+        operations: Vec<PlanOpId>,
+        owners: Vec<NodeRef>,
+    },
+    #[error("operation {operation:?} field {field:?} has kind {actual:?}; expected {expected:?}")]
+    FieldKindMismatch {
+        operation: PlanOpId,
+        owner: Option<NodeRef>,
+        field: FieldSlot,
+        expected: ExpectedFieldKind,
+        actual: LogicalFieldKind,
+    },
+    #[error("final field slot {slot} has kind {actual:?}; expected height")]
+    InvalidFinalHeightKind {
+        slot: usize,
+        actual: LogicalFieldKind,
+    },
 }
 
 /// Construction helper used by the tree compiler and semantic fixtures.
@@ -269,6 +311,10 @@ pub struct TerrainPlanBuilder {
     stamp: TerrainPlanStamp,
     fields: Vec<LogicalField>,
     operations: Vec<TerrainOp>,
+    owner_spans: Vec<(NodeRef, PlanOpSpan)>,
+    owner_fields: Vec<(NodeRef, FieldSlot)>,
+    output_owners: Vec<(OutputId, NodeRef)>,
+    dependencies: Vec<PlanAuthoredDependency>,
 }
 
 impl TerrainPlanBuilder {
@@ -277,6 +323,10 @@ impl TerrainPlanBuilder {
             stamp,
             fields: Vec::new(),
             operations: Vec::new(),
+            owner_spans: Vec::new(),
+            owner_fields: Vec::new(),
+            output_owners: Vec::new(),
+            dependencies: Vec::new(),
         }
     }
 
@@ -292,11 +342,66 @@ impl TerrainPlanBuilder {
         id
     }
 
+    pub fn operation_count(&self) -> usize {
+        self.operations.len()
+    }
+
+    pub fn record_owner_span(&mut self, owner: NodeRef, start: usize, end_exclusive: usize) {
+        if start >= end_exclusive {
+            return;
+        }
+        self.owner_spans.push((
+            owner,
+            PlanOpSpan {
+                start: PlanOpId::from_index(start),
+                end_exclusive,
+            },
+        ));
+    }
+
+    pub fn record_output_owner(&mut self, output: OutputId, owner: NodeRef) {
+        self.output_owners.push((output, owner));
+    }
+
+    pub fn record_owner_field(&mut self, owner: NodeRef, field: FieldSlot) {
+        if !self.owner_fields.contains(&(owner, field)) {
+            self.owner_fields.push((owner, field));
+        }
+    }
+
+    pub fn record_authored_dependency(
+        &mut self,
+        consumer: PlanOpId,
+        source: NodeRef,
+        kind: DepKind,
+    ) {
+        let dependency = PlanAuthoredDependency {
+            source,
+            consumer,
+            kind,
+        };
+        if !self.dependencies.contains(&dependency) {
+            self.dependencies.push(dependency);
+        }
+    }
+
     pub fn finish(self, final_height: FieldSlot) -> Result<CompiledTerrainPlan, PlanBuildError> {
         let field_count = self.fields.len();
         check_slot(final_height, field_count)?;
 
         let mut provenance = PlanProvenance::with_capacities(self.operations.len(), field_count);
+        for field in &self.fields {
+            provenance.record_field(field.slot, field.origin.authored());
+        }
+        for (owner, span) in &self.owner_spans {
+            provenance.record_span(*owner, *span);
+        }
+        for (owner, field) in &self.owner_fields {
+            provenance.record_owner_field(*owner, *field);
+        }
+        for dependency in &self.dependencies {
+            provenance.record_dependency(*dependency);
+        }
         for (index, operation) in self.operations.iter().enumerate() {
             let operation_id = PlanOpId::from_index(index);
             provenance.record_operation(operation_id, operation.origin.authored());
@@ -314,19 +419,35 @@ impl TerrainPlanBuilder {
                 provenance.record_producer(output, operation_id);
             }
             if let TerrainOpKind::PublishOutput { output, source } = &operation.kind {
-                if !provenance.record_output(*output, *source) {
+                let owner = self
+                    .output_owners
+                    .iter()
+                    .rev()
+                    .find_map(|(candidate, owner)| (*candidate == *output).then_some(*owner));
+                if !provenance.record_output(*output, *source, operation_id, owner) {
                     return Err(PlanBuildError::DuplicatePublishedOutput { output: *output });
                 }
             }
         }
 
-        let structure_signature = structure_signature(&self.fields, &self.operations, final_height);
+        let analysis =
+            validate_and_analyze(&self.fields, &self.operations, &provenance, final_height)?;
+        let structure_signature = structure_signature(
+            &self.fields,
+            &self.operations,
+            &self.owner_spans,
+            &self.owner_fields,
+            &self.output_owners,
+            &self.dependencies,
+            final_height,
+        );
         Ok(CompiledTerrainPlan {
             stamp: self.stamp,
             structure_signature,
             fields: self.fields,
             operations: self.operations,
             provenance,
+            analysis,
             final_height,
         })
     }
@@ -335,6 +456,10 @@ impl TerrainPlanBuilder {
 fn structure_signature(
     fields: &[LogicalField],
     operations: &[TerrainOp],
+    owner_spans: &[(NodeRef, PlanOpSpan)],
+    owner_fields: &[(NodeRef, FieldSlot)],
+    output_owners: &[(OutputId, NodeRef)],
+    dependencies: &[PlanAuthoredDependency],
     final_height: FieldSlot,
 ) -> PlanStructureSignature {
     let mut hasher = StablePlanHasher::default();
@@ -348,6 +473,26 @@ fn structure_signature(
     for operation in operations {
         operation.origin.hash(&mut hasher);
         hash_operation_kind(&operation.kind, &mut hasher);
+    }
+    owner_spans.len().hash(&mut hasher);
+    for (owner, span) in owner_spans {
+        owner.hash(&mut hasher);
+        span.start.hash(&mut hasher);
+        span.end_exclusive.hash(&mut hasher);
+    }
+    owner_fields.len().hash(&mut hasher);
+    for (owner, field) in owner_fields {
+        owner.hash(&mut hasher);
+        field.hash(&mut hasher);
+    }
+    output_owners.len().hash(&mut hasher);
+    for (output, owner) in output_owners {
+        output.hash(&mut hasher);
+        owner.hash(&mut hasher);
+    }
+    dependencies.len().hash(&mut hasher);
+    for dependency in dependencies {
+        dependency.hash(&mut hasher);
     }
     final_height.hash(&mut hasher);
     PlanStructureSignature::from_hash(hasher.finish())

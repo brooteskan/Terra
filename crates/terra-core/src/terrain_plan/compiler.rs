@@ -10,7 +10,9 @@ use crate::layer::{
     BindingSource, GroupInputMode, GroupKind, Layer, LayerGroup, LayerStack, NamedOutputDecl,
     StackNode,
 };
-use crate::mask::{DistNode, DistNodeKind, Distribution, MaskAsset, MaskId};
+use crate::mask::{
+    ClimateMaskChannel, DistNode, DistNodeKind, Distribution, MaskAsset, MaskId, MaskSource,
+};
 
 use super::{
     CompiledTerrainPlan, FieldSlot, GroupAuxComposite, GroupCompositeMode, LogicalFieldKind,
@@ -37,6 +39,8 @@ pub enum TerrainPlanDiagnostic {
     UnsupportedSelectedField { group: LayerId },
     #[error("output binding on {owner:?} is deferred to cross-edge compilation")]
     UnsupportedOutputBinding { owner: NodeRef },
+    #[error("authored dependency cycle involves {nodes:?}")]
+    DependencyCycle { nodes: Vec<NodeRef> },
     #[error(transparent)]
     Build(#[from] PlanBuildError),
 }
@@ -58,6 +62,7 @@ pub fn compile_terrain_plan(
 
     let mut compiler = Compiler {
         builder: TerrainPlanBuilder::new(stamp),
+        mask_assets,
     };
     let root = compiler
         .builder
@@ -65,6 +70,7 @@ pub fn compile_terrain_plan(
     compiler.builder.add_operation(TerrainOp {
         origin: PlanOrigin::Root,
         reach: Reach::LOCAL,
+        aux_reach: AuxReach::HeightOnly,
         kind: TerrainOpKind::Seed {
             source: SeedSource::Zero,
             output: root,
@@ -117,16 +123,17 @@ impl PlanState {
         }
     }
 
-    fn all_aux_slots(&self) -> Vec<FieldSlot> {
-        self.aux.iter().map(|(_, slot)| *slot).collect()
+    fn output_slots(&self) -> impl Iterator<Item = FieldSlot> + '_ {
+        std::iter::once(self.height).chain(self.aux.iter().map(|(_, slot)| *slot))
     }
 }
 
-struct Compiler {
+struct Compiler<'a> {
     builder: TerrainPlanBuilder,
+    mask_assets: &'a [MaskAsset],
 }
 
-impl Compiler {
+impl Compiler<'_> {
     fn compile_nodes(
         &mut self,
         nodes: &[StackNode],
@@ -151,6 +158,7 @@ impl Compiler {
         state: &mut PlanState,
     ) -> Result<(), TerrainPlanDiagnostic> {
         let owner_ref = NodeRef::Layer(layer.id());
+        let span_start = self.builder.operation_count();
         let origin = PlanOrigin::Authored(owner_ref);
         let base = state.height;
         let input_fields = resolve_layer_inputs(layer, state);
@@ -168,9 +176,10 @@ impl Compiler {
         }
         let output_fields = produced.iter().map(|(_, slot)| *slot).collect();
         let reach = configured_layer_reach(layer);
-        self.builder.add_operation(TerrainOp {
+        let kernel = self.builder.add_operation(TerrainOp {
             origin,
             reach,
+            aux_reach: layer.kind.aux_reach(),
             kind: TerrainOpKind::RunLayerKernel {
                 layer: layer.id(),
                 type_id: layer.kind.type_id().into(),
@@ -180,24 +189,45 @@ impl Compiler {
                 output_fields,
             },
         });
+        for binding in &layer.common.param_bindings {
+            match binding.source {
+                BindingSource::Mask(mask) => self.builder.record_authored_dependency(
+                    kernel,
+                    NodeRef::Mask(mask),
+                    crate::deps::DepKind::ParamBinding,
+                ),
+                BindingSource::LayerOutput(output) | BindingSource::GroupOutput(output) => {
+                    self.builder.record_authored_dependency(
+                        kernel,
+                        NodeRef::Output(output),
+                        crate::deps::DepKind::ParamBinding,
+                    );
+                }
+                _ => {}
+            }
+        }
         for (field, slot) in produced {
             state.set_aux(field, slot);
         }
 
         let mask = self.builder.add_field(LogicalFieldKind::Mask, origin);
-        self.builder.add_operation(TerrainOp {
+        let mask_inputs = resolve_distribution_inputs(&layer.common.masks, state, self.mask_assets);
+        let mask_op = self.builder.add_operation(TerrainOp {
             origin,
-            reach: distribution_reach(&layer.common.masks),
+            reach: crate::mask::distribution_reach(&layer.common.masks, self.mask_assets),
+            aux_reach: AuxReach::HeightOnly,
             kind: TerrainOpKind::EvaluateMask {
                 input_height: base,
-                input_fields: state.all_aux_slots(),
+                input_fields: mask_inputs,
                 output_mask: mask,
             },
         });
+        self.record_distribution_dependencies(mask_op, &layer.common.masks);
         let output = self.builder.add_field(LogicalFieldKind::Height, origin);
         self.builder.add_operation(TerrainOp {
             origin,
             reach: Reach::LOCAL,
+            aux_reach: AuxReach::HeightOnly,
             kind: TerrainOpKind::CompositeLayer {
                 layer: layer.id(),
                 base,
@@ -207,7 +237,13 @@ impl Compiler {
             },
         });
         state.height = output;
-        self.publish_outputs(owner_ref, &layer.common.outputs, state)
+        self.publish_outputs(owner_ref, &layer.common.outputs, state)?;
+        for field in state.output_slots() {
+            self.builder.record_owner_field(owner_ref, field);
+        }
+        self.builder
+            .record_owner_span(owner_ref, span_start, self.builder.operation_count());
+        Ok(())
     }
 
     fn compile_group(
@@ -216,9 +252,16 @@ impl Compiler {
         state: &mut PlanState,
     ) -> Result<(), TerrainPlanDiagnostic> {
         let owner_ref = NodeRef::Group(group.id);
+        let span_start = self.builder.operation_count();
         if group.is_pass_through() {
             self.compile_nodes(&group.children, state)?;
-            return self.publish_outputs(owner_ref, &group.outputs, state);
+            self.publish_outputs(owner_ref, &group.outputs, state)?;
+            for field in state.output_slots() {
+                self.builder.record_owner_field(owner_ref, field);
+            }
+            self.builder
+                .record_owner_span(owner_ref, span_start, self.builder.operation_count());
+            return Ok(());
         }
 
         let origin = PlanOrigin::Authored(owner_ref);
@@ -226,15 +269,18 @@ impl Compiler {
         // Group distributions observe the parent context at the group boundary,
         // before private children mutate their isolated state.
         let mask = self.builder.add_field(LogicalFieldKind::Mask, origin);
-        self.builder.add_operation(TerrainOp {
+        let mask_inputs = resolve_distribution_inputs(&group.masks, &parent, self.mask_assets);
+        let mask_op = self.builder.add_operation(TerrainOp {
             origin,
-            reach: distribution_reach(&group.masks),
+            reach: crate::mask::distribution_reach(&group.masks, self.mask_assets),
+            aux_reach: AuxReach::HeightOnly,
             kind: TerrainOpKind::EvaluateMask {
                 input_height: parent.height,
-                input_fields: parent.all_aux_slots(),
+                input_fields: mask_inputs,
                 output_mask: mask,
             },
         });
+        self.record_distribution_dependencies(mask_op, &group.masks);
 
         let private_seed = self.builder.add_field(LogicalFieldKind::Height, origin);
         let source = match group.input_mode {
@@ -247,6 +293,7 @@ impl Compiler {
         self.builder.add_operation(TerrainOp {
             origin,
             reach: Reach::LOCAL,
+            aux_reach: AuxReach::HeightOnly,
             kind: TerrainOpKind::Seed {
                 source,
                 output: private_seed,
@@ -285,6 +332,11 @@ impl Compiler {
         self.builder.add_operation(TerrainOp {
             origin,
             reach: Reach::LOCAL,
+            aux_reach: if aux.is_empty() {
+                AuxReach::HeightOnly
+            } else {
+                AuxReach::PerTexel
+            },
             kind: TerrainOpKind::CompositeGroup {
                 group: group.id,
                 parent: parent.height,
@@ -302,7 +354,13 @@ impl Compiler {
         for merged in aux {
             state.set_aux(merged.field, merged.output);
         }
-        self.publish_outputs(owner_ref, &group.outputs, state)
+        self.publish_outputs(owner_ref, &group.outputs, state)?;
+        for field in state.output_slots() {
+            self.builder.record_owner_field(owner_ref, field);
+        }
+        self.builder
+            .record_owner_span(owner_ref, span_start, self.builder.operation_count());
+        Ok(())
     }
 
     fn publish_outputs(
@@ -318,9 +376,11 @@ impl Compiler {
                     field: output.field.clone(),
                 });
             };
+            self.builder.record_output_owner(output.id, owner);
             self.builder.add_operation(TerrainOp {
                 origin: PlanOrigin::Authored(NodeRef::Output(output.id)),
                 reach: Reach::LOCAL,
+                aux_reach: AuxReach::HeightOnly,
                 kind: TerrainOpKind::PublishOutput {
                     output: output.id,
                     source,
@@ -328,6 +388,29 @@ impl Compiler {
             });
         }
         Ok(())
+    }
+
+    fn record_distribution_dependencies(
+        &mut self,
+        operation: super::PlanOpId,
+        distribution: &Distribution,
+    ) {
+        for mask in distribution_mask_ids(distribution) {
+            self.builder.record_authored_dependency(
+                operation,
+                NodeRef::Mask(mask),
+                crate::deps::DepKind::MaskRef,
+            );
+            if let Some(asset) = self.mask_assets.iter().find(|asset| asset.id == mask) {
+                if let MaskSource::LayerOutput { output_id } = asset.source {
+                    self.builder.record_authored_dependency(
+                        operation,
+                        NodeRef::Output(output_id),
+                        crate::deps::DepKind::NamedOutput,
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -356,20 +439,124 @@ fn resolve_layer_inputs(layer: &Layer, state: &PlanState) -> Vec<FieldSlot> {
 }
 
 fn configured_layer_reach(layer: &Layer) -> Reach {
-    if !layer.common.param_bindings.is_empty() || layer.kind.aux_reach() == AuxReach::Global {
+    if !layer.common.param_bindings.is_empty() {
         Reach::Full
     } else {
         layer.kind.intrinsic_reach()
     }
 }
 
-fn distribution_reach(distribution: &Distribution) -> Reach {
-    if distribution.is_empty() {
-        Reach::LOCAL
-    } else {
-        // The full mask dependency/reach compiler lands with dependency-aware
-        // validation. Full is conservative and cannot under-invalidate here.
-        Reach::Full
+fn resolve_distribution_inputs(
+    distribution: &Distribution,
+    state: &PlanState,
+    mask_assets: &[MaskAsset],
+) -> Vec<FieldSlot> {
+    let mut fields = Vec::new();
+    for node in &distribution.nodes {
+        collect_node_fields(node, mask_assets, &mut fields);
+    }
+    for entry in distribution.iter() {
+        if let Some(asset) = mask_assets.iter().find(|asset| asset.id == entry.mask.id) {
+            collect_mask_source_field(&asset.source, &mut fields);
+        }
+    }
+    fields
+        .iter()
+        .filter_map(|field| state.field(field))
+        .fold(Vec::new(), |mut slots, slot| {
+            if !slots.contains(&slot) {
+                slots.push(slot);
+            }
+            slots
+        })
+}
+
+fn collect_node_fields(node: &DistNode, mask_assets: &[MaskAsset], fields: &mut Vec<FieldId>) {
+    match &node.kind {
+        DistNodeKind::Flow { .. } => push_field(fields, FieldId::FlowAccumulation),
+        DistNodeKind::Climate { channel } => push_field(
+            fields,
+            match channel {
+                ClimateMaskChannel::Temperature => FieldId::Temperature,
+                ClimateMaskChannel::Rainfall => FieldId::Rainfall,
+                ClimateMaskChannel::Humidity => FieldId::Humidity,
+                ClimateMaskChannel::Snow => FieldId::Snow,
+                ClimateMaskChannel::SoilMoisture => FieldId::SoilMoisture,
+                ClimateMaskChannel::WindExposure => FieldId::WindExposure,
+            },
+        ),
+        DistNodeKind::MaskAsset { mask }
+        | DistNodeKind::Paint { mask }
+        | DistNodeKind::ImportedMask { mask }
+        | DistNodeKind::Distance { mask, .. } => {
+            if let Some(asset) = mask_assets.iter().find(|asset| asset.id == mask.id) {
+                collect_mask_source_field(&asset.source, fields);
+            }
+        }
+        _ => {}
+    }
+    for child in &node.children {
+        collect_node_fields(child, mask_assets, fields);
+    }
+}
+
+fn collect_mask_source_field(source: &MaskSource, fields: &mut Vec<FieldId>) {
+    let field = match source {
+        MaskSource::FlowDirection => Some(FieldId::FlowDirection),
+        MaskSource::FlowAccumulation { .. } => Some(FieldId::FlowAccumulation),
+        MaskSource::Wetness => Some(FieldId::Wetness),
+        MaskSource::Sediment => Some(FieldId::Sediment),
+        MaskSource::Erosion => Some(FieldId::Erosion),
+        MaskSource::Deposition => Some(FieldId::Deposition),
+        MaskSource::Hardness => Some(FieldId::Hardness),
+        MaskSource::Temperature => Some(FieldId::Temperature),
+        MaskSource::Rainfall => Some(FieldId::Rainfall),
+        MaskSource::Humidity => Some(FieldId::Humidity),
+        MaskSource::Snow => Some(FieldId::Snow),
+        MaskSource::SoilMoisture => Some(FieldId::SoilMoisture),
+        MaskSource::WindExposure => Some(FieldId::WindExposure),
+        MaskSource::Named(name) => Some(FieldId::Named(name.clone())),
+        _ => None,
+    };
+    if let Some(field) = field {
+        push_field(fields, field);
+    }
+}
+
+fn push_field(fields: &mut Vec<FieldId>, field: FieldId) {
+    if !fields.contains(&field) {
+        fields.push(field);
+    }
+}
+
+fn distribution_mask_ids(distribution: &Distribution) -> Vec<MaskId> {
+    let mut masks = Vec::new();
+    for entry in distribution.iter() {
+        if !masks.contains(&entry.mask.id) {
+            masks.push(entry.mask.id);
+        }
+    }
+    for node in &distribution.nodes {
+        collect_node_masks(node, &mut masks);
+    }
+    masks
+}
+
+fn collect_node_masks(node: &DistNode, masks: &mut Vec<MaskId>) {
+    let referenced = match &node.kind {
+        DistNodeKind::MaskAsset { mask }
+        | DistNodeKind::Paint { mask }
+        | DistNodeKind::ImportedMask { mask }
+        | DistNodeKind::Distance { mask, .. } => Some(mask.id),
+        _ => None,
+    };
+    if let Some(mask) = referenced {
+        if !masks.contains(&mask) {
+            masks.push(mask);
+        }
+    }
+    for child in &node.children {
+        collect_node_masks(child, masks);
     }
 }
 
@@ -385,6 +572,10 @@ fn preflight(stack: &LayerStack, mask_assets: &[MaskAsset]) -> Vec<TerrainPlanDi
         &mut diagnostics,
     );
     collect_reference_diagnostics(&stack.nodes, &known_masks, &output_ids, &mut diagnostics);
+    let dependencies = crate::deps::DependencyGraph::build_from_document(stack, mask_assets);
+    if let Err(crate::deps::DepError::Cycle(nodes)) = dependencies.detect_cycle() {
+        diagnostics.push(TerrainPlanDiagnostic::DependencyCycle { nodes });
+    }
     diagnostics
 }
 

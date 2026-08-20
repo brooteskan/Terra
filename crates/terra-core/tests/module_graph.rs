@@ -151,7 +151,16 @@ const MODULE_DEPENDENCIES: &[(&str, &[&str])] = &[
     ),
     (
         "command",
-        &["authoring", "layer", "mask", "operation_placement", "raster"],
+        &[
+            "authoring",
+            "deps",
+            "field_data",
+            "layer",
+            "mask",
+            "operation_placement",
+            "raster",
+            "terrain_plan",
+        ],
     ),
     (
         "contextual_create",
@@ -214,7 +223,6 @@ const MODULE_DEPENDENCIES: &[(&str, &[&str])] = &[
             "landscape_evolution",
             "layer",
             "mask",
-            "mask_ir",
             "quality",
             "surface",
             "tiling",
@@ -318,6 +326,7 @@ const MODULE_DEPENDENCIES: &[(&str, &[&str])] = &[
     (
         "mask",
         &[
+            "invalidation",
             "mask_execution",
             "mask_field",
             "mask_ir",

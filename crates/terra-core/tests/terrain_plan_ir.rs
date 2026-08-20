@@ -29,6 +29,7 @@ fn flat_plan(revision: u64) -> (CompiledTerrainPlan, LayerId) {
     builder.add_operation(TerrainOp {
         origin: PlanOrigin::Root,
         reach: Reach::LOCAL,
+        aux_reach: terra_core::invalidation::AuxReach::HeightOnly,
         kind: TerrainOpKind::Seed {
             source: SeedSource::Zero,
             output: root,
@@ -37,6 +38,7 @@ fn flat_plan(revision: u64) -> (CompiledTerrainPlan, LayerId) {
     builder.add_operation(TerrainOp {
         origin: owner(base),
         reach: Reach::LOCAL,
+        aux_reach: terra_core::invalidation::AuxReach::HeightOnly,
         kind: TerrainOpKind::RunLayerKernel {
             layer: base,
             type_id: "sculpt_base".into(),
@@ -49,6 +51,7 @@ fn flat_plan(revision: u64) -> (CompiledTerrainPlan, LayerId) {
     builder.add_operation(TerrainOp {
         origin: owner(base),
         reach: Reach::LOCAL,
+        aux_reach: terra_core::invalidation::AuxReach::HeightOnly,
         kind: TerrainOpKind::EvaluateMask {
             input_height: root,
             input_fields: Vec::new(),
@@ -58,6 +61,7 @@ fn flat_plan(revision: u64) -> (CompiledTerrainPlan, LayerId) {
     builder.add_operation(TerrainOp {
         origin: owner(base),
         reach: Reach::LOCAL,
+        aux_reach: terra_core::invalidation::AuxReach::HeightOnly,
         kind: TerrainOpKind::CompositeLayer {
             layer: base,
             base: root,
@@ -111,6 +115,7 @@ fn isolated_copy_input_plan_keeps_private_and_parent_fields_distinct() {
     builder.add_operation(TerrainOp {
         origin: PlanOrigin::Root,
         reach: Reach::LOCAL,
+        aux_reach: terra_core::invalidation::AuxReach::HeightOnly,
         kind: TerrainOpKind::Seed {
             source: SeedSource::Zero,
             output: parent,
@@ -119,6 +124,7 @@ fn isolated_copy_input_plan_keeps_private_and_parent_fields_distinct() {
     builder.add_operation(TerrainOp {
         origin: group_owner(group),
         reach: Reach::LOCAL,
+        aux_reach: terra_core::invalidation::AuxReach::HeightOnly,
         kind: TerrainOpKind::Seed {
             source: SeedSource::Copy(parent),
             output: private_seed,
@@ -127,6 +133,7 @@ fn isolated_copy_input_plan_keeps_private_and_parent_fields_distinct() {
     builder.add_operation(TerrainOp {
         origin: owner(child),
         reach: Reach::LOCAL,
+        aux_reach: terra_core::invalidation::AuxReach::HeightOnly,
         kind: TerrainOpKind::RunLayerKernel {
             layer: child,
             type_id: "volcano".into(),
@@ -139,6 +146,7 @@ fn isolated_copy_input_plan_keeps_private_and_parent_fields_distinct() {
     builder.add_operation(TerrainOp {
         origin: owner(child),
         reach: Reach::LOCAL,
+        aux_reach: terra_core::invalidation::AuxReach::HeightOnly,
         kind: TerrainOpKind::EvaluateMask {
             input_height: private_seed,
             input_fields: Vec::new(),
@@ -148,6 +156,7 @@ fn isolated_copy_input_plan_keeps_private_and_parent_fields_distinct() {
     builder.add_operation(TerrainOp {
         origin: owner(child),
         reach: Reach::LOCAL,
+        aux_reach: terra_core::invalidation::AuxReach::HeightOnly,
         kind: TerrainOpKind::CompositeLayer {
             layer: child,
             base: private_seed,
@@ -159,6 +168,7 @@ fn isolated_copy_input_plan_keeps_private_and_parent_fields_distinct() {
     builder.add_operation(TerrainOp {
         origin: group_owner(group),
         reach: Reach::LOCAL,
+        aux_reach: terra_core::invalidation::AuxReach::HeightOnly,
         kind: TerrainOpKind::EvaluateMask {
             input_height: parent,
             input_fields: Vec::new(),
@@ -168,6 +178,7 @@ fn isolated_copy_input_plan_keeps_private_and_parent_fields_distinct() {
     builder.add_operation(TerrainOp {
         origin: group_owner(group),
         reach: Reach::LOCAL,
+        aux_reach: terra_core::invalidation::AuxReach::HeightOnly,
         kind: TerrainOpKind::CompositeGroup {
             group,
             parent,
@@ -182,6 +193,7 @@ fn isolated_copy_input_plan_keeps_private_and_parent_fields_distinct() {
     builder.add_operation(TerrainOp {
         origin: PlanOrigin::Authored(NodeRef::Output(output_id)),
         reach: Reach::LOCAL,
+        aux_reach: terra_core::invalidation::AuxReach::HeightOnly,
         kind: TerrainOpKind::PublishOutput {
             output: output_id,
             source: group_output,

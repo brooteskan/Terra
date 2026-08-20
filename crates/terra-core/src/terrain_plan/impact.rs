@@ -4,6 +4,8 @@ use crate::deps::NodeRef;
 use crate::field_data::FieldId;
 use crate::tiling::UvRect;
 
+use super::PlanOpId;
+
 /// Resolution-independent spatial scope of a content edit.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PlanDirtyScope {
@@ -19,6 +21,52 @@ impl PlanDirtyScope {
             (Self::FullField, _) | (_, Self::FullField) => Self::FullField,
             (Self::Region(a), Self::Region(b)) => Self::Region(a.union(b)),
         }
+    }
+}
+
+/// Resolution-independent dirty scope after one or more plan operations.
+///
+/// The authored footprint remains in normalized UV while localized operation
+/// reach accumulates in samples. A backend converts both only after choosing
+/// its concrete preview/export resolution.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PropagatedDirtyScope {
+    pub scope: PlanDirtyScope,
+    pub halo_samples: u32,
+}
+
+impl PropagatedDirtyScope {
+    pub const fn new(scope: PlanDirtyScope) -> Self {
+        Self {
+            scope,
+            halo_samples: 0,
+        }
+    }
+
+    #[must_use]
+    pub fn merge(self, other: Self) -> Self {
+        Self {
+            scope: self.scope.merge(other.scope),
+            halo_samples: self.halo_samples.max(other.halo_samples),
+        }
+    }
+
+    #[must_use]
+    pub fn expand(self, reach: crate::invalidation::Reach) -> Self {
+        match reach {
+            crate::invalidation::Reach::Full => Self {
+                scope: PlanDirtyScope::FullField,
+                halo_samples: 0,
+            },
+            crate::invalidation::Reach::Localized { halo_samples } => Self {
+                halo_samples: self.halo_samples.saturating_add(halo_samples),
+                ..self
+            },
+        }
+    }
+
+    pub const fn is_full(self) -> bool {
+        matches!(self.scope, PlanDirtyScope::FullField)
     }
 }
 
@@ -54,6 +102,13 @@ pub struct TerrainPlanWork {
     pub patch_parameters: bool,
     pub patch_content: bool,
     pub realize_resources: bool,
+}
+
+/// Operations whose authored/runtime payload must be refreshed without
+/// rebuilding the structural plan.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TerrainPlanPatch {
+    pub operations: Vec<PlanOpId>,
 }
 
 impl TerrainPlanWork {

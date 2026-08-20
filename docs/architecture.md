@@ -70,6 +70,26 @@ cross-plan identity comes from authored layer/group/output IDs. Content edits su
 brush dabs advance output freshness and dirty regions without changing the plan's
 structural revision.
 
+Before a plan becomes executable, validation builds immutable def-use metadata,
+checks field kinds and production order, rejects dependency cycles, and derives
+operation/field liveness plus logical field lifetimes. Provenance is bidirectional:
+authored layers and groups map to their operation spans and fields, named outputs map
+to fields and publisher operations, and operations map back to authored owners.
+
+`TerrainPlanCache` owns the authored structural revision and the last successfully
+compiled plan. Add/remove/reorder, enable/solo, dependency-placement, and operation
+shape changes advance that revision once per command batch. Parameter edits, Base or
+stroke content, resolution changes, backend-resource preferences, and view-only edits
+reuse the compatible structure. A failed candidate leaves the previous backend output
+available for presentation, but the stale plan is rejected at the execution gate.
+
+Plan invalidation starts from stable authored provenance and walks the live def-use
+subgraph in operation order. Local scopes accumulate `Reach` halos; observed global
+auxiliary inputs use `AuxReach` to escalate only at the first operation that requires
+a full field. Unobserved auxiliary branches therefore do not globalize an otherwise
+height-only suffix. Cache counters expose compiles, hits, patched/reached operations,
+and full-field escalation reasons for tests and profiling.
+
 ## Evaluation
 
 ```

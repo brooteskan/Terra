@@ -2,18 +2,51 @@
 
 use std::collections::HashMap;
 
+use crate::deps::DepKind;
 use crate::deps::NodeRef;
 use crate::ids::OutputId;
 
 use super::{FieldSlot, PlanOpId};
+
+/// Half-open lexical operation span belonging to an authored layer/group.
+///
+/// For a group this includes nested child work. Exact operations directly
+/// owned by the group remain available through [`PlanProvenance::operations_for`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlanOpSpan {
+    pub start: PlanOpId,
+    pub end_exclusive: usize,
+}
+
+/// Resolved provenance of one stable named output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputProvenance {
+    pub field: FieldSlot,
+    pub publisher: PlanOpId,
+    pub owner: Option<NodeRef>,
+}
+
+/// An authored dependency (mask, output, binding, or group input) consumed by
+/// a plan operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PlanAuthoredDependency {
+    pub source: NodeRef,
+    pub consumer: PlanOpId,
+    pub kind: DepKind,
+}
 
 /// Stable authored provenance for plan-local operations and logical fields.
 #[derive(Debug, Clone, Default)]
 pub struct PlanProvenance {
     authored_to_ops: HashMap<NodeRef, Vec<PlanOpId>>,
     op_to_authored: Vec<Option<NodeRef>>,
-    output_fields: HashMap<OutputId, FieldSlot>,
+    authored_to_fields: HashMap<NodeRef, Vec<FieldSlot>>,
+    field_to_authored: Vec<Option<NodeRef>>,
+    owner_spans: HashMap<NodeRef, Vec<PlanOpSpan>>,
+    outputs: HashMap<OutputId, OutputProvenance>,
     field_producers: Vec<Option<PlanOpId>>,
+    authored_consumers: HashMap<NodeRef, Vec<PlanOpId>>,
+    dependencies: Vec<PlanAuthoredDependency>,
 }
 
 impl PlanProvenance {
@@ -32,7 +65,40 @@ impl PlanProvenance {
     }
 
     pub fn field_for_output(&self, output: OutputId) -> Option<FieldSlot> {
-        self.output_fields.get(&output).copied()
+        self.outputs.get(&output).map(|entry| entry.field)
+    }
+
+    pub fn output(&self, output: OutputId) -> Option<OutputProvenance> {
+        self.outputs.get(&output).copied()
+    }
+
+    pub fn fields_for(&self, owner: NodeRef) -> &[FieldSlot] {
+        self.authored_to_fields
+            .get(&owner)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    pub fn owner_of_field(&self, field: FieldSlot) -> Option<NodeRef> {
+        self.field_to_authored.get(field.index()).copied().flatten()
+    }
+
+    pub fn spans_for(&self, owner: NodeRef) -> &[PlanOpSpan] {
+        self.owner_spans
+            .get(&owner)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    pub fn consumers_for(&self, source: NodeRef) -> &[PlanOpId] {
+        self.authored_consumers
+            .get(&source)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    pub fn dependencies(&self) -> &[PlanAuthoredDependency] {
+        &self.dependencies
     }
 
     pub fn producer_of(&self, field: FieldSlot) -> Option<PlanOpId> {
@@ -43,8 +109,13 @@ impl PlanProvenance {
         Self {
             authored_to_ops: HashMap::new(),
             op_to_authored: Vec::with_capacity(operation_count),
-            output_fields: HashMap::new(),
+            authored_to_fields: HashMap::new(),
+            field_to_authored: vec![None; field_count],
+            owner_spans: HashMap::new(),
+            outputs: HashMap::new(),
             field_producers: vec![None; field_count],
+            authored_consumers: HashMap::new(),
+            dependencies: Vec::new(),
         }
     }
 
@@ -63,7 +134,54 @@ impl PlanProvenance {
         self.field_producers[field.index()] = Some(operation);
     }
 
-    pub(crate) fn record_output(&mut self, output: OutputId, field: FieldSlot) -> bool {
-        self.output_fields.insert(output, field).is_none()
+    pub(crate) fn record_field(&mut self, field: FieldSlot, owner: Option<NodeRef>) {
+        self.field_to_authored[field.index()] = owner;
+        if let Some(owner) = owner {
+            self.authored_to_fields
+                .entry(owner)
+                .or_default()
+                .push(field);
+        }
+    }
+
+    pub(crate) fn record_span(&mut self, owner: NodeRef, span: PlanOpSpan) {
+        self.owner_spans.entry(owner).or_default().push(span);
+    }
+
+    pub(crate) fn record_owner_field(&mut self, owner: NodeRef, field: FieldSlot) {
+        let fields = self.authored_to_fields.entry(owner).or_default();
+        if !fields.contains(&field) {
+            fields.push(field);
+        }
+    }
+
+    pub(crate) fn record_dependency(&mut self, dependency: PlanAuthoredDependency) {
+        let consumers = self
+            .authored_consumers
+            .entry(dependency.source)
+            .or_default();
+        if !consumers.contains(&dependency.consumer) {
+            consumers.push(dependency.consumer);
+        }
+        self.dependencies.push(dependency);
+    }
+
+    pub(crate) fn record_output(
+        &mut self,
+        output: OutputId,
+        field: FieldSlot,
+        publisher: PlanOpId,
+        owner: Option<NodeRef>,
+    ) -> bool {
+        self.outputs
+            .insert(
+                output,
+                OutputProvenance {
+                    field,
+                    publisher,
+                    owner,
+                },
+            )
+            .is_none()
     }
 }
