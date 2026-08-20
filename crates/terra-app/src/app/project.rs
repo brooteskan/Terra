@@ -395,6 +395,9 @@ impl TerraApp {
         self.scheduler.last_layer_timings.clear();
         self.scheduler.quality = PreviewQuality::Draft;
         self.scheduler.evaluator.clear_project_caches();
+        self.terrain_plan_cache = terra_core::terrain_plan::TerrainPlanCache::new();
+        self.pending_plan_edits = vec![terra_core::terrain_plan::TerrainEditClass::Structure];
+        self.pending_plan_invalidation = None;
 
         self.worker_dirty_from = None;
         self.worker_dirty_region = None;

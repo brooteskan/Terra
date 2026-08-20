@@ -31,6 +31,13 @@ pub enum GpuError {
     /// Stack needs the CPU evaluator for a structured, user-visible reason.
     #[error("cpu evaluation required: {0:?}")]
     RequiresCpu(GpuFallbackReason),
+    #[error(
+        "compiled terrain plan revision {plan_revision} is stale; expected revision {expected_revision}"
+    )]
+    StalePlan {
+        plan_revision: u64,
+        expected_revision: u64,
+    },
     #[error("failed to load source asset: {0}")]
     SourceAsset(String),
 }

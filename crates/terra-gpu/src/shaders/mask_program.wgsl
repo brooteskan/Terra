@@ -8,6 +8,10 @@ struct Uniforms {
     b: f32,
     c: f32,
     pad0: f32,
+    region_x: u32,
+    region_y: u32,
+    region_w: u32,
+    region_h: u32,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -21,8 +25,10 @@ fn load_a(i: i32, j: i32) -> f32 {
 
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    if (gid.x >= u.width || gid.y >= u.height) { return; }
-    let p = vec2<i32>(gid.xy);
+    if (gid.x >= u.region_w || gid.y >= u.region_h) { return; }
+    let absolute = vec2<u32>(u.region_x + gid.x, u.region_y + gid.y);
+    if (absolute.x >= u.width || absolute.y >= u.height) { return; }
+    let p = vec2<i32>(absolute);
     let x = textureLoad(src_a, p, 0).r;
     let y = textureLoad(src_b, p, 0).r;
     var out = x;
@@ -48,8 +54,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let r = i32(min(u.radius, 16u));
             for (var dj = -r; dj <= r; dj++) {
                 for (var di = -r; di <= r; di++) {
-                    let ii = i32(gid.x) + di;
-                    let jj = i32(gid.y) + dj;
+                let ii = i32(absolute.x) + di;
+                let jj = i32(absolute.y) + dj;
                     if (ii >= 0 && jj >= 0 && ii < i32(u.width) && jj < i32(u.height)) {
                         sum += load_a(ii, jj);
                         count += 1.0;

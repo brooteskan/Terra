@@ -7,6 +7,7 @@
 //! re-derives kernels mid-walk, so planning has a single authority.
 
 use crate::effect_filter::{effect_filter_gpu_spec, EffectFilterGpuScope};
+use terra_core::deps::NodeRef;
 use terra_core::fields::FieldId;
 use terra_core::layer::{
     BindingSource, BlendMode, DuneParams, EffectFilterKind, FractalNoiseType, IslandArchetype,
@@ -15,6 +16,7 @@ use terra_core::layer::{
     SculptStrokeKind, StreamPowerParams, TransportModel, UpliftParams,
 };
 use terra_core::mask::{MaskAsset, MaskOp, MaskSource};
+use terra_core::terrain_plan::PlanOpId;
 
 /// Max per-iteration blur radius the Blur kernel executes (`shaders/blur.wgsl`).
 pub const BLUR_MAX_RADIUS: u32 = 8;
@@ -136,7 +138,6 @@ pub enum GpuFallbackCode {
     AuxiliaryDependency,
     UnsupportedOptions,
     InvalidConfiguration,
-    TreeEvaluation,
     RuntimeResourceLimit,
 }
 
@@ -168,6 +169,11 @@ impl GpuFallbackReason {
 /// First enabled layer at which the authoritative CPU evaluator must resume.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GpuFallbackDiagnostic {
+    /// Compiled operation at which execution stopped. Legacy flat-graph
+    /// diagnostics leave this absent during the migration.
+    pub operation: Option<PlanOpId>,
+    /// Stable authored owner resolved through compiled-plan provenance.
+    pub owner: Option<NodeRef>,
     pub layer_index: usize,
     pub layer_id: terra_core::layer::LayerId,
     pub layer_name: String,
@@ -586,7 +592,7 @@ fn rejected_layer_reason(layer: &Layer) -> GpuFallbackReason {
     }
 }
 
-fn gpu_plan_for_layer(
+pub(crate) fn gpu_plan_for_layer(
     layer: &Layer,
     mask_assets: &[MaskAsset],
 ) -> Result<GpuLayerPlan, GpuFallbackReason> {
@@ -1002,6 +1008,8 @@ pub fn compile_gpu_graph(stack: &LayerStack, mask_assets: &[MaskAsset]) -> GpuCo
         .position(|(layer, plan)| layer.common.enabled && plan.is_none());
 
     let cpu_fallback = cpu_from.map(|layer_index| GpuFallbackDiagnostic {
+        operation: None,
+        owner: Some(NodeRef::Layer(layers[layer_index].id())),
         layer_index,
         layer_id: layers[layer_index].id(),
         layer_name: layers[layer_index].common.name.clone(),

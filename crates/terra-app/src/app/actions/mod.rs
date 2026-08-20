@@ -10,7 +10,10 @@ mod tools;
 mod world_rules;
 
 use crate::ui::PanelAction;
+use terra_core::deps::NodeRef;
+use terra_core::field_data::FieldId;
 use terra_core::layer::LayerId;
+use terra_core::terrain_plan::{PlanDirtyScope, TerrainEditClass, TerrainOpKind};
 use terra_core::tiling::UvRect;
 
 use super::TerraApp;
@@ -119,6 +122,34 @@ impl TerraApp {
         // (#121): both carry a bounded UV footprint, so both take the scoped worker
         // path and present just the dirty rect through the GPU.
         let has_sculpt_footprint = sculpt_dirty_region_uv.is_some();
+        if let Some(id) = dirty_from {
+            let edit = if has_sculpt_footprint {
+                TerrainEditClass::Content {
+                    owner: NodeRef::Layer(id),
+                    fields: vec![FieldId::Height],
+                    scope: PlanDirtyScope::Region(
+                        sculpt_dirty_region_uv.expect("footprint checked above"),
+                    ),
+                }
+            } else if self
+                .terrain_plan_cache
+                .last_good_plan()
+                .is_some_and(|plan| {
+                    plan_owner_shape_matches(plan, &self.session.document.stack, id)
+                })
+            {
+                TerrainEditClass::Parameters {
+                    owner: if self.session.document.stack.find_group(id).is_some() {
+                        NodeRef::Group(id)
+                    } else {
+                        NodeRef::Layer(id)
+                    },
+                }
+            } else {
+                TerrainEditClass::Structure
+            };
+            self.pending_plan_edits.push(edit);
+        }
         if let Some(region) = sculpt_dirty_region_uv {
             self.pending_gpu_dirty_region = Some(match self.pending_gpu_dirty_region {
                 Some(existing) => existing.union(region),
@@ -179,4 +210,25 @@ impl TerraApp {
             self.layers_gui.reveal_selection(&self.session.document);
         }
     }
+}
+
+fn plan_owner_shape_matches(
+    plan: &terra_core::terrain_plan::CompiledTerrainPlan,
+    stack: &terra_core::layer::LayerStack,
+    id: LayerId,
+) -> bool {
+    if let Some(layer) = stack.find(id) {
+        return plan.operations().iter().any(|operation| {
+            matches!(
+                &operation.kind,
+                TerrainOpKind::RunLayerKernel { layer: owner, type_id, .. }
+                    if *owner == id && type_id == layer.kind.type_id()
+            )
+        });
+    }
+    stack.find_group(id).is_some()
+        && !plan
+            .provenance()
+            .operations_for(NodeRef::Group(id))
+            .is_empty()
 }

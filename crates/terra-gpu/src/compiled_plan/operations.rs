@@ -13,6 +13,10 @@ struct FillUniform {
     height: u32,
     value: f32,
     _pad: f32,
+    region_x: u32,
+    region_y: u32,
+    region_w: u32,
+    region_h: u32,
 }
 
 #[repr(C)]
@@ -20,6 +24,10 @@ struct FillUniform {
 struct CopyUniform {
     width: u32,
     height: u32,
+    region_x: u32,
+    region_y: u32,
+    region_w: u32,
+    region_h: u32,
     _pad: [u32; 2],
 }
 
@@ -32,6 +40,10 @@ struct GroupUniform {
     blend_mode: u32,
     composite_mode: u32,
     _pad: [u32; 3],
+    region_x: u32,
+    region_y: u32,
+    region_w: u32,
+    region_h: u32,
 }
 
 #[repr(C)]
@@ -41,6 +53,10 @@ struct AuxUniform {
     height: u32,
     opacity: f32,
     has_parent: u32,
+    region_x: u32,
+    region_y: u32,
+    region_w: u32,
+    region_h: u32,
 }
 
 #[repr(C)]
@@ -75,6 +91,10 @@ struct MaskProgramUniform {
     b: f32,
     c: f32,
     _pad: f32,
+    region_x: u32,
+    region_y: u32,
+    region_w: u32,
+    region_h: u32,
 }
 
 struct Pipe {
@@ -178,9 +198,25 @@ impl GpuPlanOperations {
         source: SeedSource,
         output: FieldSlot,
     ) -> Result<(), GpuPlanOperationError> {
+        self.seed_field_region(device, encoder, resources, source, output, None)
+    }
+
+    pub fn seed_field_region(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        resources: &GpuPlanResources,
+        source: SeedSource,
+        output: FieldSlot,
+        region: Option<(u32, u32, u32, u32)>,
+    ) -> Result<(), GpuPlanOperationError> {
         match source {
-            SeedSource::Zero => self.fill_field(device, encoder, resources, output, 0.0),
-            SeedSource::Copy(source) => self.copy_field(device, encoder, resources, source, output),
+            SeedSource::Zero => {
+                self.fill_field_region(device, encoder, resources, output, 0.0, region)
+            }
+            SeedSource::Copy(source) => {
+                self.copy_field_region(device, encoder, resources, source, output, region)
+            }
             SeedSource::Selected(source) => {
                 Err(GpuPlanOperationError::UnsupportedSelectedField(source))
             }
@@ -200,6 +236,34 @@ impl GpuPlanOperations {
         dx: f32,
         dz: f32,
     ) -> Result<(), GpuPlanOperationError> {
+        self.evaluate_distribution_region(
+            device,
+            encoder,
+            resources,
+            input_height,
+            output_mask,
+            distribution,
+            mask_assets,
+            dx,
+            dz,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn evaluate_distribution_region(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        resources: &GpuPlanResources,
+        input_height: FieldSlot,
+        output_mask: FieldSlot,
+        distribution: &Distribution,
+        mask_assets: &[MaskAsset],
+        dx: f32,
+        dz: f32,
+        region: Option<(u32, u32, u32, u32)>,
+    ) -> Result<(), GpuPlanOperationError> {
         if !distribution.nodes.is_empty() {
             return Err(GpuPlanOperationError::UnsupportedMaskNodes);
         }
@@ -208,17 +272,18 @@ impl GpuPlanOperations {
         }
         ensure_distinct(resources, &[input_height], &[output_mask])?;
         if distribution.entries.is_empty() {
-            return self.fill_field(device, encoder, resources, output_mask, 1.0);
+            return self.fill_field_region(device, encoder, resources, output_mask, 1.0, region);
         }
 
         let key = resources.key();
+        let region = normalized_region(key.width, key.height, region);
         let [accum_a, accum_b, work_a, work_b] = [
             scalar_scratch(device, "compiled-plan-mask-accum-a", key.width, key.height),
             scalar_scratch(device, "compiled-plan-mask-accum-b", key.width, key.height),
             scalar_scratch(device, "compiled-plan-mask-work-a", key.width, key.height),
             scalar_scratch(device, "compiled-plan-mask-work-b", key.width, key.height),
         ];
-        record_fill_view(
+        record_fill_view_region(
             device,
             encoder,
             &self.fill,
@@ -226,6 +291,7 @@ impl GpuPlanOperations {
             key.width,
             key.height,
             1.0,
+            region,
         );
         let mut accumulator_is_a = true;
 
@@ -262,10 +328,10 @@ impl GpuPlanOperations {
                     strength: entry.mask.strength,
                     frequency: 0.0,
                     seed: 0.0,
-                    region_x: 0,
-                    region_y: 0,
-                    region_w: 0,
-                    region_h: 0,
+                    region_x: region.0,
+                    region_y: region.1,
+                    region_w: region.2,
+                    region_h: region.3,
                 },
             );
             let mut entry_is_a = true;
@@ -281,7 +347,7 @@ impl GpuPlanOperations {
                     source,
                     source,
                     destination,
-                    mask_operation_uniform(*operation, key.width, key.height)?,
+                    mask_operation_uniform(*operation, key.width, key.height, region)?,
                 );
                 entry_is_a = !entry_is_a;
             }
@@ -301,7 +367,7 @@ impl GpuPlanOperations {
                 accumulator,
                 entry_view,
                 destination,
-                mask_combine_uniform(entry.combine, key.width, key.height),
+                mask_combine_uniform(entry.combine, key.width, key.height, region),
             );
             accumulator_is_a = !accumulator_is_a;
         }
@@ -311,7 +377,7 @@ impl GpuPlanOperations {
         } else {
             &accum_b.view
         };
-        record_copy_views(
+        record_copy_views_region(
             device,
             encoder,
             &self.copy,
@@ -319,6 +385,7 @@ impl GpuPlanOperations {
             resources.view(output_mask)?,
             key.width,
             key.height,
+            region,
         );
         Ok(())
     }
@@ -331,10 +398,23 @@ impl GpuPlanOperations {
         output: FieldSlot,
         value: f32,
     ) -> Result<(), GpuPlanOperationError> {
+        self.fill_field_region(device, encoder, resources, output, value, None)
+    }
+
+    pub fn fill_field_region(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        resources: &GpuPlanResources,
+        output: FieldSlot,
+        value: f32,
+        region: Option<(u32, u32, u32, u32)>,
+    ) -> Result<(), GpuPlanOperationError> {
         if !value.is_finite() {
             return Err(GpuPlanOperationError::NonFiniteValue);
         }
         let key = resources.key();
+        let region = normalized_region(key.width, key.height, region);
         let uniform = uniform_buffer(
             device,
             "compiled-plan-fill-uniform",
@@ -343,6 +423,10 @@ impl GpuPlanOperations {
                 height: key.height,
                 value,
                 _pad: 0.0,
+                region_x: region.0,
+                region_y: region.1,
+                region_w: region.2,
+                region_h: region.3,
             },
         );
         let output = resources.view(output)?;
@@ -360,7 +444,7 @@ impl GpuPlanOperations {
                 },
             ],
         });
-        dispatch(encoder, &self.fill, &bind_group, key.width, key.height);
+        dispatch(encoder, &self.fill, &bind_group, region.2, region.3);
         Ok(())
     }
 
@@ -372,14 +456,31 @@ impl GpuPlanOperations {
         source: FieldSlot,
         output: FieldSlot,
     ) -> Result<(), GpuPlanOperationError> {
+        self.copy_field_region(device, encoder, resources, source, output, None)
+    }
+
+    pub fn copy_field_region(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        resources: &GpuPlanResources,
+        source: FieldSlot,
+        output: FieldSlot,
+        region: Option<(u32, u32, u32, u32)>,
+    ) -> Result<(), GpuPlanOperationError> {
         ensure_distinct(resources, &[source], &[output])?;
         let key = resources.key();
+        let region = normalized_region(key.width, key.height, region);
         let uniform = uniform_buffer(
             device,
             "compiled-plan-copy-uniform",
             &CopyUniform {
                 width: key.width,
                 height: key.height,
+                region_x: region.0,
+                region_y: region.1,
+                region_w: region.2,
+                region_h: region.3,
                 _pad: [0; 2],
             },
         );
@@ -403,7 +504,7 @@ impl GpuPlanOperations {
                 },
             ],
         });
-        dispatch(encoder, &self.copy, &bind_group, key.width, key.height);
+        dispatch(encoder, &self.copy, &bind_group, region.2, region.3);
         Ok(())
     }
 
@@ -420,6 +521,34 @@ impl GpuPlanOperations {
         output: FieldSlot,
         params: GpuGroupCompositeParams,
     ) -> Result<(), GpuPlanOperationError> {
+        self.composite_group_region(
+            device,
+            encoder,
+            resources,
+            parent,
+            private_seed,
+            child_output,
+            mask,
+            output,
+            params,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn composite_group_region(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        resources: &GpuPlanResources,
+        parent: FieldSlot,
+        private_seed: FieldSlot,
+        child_output: FieldSlot,
+        mask: FieldSlot,
+        output: FieldSlot,
+        params: GpuGroupCompositeParams,
+        region: Option<(u32, u32, u32, u32)>,
+    ) -> Result<(), GpuPlanOperationError> {
         if !params.opacity.is_finite() {
             return Err(GpuPlanOperationError::NonFiniteOpacity);
         }
@@ -431,6 +560,7 @@ impl GpuPlanOperations {
         let blend_mode = crate::graph::gpu_blend_mode(params.blend)
             .ok_or(GpuPlanOperationError::UnsupportedBlend(params.blend))?;
         let key = resources.key();
+        let region = normalized_region(key.width, key.height, region);
         let uniform = uniform_buffer(
             device,
             "compiled-plan-group-uniform",
@@ -444,6 +574,10 @@ impl GpuPlanOperations {
                     GroupCompositeMode::BiomeHeightDelta => 1,
                 },
                 _pad: [0; 3],
+                region_x: region.0,
+                region_y: region.1,
+                region_w: region.2,
+                region_h: region.3,
             },
         );
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -461,7 +595,7 @@ impl GpuPlanOperations {
                 texture_entry(5, resources.view(output)?),
             ],
         });
-        dispatch(encoder, &self.group, &bind_group, key.width, key.height);
+        dispatch(encoder, &self.group, &bind_group, region.2, region.3);
         Ok(())
     }
 
@@ -477,6 +611,24 @@ impl GpuPlanOperations {
         output: FieldSlot,
         opacity: f32,
     ) -> Result<(), GpuPlanOperationError> {
+        self.composite_aux_region(
+            device, encoder, resources, parent, child, mask, output, opacity, None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn composite_aux_region(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        resources: &GpuPlanResources,
+        parent: Option<FieldSlot>,
+        child: FieldSlot,
+        mask: FieldSlot,
+        output: FieldSlot,
+        opacity: f32,
+        region: Option<(u32, u32, u32, u32)>,
+    ) -> Result<(), GpuPlanOperationError> {
         if !opacity.is_finite() {
             return Err(GpuPlanOperationError::NonFiniteOpacity);
         }
@@ -487,6 +639,7 @@ impl GpuPlanOperations {
         }
         ensure_distinct(resources, &inputs, &[output])?;
         let key = resources.key();
+        let region = normalized_region(key.width, key.height, region);
         let uniform = uniform_buffer(
             device,
             "compiled-plan-aux-uniform",
@@ -495,6 +648,10 @@ impl GpuPlanOperations {
                 height: key.height,
                 opacity,
                 has_parent: u32::from(parent.is_some()),
+                region_x: region.0,
+                region_y: region.1,
+                region_w: region.2,
+                region_h: region.3,
             },
         );
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -511,7 +668,7 @@ impl GpuPlanOperations {
                 texture_entry(4, resources.view(output)?),
             ],
         });
-        dispatch(encoder, &self.aux, &bind_group, key.width, key.height);
+        dispatch(encoder, &self.aux, &bind_group, region.2, region.3);
         Ok(())
     }
 
@@ -523,8 +680,8 @@ impl GpuPlanOperations {
         output: &wgpu::TextureView,
         value: MaskBakeUniform,
     ) {
-        let width = value.width;
-        let height = value.height;
+        let width = value.region_w;
+        let height = value.region_h;
         let uniform = uniform_buffer(device, "compiled-plan-mask-bake-uniform", &value);
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("compiled-plan-mask-bake-bind-group"),
@@ -551,8 +708,8 @@ impl GpuPlanOperations {
         output: &wgpu::TextureView,
         value: MaskProgramUniform,
     ) {
-        let width = value.width;
-        let height = value.height;
+        let width = value.region_w;
+        let height = value.region_h;
         let uniform = uniform_buffer(device, "compiled-plan-mask-program-uniform", &value);
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("compiled-plan-mask-program-bind-group"),
@@ -598,7 +755,8 @@ fn scalar_scratch(device: &wgpu::Device, label: &str, width: u32, height: u32) -
     }
 }
 
-fn record_fill_view(
+#[allow(clippy::too_many_arguments)]
+fn record_fill_view_region(
     device: &wgpu::Device,
     encoder: &mut wgpu::CommandEncoder,
     pipe: &Pipe,
@@ -606,6 +764,7 @@ fn record_fill_view(
     width: u32,
     height: u32,
     value: f32,
+    region: (u32, u32, u32, u32),
 ) {
     let uniform = uniform_buffer(
         device,
@@ -615,6 +774,10 @@ fn record_fill_view(
             height,
             value,
             _pad: 0.0,
+            region_x: region.0,
+            region_y: region.1,
+            region_w: region.2,
+            region_h: region.3,
         },
     );
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -628,10 +791,11 @@ fn record_fill_view(
             texture_entry(1, output),
         ],
     });
-    dispatch(encoder, pipe, &bind_group, width, height);
+    dispatch(encoder, pipe, &bind_group, region.2, region.3);
 }
 
-fn record_copy_views(
+#[allow(clippy::too_many_arguments)]
+fn record_copy_views_region(
     device: &wgpu::Device,
     encoder: &mut wgpu::CommandEncoder,
     pipe: &Pipe,
@@ -639,6 +803,7 @@ fn record_copy_views(
     output: &wgpu::TextureView,
     width: u32,
     height: u32,
+    region: (u32, u32, u32, u32),
 ) {
     let uniform = uniform_buffer(
         device,
@@ -646,6 +811,10 @@ fn record_copy_views(
         &CopyUniform {
             width,
             height,
+            region_x: region.0,
+            region_y: region.1,
+            region_w: region.2,
+            region_h: region.3,
             _pad: [0; 2],
         },
     );
@@ -661,13 +830,14 @@ fn record_copy_views(
             texture_entry(2, output),
         ],
     });
-    dispatch(encoder, pipe, &bind_group, width, height);
+    dispatch(encoder, pipe, &bind_group, region.2, region.3);
 }
 
 fn mask_operation_uniform(
     operation: MaskOp,
     width: u32,
     height: u32,
+    region: (u32, u32, u32, u32),
 ) -> Result<MaskProgramUniform, GpuPlanOperationError> {
     let (mode, radius, a, b, c) = match operation {
         MaskOp::Add { amount } => (0, 0, amount, 0.0, 0.0),
@@ -696,10 +866,19 @@ fn mask_operation_uniform(
         b,
         c,
         _pad: 0.0,
+        region_x: region.0,
+        region_y: region.1,
+        region_w: region.2,
+        region_h: region.3,
     })
 }
 
-fn mask_combine_uniform(mode: MaskCombine, width: u32, height: u32) -> MaskProgramUniform {
+fn mask_combine_uniform(
+    mode: MaskCombine,
+    width: u32,
+    height: u32,
+    region: (u32, u32, u32, u32),
+) -> MaskProgramUniform {
     let mode = match mode {
         MaskCombine::Multiply => 20,
         MaskCombine::Add => 21,
@@ -719,7 +898,27 @@ fn mask_combine_uniform(mode: MaskCombine, width: u32, height: u32) -> MaskProgr
         b: 0.0,
         c: 0.0,
         _pad: 0.0,
+        region_x: region.0,
+        region_y: region.1,
+        region_w: region.2,
+        region_h: region.3,
     }
+}
+
+fn normalized_region(
+    width: u32,
+    height: u32,
+    region: Option<(u32, u32, u32, u32)>,
+) -> (u32, u32, u32, u32) {
+    debug_assert!(width > 0 && height > 0);
+    let Some((x, y, region_width, region_height)) = region else {
+        return (0, 0, width, height);
+    };
+    let x = x.min(width.saturating_sub(1));
+    let y = y.min(height.saturating_sub(1));
+    let region_width = region_width.max(1).min(width - x);
+    let region_height = region_height.max(1).min(height - y);
+    (x, y, region_width, region_height)
 }
 
 fn ensure_distinct(

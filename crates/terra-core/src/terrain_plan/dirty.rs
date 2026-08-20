@@ -189,6 +189,17 @@ fn seed_owner_fields(
     seeds: &mut [Option<PropagatedDirtyScope>],
     patched: &mut [bool],
 ) {
+    // Content changes patch the owner's kernel payload itself. Height fields
+    // recorded in provenance are observable post-composite fields, so seeding
+    // only their producer would otherwise miss the `RunLayerKernel` operation.
+    for operation in plan.provenance().operations_for(owner) {
+        if plan.operation(*operation).is_some_and(|operation| {
+            matches!(operation.kind, super::TerrainOpKind::RunLayerKernel { .. })
+        }) {
+            merge_scope(&mut seeds[operation.index()], scope);
+            patched[operation.index()] = true;
+        }
+    }
     let mut matched_field = false;
     for field in plan.provenance().fields_for(owner) {
         let matches = plan
@@ -211,7 +222,6 @@ fn seed_owner_fields(
     } else {
         for consumer in plan.provenance().consumers_for(owner) {
             merge_scope(&mut seeds[consumer.index()], scope);
-            patched[consumer.index()] = true;
         }
     }
 }
@@ -229,7 +239,6 @@ fn seed_owner(
     }
     for operation in plan.provenance().consumers_for(owner) {
         merge_scope(&mut seeds[operation.index()], scope);
-        patched[operation.index()] = true;
     }
 }
 

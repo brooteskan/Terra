@@ -3,7 +3,6 @@ use std::time::{Duration, Instant};
 use crate::logging::OperationContext;
 use crate::ui::{Preview2dMode, TerrainPreviewFreshness};
 use terra_core::eval::{EvalWorkRequest, PreviewQuality};
-use terra_core::heightfield::Heightfield;
 use terra_core::layer::{LayerId, LayerKind};
 use terra_core::mask::bake_mask_assets;
 use terra_core::tiling::UvRect;
@@ -473,6 +472,10 @@ impl TerraApp {
 
     pub(crate) fn mark_dirty_from(&mut self, id: LayerId) {
         let preview = self.session.document.preview_eval_stack();
+        self.pending_plan_edits
+            .push(terra_core::terrain_plan::TerrainEditClass::Parameters {
+                owner: terra_core::deps::NodeRef::Layer(id),
+            });
         self.scheduler.evaluator.mark_dirty_from(&preview, id);
         self.advance_output_revision();
         // No spatial footprint (param/structural edit): whole-field suffix.
@@ -484,6 +487,10 @@ impl TerraApp {
 
     pub(crate) fn mark_dirty_from_stage(&mut self, id: LayerId) {
         let preview = self.session.document.preview_eval_stack();
+        self.pending_plan_edits
+            .push(terra_core::terrain_plan::TerrainEditClass::Parameters {
+                owner: terra_core::deps::NodeRef::Layer(id),
+            });
         self.scheduler.evaluator.mark_dirty_from_stage(&preview, id);
         self.advance_output_revision();
         self.track_worker_dirty_from(&preview, id, None);
@@ -573,6 +580,8 @@ impl TerraApp {
 
     pub(crate) fn mark_all_layers_dirty(&mut self) {
         let preview = self.session.document.preview_eval_stack();
+        self.pending_plan_edits
+            .push(terra_core::terrain_plan::TerrainEditClass::Structure);
         self.scheduler.evaluator.mark_all_dirty(&preview);
         let metrics = self.session.document.metrics;
         self.terrain_runtime
@@ -732,50 +741,44 @@ impl TerraApp {
         // Interactive evaluation must never force a GPU readback/Wait on the UI thread.
         let want_cpu = false;
 
-        // Bridge for interactive suffix edits:
-        // 1) CPU layer checkpoint for prev id (param tweaks)
-        // 2) last_height / last_good when first dirty layer is *new* (add filter) —
-        //    safe prefix: prior stack output does not include the new layer yet.
-        let bridge_owned: Option<Heightfield> = {
-            let layers = preview_stack.flatten_layers();
-            let first_dirty = self
-                .gpu_engine
-                .as_ref()
-                .and_then(|gpu| gpu.first_dirty_index(&preview_stack))
-                .unwrap_or(0);
-            if first_dirty == 0 || first_dirty >= layers.len() {
-                None
-            } else {
-                let prev_id = layers[first_dirty - 1].id();
-                let dirty_id = layers[first_dirty].id();
-                let from_cache = self.scheduler.evaluator.cache.get(prev_id).and_then(|c| {
-                    if c.dirty {
-                        return None;
-                    }
-                    Some(c.height.clone())
-                });
-                from_cache.or_else(|| {
-                    let gpu_has_new = self
-                        .gpu_engine
-                        .as_ref()
-                        .is_some_and(|g| g.has_layer_cache(dirty_id, metrics));
-                    let cpu_has_new = self
-                        .scheduler
-                        .evaluator
-                        .cache
-                        .get(dirty_id)
-                        .is_some_and(|c| !c.dirty);
-                    let is_new_layer = !gpu_has_new && !cpu_has_new;
-                    if !is_new_layer {
-                        return None;
-                    }
-                    self.last_height
-                        .clone()
-                        .or_else(|| self.scheduler.last_good.as_ref().map(|h| (**h).clone()))
-                })
+        let edits = std::mem::take(&mut self.pending_plan_edits);
+        let plan_update = if edits.is_empty() {
+            self.terrain_plan_cache
+                .acquire(&preview_stack, &self.session.document.masks)
+                .map(|_| self.pending_plan_invalidation.clone().unwrap_or_default())
+        } else {
+            self.terrain_plan_cache
+                .update(&preview_stack, &self.session.document.masks, &edits)
+        };
+        let plan_invalidation = match plan_update {
+            Ok(invalidation) => {
+                self.pending_plan_invalidation = Some(invalidation.clone());
+                invalidation
+            }
+            Err(diagnostics) => {
+                log::debug!(
+                    target: "terra_app::evaluation",
+                    "compiled terrain plan requires CPU fallback ({}); {operation_context}",
+                    diagnostics
+                        .first()
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| "unknown plan diagnostic".to_string())
+                );
+                self.last_eval_fully_gpu = false;
+                self.ui_state.profile.path = "async CPU";
+                if !self.worker_refine_pending {
+                    self.enqueue_async_eval(quality);
+                }
+                self.ui_state.profile.eval_us = t0.elapsed().as_micros() as u64;
+                return;
             }
         };
-        let bridge_prefix = bridge_owned.as_ref();
+        let plan_revision = self.terrain_plan_cache.structure_revision();
+        let compiled_plan = self
+            .terrain_plan_cache
+            .current_plan()
+            .expect("successful plan acquisition is current")
+            .clone();
 
         let mut used_gpu = false;
         let mut eval_completed = false;
@@ -798,15 +801,17 @@ impl TerraApp {
                     // triggered it was bounded. Do not leak the prior local rect into it.
                     engine.set_dirty_rect(None);
                 }
-                match engine.evaluate_with_intent(
+                match engine.evaluate_compiled_with_intent(
                     &gpu.device,
                     &gpu.queue,
                     &preview_stack,
                     &self.session.document.masks,
+                    &compiled_plan,
+                    plan_revision,
+                    &plan_invalidation,
                     metrics,
                     quality,
                     want_cpu,
-                    bridge_prefix,
                     intent,
                 ) {
                     Ok(result) => {
@@ -897,6 +902,9 @@ impl TerraApp {
                                 })
                             };
                             self.last_eval_fully_gpu = result.fully_gpu;
+                            if !full_field_deferred && result.cpu_fallback.is_none() {
+                                self.pending_plan_invalidation = None;
+                            }
                             // want_cpu=false, so the GPU engine never returns a CPU prefix
                             // (`result.cpu` is always None) and the UI thread never runs a CPU
                             // stack eval — every hybrid resume routes to the async worker below.
@@ -1016,6 +1024,10 @@ impl TerraApp {
                             GpuError::SourceAsset(_) => log::warn!(
                                 target: "terra_app::evaluation",
                                 "GPU source asset failed: {error}; {operation_context}"
+                            ),
+                            GpuError::StalePlan { .. } => log::debug!(
+                                target: "terra_app::evaluation",
+                                "discarding stale GPU terrain plan: {error}; {operation_context}"
                             ),
                         }
                         // GPU path failed — async CPU, keep last-good on screen.

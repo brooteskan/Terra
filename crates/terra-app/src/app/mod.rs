@@ -253,6 +253,10 @@ pub struct TerraApp {
     full_field_refine_not_before: Option<Instant>,
     /// Wave C GPU layer preview engine (shares renderer device).
     gpu_engine: Option<GpuTerrainEngine>,
+    /// Backend-neutral structural plan and pending semantic edit batch.
+    terrain_plan_cache: terra_core::terrain_plan::TerrainPlanCache,
+    pending_plan_edits: Vec<terra_core::terrain_plan::TerrainEditClass>,
+    pending_plan_invalidation: Option<terra_core::terrain_plan::PlanInvalidation>,
     /// Last interactive GPU eval covered the full height stack (no CPU resume).
     last_eval_fully_gpu: bool,
     /// Progressive final-output tile atlas used by the LOD renderer migration.
@@ -410,6 +414,9 @@ impl Default for TerraApp {
             deferred_full_field: None,
             full_field_refine_not_before: None,
             gpu_engine: None,
+            terrain_plan_cache: terra_core::terrain_plan::TerrainPlanCache::new(),
+            pending_plan_edits: vec![terra_core::terrain_plan::TerrainEditClass::Structure],
+            pending_plan_invalidation: None,
             last_eval_fully_gpu: false,
             tile_atlas: None,
             pending_tile_uploads: VecDeque::new(),

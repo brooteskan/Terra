@@ -62,7 +62,12 @@ impl GpuPlanResourceLayout {
                 {
                     persistent.insert(*output);
                 }
-                TerrainOpKind::RunLayerKernel { output_fields, .. } => {
+                TerrainOpKind::RunLayerKernel {
+                    output_candidate,
+                    output_fields,
+                    ..
+                } => {
+                    persistent.insert(*output_candidate);
                     persistent.extend(output_fields.iter().copied());
                 }
                 TerrainOpKind::CompositeLayer { output, .. } => {
@@ -451,6 +456,19 @@ impl GpuPlanResourceCache {
 
     pub const fn current(&self) -> Option<&GpuPlanResources> {
         self.current.as_ref()
+    }
+
+    /// Temporarily transfer ownership of the active realization to an executor.
+    /// Recording failures can restore it without publishing a replacement, while
+    /// successful executions return it through [`Self::commit_candidate`].
+    pub fn take_current(&mut self) -> Option<GpuPlanResources> {
+        self.current.take()
+    }
+
+    /// Restore an execution candidate without counting it as a publication.
+    pub fn restore_current(&mut self, resources: GpuPlanResources) {
+        debug_assert!(self.current.is_none());
+        self.current = Some(resources);
     }
 
     /// Build an isolated execution candidate. Recording into this resource set

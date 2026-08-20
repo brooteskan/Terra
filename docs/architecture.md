@@ -55,8 +55,9 @@ composition behavior.
 `CompiledTerrainPlan`. The plan describes ordered operations, logical height/mask/aux
 fields, spatial reach, and stable authored provenance without owning layer payloads,
 CPU heightfields, or GPU resources. CPU and GPU backends realize that plan into their
-own physical resources and execution work. During the staged migration, the existing
-CPU evaluator and flat GPU planner remain active until their plan consumers land.
+own physical resources and execution work. The GPU backend executes this plan as its
+ordering, field-wiring, group, and invalidation authority; the legacy flat graph is
+retained only as a compatibility diagnostic and layer-kernel capability adapter.
 
 The ownership boundary is deliberate:
 
@@ -91,8 +92,8 @@ height-only suffix. Cache counters expose compiles, hits, patched/reached operat
 and full-field escalation reasons for tests and profiling.
 
 `terra-gpu::compiled_plan` realizes the validated logical fields as R32Float wgpu
-textures. Final, named-output, root, and reusable composite/aux checkpoints are
-persistent; layer candidates, masks, and isolated-group private slices are transient.
+textures. Final, named-output, root, reusable layer candidates, and composite/aux
+checkpoints are persistent; masks and isolated-group private slices are transient.
 Transient allocation uses the plan's inclusive operation lifetimes, so storage is
 reused only when `previous.last_operation < next.first_operation`. Inputs and outputs
 used by the same operation therefore never alias, nested private groups remain
@@ -110,8 +111,11 @@ The field-addressable backend implements zero/copy seeds, supported Constant/Hei
 Slope distributions, standard group blends, biome CopyInput height-delta composition,
 and explicit masked auxiliary publication. Selected fields, distribution nodes, and
 cross-output/observed auxiliary mask inputs remain gated for their dedicated phase.
-The production `GpuTerrainEngine` still uses the flat planner until #144 adopts these
-resources and operations and removes the categorical tree preflight fallback.
+`GpuTerrainEngine` accepts a revision-matching compiled plan and dispatches these
+operations in plan order. Scoped groups no longer trigger a categorical tree fallback;
+unsupported layer configurations or not-yet-resident auxiliary dependencies report the
+precise plan operation and authored owner through provenance. Recording uses staged
+resources so a stale plan or failed candidate cannot replace the last-good output.
 
 ## Evaluation
 
@@ -137,10 +141,9 @@ The plan IR and recursive `LayerStack` compiler are present. The compiler preser
 bottom-to-top order, pass-through folders, private `CopyInput` / `EmptyHeight` group
 fields, group composites, point-of-use mask operations, explicit auxiliary merges,
 and authored provenance. Solo filtering and selected/cross-tree fields remain explicit
-compile diagnostics until their dedicated compiler phases land. Production GPU
-realization and consumption land in subsequent phases. Until then, incremental CPU
-rebuild continues to use `LayerCache` + `mark_dirty_from`, and the existing GPU planner
-continues to serve flat stacks.
+compile diagnostics until their dedicated compiler phases land. Incremental GPU work
+is selected from plan invalidation and persistent field checkpoints; incremental CPU
+rebuild continues to use `LayerCache` + `mark_dirty_from`.
 Progressive preview walks `Draft → Medium → Full`: the app advances the quality ladder
 held on `EvalScheduler` and runs each authoritative CPU pass on the background
 `EvalWorker`.

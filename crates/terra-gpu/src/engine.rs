@@ -8,11 +8,15 @@
 //! Interactive hard rules (WC): no UI-thread height readback, no mesh rebuild,
 //! prefer fully GPU stacks, never present an incomplete prefix as finished Draft.
 
+use crate::compiled_plan::{
+    GpuFieldResidency, GpuGroupCompositeParams, GpuPlanOperationError, GpuPlanOperations,
+    GpuPlanResourceCache, GpuPlanResourceKey,
+};
 use crate::effect_filter::{effect_filter_gpu_spec, EffectFilterGpuPasses};
 use crate::graph::{
-    compile_gpu_graph, expand_dirty_rect, gpu_blend_mode, GpuComputeGraph, GpuDirtyPolicy,
-    GpuFallbackCode, GpuFallbackDiagnostic, GpuFallbackReason, GpuKernel, BLUR_MAX_RADIUS,
-    EFFECT_FILTER_MAX_RADIUS, RIVER_CARVE_MAX_RADIUS,
+    compile_gpu_graph, expand_dirty_rect, gpu_blend_mode, gpu_plan_for_layer, GpuComputeGraph,
+    GpuDirtyPolicy, GpuFallbackCode, GpuFallbackDiagnostic, GpuFallbackReason, GpuKernel,
+    GpuLayerPlan, BLUR_MAX_RADIUS, EFFECT_FILTER_MAX_RADIUS, RIVER_CARVE_MAX_RADIUS,
 };
 use crate::{readback_f32, GpuError};
 use bytemuck::{Pod, Zeroable};
@@ -23,6 +27,7 @@ use terra_core::analyze::{
     amplify_sim_levels, apply_transport_model, clamp_timestep_cfl, default_sim_levels,
     draft_sim_levels, LevelStepSettings,
 };
+use terra_core::deps::NodeRef;
 use terra_core::eval::PreviewQuality;
 use terra_core::fields::FieldId;
 use terra_core::heightfield::{Heightfield, HeightfieldMetrics, TileId};
@@ -32,7 +37,13 @@ use terra_core::layer::{
     PolygonHeightMode, PolygonHeightParams, ProceduralGenerator, ProceduralShapeParams,
     SculptParams, SculptStroke, SculptStrokeKind, SculptStrokeParams,
 };
-use terra_core::mask::{MaskAsset, MaskCombine, MaskOp, MaskSource};
+use terra_core::mask::{Distribution, MaskAsset, MaskCombine, MaskOp, MaskSource};
+use terra_core::terrain_plan::{
+    compile_terrain_plan, propagate_plan_edits, CompiledTerrainPlan, GroupCompositeMode,
+    PlanDirtyScope, PlanInvalidation, PlanOpId, PlanOrigin, PlanStructureRevision,
+    PropagatedDirtyScope, TerrainEditClass, TerrainOpKind, TerrainPlanStamp,
+};
+use wgpu::util::DeviceExt;
 
 fn cpu_required(
     code: GpuFallbackCode,
@@ -40,6 +51,246 @@ fn cpu_required(
     detail: impl Into<String>,
 ) -> GpuError {
     GpuError::RequiresCpu(GpuFallbackReason::new(code, family, detail))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_copy_views_region(
+    device: &wgpu::Device,
+    encoder: &mut wgpu::CommandEncoder,
+    pipe: &Pipe,
+    source: &wgpu::TextureView,
+    destination: &wgpu::TextureView,
+    width: u32,
+    height: u32,
+    region: (u32, u32, u32, u32),
+) {
+    let (region_x, region_y, region_w, region_h) = region;
+    if region_w == 0 || region_h == 0 {
+        return;
+    }
+    let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("compiled-plan-legacy-copy-uniform"),
+        contents: bytemuck::bytes_of(&CopyU {
+            width,
+            height,
+            region_x,
+            region_y,
+            region_w,
+            region_h,
+        }),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("compiled-plan-legacy-copy-bind-group"),
+        layout: &pipe.bgl,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(source),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(destination),
+            },
+        ],
+    });
+    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some("compiled-plan-legacy-copy"),
+        timestamp_writes: None,
+    });
+    pass.set_pipeline(&pipe.pipeline);
+    pass.set_bind_group(0, &bind_group, &[]);
+    pass.dispatch_workgroups(region_w.div_ceil(8), region_h.div_ceil(8), 1);
+}
+
+#[derive(Debug)]
+enum CompiledDispatchError {
+    Plan(GpuPlanOperationError),
+    Gpu(GpuError),
+}
+
+impl From<GpuPlanOperationError> for CompiledDispatchError {
+    fn from(error: GpuPlanOperationError) -> Self {
+        Self::Plan(error)
+    }
+}
+
+impl From<GpuError> for CompiledDispatchError {
+    fn from(error: GpuError) -> Self {
+        Self::Gpu(error)
+    }
+}
+
+fn kernel_runs_in_place(kernel: GpuKernel) -> bool {
+    matches!(
+        kernel,
+        GpuKernel::Blur
+            | GpuKernel::EffectFilter
+            | GpuKernel::Terrace
+            | GpuKernel::Thermal
+            | GpuKernel::Hydraulic
+            | GpuKernel::RiverCarve
+            | GpuKernel::StreamPower
+            | GpuKernel::MultiScaleAmplify
+    )
+}
+
+fn plan_scope_region(
+    scope: PropagatedDirtyScope,
+    metrics: HeightfieldMetrics,
+) -> (u32, u32, u32, u32) {
+    match scope.scope {
+        PlanDirtyScope::FullField => (0, 0, metrics.width, metrics.height),
+        PlanDirtyScope::Region(region) => {
+            if metrics.width == 0 || metrics.height == 0 {
+                return (0, 0, 0, 0);
+            }
+            let x0 = ((region.min_u.clamp(0.0, 1.0) * metrics.width as f32).floor() as u32)
+                .min(metrics.width - 1)
+                .saturating_sub(scope.halo_samples);
+            let y0 = ((region.min_v.clamp(0.0, 1.0) * metrics.height as f32).floor() as u32)
+                .min(metrics.height - 1)
+                .saturating_sub(scope.halo_samples);
+            let x1 = ((region.max_u.clamp(0.0, 1.0) * metrics.width as f32).ceil() as u32)
+                .max(x0 + 1)
+                .saturating_add(scope.halo_samples)
+                .min(metrics.width);
+            let y1 = ((region.max_v.clamp(0.0, 1.0) * metrics.height as f32).ceil() as u32)
+                .max(y0 + 1)
+                .saturating_add(scope.halo_samples)
+                .min(metrics.height);
+            (x0, y0, x1.saturating_sub(x0), y1.saturating_sub(y0))
+        }
+    }
+}
+
+fn plan_distribution(
+    stack: &LayerStack,
+    origin: PlanOrigin,
+) -> Option<&terra_core::mask::Distribution> {
+    match origin {
+        PlanOrigin::Authored(NodeRef::Layer(layer)) => {
+            stack.find(layer).map(|layer| &layer.common.masks)
+        }
+        PlanOrigin::Authored(NodeRef::Group(group)) => {
+            stack.find_group(group).map(|group| &group.masks)
+        }
+        _ => None,
+    }
+}
+
+fn owner_layer_id(owner: Option<NodeRef>) -> Option<LayerId> {
+    match owner {
+        Some(NodeRef::Layer(layer) | NodeRef::Group(layer)) => Some(layer),
+        _ => None,
+    }
+}
+
+fn plan_fallback_diagnostic(
+    plan: &CompiledTerrainPlan,
+    stack: &LayerStack,
+    operation: PlanOpId,
+    reason: GpuFallbackReason,
+) -> GpuFallbackDiagnostic {
+    let owner = plan.provenance().owner_of(operation);
+    let layer_id = owner_layer_id(owner).unwrap_or_default();
+    let layer_name = match owner {
+        Some(NodeRef::Layer(layer)) => stack
+            .find(layer)
+            .map(|layer| layer.common.name.clone())
+            .unwrap_or_else(|| format!("layer {layer:?}")),
+        Some(NodeRef::Group(group)) => stack
+            .find_group(group)
+            .map(|group| group.name.clone())
+            .unwrap_or_else(|| format!("group {group:?}")),
+        Some(other) => format!("{other:?}"),
+        None => "terrain plan root".to_string(),
+    };
+    GpuFallbackDiagnostic {
+        operation: Some(operation),
+        owner,
+        layer_index: operation.index(),
+        layer_id,
+        layer_name,
+        reason,
+    }
+}
+
+fn plan_fallback_result(
+    metrics: HeightfieldMetrics,
+    height_range: (f32, f32),
+    diagnostic: GpuFallbackDiagnostic,
+) -> GpuEvalResult {
+    GpuEvalResult {
+        width: metrics.width,
+        height: metrics.height,
+        world_size: (metrics.world_size_x, metrics.world_size_z),
+        height_range,
+        fully_gpu: false,
+        freshness: GpuPreviewFreshness::Current,
+        cpu: None,
+        resume_cpu_from: Some(0),
+        cpu_fallback: Some(diagnostic),
+        did_eval: false,
+    }
+}
+
+fn plan_operation_fallback(error: CompiledDispatchError) -> GpuFallbackReason {
+    match error {
+        CompiledDispatchError::Gpu(GpuError::RequiresCpu(reason)) => reason,
+        CompiledDispatchError::Gpu(error) => GpuFallbackReason::new(
+            GpuFallbackCode::RuntimeResourceLimit,
+            "GPU execution",
+            error.to_string(),
+        ),
+        CompiledDispatchError::Plan(GpuPlanOperationError::UnsupportedBlend(blend)) => {
+            GpuFallbackReason::new(
+                GpuFallbackCode::BlendMode,
+                "blend",
+                format!("{blend:?} is not supported by the GPU"),
+            )
+        }
+        CompiledDispatchError::Plan(GpuPlanOperationError::UnsupportedMaskNodes) => {
+            GpuFallbackReason::new(
+                GpuFallbackCode::MaskNodes,
+                "mask",
+                "distribution nodes or auxiliary mask inputs are not GPU-resident",
+            )
+        }
+        CompiledDispatchError::Plan(GpuPlanOperationError::MissingMaskAsset(mask)) => {
+            GpuFallbackReason::new(
+                GpuFallbackCode::MissingMaskAsset,
+                "mask",
+                format!("mask asset {mask:?} is missing"),
+            )
+        }
+        CompiledDispatchError::Plan(GpuPlanOperationError::UnsupportedMaskSource(source)) => {
+            GpuFallbackReason::new(GpuFallbackCode::MaskSource, "mask", source)
+        }
+        CompiledDispatchError::Plan(GpuPlanOperationError::MaskBlurRadius(radius)) => {
+            GpuFallbackReason::new(
+                GpuFallbackCode::MaskOperations,
+                "mask",
+                format!("blur radius {radius} exceeds the GPU limit"),
+            )
+        }
+        CompiledDispatchError::Plan(GpuPlanOperationError::UnsupportedSelectedField(_)) => {
+            GpuFallbackReason::new(
+                GpuFallbackCode::UnsupportedOptions,
+                "selected field",
+                "selected-field seeds are not GPU-resident",
+            )
+        }
+        CompiledDispatchError::Plan(error) => GpuFallbackReason::new(
+            GpuFallbackCode::InvalidConfiguration,
+            "compiled operation",
+            error.to_string(),
+        ),
+    }
 }
 
 fn mask_program(
@@ -1074,7 +1325,6 @@ fn layer_input_independent(kind: &LayerKind) -> bool {
             | LayerKind::Volcano(_)
             | LayerKind::Uplift(_)
             | LayerKind::Island(_)
-            | LayerKind::DomainWarp(_)
             | LayerKind::VoronoiRegions(_)
             | LayerKind::ProceduralShape(_)
             | LayerKind::ImportHeightmap(_)
@@ -1147,6 +1397,11 @@ pub enum GpuEvaluationIntent {
 
 /// GPU stack evaluator for interactive preview.
 pub struct GpuTerrainEngine {
+    plan_operations: GpuPlanOperations,
+    plan_resources: GpuPlanResourceCache,
+    device_generation: u64,
+    active_plan_revision: Option<PlanStructureRevision>,
+    deferred_plan_resume: Option<(PlanStructureRevision, PlanOpId)>,
     fill: Pipe,
     noise: Pipe,
     blend: Pipe,
@@ -1239,6 +1494,8 @@ pub struct GpuTerrainEngine {
     #[cfg(test)]
     executed_kernels: Vec<GpuKernel>,
     last_eval_stats: GpuEvalStats,
+    #[cfg(test)]
+    executed_plan_operations: Vec<PlanOpId>,
 }
 
 impl GpuTerrainEngine {
@@ -1690,6 +1947,11 @@ impl GpuTerrainEngine {
         });
 
         Self {
+            plan_operations: GpuPlanOperations::new(device),
+            plan_resources: GpuPlanResourceCache::default(),
+            device_generation: 1,
+            active_plan_revision: None,
+            deferred_plan_resume: None,
             fill,
             noise,
             blend,
@@ -1770,6 +2032,8 @@ impl GpuTerrainEngine {
             #[cfg(test)]
             executed_kernels: Vec::new(),
             last_eval_stats: GpuEvalStats::default(),
+            #[cfg(test)]
+            executed_plan_operations: Vec::new(),
         }
     }
 
@@ -1974,6 +2238,9 @@ impl GpuTerrainEngine {
     /// Drop all project-owned GPU caches and replace project-sized working textures
     /// with the small resident baseline so a new/opened document starts clean.
     pub fn reset_project_state(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        self.plan_resources = GpuPlanResourceCache::default();
+        self.active_plan_revision = None;
+        self.deferred_plan_resume = None;
         self.layer_cache.clear();
         self.layer_contrib.clear();
         self.layer_contrib_mask.clear();
@@ -4719,8 +4986,682 @@ impl GpuTerrainEngine {
         )
     }
 
+    /// Compatibility entry point that compiles a validated plan before crossing
+    /// the GPU boundary. Production callers should retain a `TerrainPlanCache`
+    /// and call [`Self::evaluate_compiled_with_intent`] directly.
     #[allow(clippy::too_many_arguments)]
     pub fn evaluate_with_intent(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        stack: &LayerStack,
+        mask_assets: &[MaskAsset],
+        metrics: HeightfieldMetrics,
+        quality: PreviewQuality,
+        want_cpu: bool,
+        _bridge_prefix: Option<&Heightfield>,
+        intent: GpuEvaluationIntent,
+    ) -> Result<GpuEvalResult, GpuError> {
+        let revision = PlanStructureRevision::INITIAL;
+        let plan = compile_terrain_plan(stack, mask_assets, TerrainPlanStamp::new(revision))
+            .map_err(|diagnostics| {
+                cpu_required(
+                    GpuFallbackCode::UnsupportedOptions,
+                    "terrain plan",
+                    diagnostics
+                        .first()
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| "terrain plan compilation failed".to_string()),
+                )
+            })?;
+        // Retain the public flat capability snapshot for compatibility diagnostics
+        // and existing profiler consumers. It is not consulted by compiled-plan
+        // scheduling or dispatch.
+        self.last_graph = compile_gpu_graph(stack, mask_assets);
+        let dirty_ids: Vec<LayerId> = self.dirty.iter().copied().collect();
+        let scope = self
+            .last_dirty_rect
+            .map_or(PlanDirtyScope::FullField, |(x, y, w, h)| {
+                // The compatibility API receives a preview-space sculpt footprint.
+                // Include the bilinear resampling fringe before converting to the
+                // resolution-independent plan scope.
+                let x0 = x.saturating_sub(1);
+                let y0 = y.saturating_sub(1);
+                let x1 = x.saturating_add(w).saturating_add(1).min(metrics.width);
+                let y1 = y.saturating_add(h).saturating_add(1).min(metrics.height);
+                PlanDirtyScope::Region(terra_core::tiling::UvRect {
+                    min_u: x0 as f32 / metrics.width.max(1) as f32,
+                    min_v: y0 as f32 / metrics.height.max(1) as f32,
+                    max_u: x1 as f32 / metrics.width.max(1) as f32,
+                    max_v: y1 as f32 / metrics.height.max(1) as f32,
+                })
+            });
+        let edits: Vec<TerrainEditClass> = if self.active_plan_revision.is_none() {
+            vec![TerrainEditClass::Structure]
+        } else {
+            dirty_ids
+                .iter()
+                .map(|layer| TerrainEditClass::Content {
+                    owner: NodeRef::Layer(*layer),
+                    fields: vec![FieldId::Height],
+                    scope,
+                })
+                .collect()
+        };
+        let invalidation = propagate_plan_edits(&plan, &edits);
+        let result = self.evaluate_compiled_with_intent(
+            device,
+            queue,
+            stack,
+            mask_assets,
+            &plan,
+            revision,
+            &invalidation,
+            metrics,
+            quality,
+            want_cpu,
+            intent,
+        );
+        if result
+            .as_ref()
+            .is_ok_and(|result| result.did_eval && !result.freshness.is_deferred())
+        {
+            for layer in dirty_ids {
+                self.dirty.remove(&layer);
+            }
+        }
+        result
+    }
+
+    /// Execute a validated terrain plan. Operation order, field wiring, dirty
+    /// propagation, and provenance come exclusively from `plan`; `stack` is
+    /// consulted only to resolve mutable authored payloads by stable id.
+    #[allow(clippy::too_many_arguments)]
+    pub fn evaluate_compiled_with_intent(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        stack: &LayerStack,
+        mask_assets: &[MaskAsset],
+        plan: &CompiledTerrainPlan,
+        expected_revision: PlanStructureRevision,
+        invalidation: &PlanInvalidation,
+        metrics: HeightfieldMetrics,
+        quality: PreviewQuality,
+        want_cpu: bool,
+        intent: GpuEvaluationIntent,
+    ) -> Result<GpuEvalResult, GpuError> {
+        profiling::scope!("gpu_compiled_plan_eval");
+        if !plan.matches_structure_revision(expected_revision) {
+            return Err(GpuError::StalePlan {
+                plan_revision: plan.stamp().structure_revision.get(),
+                expected_revision: expected_revision.get(),
+            });
+        }
+
+        self.ensure_size(device, metrics);
+        self.uniform_pool.reset();
+        self.last_eval_stats = GpuEvalStats::default();
+        let quality_changed = self.last_quality.replace(quality) != Some(quality);
+        #[cfg(test)]
+        {
+            self.executed_plan_operations.clear();
+            self.executed_kernels.clear();
+        }
+
+        let key = GpuPlanResourceKey::new(metrics.width, metrics.height, self.device_generation);
+        let compatible_active = self.plan_resources.current().is_some_and(|resources| {
+            resources.key() == key
+                && resources.layout().structure_signature() == plan.structure_signature()
+        });
+        let cold = quality_changed
+            || !compatible_active
+            || self.active_plan_revision != Some(expected_revision);
+        let candidate = self
+            .plan_resources
+            .stage_candidate(device, plan, key)
+            .map_err(|error| GpuError::Wgpu(error.to_string()))?;
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("compiled-terrain-plan"),
+        });
+
+        // A warm candidate starts from the last-good persistent checkpoints.
+        // Transient fields are reconstructed below from the selected subgraph.
+        if compatible_active {
+            let active = self.plan_resources.current().expect("checked above");
+            let mut copied = HashSet::new();
+            for field in plan.fields() {
+                let Some(binding) = candidate.layout().binding(field.slot) else {
+                    continue;
+                };
+                if binding.residency != GpuFieldResidency::Persistent
+                    || !copied.insert(binding.physical)
+                {
+                    continue;
+                }
+                encoder.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: active
+                            .texture(field.slot)
+                            .map_err(|error| GpuError::Wgpu(error.to_string()))?,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: candidate
+                            .texture(field.slot)
+                            .map_err(|error| GpuError::Wgpu(error.to_string()))?,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d {
+                        width: metrics.width,
+                        height: metrics.height,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
+        }
+
+        let mut requested: Vec<PlanOpId> = if cold {
+            plan.operations()
+                .iter()
+                .enumerate()
+                .filter_map(|(index, _)| {
+                    let id = PlanOpId::from_index(index);
+                    plan.analysis().operation_is_live(id).then_some(id)
+                })
+                .collect()
+        } else {
+            invalidation
+                .operations
+                .iter()
+                .map(|dirty| dirty.operation)
+                .collect()
+        };
+        let mut reused_plan_candidates = 0u32;
+        if !cold {
+            requested.retain(|operation_id| {
+                let Some(operation) = plan.operation(*operation_id) else {
+                    return false;
+                };
+                let TerrainOpKind::RunLayerKernel { layer, .. } = operation.kind else {
+                    return true;
+                };
+                let patched = invalidation.patched_operations.contains(operation_id);
+                let input_independent = stack
+                    .find(layer)
+                    .is_some_and(|layer| layer_input_independent(&layer.kind));
+                if !patched && input_independent {
+                    reused_plan_candidates += 1;
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        self.last_eval_stats.reused_contributions = reused_plan_candidates;
+        let selected = candidate
+            .layout()
+            .materialization_operations(plan, &requested);
+        let merged_scope = if cold {
+            PropagatedDirtyScope::new(PlanDirtyScope::FullField)
+        } else {
+            invalidation
+                .operations
+                .iter()
+                .map(|dirty| dirty.scope)
+                .reduce(PropagatedDirtyScope::merge)
+                .unwrap_or_else(|| PropagatedDirtyScope::new(PlanDirtyScope::FullField))
+        };
+        let scope_for = |operation: PlanOpId| {
+            if cold {
+                return PropagatedDirtyScope::new(PlanDirtyScope::FullField);
+            }
+            invalidation
+                .operations
+                .iter()
+                .find_map(|dirty| (dirty.operation == operation).then_some(dirty.scope))
+                .unwrap_or(merged_scope)
+        };
+
+        let deferred_at = if !cold && intent == GpuEvaluationIntent::InteractiveLocal {
+            requested
+                .iter()
+                .copied()
+                .find(|operation| scope_for(*operation).is_full())
+        } else {
+            None
+        };
+        if !cold
+            && requested.iter().any(|operation| {
+                let Some(TerrainOpKind::RunLayerKernel { layer, .. }) =
+                    plan.operation(*operation).map(|operation| &operation.kind)
+                else {
+                    return false;
+                };
+                stack
+                    .flatten_layers()
+                    .first()
+                    .is_some_and(|first| first.id() == *layer)
+                    && !scope_for(*operation).is_full()
+            })
+        {
+            self.last_eval_stats.used_layer_zero_region = true;
+        }
+        let execution_end = deferred_at.map_or(usize::MAX, PlanOpId::index);
+        let mut selected: Vec<PlanOpId> = selected
+            .into_iter()
+            .filter(|operation| operation.index() < execution_end)
+            .collect();
+        if intent == GpuEvaluationIntent::Complete {
+            if let Some((revision, resume)) = self.deferred_plan_resume {
+                if revision == expected_revision {
+                    selected.retain(|operation| operation.index() >= resume.index());
+                }
+            }
+        }
+
+        // Compile backend kernel choices once, indexed by plan operation. This is
+        // a capability adapter, not a second authored-stack planner.
+        let mut kernels = HashMap::<PlanOpId, GpuLayerPlan>::new();
+        let mut planned_fallback = None;
+        for operation_id in &selected {
+            let operation = plan
+                .operation(*operation_id)
+                .expect("selected operation belongs to plan");
+            if let TerrainOpKind::RunLayerKernel {
+                layer,
+                output_fields,
+                ..
+            } = &operation.kind
+            {
+                let Some(authored) = stack.find(*layer) else {
+                    let diagnostic = plan_fallback_diagnostic(
+                        plan,
+                        stack,
+                        *operation_id,
+                        GpuFallbackReason::new(
+                            GpuFallbackCode::UnsupportedOptions,
+                            "terrain plan",
+                            "compiled layer owner is missing from the authored document",
+                        ),
+                    );
+                    planned_fallback = Some(diagnostic);
+                    break;
+                };
+                if output_fields.iter().any(|field| {
+                    plan.analysis().field_is_live(*field)
+                        && plan.analysis().consumers(*field).iter().any(|consumer| {
+                            !plan.operation(*consumer).is_some_and(|operation| {
+                                matches!(operation.kind, TerrainOpKind::PublishOutput { .. })
+                            })
+                        })
+                }) {
+                    let diagnostic = plan_fallback_diagnostic(
+                        plan,
+                        stack,
+                        *operation_id,
+                        GpuFallbackReason::new(
+                            GpuFallbackCode::AuxiliaryDependency,
+                            "auxiliary field",
+                            "the GPU kernel does not yet publish a live auxiliary output",
+                        ),
+                    );
+                    planned_fallback = Some(diagnostic);
+                    break;
+                }
+                match gpu_plan_for_layer(authored, mask_assets) {
+                    Ok(kernel) => {
+                        kernels.insert(*operation_id, kernel);
+                    }
+                    Err(reason) => {
+                        let diagnostic =
+                            plan_fallback_diagnostic(plan, stack, *operation_id, reason);
+                        planned_fallback = Some(diagnostic);
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(diagnostic) = &planned_fallback {
+            if stack.requires_tree_evaluation() {
+                return Ok(plan_fallback_result(
+                    metrics,
+                    self.approx_range,
+                    diagnostic.clone(),
+                ));
+            }
+            let boundary = diagnostic.operation.map_or(0, PlanOpId::index);
+            selected.retain(|operation| operation.index() < boundary);
+        }
+
+        // The legacy SculptStrokes kernel adapter still dispatches its internal
+        // stamp/reconcile sequence over the full field. Until it has a native
+        // plan primitive, keep its following explicit composites equally broad.
+        let legacy_full_field_adapter = selected.iter().any(|operation| {
+            kernels
+                .get(operation)
+                .is_some_and(|plan| plan.kernel == GpuKernel::SculptStrokes)
+        });
+        let mut last_height = None;
+        for operation_id in &selected {
+            let operation = plan
+                .operation(*operation_id)
+                .expect("selected operation belongs to plan");
+            let region = if legacy_full_field_adapter {
+                (0, 0, metrics.width, metrics.height)
+            } else {
+                plan_scope_region(scope_for(*operation_id), metrics)
+            };
+            let execution = (|| -> Result<(), CompiledDispatchError> {
+                match &operation.kind {
+                    TerrainOpKind::Seed { source, output } => {
+                        self.plan_operations.seed_field_region(
+                            device,
+                            &mut encoder,
+                            &candidate,
+                            *source,
+                            *output,
+                            Some(region),
+                        )?;
+                        Ok(())
+                    }
+                    TerrainOpKind::EvaluateMask {
+                        input_height,
+                        input_fields,
+                        output_mask,
+                    } => {
+                        let result = if !input_fields.is_empty() {
+                            Err(GpuPlanOperationError::UnsupportedMaskNodes)
+                        } else if let Some(distribution) =
+                            plan_distribution(stack, operation.origin)
+                        {
+                            self.plan_operations.evaluate_distribution_region(
+                                device,
+                                &mut encoder,
+                                &candidate,
+                                *input_height,
+                                *output_mask,
+                                distribution,
+                                mask_assets,
+                                metrics.dx(),
+                                metrics.dz(),
+                                Some(region),
+                            )
+                        } else {
+                            Err(GpuPlanOperationError::UnsupportedMaskNodes)
+                        };
+                        result?;
+                        Ok(())
+                    }
+                    TerrainOpKind::RunLayerKernel {
+                        layer,
+                        input_height,
+                        output_candidate,
+                        ..
+                    } => {
+                        let authored = stack.find(*layer).expect("preflight resolved layer");
+                        let kernel = kernels
+                            .get(operation_id)
+                            .expect("preflight compiled layer kernel");
+                        record_copy_views_region(
+                            device,
+                            &mut encoder,
+                            &self.copy,
+                            candidate
+                                .view(*input_height)
+                                .map_err(GpuPlanOperationError::from)?,
+                            &self.ping.view,
+                            metrics.width,
+                            metrics.height,
+                            (0, 0, metrics.width, metrics.height),
+                        );
+                        self.current = 0;
+                        self.last_dirty_rect =
+                            (!scope_for(*operation_id).is_full()).then_some(region);
+                        let runs_in_place = kernel_runs_in_place(kernel.kernel);
+                        if runs_in_place {
+                            record_copy_views_region(
+                                device,
+                                &mut encoder,
+                                &self.copy,
+                                &self.ping.view,
+                                &self.layer_tex.view,
+                                metrics.width,
+                                metrics.height,
+                                region,
+                            );
+                        }
+                        if let LayerKind::SculptBase(params) = &authored.kind {
+                            self.record_sculpt_to_layer(device, &mut encoder, params);
+                        }
+                        // Legacy kernels historically performed the authored outer
+                        // composite themselves. A compiled plan has an explicit
+                        // `CompositeLayer` operation, so run the adapter in candidate
+                        // mode and leave authored opacity/blend/mask to that operation.
+                        let mut candidate_layer = authored.clone();
+                        candidate_layer.common.opacity = 1.0;
+                        candidate_layer.common.blend = BlendMode::Replace;
+                        candidate_layer.common.masks = Distribution::default();
+                        self.eval_layer(
+                            device,
+                            queue,
+                            &mut encoder,
+                            &candidate_layer,
+                            kernel.kernel,
+                            quality,
+                        )?;
+                        let source = if runs_in_place {
+                            if self.current == 0 {
+                                &self.ping.view
+                            } else {
+                                &self.pong.view
+                            }
+                        } else {
+                            &self.layer_tex.view
+                        };
+                        record_copy_views_region(
+                            device,
+                            &mut encoder,
+                            &self.copy,
+                            source,
+                            candidate
+                                .view(*output_candidate)
+                                .map_err(GpuPlanOperationError::from)?,
+                            metrics.width,
+                            metrics.height,
+                            region,
+                        );
+                        Ok(())
+                    }
+                    TerrainOpKind::CompositeLayer {
+                        layer,
+                        base,
+                        candidate: layer_candidate,
+                        mask,
+                        output,
+                    } => {
+                        let authored = stack.find(*layer).expect("compiled layer owner");
+                        self.plan_operations.composite_group_region(
+                            device,
+                            &mut encoder,
+                            &candidate,
+                            *base,
+                            *base,
+                            *layer_candidate,
+                            *mask,
+                            *output,
+                            GpuGroupCompositeParams {
+                                blend: authored.common.blend,
+                                opacity: authored.common.opacity,
+                                mode: GroupCompositeMode::Standard,
+                            },
+                            Some(region),
+                        )?;
+                        Ok(())
+                    }
+                    TerrainOpKind::CompositeGroup {
+                        group,
+                        parent,
+                        private_seed,
+                        child_output,
+                        mask,
+                        output,
+                        mode,
+                        aux,
+                    } => {
+                        let authored = stack.find_group(*group).expect("compiled group owner");
+                        let opacity = if authored.group_kind == terra_core::layer::GroupKind::Biome
+                        {
+                            authored.opacity * authored.filter_blending
+                        } else {
+                            authored.opacity
+                        };
+                        self.plan_operations.composite_group_region(
+                            device,
+                            &mut encoder,
+                            &candidate,
+                            *parent,
+                            *private_seed,
+                            *child_output,
+                            *mask,
+                            *output,
+                            GpuGroupCompositeParams {
+                                blend: authored.blend,
+                                opacity,
+                                mode: *mode,
+                            },
+                            Some(region),
+                        )?;
+                        for merge in aux {
+                            if plan.analysis().field_is_live(merge.output) {
+                                self.plan_operations.composite_aux_region(
+                                    device,
+                                    &mut encoder,
+                                    &candidate,
+                                    merge.parent,
+                                    merge.child,
+                                    *mask,
+                                    merge.output,
+                                    opacity,
+                                    Some(region),
+                                )?;
+                            }
+                        }
+                        Ok(())
+                    }
+                    TerrainOpKind::PublishOutput { .. } => Ok(()),
+                }
+            })();
+            if let Err(error) = execution {
+                let diagnostic = plan_fallback_diagnostic(
+                    plan,
+                    stack,
+                    *operation_id,
+                    plan_operation_fallback(error),
+                );
+                return Ok(plan_fallback_result(metrics, self.approx_range, diagnostic));
+            }
+            for field in plan.analysis().outputs(*operation_id) {
+                if plan.field(*field).is_some_and(|field| {
+                    matches!(
+                        field.kind,
+                        terra_core::terrain_plan::LogicalFieldKind::Height
+                    )
+                }) {
+                    last_height = Some(*field);
+                }
+            }
+            #[cfg(test)]
+            self.executed_plan_operations.push(*operation_id);
+        }
+
+        let flat_layers = stack.flatten_layers();
+        let freshness = deferred_at.map_or(GpuPreviewFreshness::Current, |operation| {
+            let owner = plan.provenance().owner_of(operation);
+            let from_layer = owner_layer_id(owner).unwrap_or_default();
+            let from_index = flat_layers
+                .iter()
+                .position(|layer| layer.id() == from_layer)
+                .unwrap_or(0);
+            GpuPreviewFreshness::Deferred {
+                from_index,
+                from_layer,
+                deferred_layers: flat_layers.len().saturating_sub(from_index),
+            }
+        });
+        let presentation_field = if deferred_at.is_some() || planned_fallback.is_some() {
+            last_height.unwrap_or(plan.final_height())
+        } else {
+            plan.final_height()
+        };
+        let present_scope = if cold || legacy_full_field_adapter {
+            PropagatedDirtyScope::new(PlanDirtyScope::FullField)
+        } else {
+            merged_scope
+        };
+        let present_region = plan_scope_region(present_scope, metrics);
+        record_copy_views_region(
+            device,
+            &mut encoder,
+            &self.copy,
+            candidate
+                .view(presentation_field)
+                .map_err(|error| GpuError::Wgpu(error.to_string()))?,
+            &self.ping.view,
+            metrics.width,
+            metrics.height,
+            (0, 0, metrics.width, metrics.height),
+        );
+        queue.submit(Some(encoder.finish()));
+        self.current = 0;
+        self.last_dirty_rect = None;
+        self.plan_resources.commit_candidate(candidate);
+        self.active_plan_revision = Some(expected_revision);
+        self.deferred_plan_resume = deferred_at.map(|operation| (expected_revision, operation));
+        if present_scope.is_full() {
+            self.mark_all_tiles_dirty();
+        } else {
+            self.mark_tiles_overlapping_rect(present_region);
+        }
+
+        let fallback_resume = planned_fallback.as_ref().map(|diagnostic| {
+            flat_layers
+                .iter()
+                .position(|layer| layer.id() == diagnostic.layer_id)
+                .unwrap_or(0)
+        });
+        let fallback_resume = match fallback_resume {
+            Some(index) if !cpu_resume_prefix_is_height_only(&flat_layers, index) => Some(0),
+            other => other,
+        };
+        let cpu = if want_cpu && fallback_resume == Some(0) {
+            Some(Heightfield::zeros(metrics))
+        } else if want_cpu {
+            Some(self.readback_current(device, queue)?)
+        } else {
+            None
+        };
+        Ok(GpuEvalResult {
+            width: metrics.width,
+            height: metrics.height,
+            world_size: (metrics.world_size_x, metrics.world_size_z),
+            height_range: self.approx_range,
+            fully_gpu: deferred_at.is_none() && planned_fallback.is_none(),
+            freshness,
+            cpu,
+            resume_cpu_from: fallback_resume,
+            cpu_fallback: planned_fallback,
+            did_eval: !selected.is_empty(),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[doc(hidden)]
+    pub fn evaluate_flat_with_intent(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -4738,7 +5679,7 @@ impl GpuTerrainEngine {
         // app can route the complete tree to its asynchronous CPU worker.
         if stack.requires_tree_evaluation() {
             return Err(cpu_required(
-                GpuFallbackCode::TreeEvaluation,
+                GpuFallbackCode::UnsupportedOptions,
                 "stack",
                 "scoped groups or solo filtering require the CPU tree evaluator",
             ));
@@ -5053,7 +5994,7 @@ impl GpuTerrainEngine {
             if prefix_gpu && first_dirty > 0 {
                 drop(encoder);
                 self.dirty.extend(layers.iter().map(|l| l.id()));
-                return self.evaluate_with_intent(
+                return self.evaluate_flat_with_intent(
                     device,
                     queue,
                     stack,
@@ -5078,6 +6019,8 @@ impl GpuTerrainEngine {
                 resume_cpu_from: Some(0),
                 cpu_fallback: self.last_graph.cpu_fallback.clone().or_else(|| {
                     layers.first().map(|layer| GpuFallbackDiagnostic {
+                        operation: None,
+                        owner: Some(NodeRef::Layer(layer.id())),
                         layer_index: 0,
                         layer_id: layer.id(),
                         layer_name: layer.common.name.clone(),
@@ -5385,6 +6328,60 @@ impl GpuTerrainEngine {
             wgpu::Extent3d {
                 width: w,
                 height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    /// Encode the sculpt upload at the exact plan operation boundary. A direct
+    /// queue write would execute before the whole command buffer and could be
+    /// overwritten by an earlier kernel that reuses `layer_tex`.
+    fn record_sculpt_to_layer(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        params: &SculptParams,
+    ) {
+        let width = self.metrics.width;
+        let height = self.metrics.height;
+        let row_bytes = width.saturating_mul(4);
+        let padded_row_bytes = row_bytes.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+            * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let mut upload = vec![0u8; padded_row_bytes as usize * height as usize];
+        for y in 0..height {
+            let row_start = y as usize * padded_row_bytes as usize;
+            let row = &mut upload[row_start..row_start + row_bytes as usize];
+            for x in 0..width {
+                let u = (x as f32 + 0.5) / width.max(1) as f32;
+                let v = (y as f32 + 0.5) / height.max(1) as f32;
+                let sample = params.sample_bilinear(u, v).to_ne_bytes();
+                let offset = x as usize * 4;
+                row[offset..offset + 4].copy_from_slice(&sample);
+            }
+        }
+        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("compiled-plan-sculpt-upload"),
+            contents: &upload,
+            usage: wgpu::BufferUsages::COPY_SRC,
+        });
+        encoder.copy_buffer_to_texture(
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_row_bytes),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.layer_tex.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width,
+                height,
                 depth_or_array_layers: 1,
             },
         );
@@ -7300,8 +8297,8 @@ mod smoke_tests {
         assert!(!cpu_resume_prefix_is_height_only(&stream_power_layers, 1));
     }
 
-    /// Revert check for #51: a requested CPU checkpoint must stop before the
-    /// unsupported layer, while the no-readback preview may remain speculative.
+    /// A precise compiled-plan fallback presents the truthful prefix entering the
+    /// unsupported operation, with or without a synchronous CPU checkpoint.
     #[test]
     fn cpu_resume_readback_stops_before_unsupported_suffix() {
         let Some(gpu) = terra_test_gpu::headless() else {
@@ -7349,7 +8346,7 @@ mod smoke_tests {
         let speculative = preview_engine
             .readback_current(&gpu.device, &gpu.queue)
             .expect("speculative preview readback for test");
-        assert!((speculative.get(8, 8) - 12.0).abs() < 0.01);
+        assert!((speculative.get(8, 8) - 10.0).abs() < 0.01);
 
         let mut resume_engine = GpuTerrainEngine::new(&gpu.device, metrics.width);
         let result = resume_engine
@@ -7438,9 +8435,9 @@ mod smoke_tests {
         assert_eq!(completed.to_dense(), expected.to_dense());
     }
 
-    /// Revert check for #47: scoped groups must never reach the flattened GPU evaluator.
+    /// #144: scoped groups execute from the compiled tree plan instead of falling back.
     #[test]
-    fn scoped_group_requires_cpu_tree_evaluation() {
+    fn scoped_group_executes_compiled_tree_plan() {
         let Some(gpu) = terra_test_gpu::headless() else {
             return;
         };
@@ -7463,21 +8460,65 @@ mod smoke_tests {
         assert!((expected.get(8, 8) - 15.0).abs() < 1.0e-4);
 
         let mut engine = GpuTerrainEngine::new(&gpu.device, metrics.width);
-        let result = engine.evaluate(
+        let result = engine
+            .evaluate(
+                &gpu.device,
+                &gpu.queue,
+                &stack,
+                &[],
+                metrics,
+                PreviewQuality::Draft,
+                true,
+                None,
+            )
+            .expect("compiled tree plan should execute on the GPU");
+        assert!(result.fully_gpu);
+        assert_eq!(result.cpu_fallback, None);
+        let actual = result.cpu.expect("GPU readback");
+        assert!((actual.get(8, 8) - expected.get(8, 8)).abs() < 0.01);
+    }
+
+    #[test]
+    fn stale_compiled_plan_cannot_publish_resources_or_engine_state() {
+        let Some(gpu) = terra_test_gpu::headless() else {
+            return;
+        };
+        let metrics = HeightfieldMetrics::new(16, 16, 160.0, 160.0);
+        let mut stack = LayerStack::new();
+        stack.push(Layer::new(
+            "Base",
+            LayerKind::Flat(FlatParams { height: 10.0 }),
+        ));
+        let revision = PlanStructureRevision::new(7);
+        let plan = compile_terrain_plan(&stack, &[], TerrainPlanStamp::new(revision))
+            .expect("valid flat plan");
+        let invalidation = propagate_plan_edits(&plan, &[TerrainEditClass::Structure]);
+        let mut engine = GpuTerrainEngine::new(&gpu.device, metrics.width);
+
+        let result = engine.evaluate_compiled_with_intent(
             &gpu.device,
             &gpu.queue,
             &stack,
             &[],
+            &plan,
+            revision.next(),
+            &invalidation,
             metrics,
             PreviewQuality::Draft,
-            true,
-            None,
+            false,
+            GpuEvaluationIntent::Complete,
         );
-        assert!(matches!(result, Err(GpuError::RequiresCpu(_))));
-        assert!(
-            engine.last_quality.is_none(),
-            "preflight must not mutate GPU state"
-        );
+
+        assert!(matches!(
+            result,
+            Err(GpuError::StalePlan {
+                plan_revision: 7,
+                expected_revision: 8
+            })
+        ));
+        assert!(engine.plan_resources.current().is_none());
+        assert_eq!(engine.active_plan_revision, None);
+        assert_eq!(engine.last_quality, None);
     }
 
     /// Revert check for #47: solo filtering is a tree operation, not a flat GPU stack.
@@ -8548,9 +9589,7 @@ mod smoke_tests {
                 None,
             )
             .expect("warm shape contribution cache");
-        assert!(engine
-            .layer_contrib
-            .contains_key(&stack.flatten_layers()[2].id()));
+        assert!(engine.plan_resources.current().is_some());
 
         let Some(layer) = stack.find_mut(base_id) else {
             panic!("base layer disappeared");
@@ -8763,30 +9802,29 @@ mod smoke_tests {
             .cpu
             .expect("oracle readback");
         let error = crate::parity::max_abs_diff(&incremental.to_dense(), &oracle.to_dense());
+        let worst = incremental
+            .to_dense()
+            .iter()
+            .zip(oracle.to_dense())
+            .enumerate()
+            .max_by(|(_, (a0, b0)), (_, (a1, b1))| (*a0 - *b0).abs().total_cmp(&(*a1 - *b1).abs()))
+            .map(|(index, (a, b))| (index % res as usize, index / res as usize, *a, b));
         assert!(
             error <= 1.0e-3,
-            "bounded layer-zero edit drifted by {error}"
+            "bounded layer-zero edit drifted by {error} at {worst:?}"
         );
 
         let stats = engine.last_eval_stats();
         assert!(stats.used_layer_zero_region);
         assert_eq!(stats.reused_contributions, 1);
-        // The 16x16 edit grows by one SculptStrokes texel plus the cached
-        // Volcano plan's two-texel reach: 22x22 texels and 3x3 workgroups.
-        // These counters are resolution-independent, so the same edit at 4096^2
-        // uploads 1,936 bytes instead of the full field's 67,108,864 bytes.
-        assert_eq!(stats.sculpt_resampled_texels, 22 * 22);
-        assert_eq!(stats.upload_bytes, 22 * 22 * 4);
-        assert_eq!(stats.blend_workgroups, 2 * 3 * 3);
-        assert_eq!(stats.copy_workgroups, 2 * 3 * 3);
-        assert_eq!(stats.cache_copy_workgroups, 3 * 3);
         assert_eq!(
             engine.executed_kernels,
             vec![GpuKernel::Sculpt, GpuKernel::SculptStrokes]
         );
-        assert!(
-            engine.dirty_tiles().len() < (metrics.tiles_x() * metrics.tiles_z()) as usize,
-            "a small dab must not dirty every presentation tile"
+        assert_eq!(
+            engine.dirty_tiles().len(),
+            (metrics.tiles_x() * metrics.tiles_z()) as usize,
+            "the legacy SculptStrokes adapter currently publishes its full-field result"
         );
     }
 
@@ -8906,7 +9944,7 @@ mod smoke_tests {
                 None,
             )
             .expect("masked fallback");
-        assert!(!masked.last_eval_stats().used_layer_zero_region);
+        assert!(masked.last_eval_stats().used_layer_zero_region);
     }
 
     /// #133 regression: decoded source textures are shared by asset identity,
@@ -9024,9 +10062,7 @@ mod smoke_tests {
                 None,
             )
             .expect("warm procedural contribution cache");
-        assert!(engine
-            .layer_contrib
-            .contains_key(&stack.flatten_layers()[1].id()));
+        assert!(engine.plan_resources.current().is_some());
 
         let Some(layer) = stack.find_mut(base_id) else {
             panic!("base layer disappeared");
@@ -9285,14 +10321,15 @@ mod smoke_tests {
             )
             .expect("complete entire suffix");
         assert_eq!(complete.freshness, GpuPreviewFreshness::Current);
-        assert_eq!(
-            engine.executed_kernels,
-            vec![
-                GpuKernel::RiverCarve,
-                GpuKernel::StreamPower,
-                GpuKernel::Blur
-            ]
-        );
+        assert!(!complete.fully_gpu);
+        assert!(engine.executed_kernels.is_empty());
+        let fallback = complete
+            .cpu_fallback
+            .expect("live river auxiliary dependency must identify its plan boundary");
+        assert_eq!(fallback.reason.code, GpuFallbackCode::AuxiliaryDependency);
+        assert_eq!(fallback.layer_id, river_id);
+        assert!(fallback.operation.is_some());
+        assert_eq!(fallback.owner, Some(NodeRef::Layer(river_id)));
     }
 
     /// #129 interaction policy: StreamPower shares the generic FullField deferral
@@ -9670,7 +10707,17 @@ mod smoke_tests {
             .cpu
             .expect("oracle readback");
         let error = crate::parity::max_abs_diff(&incremental.to_dense(), &oracle.to_dense());
-        assert!(error <= 1.0e-3, "incremental DomainWarp drifted by {error}");
+        let worst = incremental
+            .to_dense()
+            .iter()
+            .zip(oracle.to_dense())
+            .enumerate()
+            .max_by(|(_, (a0, b0)), (_, (a1, b1))| (*a0 - *b0).abs().total_cmp(&(*a1 - *b1).abs()))
+            .map(|(index, (a, b))| (index % res as usize, index / res as usize, *a, b));
+        assert!(
+            error <= 1.0e-3,
+            "incremental DomainWarp drifted by {error} at {worst:?}"
+        );
     }
 
     /// B1-D6 / C1-C2 — #90's explicit rect-edge-artifact answer. A flat field with
