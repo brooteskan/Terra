@@ -1258,6 +1258,13 @@ pub struct FrameProfile {
     pub path: &'static str,
     /// First layer and stable reason code at an intentional GPU-to-CPU boundary.
     pub gpu_fallback: Option<terra_gpu::GpuFallbackDiagnostic>,
+    /// Interaction/generation observability required by #148.
+    pub first_visible_preview_us: u64,
+    pub settled_authoritative_us: u64,
+    pub plan: terra_core::terrain_plan::PlanCacheStatsSnapshot,
+    pub gpu: terra_gpu::GpuEvalStats,
+    pub cpu_worker: terra_core::eval::EvalWorkerStatsSnapshot,
+    pub cpu_published: u64,
     pub terrain_grid_size: u32,
     pub tiles_x: u32,
     pub tiles_z: u32,

@@ -14,7 +14,7 @@ pub use scheduler::EvalScheduler;
 pub use smart_cache::DiskSmartCache;
 pub use worker::{
     EvalWorkFailure, EvalWorkRequest, EvalWorkResult, EvalWorker, EvalWorkerEvent,
-    EvalWorkerSubmitError,
+    EvalWorkerStatsSnapshot, EvalWorkerSubmitError,
 };
 
 use crate::field_data::AuxMaps;

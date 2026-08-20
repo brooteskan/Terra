@@ -27,6 +27,9 @@ pub struct FullFieldEscalation {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PlanDirtyOperation {
     pub operation: PlanOpId,
+    /// Scope arriving at this operation before applying its own reach contract.
+    pub incoming_scope: PropagatedDirtyScope,
+    /// Scope emitted after applying operation and observed auxiliary reach.
     pub scope: PropagatedDirtyScope,
 }
 
@@ -157,6 +160,7 @@ pub fn propagate_plan_edits(
         }
         operations.push(PlanDirtyOperation {
             operation: operation_id,
+            incoming_scope: incoming,
             scope: operation_scope,
         });
     }

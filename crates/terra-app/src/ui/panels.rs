@@ -573,6 +573,47 @@ fn profiler_panel(ui: &mut GuiContext<'_>, ui_state: &UiState) {
     );
     ui.separator();
     label(ui, &format!("Layer eval:  {:>6} us", p.eval_us));
+    label(
+        ui,
+        &format!(
+            "Visible/settled: {:>6} / {:>6} us",
+            p.first_visible_preview_us, p.settled_authoritative_us
+        ),
+    );
+    label(
+        ui,
+        &format!(
+            "Plan compile: {} ({} us)  |  walks/deps {}/{}",
+            p.plan.plan_compiles,
+            p.plan.plan_compile_us,
+            p.plan.authored_tree_walks,
+            p.plan.dependency_builds
+        ),
+    );
+    label(
+        ui,
+        &format!(
+            "GPU ops run/publish/skip/reuse/defer: {}/{}/{}/{}/{}  |  groups {}",
+            p.gpu.operations_dispatched,
+            p.gpu.operations_published,
+            p.gpu.operations_skipped,
+            p.gpu.operations_reused,
+            p.gpu.operations_deferred,
+            p.gpu.plan_workgroups
+        ),
+    );
+    label(
+        ui,
+        &format!(
+            "GPU bytes upload/readback: {}/{}  |  CPU jobs submit/cancel/done/publish: {}/{}/{}/{}",
+            p.gpu.total_upload_bytes(),
+            p.gpu.readback_bytes,
+            p.cpu_worker.submitted,
+            p.cpu_worker.cancelled + p.cpu_worker.stale_skipped,
+            p.cpu_worker.completed,
+            p.cpu_published
+        ),
+    );
     label(ui, &format!("GPU upload:  {:>6} us", p.upload_us));
     label(ui, &format!("Terrain draw:{:>6} us", p.render_us));
     if p.gpu_timestamps_supported {

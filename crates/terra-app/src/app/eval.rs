@@ -704,6 +704,8 @@ impl TerraApp {
     pub(crate) fn run_eval_step_with_intent(&mut self, intent: GpuEvaluationIntent) {
         profiling::scope!("eval_step");
         let t0 = Instant::now();
+        self.ui_state.profile.first_visible_preview_us = 0;
+        self.ui_state.profile.settled_authoritative_us = 0;
         if self.force_draft {
             self.scheduler.quality = PreviewQuality::Draft;
             self.force_draft = false;
@@ -888,6 +890,15 @@ impl TerraApp {
                                 PreviewQuality::Export => "Export quality",
                             };
                             self.ui_state.profile.gpu_fallback = result.cpu_fallback.clone();
+                            self.ui_state.profile.first_visible_preview_us =
+                                t0.elapsed().as_micros() as u64;
+                            if result.fully_gpu
+                                && result.cpu_fallback.is_none()
+                                && !result.freshness.is_deferred()
+                            {
+                                self.ui_state.profile.settled_authoritative_us =
+                                    t0.elapsed().as_micros() as u64;
+                            }
 
                             // Interactive path: GPU present is authoritative for the frame.
                             // Never sync-evaluate CPU on the UI thread — that hangs the app
@@ -1054,6 +1065,13 @@ impl TerraApp {
 
         let elapsed = t0.elapsed().as_micros() as u64;
         self.ui_state.profile.eval_us = elapsed;
+        self.ui_state.profile.plan = self.terrain_plan_cache.stats().snapshot();
+        self.ui_state.profile.gpu = self
+            .gpu_engine
+            .as_ref()
+            .map(|engine| engine.last_eval_stats())
+            .unwrap_or_default();
+        self.ui_state.profile.cpu_worker = self.eval_worker.stats();
         if eval_completed {
             self.ui_state.quality = quality;
             self.ui_state.build_progress = Some(quality_stage_progress(quality));
@@ -1329,6 +1347,13 @@ mod tests {
     use terra_core::heightfield::{Heightfield, HeightfieldMetrics};
     use terra_core::layer::{FlatParams, Layer, LayerKind, LayerStack, StreamPowerParams};
     use terra_core::tiling::UvRect;
+    use terra_core::deps::NodeRef;
+    use terra_core::field_data::FieldId;
+    use terra_core::layer::{BrushDab, BrushEditable, SculptStrokeKind};
+    use terra_core::terrain_plan::{PlanDirtyScope, TerrainEditClass};
+    use terra_core::test_fixtures::{untitled6_document, Untitled6Variant};
+    use terra_gpu::{GpuEvaluationIntent, GpuTerrainEngine};
+    use terra_render::{GpuContext, TerrainRenderer};
 
     use super::{uv_to_texel_rect, DeferredFullField, TerraApp};
 
@@ -1362,6 +1387,77 @@ mod tests {
             max_v: 1.0,
         };
         assert_eq!(uv_to_texel_rect(region, 512, 256), (0, 0, 512, 256));
+    }
+
+    /// #148 app-path ratchet: a mouse-down tree gesture presents through the
+    /// renderer without submitting a CPU tree job or recompiling the plan.
+    #[test]
+    fn untitled6_mouse_down_preview_is_gpu_only_and_visible() {
+        let Some(gpu) = terra_test_gpu::headless() else {
+            return;
+        };
+        let context = GpuContext {
+            device: gpu.device.clone(),
+            queue: gpu.queue.clone(),
+            surface_format: wgpu::TextureFormat::Rgba8Unorm,
+        };
+        let (document, ids) = untitled6_document(96, Untitled6Variant::SupportedTree);
+        let mut app = TerraApp::default();
+        app.session.document = document;
+        app.scheduler.quality = PreviewQuality::Draft;
+        app.renderer = Some(TerrainRenderer::new_headless(&context, 96, 96));
+        app.gpu_engine = Some(GpuTerrainEngine::new(&context.device, 96));
+        app.gpu = Some(context);
+        app.run_eval_step_with_intent(GpuEvaluationIntent::Complete);
+        assert_eq!(app.ui_state.profile.path, "GPU");
+
+        let plan_before = app.terrain_plan_cache.stats().snapshot();
+        let worker_before = app.eval_worker.stats();
+        app.session
+            .document
+            .stack
+            .find_mut(ids.base)
+            .expect("Base")
+            .apply_brush(
+                SculptStrokeKind::Raise,
+                BrushDab {
+                    u: 0.5,
+                    v: 0.5,
+                    radius_uv: 0.04,
+                    radius_m: 80.0,
+                    strength: 5.0,
+                    target_height: 0.0,
+                    falloff: 0.5,
+                    continuing: false,
+                },
+            );
+        let region = UvRect::from_center_radius(0.5, 0.5, 0.04);
+        app.pending_gpu_dirty_region = Some(region);
+        app.pending_plan_edits.push(TerrainEditClass::Content {
+            owner: NodeRef::Layer(ids.base),
+            fields: vec![FieldId::Height],
+            scope: PlanDirtyScope::Region(region),
+        });
+        app.eval_token = app.eval_token.saturating_add(1);
+        app.eval_worker.set_token(app.eval_token);
+        app.run_eval_step_with_intent(GpuEvaluationIntent::InteractiveLocal);
+
+        let plan_after = app.terrain_plan_cache.stats().snapshot();
+        let worker_after = app.eval_worker.stats();
+        assert_eq!(app.ui_state.profile.path, "GPU");
+        assert_eq!(
+            (app.ui_state.profile.tex_w, app.ui_state.profile.tex_h),
+            (128, 128),
+            "Draft quality clamps the 96-sample fixture to its 128-sample floor"
+        );
+        assert_eq!(plan_after.plan_compiles, plan_before.plan_compiles);
+        assert_eq!(plan_after.authored_tree_walks, plan_before.authored_tree_walks);
+        assert_eq!(plan_after.dependency_builds, plan_before.dependency_builds);
+        assert_eq!(worker_after.submitted, worker_before.submitted);
+        let stats = app.gpu_engine.as_ref().unwrap().last_eval_stats();
+        assert_eq!(stats.readback_bytes, 0);
+        assert_eq!(stats.operations_deferred, 0);
+        assert!(stats.operations_dispatched > 0);
     }
 
     #[test]

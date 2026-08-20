@@ -74,6 +74,10 @@ pub const DUNES_PREVIEW: ParityTolerance = ParityTolerance::new(36.0, 7.8e-1);
 pub const CANYONS_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-3, 1.0e-5);
 pub const MESA_PREVIEW: ParityTolerance = ParityTolerance::new(3.0e-3, 1.0e-5);
 pub const VOLCANO_PREVIEW: ParityTolerance = ParityTolerance::new(4.0e-3, 1.0e-5);
+/// #148 cumulative Base/SculptStrokes + isolated-biome Volcano interaction.
+/// This covers the sum of the individual exact-height-class contracts through
+/// two additional group composites.
+pub const UNTITLED6_INTERACTION: ParityTolerance = ParityTolerance::new(2.0e-2, 1.0e-5);
 pub const UPLIFT_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-1, 2.0e-5);
 pub const PLATEAU_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-3, 1.0e-5);
 pub const ARCHIPELAGO_PREVIEW: ParityTolerance = ParityTolerance::new(3.0e-2, 5.0e-6);

@@ -616,6 +616,45 @@ pub struct GpuEvalStats {
     pub stroke_payload_rebuilds: u32,
     /// Warm compiled-plan executions that reused the existing resource realization.
     pub warm_plan_resource_reuses: u32,
+    /// Compiled plan operation disposition for this evaluation.
+    pub operations_dispatched: u32,
+    pub operations_published: u32,
+    pub operations_skipped: u32,
+    pub operations_reused: u32,
+    pub operations_deferred: u32,
+    /// One logical 8x8 dispatch footprint per executed plan operation. This is
+    /// deliberately separate from multipass kernel-specific counters above.
+    pub plan_workgroups: u64,
+    /// Dense height bytes copied back to the CPU by this evaluation.
+    pub readback_bytes: u64,
+}
+
+impl GpuEvalStats {
+    pub const fn total_upload_bytes(self) -> u64 {
+        self.upload_bytes
+            .saturating_add(self.stroke_header_upload_bytes)
+            .saturating_add(self.stroke_point_upload_bytes)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuPlanOperationDisposition {
+    Dispatched,
+    Published,
+    Deferred,
+    Reused,
+    Skipped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GpuPlanOperationTrace {
+    pub operation: PlanOpId,
+    pub owner: Option<NodeRef>,
+    pub incoming_scope: PropagatedDirtyScope,
+    pub output_scope: PropagatedDirtyScope,
+    pub incoming_region: (u32, u32, u32, u32),
+    pub output_region: (u32, u32, u32, u32),
+    pub disposition: GpuPlanOperationDisposition,
 }
 
 #[repr(C)]
@@ -1530,6 +1569,7 @@ pub struct GpuTerrainEngine {
     #[cfg(test)]
     executed_kernels: Vec<GpuKernel>,
     last_eval_stats: GpuEvalStats,
+    last_plan_operation_trace: Vec<GpuPlanOperationTrace>,
     #[cfg(test)]
     executed_plan_operations: Vec<PlanOpId>,
 }
@@ -2069,6 +2109,7 @@ impl GpuTerrainEngine {
             #[cfg(test)]
             executed_kernels: Vec::new(),
             last_eval_stats: GpuEvalStats::default(),
+            last_plan_operation_trace: Vec::new(),
             #[cfg(test)]
             executed_plan_operations: Vec::new(),
         }
@@ -2076,6 +2117,10 @@ impl GpuTerrainEngine {
 
     pub fn last_eval_stats(&self) -> GpuEvalStats {
         self.last_eval_stats
+    }
+
+    pub fn last_plan_operation_trace(&self) -> &[GpuPlanOperationTrace] {
+        &self.last_plan_operation_trace
     }
 
     /// Bounding sample rect of tiles touched since last clear (padded for normals).
@@ -2288,6 +2333,7 @@ impl GpuTerrainEngine {
         self.last_quality = None;
         self.last_graph = crate::graph::GpuComputeGraph::default();
         self.last_eval_stats = GpuEvalStats::default();
+        self.last_plan_operation_trace.clear();
         self.tile_sched = TileScheduler::new();
         self.approx_range = (0.0, 1.0);
         self.current = 0;
@@ -5149,6 +5195,7 @@ impl GpuTerrainEngine {
         self.ensure_size(device, metrics);
         self.uniform_pool.reset();
         self.last_eval_stats = GpuEvalStats::default();
+        self.last_plan_operation_trace.clear();
         let quality_changed = self.last_quality.replace(quality) != Some(quality);
         #[cfg(test)]
         {
@@ -5194,6 +5241,7 @@ impl GpuTerrainEngine {
                 .collect()
         };
         let mut reused_plan_candidates = 0u32;
+        let mut reused_plan_operations = Vec::new();
         if !cold {
             requested.retain(|operation_id| {
                 let Some(operation) = plan.operation(*operation_id) else {
@@ -5208,6 +5256,7 @@ impl GpuTerrainEngine {
                     .is_some_and(|layer| layer_input_independent(&layer.kind));
                 if !patched && input_independent {
                     reused_plan_candidates += 1;
+                    reused_plan_operations.push(*operation_id);
                     false
                 } else {
                     true
@@ -5215,6 +5264,7 @@ impl GpuTerrainEngine {
             });
         }
         self.last_eval_stats.reused_contributions = reused_plan_candidates;
+        self.last_eval_stats.operations_reused = reused_plan_candidates;
         let selected = staged_candidate
             .as_ref()
             .map(|candidate| candidate.layout())
@@ -5267,6 +5317,10 @@ impl GpuTerrainEngine {
             self.last_eval_stats.used_layer_zero_region = true;
         }
         let execution_end = deferred_at.map_or(usize::MAX, PlanOpId::index);
+        self.last_eval_stats.operations_deferred = requested
+            .iter()
+            .filter(|operation| operation.index() >= execution_end)
+            .count() as u32;
         let mut selected: Vec<PlanOpId> = selected
             .into_iter()
             .filter(|operation| operation.index() < execution_end)
@@ -5641,6 +5695,23 @@ impl GpuTerrainEngine {
                 }
                 return Ok(plan_fallback_result(metrics, self.approx_range, diagnostic));
             }
+            if matches!(operation.kind, TerrainOpKind::PublishOutput { .. }) {
+                self.last_eval_stats.operations_published = self
+                    .last_eval_stats
+                    .operations_published
+                    .saturating_add(1);
+            } else {
+                self.last_eval_stats.operations_dispatched = self
+                    .last_eval_stats
+                    .operations_dispatched
+                    .saturating_add(1);
+                self.last_eval_stats.plan_workgroups = self
+                    .last_eval_stats
+                    .plan_workgroups
+                    .saturating_add(
+                        u64::from(region.2.div_ceil(8)) * u64::from(region.3.div_ceil(8)),
+                    );
+            }
             for field in plan.analysis().outputs(*operation_id) {
                 if plan.field(*field).is_some_and(|field| {
                     matches!(
@@ -5727,10 +5798,74 @@ impl GpuTerrainEngine {
         let cpu = if want_cpu && fallback_resume == Some(0) {
             Some(Heightfield::zeros(metrics))
         } else if want_cpu {
+            self.last_eval_stats.readback_bytes = u64::from(metrics.width)
+                .saturating_mul(u64::from(metrics.height))
+                .saturating_mul(4);
             Some(self.readback_current(device, queue)?)
         } else {
             None
         };
+        let live_operations = plan
+            .operations()
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| plan.analysis().operation_is_live(PlanOpId::from_index(*index)))
+            .count() as u32;
+        self.last_eval_stats.operations_skipped = live_operations.saturating_sub(
+            self.last_eval_stats
+                .operations_dispatched
+                .saturating_add(self.last_eval_stats.operations_published)
+                .saturating_add(self.last_eval_stats.operations_deferred)
+                .saturating_add(self.last_eval_stats.operations_reused),
+        );
+        let full_scope = PropagatedDirtyScope::new(PlanDirtyScope::FullField);
+        self.last_plan_operation_trace = plan
+            .operations()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, _)| {
+                let operation = PlanOpId::from_index(index);
+                if !plan.analysis().operation_is_live(operation) {
+                    return None;
+                }
+                let dirty = invalidation
+                    .operations
+                    .iter()
+                    .find(|dirty| dirty.operation == operation);
+                let incoming_scope = if cold {
+                    full_scope
+                } else {
+                    dirty.map_or(merged_scope, |dirty| dirty.incoming_scope)
+                };
+                let output_scope = if cold {
+                    full_scope
+                } else {
+                    dirty.map_or(merged_scope, |dirty| dirty.scope)
+                };
+                let disposition = if selected.contains(&operation)
+                    && matches!(plan.operations()[index].kind, TerrainOpKind::PublishOutput { .. })
+                {
+                    GpuPlanOperationDisposition::Published
+                } else if selected.contains(&operation) {
+                    GpuPlanOperationDisposition::Dispatched
+                } else if operation.index() >= execution_end && requested.contains(&operation) {
+                    GpuPlanOperationDisposition::Deferred
+                } else if reused_plan_operations.contains(&operation) {
+                    GpuPlanOperationDisposition::Reused
+                } else {
+                    GpuPlanOperationDisposition::Skipped
+                };
+                Some(GpuPlanOperationTrace {
+                    operation,
+                    owner: plan.provenance().owner_of(operation),
+                    incoming_scope,
+                    output_scope,
+                    incoming_region: plan_scope_region(incoming_scope, metrics),
+                    output_region: plan_scope_region(output_scope, metrics),
+                    disposition,
+                })
+            })
+            .collect();
         Ok(GpuEvalResult {
             width: metrics.width,
             height: metrics.height,
@@ -8466,10 +8601,14 @@ mod smoke_tests {
         SculptParams, StackNode, Stamp2dParams, StreamPowerParams, ThermalErosionParams,
         VoronoiParams,
     };
+    use terra_core::layer::{BrushDab, BrushEditable, SculptStrokeKind};
     use terra_core::mask::{
         bake_mask_assets, DistributionEntry, MaskAsset, MaskCombine, MaskId, MaskOp, MaskRef,
         MaskSource,
     };
+    use terra_core::terrain_plan::TerrainPlanCache;
+    use terra_core::test_fixtures::{untitled6_document, Untitled6Variant};
+    use terra_core::tiling::UvRect;
 
     fn cpu_oracle(stack: &LayerStack, metrics: HeightfieldMetrics) -> Heightfield {
         let mut evaluator = StackEvaluator::new();
@@ -11301,5 +11440,222 @@ mod smoke_tests {
             "masked incremental diverged from the full oracle by {max_err}; the mask bake \
              did not cover the full field outside the dirty rect"
         );
+    }
+
+    /// #148: warm Raise and Pinch gestures on both authored sculpt payloads
+    /// remain on the bounded compiled tree plan.
+    #[test]
+    fn untitled6_tree_warm_brushes_stay_bounded() {
+        let Some(gpu) = terra_test_gpu::headless() else {
+            return;
+        };
+        let res = 96u32;
+        for (target_strokes, brush) in [
+            (false, SculptStrokeKind::Raise),
+            (false, SculptStrokeKind::Pinch),
+            (true, SculptStrokeKind::Raise),
+            (true, SculptStrokeKind::Pinch),
+        ] {
+            let (mut document, ids) =
+                untitled6_document(res, Untitled6Variant::SupportedTree);
+            document.metrics.tile_size = 16;
+            document.metrics.halo = 2;
+            let target = if target_strokes {
+                ids.sculpt_strokes
+            } else {
+                ids.base
+            };
+            let mut cache = TerrainPlanCache::new();
+            let cold = cache
+                .update(
+                    &document.stack,
+                    &document.masks,
+                    &[TerrainEditClass::Structure],
+                )
+                .expect("compile fixture");
+            let mut engine = GpuTerrainEngine::new(&gpu.device, res);
+            engine
+                .evaluate_compiled_with_intent(
+                    &gpu.device,
+                    &gpu.queue,
+                    &document.stack,
+                    &document.masks,
+                    cache.current_plan().unwrap(),
+                    cache.structure_revision(),
+                    &cold,
+                    document.metrics,
+                    PreviewQuality::Draft,
+                    false,
+                    GpuEvaluationIntent::Complete,
+                )
+                .expect("warm resources");
+            let plan_before = cache.stats().snapshot();
+
+            let layer = document.stack.find_mut(target).expect("gesture target");
+            for (index, u) in [0.47, 0.50, 0.53].into_iter().enumerate() {
+                layer.apply_brush(
+                    brush,
+                    BrushDab {
+                        u,
+                        v: 0.5,
+                        radius_uv: 0.035,
+                        radius_m: 90.0,
+                        strength: 4.0,
+                        target_height: 24.0,
+                        falloff: 0.55,
+                        continuing: index != 0,
+                    },
+                );
+            }
+            let invalidation = cache
+                .update(
+                    &document.stack,
+                    &document.masks,
+                    &[TerrainEditClass::Content {
+                        owner: NodeRef::Layer(target),
+                        fields: vec![FieldId::Height],
+                        scope: PlanDirtyScope::Region(UvRect::from_center_radius(0.5, 0.5, 0.07)),
+                    }],
+                )
+                .expect("patch gesture");
+            let result = engine
+                .evaluate_compiled_with_intent(
+                    &gpu.device,
+                    &gpu.queue,
+                    &document.stack,
+                    &document.masks,
+                    cache.current_plan().unwrap(),
+                    cache.structure_revision(),
+                    &invalidation,
+                    document.metrics,
+                    PreviewQuality::Draft,
+                    false,
+                    GpuEvaluationIntent::InteractiveLocal,
+                )
+                .expect("interactive gesture");
+            assert!(result.fully_gpu, "{target_strokes}/{brush:?}");
+            assert_eq!(result.freshness, GpuPreviewFreshness::Current);
+            assert!(result.cpu_fallback.is_none());
+
+            let plan_after = cache.stats().snapshot();
+            assert_eq!(plan_after.plan_compiles, plan_before.plan_compiles);
+            assert_eq!(plan_after.authored_tree_walks, plan_before.authored_tree_walks);
+            assert_eq!(plan_after.dependency_builds, plan_before.dependency_builds);
+            let stats = engine.last_eval_stats();
+            assert!(stats.operations_dispatched > 0);
+            assert!(stats.operations_reused > 0, "Volcano contribution should be reused");
+            assert_eq!(stats.operations_deferred, 0);
+            assert_eq!(stats.readback_bytes, 0);
+            assert!(stats.upload_bytes < u64::from(res * res * 4), "{stats:?}");
+            assert!(engine.last_plan_operation_trace().iter().any(|operation| {
+                operation.disposition == GpuPlanOperationDisposition::Dispatched
+                    && operation.output_region.2 < res
+                    && operation.output_region.3 < res
+            }));
+
+            let settled = engine
+                .readback_current(&gpu.device, &gpu.queue)
+                .expect("settled preview");
+            let oracle = cpu_oracle(&document.stack, document.metrics);
+            crate::parity::assert_field_parity(
+                &format!("Untitled6 target_strokes={target_strokes} brush={brush:?}"),
+                &settled,
+                &oracle,
+                crate::parity::UNTITLED6_INTERACTION,
+            );
+        }
+    }
+
+    /// Manual release probe for the acceptance resolutions. Adapter timing is
+    /// reported, not asserted, because CI hardware is intentionally variable.
+    #[test]
+    #[ignore = "run in release mode to record #148 adapter timings"]
+    fn untitled6_release_timing_probe_2048_4096() {
+        let Some(gpu) = terra_test_gpu::headless() else {
+            return;
+        };
+        for res in [2048u32, 4096] {
+            let (mut document, ids) =
+                untitled6_document(res, Untitled6Variant::SupportedTree);
+            let mut cache = TerrainPlanCache::new();
+            let cold_invalidation = cache
+                .update(
+                    &document.stack,
+                    &document.masks,
+                    &[TerrainEditClass::Structure],
+                )
+                .unwrap();
+            let mut engine = GpuTerrainEngine::new(&gpu.device, res);
+            let cold_started = std::time::Instant::now();
+            engine
+                .evaluate_compiled_with_intent(
+                    &gpu.device,
+                    &gpu.queue,
+                    &document.stack,
+                    &document.masks,
+                    cache.current_plan().unwrap(),
+                    cache.structure_revision(),
+                    &cold_invalidation,
+                    document.metrics,
+                    PreviewQuality::Draft,
+                    false,
+                    GpuEvaluationIntent::Complete,
+                )
+                .unwrap();
+            let _ = gpu.device.poll(wgpu::Maintain::Wait);
+            let cold_ms = cold_started.elapsed().as_secs_f64() * 1000.0;
+
+            document
+                .stack
+                .find_mut(ids.base)
+                .unwrap()
+                .apply_brush(
+                    SculptStrokeKind::Raise,
+                    BrushDab {
+                        u: 0.5,
+                        v: 0.5,
+                        radius_uv: 0.01,
+                        radius_m: 40.0,
+                        strength: 3.0,
+                        target_height: 0.0,
+                        falloff: 0.5,
+                        continuing: false,
+                    },
+                );
+            let invalidation = cache
+                .update(
+                    &document.stack,
+                    &document.masks,
+                    &[TerrainEditClass::Content {
+                        owner: NodeRef::Layer(ids.base),
+                        fields: vec![FieldId::Height],
+                        scope: PlanDirtyScope::Region(UvRect::from_center_radius(0.5, 0.5, 0.01)),
+                    }],
+                )
+                .unwrap();
+            let warm_started = std::time::Instant::now();
+            engine
+                .evaluate_compiled_with_intent(
+                    &gpu.device,
+                    &gpu.queue,
+                    &document.stack,
+                    &document.masks,
+                    cache.current_plan().unwrap(),
+                    cache.structure_revision(),
+                    &invalidation,
+                    document.metrics,
+                    PreviewQuality::Draft,
+                    false,
+                    GpuEvaluationIntent::InteractiveLocal,
+                )
+                .unwrap();
+            let _ = gpu.device.poll(wgpu::Maintain::Wait);
+            println!(
+                "issue148 resolution={res} adapter={:?} cold_ms={cold_ms:.3} warm_ms={:.3} stats={:?}",
+                gpu.adapter_info,
+                warm_started.elapsed().as_secs_f64() * 1000.0,
+                engine.last_eval_stats()
+            );
+        }
     }
 }

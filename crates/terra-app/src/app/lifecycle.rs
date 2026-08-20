@@ -581,6 +581,8 @@ impl ApplicationHandler for TerraApp {
             while let Some(event) = self.eval_worker.try_recv_event() {
                 match event {
                     EvalWorkerEvent::Completed(result) if result.token == self.eval_token => {
+                        self.ui_state.profile.cpu_published =
+                            self.ui_state.profile.cpu_published.saturating_add(1);
                         self.ui_state.evaluation_failure = None;
                         let quality = result.quality;
                         let height = result.height;

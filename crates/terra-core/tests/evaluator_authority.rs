@@ -225,6 +225,13 @@ const APPROVED_EXECUTION_SEAMS: &[ApprovedSeam] = &[
                 },
             },
             EntryPoint {
+                method: "stats",
+                caller: SourceEvidence {
+                    path: "crates/terra-app/src/app/eval.rs",
+                    needle: "eval_worker.stats()",
+                },
+            },
+            EntryPoint {
                 method: "set_token",
                 caller: SourceEvidence {
                     path: "crates/terra-app/src/app/eval.rs",

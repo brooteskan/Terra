@@ -27,6 +27,6 @@ pub use cancel::{CancelFlag, CancelToken};
 pub use debounced::Debounced;
 pub use fill::try_par_fill;
 pub use job::{spawn_one_shot, JobCtx, JobError, JobHandle};
-pub use latest_wins::{JobEvent, LatestWins, SubmitError};
+pub use latest_wins::{JobEvent, LatestWins, LatestWinsStatsSnapshot, SubmitError};
 pub use pool::Pool;
 pub use registry::{JobRegistry, Pending, Pollable, Tick};

@@ -4,6 +4,7 @@ use crate::deps::NodeRef;
 use crate::invalidation::{AuxReach, Reach};
 use crate::layer::LayerStack;
 use crate::mask::MaskAsset;
+use std::time::Instant;
 
 use super::{
     compile_terrain_plan, propagate_plan_edits, CompiledTerrainPlan, PlanInvalidation,
@@ -15,6 +16,12 @@ use super::{
 pub struct PlanCacheStatsSnapshot {
     pub plan_compiles: u64,
     pub successful_compiles: u64,
+    /// Wall-clock time spent compiling structural plans, in microseconds.
+    pub plan_compile_us: u64,
+    /// Authored tree traversals attributable to structural plan compilation.
+    pub authored_tree_walks: u64,
+    /// Dependency graph builds attributable to structural plan compilation.
+    pub dependency_builds: u64,
     pub plan_cache_hits: u64,
     pub patched_operations: u64,
     pub operations_reached: u64,
@@ -113,11 +120,22 @@ impl TerrainPlanCache {
         }
 
         self.stats.snapshot.plan_compiles = self.stats.snapshot.plan_compiles.saturating_add(1);
-        let candidate = compile_terrain_plan(
+        self.stats.snapshot.authored_tree_walks =
+            self.stats.snapshot.authored_tree_walks.saturating_add(1);
+        self.stats.snapshot.dependency_builds =
+            self.stats.snapshot.dependency_builds.saturating_add(1);
+        let compile_started = Instant::now();
+        let compiled = compile_terrain_plan(
             stack,
             mask_assets,
             TerrainPlanStamp::new(self.structure_revision),
-        )?;
+        );
+        self.stats.snapshot.plan_compile_us = self
+            .stats
+            .snapshot
+            .plan_compile_us
+            .saturating_add(compile_started.elapsed().as_micros() as u64);
+        let candidate = compiled?;
         self.stats.snapshot.successful_compiles =
             self.stats.snapshot.successful_compiles.saturating_add(1);
         self.last_good = Some(candidate);

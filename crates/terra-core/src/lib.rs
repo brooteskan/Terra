@@ -57,6 +57,8 @@ pub mod surface;
 pub mod terrain;
 pub mod terrain_plan;
 pub mod terrain_recipe;
+#[doc(hidden)]
+pub mod test_fixtures;
 pub mod tiling;
 pub mod volumetric;
 pub mod world_archetype;

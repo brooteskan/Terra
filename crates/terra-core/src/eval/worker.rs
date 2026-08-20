@@ -13,6 +13,16 @@ use std::sync::Arc;
 use std::time::Instant;
 use terra_jobs::{CancelToken, JobError, JobEvent, LatestWins};
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EvalWorkerStatsSnapshot {
+    pub submitted: u64,
+    pub stale_skipped: u64,
+    pub started: u64,
+    pub completed: u64,
+    pub failed: u64,
+    pub cancelled: u64,
+}
+
 // The worker thread, its channels, stale-skip, and sleep-based polling now live
 // in `terra-jobs`; only the tests still touch the raw mpsc / thread primitives.
 #[cfg(test)]
@@ -108,6 +118,7 @@ pub struct EvalWorker {
     pub current_token: Arc<AtomicU64>,
     /// True while a job may still be running (best-effort).
     pub busy: bool,
+    cancelled_results: u64,
 }
 
 impl EvalWorker {
@@ -141,6 +152,7 @@ impl EvalWorker {
             inner,
             current_token,
             busy: false,
+            cancelled_results: 0,
         }
     }
 
@@ -169,10 +181,15 @@ impl EvalWorker {
                 JobEvent::Completed {
                     token,
                     value: (quality, result),
-                } => match job_result_event(token, quality, result) {
+                } => {
+                    if matches!(&result, Err(EvalError::Cancelled)) {
+                        self.cancelled_results = self.cancelled_results.saturating_add(1);
+                    }
+                    match job_result_event(token, quality, result) {
                     Some(event) => event,
                     None => continue, // cancelled result: suppressed
-                },
+                    }
+                }
                 JobEvent::Failed {
                     token,
                     request,
@@ -209,6 +226,18 @@ impl EvalWorker {
 
     pub fn shutdown(&self) {
         self.inner.shutdown();
+    }
+
+    pub fn stats(&self) -> EvalWorkerStatsSnapshot {
+        let inner = self.inner.stats();
+        EvalWorkerStatsSnapshot {
+            submitted: inner.submitted,
+            stale_skipped: inner.stale_skipped,
+            started: inner.started,
+            completed: inner.completed,
+            failed: inner.failed,
+            cancelled: self.cancelled_results,
+        }
     }
 
     /// Replace the worker thread and its evaluator/cache after an unexpected disconnect.

@@ -28,6 +28,36 @@ use std::thread::{self, JoinHandle};
 use crate::job::panic_payload_message;
 use crate::{CancelToken, JobError};
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LatestWinsStatsSnapshot {
+    pub submitted: u64,
+    pub stale_skipped: u64,
+    pub started: u64,
+    pub completed: u64,
+    pub failed: u64,
+}
+
+#[derive(Default)]
+struct LatestWinsStats {
+    submitted: AtomicU64,
+    stale_skipped: AtomicU64,
+    started: AtomicU64,
+    completed: AtomicU64,
+    failed: AtomicU64,
+}
+
+impl LatestWinsStats {
+    fn snapshot(&self) -> LatestWinsStatsSnapshot {
+        LatestWinsStatsSnapshot {
+            submitted: self.submitted.load(Ordering::Relaxed),
+            stale_skipped: self.stale_skipped.load(Ordering::Relaxed),
+            started: self.started.load(Ordering::Relaxed),
+            completed: self.completed.load(Ordering::Relaxed),
+            failed: self.failed.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// A message to the worker thread.
 enum Msg<Req> {
     // Boxed so the idle `Shutdown` slot and queued channel entries aren't sized
@@ -86,6 +116,7 @@ pub struct LatestWins<Req, T> {
     /// stores into it; the worker reads it to stale-skip and to build cancel
     /// tokens.
     counter: Arc<AtomicU64>,
+    stats: Arc<LatestWinsStats>,
     disconnected_reported: bool,
     _handle: JoinHandle<()>,
 }
@@ -119,6 +150,8 @@ impl<Req, T> LatestWins<Req, T> {
         let (job_tx, job_rx) = mpsc::channel::<Msg<Req>>();
         let (event_tx, event_rx) = mpsc::channel::<JobEvent<Req, T>>();
         let worker_counter = Arc::clone(&counter);
+        let stats = Arc::new(LatestWinsStats::default());
+        let worker_stats = Arc::clone(&stats);
 
         let handle = thread::Builder::new()
             .name(name.to_string())
@@ -132,14 +165,19 @@ impl<Req, T> LatestWins<Req, T> {
                     // generation on, so this job's output is unwanted. Drop it
                     // silently — no event — before doing any work.
                     if token != worker_counter.load(Ordering::Acquire) {
+                        worker_stats.stale_skipped.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
+                    worker_stats.started.fetch_add(1, Ordering::Relaxed);
                     let cancel = CancelToken::generation(Arc::clone(&worker_counter), token);
                     let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         job(&mut state, &request, &cancel)
                     }));
                     let event = match ran {
-                        Ok(Ok(value)) => JobEvent::Completed { token, value },
+                        Ok(Ok(value)) => {
+                            worker_stats.completed.fetch_add(1, Ordering::Relaxed);
+                            JobEvent::Completed { token, value }
+                        }
                         Ok(Err(error)) => JobEvent::Failed {
                             token,
                             request,
@@ -156,6 +194,9 @@ impl<Req, T> LatestWins<Req, T> {
                             }
                         }
                     };
+                    if matches!(event, JobEvent::Failed { .. }) {
+                        worker_stats.failed.fetch_add(1, Ordering::Relaxed);
+                    }
                     if event_tx.send(event).is_err() {
                         break; // Receiver gone; nothing more to deliver.
                     }
@@ -167,6 +208,7 @@ impl<Req, T> LatestWins<Req, T> {
             tx: job_tx,
             rx: event_rx,
             counter,
+            stats,
             disconnected_reported: false,
             _handle: handle,
         }
@@ -178,18 +220,27 @@ impl<Req, T> LatestWins<Req, T> {
     /// even if the send fails. A [`SubmitError`] means the worker has ended.
     pub fn submit(&self, request: Req, token: u64) -> Result<(), SubmitError> {
         self.counter.store(token, Ordering::Release);
-        self.tx
+        let submitted = self
+            .tx
             .send(Msg::Job {
                 request: Box::new(request),
                 token,
             })
-            .map_err(|_| SubmitError)
+            .map_err(|_| SubmitError);
+        if submitted.is_ok() {
+            self.stats.submitted.fetch_add(1, Ordering::Relaxed);
+        }
+        submitted
     }
 
     /// The shared generation counter. Store a new value to supersede in-flight and
     /// queued work without submitting.
     pub fn counter(&self) -> &Arc<AtomicU64> {
         &self.counter
+    }
+
+    pub fn stats(&self) -> LatestWinsStatsSnapshot {
+        self.stats.snapshot()
     }
 
     /// Non-blocking poll for one event.
@@ -299,6 +350,16 @@ mod tests {
         assert!(
             exec.try_recv().is_none(),
             "the stale job must not produce an event"
+        );
+        assert_eq!(
+            exec.stats(),
+            LatestWinsStatsSnapshot {
+                submitted: 2,
+                stale_skipped: 1,
+                started: 1,
+                completed: 1,
+                failed: 0,
+            }
         );
     }
 
