@@ -9,14 +9,14 @@
 //! prefer fully GPU stacks, never present an incomplete prefix as finished Draft.
 
 use crate::compiled_plan::{
-    GpuFieldResidency, GpuGroupCompositeParams, GpuPlanOperationError, GpuPlanOperations,
-    GpuPlanResourceCache, GpuPlanResourceKey,
+    GpuGroupCompositeParams, GpuPlanOperationError, GpuPlanOperations, GpuPlanResourceCache,
+    GpuPlanResourceKey,
 };
 use crate::effect_filter::{effect_filter_gpu_spec, EffectFilterGpuPasses};
 use crate::graph::{
-    compile_gpu_graph, expand_dirty_rect, gpu_blend_mode, gpu_plan_for_layer, GpuComputeGraph,
-    GpuDirtyPolicy, GpuFallbackCode, GpuFallbackDiagnostic, GpuFallbackReason, GpuKernel,
-    GpuLayerPlan, BLUR_MAX_RADIUS, EFFECT_FILTER_MAX_RADIUS, RIVER_CARVE_MAX_RADIUS,
+    compile_gpu_graph, expand_dirty_rect, gpu_blend_mode, GpuComputeGraph, GpuDirtyPolicy,
+    GpuFallbackCode, GpuFallbackDiagnostic, GpuFallbackReason, GpuKernel, GpuLayerPlan,
+    BLUR_MAX_RADIUS, EFFECT_FILTER_MAX_RADIUS, RIVER_CARVE_MAX_RADIUS,
 };
 use crate::{readback_f32, GpuError};
 use bytemuck::{Pod, Zeroable};
@@ -616,6 +616,13 @@ pub struct GpuEvalStats {
     pub copy_workgroups: u64,
     pub cache_copy_workgroups: u64,
     pub reused_contributions: u32,
+    /// Bytes transferred for authored SculptStrokes runtime payloads.
+    pub stroke_header_upload_bytes: u64,
+    pub stroke_point_upload_bytes: u64,
+    /// Full stroke payload uploads, including cold creation and capacity growth.
+    pub stroke_payload_rebuilds: u32,
+    /// Warm compiled-plan executions that reused the existing resource realization.
+    pub warm_plan_resource_reuses: u32,
 }
 
 #[repr(C)]
@@ -660,7 +667,7 @@ struct PolygonHeightU {
 /// `shaders/sculpt_strokes.wgsl` (48 bytes, 8-byte aligned for the trailing
 /// `vec2<f32>` bbox fields); `points` are uploaded separately as `vec4<f32>`.
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
+#[derive(Clone, Copy, PartialEq, Pod, Zeroable)]
 struct StrokeHeaderGpu {
     kind: u32,
     first_point: u32,
@@ -673,6 +680,18 @@ struct StrokeHeaderGpu {
     bbox_min: [f32; 2],
     bbox_max: [f32; 2],
 }
+
+struct StrokeRuntimeBuffers {
+    headers: wgpu::Buffer,
+    points: wgpu::Buffer,
+    header_capacity: usize,
+    point_capacity: usize,
+    uploaded_headers: Vec<StrokeHeaderGpu>,
+    uploaded_points: Vec<[f32; 4]>,
+}
+
+const INITIAL_STROKE_HEADER_CAPACITY: usize = 8;
+const INITIAL_STROKE_POINT_CAPACITY: usize = 64;
 
 /// Alias-collapsed kind id shared with `shaders/sculpt_strokes.wgsl`. Only kinds
 /// the planner admits are ever uploaded — the per-sample maps, the base-3x3
@@ -793,6 +812,27 @@ fn make_storage_buffer(
     });
     queue.write_buffer(&buf, 0, bytes);
     buf
+}
+
+fn make_runtime_storage_buffer(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label: &str,
+    element_size: usize,
+    capacity: usize,
+    bytes: &[u8],
+) -> wgpu::Buffer {
+    let size = element_size.saturating_mul(capacity.max(1)).max(16) as u64;
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    if !bytes.is_empty() {
+        queue.write_buffer(&buffer, 0, bytes);
+    }
+    buffer
 }
 
 #[repr(C)]
@@ -1473,6 +1513,9 @@ pub struct GpuTerrainEngine {
     layer_contrib_mask: HashMap<LayerId, HeightTex>,
     /// Raw normalized source rasters, independent from output-sized contributions.
     source_rasters: HashMap<PathBuf, SourceRasterTex>,
+    /// Persistent authored stroke payloads keyed by stable layer identity. Live
+    /// gesture samples update only the appended point tail and active header.
+    stroke_runtime: HashMap<LayerId, StrokeRuntimeBuffers>,
     #[cfg(test)]
     source_upload_count: usize,
     dirty: HashSet<LayerId>,
@@ -2011,6 +2054,7 @@ impl GpuTerrainEngine {
             layer_contrib: HashMap::new(),
             layer_contrib_mask: HashMap::new(),
             source_rasters: HashMap::new(),
+            stroke_runtime: HashMap::new(),
             #[cfg(test)]
             source_upload_count: 0,
             dirty: HashSet::new(),
@@ -2245,6 +2289,7 @@ impl GpuTerrainEngine {
         self.layer_contrib.clear();
         self.layer_contrib_mask.clear();
         self.source_rasters.clear();
+        self.stroke_runtime.clear();
         self.dirty.clear();
         self.last_dirty_rect = None;
         self.last_quality = None;
@@ -2332,6 +2377,7 @@ impl GpuTerrainEngine {
         self.layer_cache.clear();
         self.layer_contrib.clear();
         self.layer_contrib_mask.clear();
+        self.stroke_runtime.clear();
         self.dirty.clear();
     }
 
@@ -4881,7 +4927,15 @@ impl GpuTerrainEngine {
                 LayerKind::SculptStrokes(params) => {
                     #[cfg(test)]
                     self.executed_kernels.push(GpuKernel::SculptStrokes);
-                    self.run_sculpt_strokes(device, queue, &mut encoder, params, source, region);
+                    self.run_sculpt_strokes(
+                        device,
+                        queue,
+                        &mut encoder,
+                        id,
+                        params,
+                        source,
+                        region,
+                    );
                     for stroke in &params.strokes {
                         if stroke.enabled
                             && matches!(
@@ -5117,53 +5171,18 @@ impl GpuTerrainEngine {
         let cold = quality_changed
             || !compatible_active
             || self.active_plan_revision != Some(expected_revision);
-        let candidate = self
-            .plan_resources
-            .stage_candidate(device, plan, key)
-            .map_err(|error| GpuError::Wgpu(error.to_string()))?;
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("compiled-terrain-plan"),
-        });
-
-        // A warm candidate starts from the last-good persistent checkpoints.
-        // Transient fields are reconstructed below from the selected subgraph.
-        if compatible_active {
-            let active = self.plan_resources.current().expect("checked above");
-            let mut copied = HashSet::new();
-            for field in plan.fields() {
-                let Some(binding) = candidate.layout().binding(field.slot) else {
-                    continue;
-                };
-                if binding.residency != GpuFieldResidency::Persistent
-                    || !copied.insert(binding.physical)
-                {
-                    continue;
-                }
-                encoder.copy_texture_to_texture(
-                    wgpu::TexelCopyTextureInfo {
-                        texture: active
-                            .texture(field.slot)
-                            .map_err(|error| GpuError::Wgpu(error.to_string()))?,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d::ZERO,
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    wgpu::TexelCopyTextureInfo {
-                        texture: candidate
-                            .texture(field.slot)
-                            .map_err(|error| GpuError::Wgpu(error.to_string()))?,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d::ZERO,
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    wgpu::Extent3d {
-                        width: metrics.width,
-                        height: metrics.height,
-                        depth_or_array_layers: 1,
-                    },
-                );
-            }
-        }
+        // Cold/structural/resource executions remain transactional candidates.
+        // A compatible warm content edit executes against the retained realization
+        // after preflight, avoiding per-dab allocation and whole-texture copies.
+        let mut staged_candidate = if cold {
+            Some(
+                self.plan_resources
+                    .stage_candidate(device, plan, key)
+                    .map_err(|error| GpuError::Wgpu(error.to_string()))?,
+            )
+        } else {
+            None
+        };
 
         let mut requested: Vec<PlanOpId> = if cold {
             plan.operations()
@@ -5203,8 +5222,11 @@ impl GpuTerrainEngine {
             });
         }
         self.last_eval_stats.reused_contributions = reused_plan_candidates;
-        let selected = candidate
-            .layout()
+        let selected = staged_candidate
+            .as_ref()
+            .map(|candidate| candidate.layout())
+            .or_else(|| self.plan_resources.current().map(|active| active.layout()))
+            .expect("cold candidate or compatible active plan resources")
             .materialization_operations(plan, &requested);
         let merged_scope = if cold {
             PropagatedDirtyScope::new(PlanDirtyScope::FullField)
@@ -5264,8 +5286,31 @@ impl GpuTerrainEngine {
             }
         }
 
-        // Compile backend kernel choices once, indexed by plan operation. This is
-        // a capability adapter, not a second authored-stack planner.
+        // Consume the one flat capability compilation as the backend adapter for
+        // authored payloads. The terrain plan remains the scheduling authority;
+        // this graph supplies only executable kernel choices and rejection detail.
+        self.last_graph = compile_gpu_graph(stack, mask_assets);
+        let flat_layers = stack.flatten_layers();
+        let layer_gpu_decisions: HashMap<
+            LayerId,
+            (Option<GpuLayerPlan>, Option<GpuFallbackReason>),
+        > = flat_layers
+            .iter()
+            .enumerate()
+            .map(|(index, layer)| {
+                (
+                    layer.id(),
+                    (
+                        self.last_graph.plans.get(index).copied().flatten(),
+                        self.last_graph
+                            .fallback_reasons
+                            .get(index)
+                            .cloned()
+                            .flatten(),
+                    ),
+                )
+            })
+            .collect();
         let mut kernels = HashMap::<PlanOpId, GpuLayerPlan>::new();
         let mut planned_fallback = None;
         for operation_id in &selected {
@@ -5278,7 +5323,7 @@ impl GpuTerrainEngine {
                 ..
             } = &operation.kind
             {
-                let Some(authored) = stack.find(*layer) else {
+                let Some(_authored) = stack.find(*layer) else {
                     let diagnostic = plan_fallback_diagnostic(
                         plan,
                         stack,
@@ -5313,11 +5358,20 @@ impl GpuTerrainEngine {
                     planned_fallback = Some(diagnostic);
                     break;
                 }
-                match gpu_plan_for_layer(authored, mask_assets) {
-                    Ok(kernel) => {
-                        kernels.insert(*operation_id, kernel);
+                match layer_gpu_decisions.get(layer) {
+                    Some((Some(kernel), _)) => {
+                        kernels.insert(*operation_id, *kernel);
                     }
-                    Err(reason) => {
+                    decision => {
+                        let reason = decision
+                            .and_then(|(_, reason)| reason.clone())
+                            .unwrap_or_else(|| {
+                                GpuFallbackReason::new(
+                                    GpuFallbackCode::UnsupportedOptions,
+                                    "GPU capability graph",
+                                    "layer has no executable GPU kernel choice",
+                                )
+                            });
                         let diagnostic =
                             plan_fallback_diagnostic(plan, stack, *operation_id, reason);
                         planned_fallback = Some(diagnostic);
@@ -5338,24 +5392,26 @@ impl GpuTerrainEngine {
             selected.retain(|operation| operation.index() < boundary);
         }
 
-        // The legacy SculptStrokes kernel adapter still dispatches its internal
-        // stamp/reconcile sequence over the full field. Until it has a native
-        // plan primitive, keep its following explicit composites equally broad.
-        let legacy_full_field_adapter = selected.iter().any(|operation| {
-            kernels
-                .get(operation)
-                .is_some_and(|plan| plan.kernel == GpuKernel::SculptStrokes)
+        let warm_execution = staged_candidate.is_none();
+        let candidate = staged_candidate.take().unwrap_or_else(|| {
+            self.last_eval_stats.warm_plan_resource_reuses = self
+                .last_eval_stats
+                .warm_plan_resource_reuses
+                .saturating_add(1);
+            self.plan_resources
+                .take_current()
+                .expect("compatible warm realization checked above")
         });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("compiled-terrain-plan"),
+        });
+
         let mut last_height = None;
         for operation_id in &selected {
             let operation = plan
                 .operation(*operation_id)
                 .expect("selected operation belongs to plan");
-            let region = if legacy_full_field_adapter {
-                (0, 0, metrics.width, metrics.height)
-            } else {
-                plan_scope_region(scope_for(*operation_id), metrics)
-            };
+            let region = plan_scope_region(scope_for(*operation_id), metrics);
             let execution = (|| -> Result<(), CompiledDispatchError> {
                 match &operation.kind {
                     TerrainOpKind::Seed { source, output } => {
@@ -5417,7 +5473,11 @@ impl GpuTerrainEngine {
                             &self.ping.view,
                             metrics.width,
                             metrics.height,
-                            (0, 0, metrics.width, metrics.height),
+                            // `ping` is also the last-presented height texture. A
+                            // warm local execution must preserve its pixels outside
+                            // the propagated scope; the kernel only reads the
+                            // region (including its planned halo) below.
+                            region,
                         );
                         self.current = 0;
                         self.last_dirty_rect =
@@ -5436,7 +5496,11 @@ impl GpuTerrainEngine {
                             );
                         }
                         if let LayerKind::SculptBase(params) = &authored.kind {
-                            self.record_sculpt_to_layer(device, &mut encoder, params);
+                            let patch_region = (!cold
+                                && invalidation.patched_operations.contains(operation_id)
+                                && !scope_for(*operation_id).is_full())
+                            .then_some(region);
+                            self.record_sculpt_to_layer(device, &mut encoder, params, patch_region);
                         }
                         // Legacy kernels historically performed the authored outer
                         // composite themselves. A compiled plan has an explicit
@@ -5563,6 +5627,9 @@ impl GpuTerrainEngine {
                     *operation_id,
                     plan_operation_fallback(error),
                 );
+                if warm_execution {
+                    self.plan_resources.restore_current(candidate);
+                }
                 return Ok(plan_fallback_result(metrics, self.approx_range, diagnostic));
             }
             for field in plan.analysis().outputs(*operation_id) {
@@ -5579,7 +5646,6 @@ impl GpuTerrainEngine {
             self.executed_plan_operations.push(*operation_id);
         }
 
-        let flat_layers = stack.flatten_layers();
         let freshness = deferred_at.map_or(GpuPreviewFreshness::Current, |operation| {
             let owner = plan.provenance().owner_of(operation);
             let from_layer = owner_layer_id(owner).unwrap_or_default();
@@ -5598,28 +5664,39 @@ impl GpuTerrainEngine {
         } else {
             plan.final_height()
         };
-        let present_scope = if cold || legacy_full_field_adapter {
+        let present_scope = if cold {
             PropagatedDirtyScope::new(PlanDirtyScope::FullField)
         } else {
             merged_scope
         };
         let present_region = plan_scope_region(present_scope, metrics);
+        let presentation_view = match candidate.view(presentation_field) {
+            Ok(view) => view,
+            Err(error) => {
+                if warm_execution {
+                    self.plan_resources.restore_current(candidate);
+                }
+                return Err(GpuError::Wgpu(error.to_string()));
+            }
+        };
         record_copy_views_region(
             device,
             &mut encoder,
             &self.copy,
-            candidate
-                .view(presentation_field)
-                .map_err(|error| GpuError::Wgpu(error.to_string()))?,
+            presentation_view,
             &self.ping.view,
             metrics.width,
             metrics.height,
-            (0, 0, metrics.width, metrics.height),
+            present_region,
         );
         queue.submit(Some(encoder.finish()));
         self.current = 0;
         self.last_dirty_rect = None;
-        self.plan_resources.commit_candidate(candidate);
+        if warm_execution {
+            self.plan_resources.restore_current(candidate);
+        } else {
+            self.plan_resources.commit_candidate(candidate);
+        }
         self.active_plan_revision = Some(expected_revision);
         self.deferred_plan_resume = deferred_at.map(|operation| (expected_revision, operation));
         if present_scope.is_full() {
@@ -6337,26 +6414,34 @@ impl GpuTerrainEngine {
     /// queue write would execute before the whole command buffer and could be
     /// overwritten by an earlier kernel that reuses `layer_tex`.
     fn record_sculpt_to_layer(
-        &self,
+        &mut self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
         params: &SculptParams,
+        region: Option<(u32, u32, u32, u32)>,
     ) {
-        let width = self.metrics.width;
-        let height = self.metrics.height;
+        let full_width = self.metrics.width;
+        let full_height = self.metrics.height;
+        let (origin_x, origin_y, width, height) = region.unwrap_or((0, 0, full_width, full_height));
         let row_bytes = width.saturating_mul(4);
         let padded_row_bytes = row_bytes.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
             * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
         let mut upload = vec![0u8; padded_row_bytes as usize * height as usize];
-        for y in 0..height {
-            let row_start = y as usize * padded_row_bytes as usize;
+        let mut lo = f32::INFINITY;
+        let mut hi = f32::NEG_INFINITY;
+        for local_y in 0..height {
+            let row_start = local_y as usize * padded_row_bytes as usize;
             let row = &mut upload[row_start..row_start + row_bytes as usize];
-            for x in 0..width {
-                let u = (x as f32 + 0.5) / width.max(1) as f32;
-                let v = (y as f32 + 0.5) / height.max(1) as f32;
-                let sample = params.sample_bilinear(u, v).to_ne_bytes();
-                let offset = x as usize * 4;
-                row[offset..offset + 4].copy_from_slice(&sample);
+            for local_x in 0..width {
+                let x = origin_x + local_x;
+                let y = origin_y + local_y;
+                let u = (x as f32 + 0.5) / full_width.max(1) as f32;
+                let v = (y as f32 + 0.5) / full_height.max(1) as f32;
+                let sample = params.sample_bilinear(u, v);
+                lo = lo.min(sample);
+                hi = hi.max(sample);
+                let offset = local_x as usize * 4;
+                row[offset..offset + 4].copy_from_slice(&sample.to_ne_bytes());
             }
         }
         let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -6376,7 +6461,11 @@ impl GpuTerrainEngine {
             wgpu::TexelCopyTextureInfo {
                 texture: &self.layer_tex.texture,
                 mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
+                origin: wgpu::Origin3d {
+                    x: origin_x,
+                    y: origin_y,
+                    z: 0,
+                },
                 aspect: wgpu::TextureAspect::All,
             },
             wgpu::Extent3d {
@@ -6385,6 +6474,18 @@ impl GpuTerrainEngine {
                 depth_or_array_layers: 1,
             },
         );
+        if lo <= hi {
+            self.expand_range(lo, hi);
+        }
+        let texels = u64::from(width) * u64::from(height);
+        self.last_eval_stats.sculpt_resampled_texels = self
+            .last_eval_stats
+            .sculpt_resampled_texels
+            .saturating_add(texels);
+        self.last_eval_stats.upload_bytes = self
+            .last_eval_stats
+            .upload_bytes
+            .saturating_add(texels.saturating_mul(4));
     }
 
     /// Resample and upload only a warm edit's destination footprint. Destination
@@ -6644,29 +6745,174 @@ impl GpuTerrainEngine {
     /// segment) reads it. With no Flatten present this degenerates to one stamp of
     /// `[0, n)` reading the layer input — the pre-#117 path. `edited` is order- and
     /// target-independent, so a single pass computes it over the whole set.
+    fn stroke_runtime_buffers(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        layer: LayerId,
+        headers: Vec<StrokeHeaderGpu>,
+        points: Vec<[f32; 4]>,
+    ) -> (wgpu::Buffer, wgpu::Buffer) {
+        let header_size = std::mem::size_of::<StrokeHeaderGpu>();
+        let point_size = std::mem::size_of::<[f32; 4]>();
+        let existing = self.stroke_runtime.remove(&layer);
+        let runtime = if let Some(mut runtime) = existing {
+            let points_append = runtime.uploaded_points.len() <= points.len()
+                && runtime.uploaded_points == points[..runtime.uploaded_points.len()];
+            let header_start = if runtime.uploaded_headers.len() == headers.len()
+                && !headers.is_empty()
+                && runtime.uploaded_headers[..headers.len() - 1] == headers[..headers.len() - 1]
+            {
+                Some(headers.len() - 1)
+            } else if runtime.uploaded_headers.len() < headers.len()
+                && runtime.uploaded_headers == headers[..runtime.uploaded_headers.len()]
+            {
+                Some(runtime.uploaded_headers.len())
+            } else if runtime.uploaded_headers == headers {
+                Some(headers.len())
+            } else {
+                None
+            };
+            let has_capacity =
+                headers.len() <= runtime.header_capacity && points.len() <= runtime.point_capacity;
+
+            if let Some(header_start) = header_start.filter(|_| points_append && has_capacity) {
+                if header_start < headers.len() {
+                    let bytes = bytemuck::cast_slice(&headers[header_start..]);
+                    queue.write_buffer(
+                        &runtime.headers,
+                        (header_start * header_size) as u64,
+                        bytes,
+                    );
+                    self.last_eval_stats.stroke_header_upload_bytes = self
+                        .last_eval_stats
+                        .stroke_header_upload_bytes
+                        .saturating_add(bytes.len() as u64);
+                }
+                let point_start = runtime.uploaded_points.len();
+                if point_start < points.len() {
+                    let bytes = bytemuck::cast_slice(&points[point_start..]);
+                    queue.write_buffer(&runtime.points, (point_start * point_size) as u64, bytes);
+                    self.last_eval_stats.stroke_point_upload_bytes = self
+                        .last_eval_stats
+                        .stroke_point_upload_bytes
+                        .saturating_add(bytes.len() as u64);
+                }
+                runtime.uploaded_headers = headers;
+                runtime.uploaded_points = points;
+                runtime
+            } else {
+                let header_capacity = headers
+                    .len()
+                    .max(INITIAL_STROKE_HEADER_CAPACITY)
+                    .next_power_of_two();
+                let point_capacity = points
+                    .len()
+                    .max(INITIAL_STROKE_POINT_CAPACITY)
+                    .next_power_of_two();
+                let header_bytes = bytemuck::cast_slice(&headers);
+                let point_bytes = bytemuck::cast_slice(&points);
+                self.last_eval_stats.stroke_header_upload_bytes = self
+                    .last_eval_stats
+                    .stroke_header_upload_bytes
+                    .saturating_add(header_bytes.len() as u64);
+                self.last_eval_stats.stroke_point_upload_bytes = self
+                    .last_eval_stats
+                    .stroke_point_upload_bytes
+                    .saturating_add(point_bytes.len() as u64);
+                self.last_eval_stats.stroke_payload_rebuilds = self
+                    .last_eval_stats
+                    .stroke_payload_rebuilds
+                    .saturating_add(1);
+                StrokeRuntimeBuffers {
+                    headers: make_runtime_storage_buffer(
+                        device,
+                        queue,
+                        "sculpt-stroke-headers",
+                        header_size,
+                        header_capacity,
+                        header_bytes,
+                    ),
+                    points: make_runtime_storage_buffer(
+                        device,
+                        queue,
+                        "sculpt-stroke-points",
+                        point_size,
+                        point_capacity,
+                        point_bytes,
+                    ),
+                    header_capacity,
+                    point_capacity,
+                    uploaded_headers: headers,
+                    uploaded_points: points,
+                }
+            }
+        } else {
+            let header_capacity = headers
+                .len()
+                .max(INITIAL_STROKE_HEADER_CAPACITY)
+                .next_power_of_two();
+            let point_capacity = points
+                .len()
+                .max(INITIAL_STROKE_POINT_CAPACITY)
+                .next_power_of_two();
+            let header_bytes = bytemuck::cast_slice(&headers);
+            let point_bytes = bytemuck::cast_slice(&points);
+            self.last_eval_stats.stroke_header_upload_bytes = self
+                .last_eval_stats
+                .stroke_header_upload_bytes
+                .saturating_add(header_bytes.len() as u64);
+            self.last_eval_stats.stroke_point_upload_bytes = self
+                .last_eval_stats
+                .stroke_point_upload_bytes
+                .saturating_add(point_bytes.len() as u64);
+            self.last_eval_stats.stroke_payload_rebuilds = self
+                .last_eval_stats
+                .stroke_payload_rebuilds
+                .saturating_add(1);
+            StrokeRuntimeBuffers {
+                headers: make_runtime_storage_buffer(
+                    device,
+                    queue,
+                    "sculpt-stroke-headers",
+                    header_size,
+                    header_capacity,
+                    header_bytes,
+                ),
+                points: make_runtime_storage_buffer(
+                    device,
+                    queue,
+                    "sculpt-stroke-points",
+                    point_size,
+                    point_capacity,
+                    point_bytes,
+                ),
+                header_capacity,
+                point_capacity,
+                uploaded_headers: headers,
+                uploaded_points: points,
+            }
+        };
+        let result = (runtime.headers.clone(), runtime.points.clone());
+        self.stroke_runtime.insert(layer, runtime);
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn run_sculpt_strokes(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
+        layer: LayerId,
         p: &SculptStrokeParams,
         source: TexSlot,
         region: (u32, u32, u32, u32),
     ) {
         let strokes: Vec<&SculptStroke> = p.strokes.iter().filter(|s| s.enabled).collect();
         let (headers, points) = build_stroke_buffers(&strokes, &self.metrics);
-        let header_buf = make_storage_buffer(
-            device,
-            queue,
-            "sculpt-stroke-headers",
-            bytemuck::cast_slice(&headers),
-        );
-        let point_buf = make_storage_buffer(
-            device,
-            queue,
-            "sculpt-stroke-points",
-            bytemuck::cast_slice(&points),
-        );
+        let (header_buf, point_buf) =
+            self.stroke_runtime_buffers(device, queue, layer, headers, points);
 
         let width = self.metrics.width;
         let height = self.metrics.height;
@@ -7145,8 +7391,10 @@ impl GpuTerrainEngine {
             }
             (GpuKernel::Sculpt, LayerKind::SculptBase(p)) => {
                 // `layer_tex` was filled by `upload_sculpt_to_layer` just before this call.
-                let (lo, hi) = p.sample_range();
-                self.expand_range(lo, hi);
+                if self.last_dirty_rect.is_none() {
+                    let (lo, hi) = p.sample_range();
+                    self.expand_range(lo, hi);
+                }
                 self.blend_into_current(
                     device,
                     queue,
@@ -7167,9 +7415,11 @@ impl GpuTerrainEngine {
                     device,
                     queue,
                     encoder,
+                    layer.id(),
                     p,
                     source,
-                    (0, 0, self.metrics.width, self.metrics.height),
+                    self.last_dirty_rect
+                        .unwrap_or((0, 0, self.metrics.width, self.metrics.height)),
                 );
                 // Presentation range: fold in only the *absolute* stamp targets, like
                 // every other kernel expands with stable values. The additive kinds
@@ -9821,10 +10071,13 @@ mod smoke_tests {
             engine.executed_kernels,
             vec![GpuKernel::Sculpt, GpuKernel::SculptStrokes]
         );
-        assert_eq!(
-            engine.dirty_tiles().len(),
-            (metrics.tiles_x() * metrics.tiles_z()) as usize,
-            "the legacy SculptStrokes adapter currently publishes its full-field result"
+        assert!(
+            engine.dirty_tiles().len() < (metrics.tiles_x() * metrics.tiles_z()) as usize,
+            "a warm compiled-plan stroke suffix must preserve bounded presentation"
+        );
+        assert!(
+            stats.upload_bytes < u64::from(metrics.width * metrics.height * 4),
+            "compiled-plan Base upload must scale with the expanded edit region"
         );
     }
 
@@ -10619,6 +10872,103 @@ mod smoke_tests {
             engine.approx_range, range_after_full,
             "incremental stroke dabs drifted the presentation range"
         );
+    }
+
+    /// #145: a continuing drag patches only the changed stroke header and the
+    /// appended point. It reuses both the compiled-plan realization and spare
+    /// buffer capacity, while the settled regional result remains identical to
+    /// a fresh full evaluation.
+    #[test]
+    fn warm_stroke_append_uploads_only_the_runtime_tail() {
+        let Some(gpu) = terra_test_gpu::headless() else {
+            return;
+        };
+        let res = 48u32;
+        let metrics = HeightfieldMetrics::new(res, res, 480.0, 480.0);
+        let mut stack = LayerStack::new();
+        stack.push(Layer::new(
+            "base",
+            LayerKind::SculptBase(SculptParams::filled(res, 20.0)),
+        ));
+        let params = raise_strokes(0.46, 0.5, 8.0);
+        let strokes = Layer::new("strokes", LayerKind::SculptStrokes(params));
+        let strokes_id = strokes.id();
+        stack.push(strokes);
+
+        let mut engine = GpuTerrainEngine::new(&gpu.device, res);
+        engine.mark_all_dirty(&stack);
+        engine
+            .evaluate(
+                &gpu.device,
+                &gpu.queue,
+                &stack,
+                &[],
+                metrics,
+                PreviewQuality::Draft,
+                false,
+                None,
+            )
+            .expect("prime stroke runtime with spare geometric capacity");
+
+        let LayerKind::SculptStrokes(params) =
+            &mut stack.find_mut(strokes_id).expect("stroke layer").kind
+        else {
+            panic!("stroke layer changed kind");
+        };
+        params.strokes[0]
+            .points
+            .push(terra_core::layer::SculptPoint {
+                u: 0.52,
+                v: 0.5,
+                pressure: 1.0,
+            });
+        engine.set_dirty_rect(Some((18, 18, 16, 12)));
+        engine.mark_dirty(strokes_id);
+        let incremental = engine
+            .evaluate(
+                &gpu.device,
+                &gpu.queue,
+                &stack,
+                &[],
+                metrics,
+                PreviewQuality::Draft,
+                true,
+                None,
+            )
+            .expect("append one warm stroke point")
+            .cpu
+            .expect("incremental readback");
+
+        let stats = engine.last_eval_stats();
+        assert_eq!(stats.stroke_payload_rebuilds, 0);
+        assert_eq!(
+            stats.stroke_header_upload_bytes,
+            std::mem::size_of::<StrokeHeaderGpu>() as u64
+        );
+        assert_eq!(stats.stroke_point_upload_bytes, 16);
+        assert_eq!(stats.warm_plan_resource_reuses, 1);
+        assert!(
+            stats.blend_workgroups < u64::from(res.div_ceil(8) * res.div_ceil(8)),
+            "warm stroke work must remain below a full-field dispatch"
+        );
+
+        let mut oracle_engine = GpuTerrainEngine::new(&gpu.device, res);
+        let oracle = oracle_engine
+            .evaluate(
+                &gpu.device,
+                &gpu.queue,
+                &stack,
+                &[],
+                metrics,
+                PreviewQuality::Draft,
+                true,
+                None,
+            )
+            .expect("fresh stroke oracle")
+            .cpu
+            .expect("oracle readback");
+        let error = crate::parity::max_abs_diff(&incremental.to_dense(), &oracle.to_dense());
+        assert!(error <= 1.0e-3, "warm stroke append drifted by {error}");
     }
 
     /// #125: domain displacement changes only which procedural-noise coordinate is

@@ -648,6 +648,11 @@ impl TerraApp {
                 self.session.document.stack.push_routed(layer, None, false);
                 self.session.document.selected = Some(id);
                 self.ui_state.shape_session_layer = Some(id);
+                // The layer is created once at gesture start. Its first dab is a
+                // content edit, but the compiled plan must first observe the new
+                // topology; subsequent dabs reuse that single structural revision.
+                self.pending_plan_edits
+                    .push(terra_core::terrain_plan::TerrainEditClass::Structure);
                 let msg = format!("Created new Shape Layer \"{display_name}\" to paint on");
                 log::info!("{msg}");
                 self.ui_state.status = msg;
@@ -844,6 +849,7 @@ impl TerraApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::PanelAction;
     use terra_core::{FieldId, Heightfield, HeightfieldMetrics, TerrainTileKey};
     use terra_gpu::{GpuPageTableEntry, GpuTileAtlas};
     use terra_render::{GpuContext, TerrainRenderer};
@@ -891,6 +897,139 @@ mod tests {
             .flatten_layers()
             .iter()
             .any(|layer| matches!(&layer.kind, terra_core::LayerKind::TerrainConstraints(_))));
+    }
+
+    /// #145: a layer-creating brush changes topology once at gesture start; its
+    /// first and later dabs are runtime content patches on that retained plan.
+    #[test]
+    fn shape_layer_creation_compiles_once_and_continuing_dabs_do_not_recompile() {
+        use terra_core::authoring::SculptStrokeKind;
+        use terra_core::layer::LayerStack;
+        use terra_core::shape_history::ShapeTool;
+        use terra_core::terrain_plan::{TerrainEditClass, TerrainPlanCache};
+
+        let mut app = TerraApp::default();
+        app.session.document.stack = LayerStack::new();
+        app.session.document.selected = None;
+        app.pending_plan_edits.clear();
+        app.terrain_plan_cache = TerrainPlanCache::new();
+        let empty = app.session.document.preview_eval_stack();
+        app.terrain_plan_cache
+            .acquire(&empty, &app.session.document.masks)
+            .expect("prime empty authored topology");
+        app.terrain_plan_cache.stats_mut().reset();
+
+        let layer = app
+            .ensure_shape_history_target(ShapeTool::Raise)
+            .expect("Raise creates a Shape Layer");
+        assert_eq!(
+            app.pending_plan_edits
+                .iter()
+                .filter(|edit| matches!(edit, TerrainEditClass::Structure))
+                .count(),
+            1,
+            "gesture start records exactly one topology change"
+        );
+
+        let dab = |u| PanelAction::PaintSculptStamp {
+            layer,
+            u,
+            v: 0.5,
+            radius: 0.04,
+            strength: 8.0,
+            stroke_kind: SculptStrokeKind::Raise,
+            target_height: 0.0,
+        };
+        app.apply_actions(vec![dab(0.48)]);
+        let edits = std::mem::take(&mut app.pending_plan_edits);
+        let stack = app.session.document.preview_eval_stack();
+        app.terrain_plan_cache
+            .update(&stack, &app.session.document.masks, &edits)
+            .expect("compile the gesture-start topology");
+
+        for (previous, u) in [(0.48, 0.50), (0.50, 0.52)] {
+            app.last_paint_uv = Some((previous, 0.5));
+            app.apply_actions(vec![dab(u)]);
+            let edits = std::mem::take(&mut app.pending_plan_edits);
+            assert!(edits.iter().all(|edit| matches!(
+                edit,
+                TerrainEditClass::Content { owner, .. }
+                    if *owner == terra_core::deps::NodeRef::Layer(layer)
+            )));
+            let stack = app.session.document.preview_eval_stack();
+            app.terrain_plan_cache
+                .update(&stack, &app.session.document.masks, &edits)
+                .expect("patch continuing dab");
+        }
+
+        let stats = app.terrain_plan_cache.stats().snapshot();
+        assert_eq!(stats.plan_compiles, 1);
+        assert_eq!(stats.successful_compiles, 1);
+        assert_eq!(stats.plan_cache_hits, 2);
+        let terra_core::LayerKind::SculptStrokes(params) =
+            &app.session.document.stack.find(layer).unwrap().kind
+        else {
+            panic!("created target is not a stroke layer");
+        };
+        assert_eq!(params.strokes.len(), 1, "one continuing authored stroke");
+        assert_eq!(params.strokes[0].points.len(), 3, "three runtime dabs");
+    }
+
+    /// #145: Base painting is content-only even when the document contains an
+    /// authored tree, so repeated dabs retain the structural plan revision.
+    #[test]
+    fn base_dabs_in_tree_are_content_only_plan_cache_hits() {
+        use terra_core::authoring::SculptStrokeKind;
+        use terra_core::layer::{Layer, LayerGroup, LayerKind, LayerStack, SculptParams};
+        use terra_core::terrain_plan::{TerrainEditClass, TerrainPlanCache};
+
+        let mut app = TerraApp::default();
+        let base = Layer::new(
+            "Base",
+            LayerKind::SculptBase(SculptParams::filled(64, 12.0)),
+        );
+        let base_id = base.id();
+        let mut tree = LayerGroup::new("Tree");
+        tree.children
+            .push(terra_core::layer::StackNode::Layer(base));
+        app.session.document.stack = LayerStack::new();
+        app.session.document.stack.push_group(tree);
+        app.session.document.selected = Some(base_id);
+        app.pending_plan_edits.clear();
+        app.terrain_plan_cache = TerrainPlanCache::new();
+        let stack = app.session.document.preview_eval_stack();
+        app.terrain_plan_cache
+            .acquire(&stack, &app.session.document.masks)
+            .expect("prime tree plan");
+        let revision = app.terrain_plan_cache.structure_revision();
+        app.terrain_plan_cache.stats_mut().reset();
+
+        for u in [0.48, 0.50, 0.52] {
+            app.apply_actions(vec![PanelAction::PaintSculptStamp {
+                layer: base_id,
+                u,
+                v: 0.5,
+                radius: 0.04,
+                strength: 3.0,
+                stroke_kind: SculptStrokeKind::Raise,
+                target_height: 0.0,
+            }]);
+            let edits = std::mem::take(&mut app.pending_plan_edits);
+            assert!(edits.iter().all(|edit| matches!(
+                edit,
+                TerrainEditClass::Content { owner, .. }
+                    if *owner == terra_core::deps::NodeRef::Layer(base_id)
+            )));
+            let stack = app.session.document.preview_eval_stack();
+            app.terrain_plan_cache
+                .update(&stack, &app.session.document.masks, &edits)
+                .expect("patch Base dab");
+        }
+
+        let stats = app.terrain_plan_cache.stats().snapshot();
+        assert_eq!(app.terrain_plan_cache.structure_revision(), revision);
+        assert_eq!(stats.plan_compiles, 0);
+        assert_eq!(stats.plan_cache_hits, 3);
     }
 
     /// Revert check for #34: document reset must retain an empty atlas and the
