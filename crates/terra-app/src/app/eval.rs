@@ -1349,10 +1349,10 @@ mod tests {
         FlatParams, Layer, LayerKind, LayerStack, SculptStrokeKind, StreamPowerParams,
     };
     use terra_core::shape_history::ShapeTool;
-    use terra_core::tiling::UvRect;
     use terra_core::test_fixtures::{untitled6_document, Untitled6Variant};
+    use terra_core::tiling::UvRect;
     use terra_gpu::{GpuEvaluationIntent, GpuTerrainEngine};
-    use terra_render::{GpuContext, TerrainRenderer};
+    use terra_render::{GpuContext, HeightPresentGeom, TerrainRenderer};
 
     use crate::ui::PanelAction;
 
@@ -1456,9 +1456,88 @@ mod tests {
             "Draft quality clamps the 96-sample fixture to its 128-sample floor"
         );
         assert_eq!(plan_after.plan_compiles, plan_before.plan_compiles);
-        assert_eq!(plan_after.authored_tree_walks, plan_before.authored_tree_walks);
+        assert_eq!(
+            plan_after.authored_tree_walks,
+            plan_before.authored_tree_walks
+        );
         assert_eq!(plan_after.dependency_builds, plan_before.dependency_builds);
         assert_eq!(worker_after, worker_before);
+        assert_eq!(app.ui_state.profile.cpu_published, cpu_published_before);
+
+        // #151 renderer seam: after the shared cold present and consecutive warm
+        // local dabs, the accumulated regional frame must exactly match a full
+        // presentation of the engine's complete current texture. The readbacks
+        // below belong only to the test oracle; engine stats above/below must stay 0.
+        let regional_target = gpu.target(96, 96, wgpu::TextureFormat::Rgba8Unorm);
+        app.renderer
+            .as_mut()
+            .expect("headless renderer")
+            .render_to_view(&regional_target.view, 96, 96);
+        let regional_frame = gpu.read_rgba8(&regional_target);
+
+        let geom = {
+            let heights = &app.renderer.as_ref().expect("headless renderer").heights;
+            HeightPresentGeom {
+                width: heights.tex_size.0,
+                height: heights.tex_size.1,
+                world_size: heights.world_size,
+                height_range: heights.height_range,
+                dx: heights.world_size.0 / heights.tex_size.0.max(1) as f32,
+                dz: heights.world_size.1 / heights.tex_size.1.max(1) as f32,
+            }
+        };
+        let oracle_context = GpuContext {
+            device: gpu.device.clone(),
+            queue: gpu.queue.clone(),
+            surface_format: wgpu::TextureFormat::Rgba8Unorm,
+        };
+        let mut oracle = TerrainRenderer::new_headless(&oracle_context, 96, 96);
+        let engine = app.gpu_engine.as_ref().expect("GPU engine");
+        oracle.present_gpu_height_shared(
+            engine.output_texture(),
+            engine.output_texture_view(),
+            geom,
+            None,
+        );
+        oracle.camera = app
+            .renderer
+            .as_ref()
+            .expect("headless renderer")
+            .camera
+            .clone();
+        let full_target = gpu.target(96, 96, wgpu::TextureFormat::Rgba8Unorm);
+        oracle.render_to_view(&full_target.view, 96, 96);
+        let full_frame = gpu.read_rgba8(&full_target);
+
+        let mut differing_pixels = 0u32;
+        let mut first_mismatch = None;
+        for y in 0..regional_frame.height() {
+            for x in 0..regional_frame.width() {
+                let regional = regional_frame.get(x, y);
+                let full = full_frame.get(x, y);
+                if regional != full {
+                    differing_pixels += 1;
+                    if first_mismatch.is_none() {
+                        first_mismatch = Some((x, y, regional, full));
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            differing_pixels, 0,
+            "warm regional frame differs from full engine-texture present in \
+             {differing_pixels} pixel(s); first mismatch {first_mismatch:?}"
+        );
+        assert_eq!(
+            app.gpu_engine
+                .as_ref()
+                .unwrap()
+                .last_eval_stats()
+                .readback_bytes,
+            0,
+            "renderer oracle must not alter the engine's no-readback result"
+        );
+        assert_eq!(app.eval_worker.stats(), worker_before);
         assert_eq!(app.ui_state.profile.cpu_published, cpu_published_before);
 
         for quality in [PreviewQuality::Medium, PreviewQuality::Full] {

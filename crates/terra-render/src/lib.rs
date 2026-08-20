@@ -1469,7 +1469,9 @@ impl TerrainRenderer {
     }
 
     /// Bind a GPU engine height texture directly when formats match (full field).
-    /// Partial [`SampleRect`] updates still copy through the double-buffer path.
+    /// Partial [`SampleRect`] updates still copy through the double-buffer path; the
+    /// first partial after sharing promotes once to a full GPU copy to establish a
+    /// renderer-local baseline, then later partials remain region-bounded.
     pub fn present_gpu_height_shared(
         &mut self,
         src: &wgpu::Texture,

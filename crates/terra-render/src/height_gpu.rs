@@ -99,7 +99,10 @@ impl HeightSlot {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba16Float,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
         Self {
@@ -209,6 +212,10 @@ pub struct HeightGpu {
     placement_tint: RgbaAuxMap,
     /// External R32Float height view (GPU engine output) when sharing without copy.
     shared_height_view: Option<wgpu::TextureView>,
+    /// Both renderer-local slots contain the same complete height and normal state.
+    /// Shared presentation and one-slot CPU uploads invalidate this; the next GPU
+    /// regional present promotes to a full copy before bounded updates resume.
+    local_slots_coherent: bool,
     retirement: crate::retirement::DeferredGpuRetirement,
     current_frame: u64,
 }
@@ -318,6 +325,7 @@ impl HeightGpu {
             biomes,
             placement_tint,
             shared_height_view: None,
+            local_slots_coherent: false,
             retirement: crate::retirement::DeferredGpuRetirement::new(3),
             current_frame: 0,
         }
@@ -338,6 +346,7 @@ impl HeightGpu {
         if self.slots[self.write].width == width && self.slots[self.write].height_px == height {
             return;
         }
+        self.local_slots_coherent = false;
         let old_write = std::mem::replace(
             &mut self.slots[self.write],
             HeightSlot::new(device, width, height),
@@ -388,6 +397,7 @@ impl HeightGpu {
         // Without this, interactive filter stamps / async CPU results upload
         // invisibly while the terrain keeps showing a stale shared texture.
         self.shared_height_view = None;
+        self.local_slots_coherent = false;
         let w = hf.metrics.width;
         let h = hf.metrics.height;
         self.ensure_size(device, w, h);
@@ -580,37 +590,22 @@ impl HeightGpu {
             w: width,
             h: height,
         };
-        let rect = region.unwrap_or(full);
-        let partial = rect.w != width || rect.h != height;
+        let requested = region.unwrap_or(full);
+        let requested_is_partial =
+            requested.x != 0 || requested.y != 0 || requested.w != width || requested.h != height;
+        // A shared present, first present, CPU upload, or resize leaves no proof that
+        // both local slots hold a complete current field. The engine source is complete,
+        // so promote this one transition to a full GPU copy and restore the invariant.
+        let rect = if requested_is_partial && !self.local_slots_coherent {
+            full
+        } else {
+            requested
+        };
+        let partial = rect.x != 0 || rect.y != 0 || rect.w != width || rect.h != height;
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("height-copy-enc"),
         });
-        if partial
-            && self.slots[self.display].width == width
-            && self.slots[self.display].height_px == height
-        {
-            // Seed write slot from last display, then overlay dirty region.
-            encoder.copy_texture_to_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &self.slots[self.display].height,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::TexelCopyTextureInfo {
-                    texture: &self.slots[self.write].height,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::Extent3d {
-                    width,
-                    height,
-                    depth_or_array_layers: 1,
-                },
-            );
-        }
         encoder.copy_texture_to_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: src,
@@ -638,8 +633,6 @@ impl HeightGpu {
                 depth_or_array_layers: 1,
             },
         );
-        queue.submit(Some(encoder.finish()));
-
         let normal_rect = if partial {
             SampleRect {
                 x: rect.x.saturating_sub(1),
@@ -650,8 +643,78 @@ impl HeightGpu {
         } else {
             rect
         };
+        self.encode_normals_for_write(
+            device,
+            queue,
+            &mut encoder,
+            width,
+            height,
+            dx,
+            dz,
+            normal_rect,
+        );
 
-        self.compute_normals_region_and_swap(device, queue, width, height, dx, dz, normal_rect);
+        // Keep the other slot caught up using only the regions changed above. This
+        // preserves alternating-slot correctness without a full-field seed on every dab.
+        let write_slot = &self.slots[self.write];
+        let display_slot = &self.slots[self.display];
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &write_slot.height,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: rect.x,
+                    y: rect.y,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &display_slot.height,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: rect.x,
+                    y: rect.y,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width: rect.w,
+                height: rect.h,
+                depth_or_array_layers: 1,
+            },
+        );
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &write_slot.normal,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: normal_rect.x,
+                    y: normal_rect.y,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &display_slot.normal,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: normal_rect.x,
+                    y: normal_rect.y,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width: normal_rect.w,
+                height: normal_rect.h,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(Some(encoder.finish()));
+        std::mem::swap(&mut self.display, &mut self.write);
+        self.local_slots_coherent = true;
     }
 
     // Carries the normals-dispatch geometry (grid `w`/`h`, spacings `dx`/`dz`,
@@ -662,6 +725,27 @@ impl HeightGpu {
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        w: u32,
+        h: u32,
+        dx: f32,
+        dz: f32,
+        region: SampleRect,
+    ) {
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("normal-enc"),
+        });
+        self.encode_normals_for_write(device, queue, &mut encoder, w, h, dx, dz, region);
+        queue.submit(Some(encoder.finish()));
+        std::mem::swap(&mut self.display, &mut self.write);
+        self.local_slots_coherent = false;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_normals_for_write(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
         w: u32,
         h: u32,
         dx: f32,
@@ -708,9 +792,6 @@ impl HeightGpu {
             .as_ref()
             .expect("normal bind group");
 
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("normal-enc"),
-        });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("normals"),
@@ -720,8 +801,6 @@ impl HeightGpu {
             pass.set_bind_group(0, bind, &[]);
             pass.dispatch_workgroups(region.w.div_ceil(8), region.h.div_ceil(8), 1);
         }
-        queue.submit(Some(encoder.finish()));
-        std::mem::swap(&mut self.display, &mut self.write);
     }
 
     /// Sample an external R32Float height texture in place; normals are computed locally.
@@ -741,6 +820,7 @@ impl HeightGpu {
             dz,
         } = geom;
         self.shared_height_view = Some(src_view.clone());
+        self.local_slots_coherent = false;
         self.tex_size = (width, height);
         self.world_size = world_size;
         let (lo, hi) = if height_range.0 <= height_range.1 {
@@ -837,6 +917,7 @@ impl HeightGpu {
         world_size: (f32, f32),
     ) {
         self.shared_height_view = None;
+        self.local_slots_coherent = false;
         self.world_size = world_size;
         self.height_range = (0.0, 1.0);
         let w = PROJECT_RESET_TEXTURE_EXTENT;
