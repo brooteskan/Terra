@@ -122,6 +122,31 @@ impl InputSnapshot {
             .filter(|event| event.event.is_pointer_sample())
             .count()
     }
+
+    pub(crate) fn first_primary_press_receipt(&self) -> Option<Instant> {
+        self.events.iter().find_map(|event| {
+            matches!(
+                event.event,
+                InputEvent::PointerButton {
+                    state: ElementState::Pressed,
+                    button: MouseButton::Left,
+                }
+            )
+            .then_some(event.received_at)
+        })
+    }
+
+    pub(crate) fn has_primary_pointer_edge(&self) -> bool {
+        self.events.iter().any(|event| {
+            matches!(
+                event.event,
+                InputEvent::PointerButton {
+                    button: MouseButton::Left,
+                    ..
+                }
+            )
+        })
+    }
 }
 
 #[cfg(test)]

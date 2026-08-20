@@ -8,6 +8,7 @@ use terra_core::mask::bake_mask_assets;
 use terra_core::tiling::UvRect;
 use terra_gpu::{GpuError, GpuEvaluationIntent, GpuPreviewFreshness};
 
+use super::frame_trace::FrameTraceEventKind;
 use super::{quality_stage_progress, DeferredFullField, TerraApp};
 
 /// Interactive Full preview ceiling — same 1 m footing as WC (world metres ≈ samples),
@@ -716,20 +717,61 @@ impl TerraApp {
     pub(crate) fn run_eval_step_with_intent(&mut self, intent: GpuEvaluationIntent) {
         profiling::scope!("eval_step");
         let t0 = Instant::now();
+        let trace_id = self.frame_trace.next_evaluation_id();
+        let trace_identity = self.logical_frames.active_identity();
+        self.frame_trace.record(
+            t0,
+            FrameTraceEventKind::EvaluationRequested,
+            trace_identity,
+            self.logical_frames.active_phase(),
+            Some(trace_id),
+            Some(self.scheduler.quality),
+            Some(intent),
+            None,
+        );
         self.ui_state.profile.first_visible_preview_us = 0;
         self.ui_state.profile.settled_authoritative_us = 0;
-        if self.force_draft {
-            self.scheduler.quality = PreviewQuality::Draft;
-            self.force_draft = false;
-        }
         let preview = self
             .session
             .document
             .preview_resolution
             .min(INTERACTIVE_PREVIEW_CAP);
         let export = self.session.document.export_resolution;
+        if self.force_draft {
+            let full_resolution = PreviewQuality::Full.resolution(preview, export);
+            let selected_is_base = self.session.document.selected
+                .and_then(|selected| self.session.document.stack.find(selected))
+                .is_some_and(|layer| matches!(layer.kind, LayerKind::SculptBase(_)));
+            let retained_full = self.renderer.as_ref().is_some_and(|renderer| {
+                renderer.heights.tex_size.0 == full_resolution
+                    && renderer.heights.tex_size.1 == full_resolution
+            });
+            self.scheduler.quality = if selected_is_base
+                && self.pending_gpu_dirty_region.is_some()
+                && self.last_eval_fully_gpu
+                && retained_full
+            {
+                // A bounded Base edit can update the already-valid Full realization
+                // regionally. Keeping it resident avoids the Draft→Full allocation
+                // cliff and makes the required interactive result authoritative.
+                PreviewQuality::Full
+            } else {
+                PreviewQuality::Draft
+            };
+            self.force_draft = false;
+        }
         let base = self.session.document.metrics;
         let quality = self.scheduler.quality;
+        self.frame_trace.record(
+            Instant::now(),
+            FrameTraceEventKind::EvaluationStarted,
+            trace_identity,
+            self.logical_frames.active_phase(),
+            Some(trace_id),
+            Some(quality),
+            Some(intent),
+            Some(t0.elapsed()),
+        );
         // Global + active region â€” interactive preview must include world.global.
         let preview_stack = self.session.document.preview_eval_stack();
         self.ui_state.refining_layer_name = self
@@ -755,6 +797,7 @@ impl TerraApp {
         // Interactive evaluation must never force a GPU readback/Wait on the UI thread.
         let want_cpu = false;
 
+        let plan_acquire_started = Instant::now();
         let edits = std::mem::take(&mut self.pending_plan_edits);
         let plan_update = if edits.is_empty() {
             self.terrain_plan_cache
@@ -787,6 +830,16 @@ impl TerraApp {
                 return;
             }
         };
+        self.frame_trace.record(
+            Instant::now(),
+            FrameTraceEventKind::PlanAcquired,
+            trace_identity,
+            self.logical_frames.active_phase(),
+            Some(trace_id),
+            Some(quality),
+            Some(intent),
+            Some(plan_acquire_started.elapsed()),
+        );
         let plan_revision = self.terrain_plan_cache.structure_revision();
         let compiled_plan = self
             .terrain_plan_cache
@@ -815,6 +868,13 @@ impl TerraApp {
                     // triggered it was bounded. Do not leak the prior local rect into it.
                     engine.set_dirty_rect(None);
                 }
+                let gpu_eval_started = Instant::now();
+                let resolved_trace_identity = trace_identity.unwrap_or_default();
+                engine.set_evaluation_trace_context(terra_gpu::GpuEvaluationTraceContext {
+                    frame_id: resolved_trace_identity.id.get(),
+                    generation: resolved_trace_identity.generation.get(),
+                    evaluation_id: trace_id.get(),
+                });
                 match engine.evaluate_compiled_with_intent(
                     &gpu.device,
                     &gpu.queue,
@@ -829,8 +889,28 @@ impl TerraApp {
                     intent,
                 ) {
                     Ok(result) => {
+                        self.frame_trace.record_evaluation_submission(
+                            Instant::now(),
+                            trace_identity,
+                            self.logical_frames.active_phase(),
+                            trace_id,
+                            quality,
+                            intent,
+                            gpu_eval_started.elapsed(),
+                            engine.last_eval_stats(),
+                        );
                         if token != self.eval_token {
                             // Stale generation â€” discard.
+                            self.frame_trace.record(
+                                Instant::now(),
+                                FrameTraceEventKind::CandidateRejectedStale,
+                                trace_identity,
+                                self.logical_frames.active_phase(),
+                                Some(trace_id),
+                                Some(quality),
+                                Some(intent),
+                                None,
+                            );
                         } else {
                             let dx = metrics.dx();
                             let dz = metrics.dz();
@@ -889,6 +969,17 @@ impl TerraApp {
                                 self.needs_height_upload = false;
                                 self.last_complete_generation =
                                     super::logical_frame::EditGeneration::new(token);
+                                self.last_accepted_evaluation_id = trace_id.get();
+                                self.frame_trace.record(
+                                    Instant::now(),
+                                    FrameTraceEventKind::CandidateAccepted,
+                                    trace_identity,
+                                    self.logical_frames.active_phase(),
+                                    Some(trace_id),
+                                    Some(quality),
+                                    Some(intent),
+                                    Some(t0.elapsed()),
+                                );
                             } else {
                                 let _ = engine.take_dirty_region(1);
                             }
@@ -1570,6 +1661,27 @@ mod tests {
             assert_eq!(stats.readback_bytes, 0, "{quality:?}");
             assert_eq!(stats.operations_deferred, 0, "{quality:?}");
         }
+
+        app.apply_actions(vec![PanelAction::PaintSculptStamp {
+            layer: target,
+            u: 0.56,
+            v: 0.5,
+            radius: 0.04,
+            strength: 1.0,
+            stroke_kind: SculptStrokeKind::Raise,
+            target_height: 0.0,
+        }]);
+        assert!(app.force_draft, "the ordinary edit path requests Draft");
+        app.run_eval_step_with_intent(GpuEvaluationIntent::InteractiveLocal);
+        assert_eq!(
+            app.scheduler.quality,
+            PreviewQuality::Full,
+            "a bounded Base edit keeps an already-valid Full realization resident"
+        );
+        let stats = app.gpu_engine.as_ref().unwrap().last_eval_stats();
+        assert!(!stats.cold_execution);
+        assert!(stats.dirty_texels < u64::from(stats.resolution).pow(2));
+        assert_eq!(stats.readback_bytes, 0);
     }
 
     #[test]

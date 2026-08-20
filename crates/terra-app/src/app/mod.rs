@@ -2,6 +2,7 @@
 
 mod actions;
 mod eval;
+mod frame_trace;
 mod helpers;
 mod input;
 mod lifecycle;
@@ -36,6 +37,11 @@ use winit::window::Window;
 
 pub(crate) const EDIT_DEBOUNCE_MS: u128 = 40;
 pub(crate) const REFINE_INTERVAL_MS: u128 = 80;
+/// Required quiet time after input before optional Medium/Full work may start.
+pub(crate) const POST_INPUT_REFINE_GRACE_MS: u64 = 80;
+/// Host-side logical-frame budget. This is a start/defer gate, never a promise
+/// that an already-started GPU submission can be preempted.
+pub(crate) const LOGICAL_FRAME_HOST_BUDGET_MS: u64 = 8;
 pub(crate) const FULL_FIELD_SETTLE_MS: u64 = 75;
 pub(crate) const FULL_FIELD_REFINE_MS: u64 = 225;
 
@@ -199,8 +205,12 @@ pub struct TerraApp {
     input: input::InputAccumulator,
     /// Logical scheduling/diagnostic lifecycle; deliberately app-owned and non-global.
     logical_frames: logical_frame::LogicalFrameCoordinator,
+    /// Bounded, frame/generation-correlated observability for the Base brush path.
+    frame_trace: frame_trace::FrameTraceRecorder,
     /// Most recent complete terrain generation made available for presentation.
     last_complete_generation: logical_frame::EditGeneration,
+    last_accepted_evaluation_id: u64,
+    last_reported_presentation_timing_frame: u64,
     /// A matching Medium/Full job is queued or executing on the worker.
     worker_refine_pending: bool,
     /// Earliest edited layer not yet communicated to the persistent worker cache.
@@ -249,6 +259,10 @@ pub struct TerraApp {
     needs_height_upload: bool,
     last_refine: Instant,
     last_edit: Instant,
+    /// Optional refinement cannot start before this input-anchored deadline.
+    optional_refine_not_before: Option<Instant>,
+    /// Generation for which the optional-refinement deadline was armed.
+    optional_refine_generation: u64,
     pending_eval: bool,
     /// When true, next eval starts from Draft even if already refining.
     force_draft: bool,
@@ -398,7 +412,10 @@ impl Default for TerraApp {
             eval_token: 0,
             input: input::InputAccumulator::default(),
             logical_frames: logical_frame::LogicalFrameCoordinator::default(),
+            frame_trace: frame_trace::FrameTraceRecorder::default(),
             last_complete_generation: logical_frame::EditGeneration::default(),
+            last_accepted_evaluation_id: 0,
+            last_reported_presentation_timing_frame: 0,
             worker_refine_pending: false,
             worker_dirty_from: None,
             worker_dirty_region: None,
@@ -424,6 +441,8 @@ impl Default for TerraApp {
             needs_height_upload: false,
             last_refine: now,
             last_edit: now,
+            optional_refine_not_before: None,
+            optional_refine_generation: 0,
             pending_eval: false,
             force_draft: false,
             pending_gpu_dirty_region: None,

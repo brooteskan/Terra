@@ -61,7 +61,7 @@ pub use clipmap::{
     ClipmapConfig, ClipmapPresentPlan, ClipmapRingDraw, ClipmapRingLevel, WorldGridConfig,
 };
 pub use frame_graph::{FrameGraph, FrameSchedule, PassKind};
-pub use gpu_timing::GpuTimings;
+pub use gpu_timing::{GpuPresentationTraceContext, GpuTimings};
 pub use grid::TerrainGrid;
 pub use guides::{GuideOverlay, GuideState};
 pub use height_gpu::{AuxMaps, HeightGpu, HeightPresentGeom};
@@ -257,6 +257,7 @@ pub struct TerrainRenderer {
     pub last_upload_us: u64,
     /// Last resolved GPU pass timings (0 when TIMESTAMP_QUERY unavailable).
     pub last_gpu_timings: GpuTimings,
+    pending_presentation_trace: GpuPresentationTraceContext,
     /// Terrain mesh resolution drawn last frame (profiler).
     pub last_grid_resolution: u32,
     /// After first height present, leave orbit target alone so uploads don't fight the user.
@@ -619,6 +620,10 @@ impl TerrainRenderer {
     /// Current swapchain dimensions in physical pixels (each always ≥ 1).
     pub fn size(&self) -> (u32, u32) {
         (self.config.width, self.config.height)
+    }
+
+    pub fn set_presentation_trace_context(&mut self, context: GpuPresentationTraceContext) {
+        self.pending_presentation_trace = context;
     }
 
     /// Swapchain color format the surface was configured with.
@@ -1109,6 +1114,7 @@ impl TerrainRenderer {
             ocean_pipeline,
             last_upload_us: 0,
             last_gpu_timings: GpuTimings::default(),
+            pending_presentation_trace: GpuPresentationTraceContext::default(),
             last_grid_resolution: 0,
             camera_framed: false,
             brush,
@@ -2052,7 +2058,7 @@ impl TerrainRenderer {
         if let Some(timer) = self.gpu_timer.as_mut() {
             timer.poll_readback(&self.device);
             self.last_gpu_timings = timer.last();
-            timer.begin_frame();
+            timer.begin_frame(std::mem::take(&mut self.pending_presentation_trace));
         }
         self.staging.begin_frame();
 

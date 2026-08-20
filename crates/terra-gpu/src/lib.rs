@@ -7,6 +7,7 @@ pub mod compiled_plan;
 pub mod derivatives;
 pub mod effect_filter;
 pub mod engine;
+mod evaluation_timing;
 pub mod graph;
 pub mod parity;
 pub mod tile_cache;
@@ -15,6 +16,7 @@ pub use derivatives::{cpu_slope_oracle, run_derivative_gpu, GpuDerivativeMode};
 pub use engine::{
     GpuEvalResult, GpuEvalStats, GpuEvaluationIntent, GpuPreviewFreshness, GpuTerrainEngine,
 };
+pub use evaluation_timing::{GpuEvaluationTiming, GpuEvaluationTraceContext};
 pub use graph::{
     compile_gpu_graph, expand_dirty_rect, layer_gpu_supported, GpuComputeGraph, GpuDirtyPolicy,
     GpuFallbackCode, GpuFallbackDiagnostic, GpuFallbackReason, GpuKernel, GpuLayerPlan,

@@ -1,0 +1,324 @@
+//! Bounded logical-frame tracing for the Base-brush/refinement workload.
+//!
+//! Recording is deliberately allocation-light and never performs I/O. The
+//! benchmark/reporting path may snapshot and serialize records after a run.
+
+use std::collections::VecDeque;
+use std::time::{Duration, Instant};
+
+use terra_core::eval::PreviewQuality;
+use terra_gpu::GpuEvaluationIntent;
+
+use super::logical_frame::{EditGeneration, FrameIdentity, FramePhase, LogicalFrameId};
+
+const EVENT_CAPACITY: usize = 2_048;
+const SAMPLE_CAPACITY: usize = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct EvaluationTraceId(u64);
+
+impl EvaluationTraceId {
+    pub(crate) const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub(crate) const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FrameTraceEventKind {
+    OsInputReceipt,
+    SnapshotSealed,
+    ToolUpdateComplete,
+    StrokeRelease,
+    FollowUpPressReceipt,
+    FollowUpPressSealed,
+    EvaluationRequested,
+    EvaluationStarted,
+    PlanAcquired,
+    QueueSubmitted,
+    CandidateAccepted,
+    CandidateRejectedStale,
+    PresentationRequested,
+    SurfacePresented,
+    GpuEvaluationResolved,
+    GpuPresentationResolved,
+    HeartbeatOverBudget,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub(crate) struct FrameTraceEvent {
+    pub(crate) at: Instant,
+    pub(crate) kind: FrameTraceEventKind,
+    pub(crate) frame: LogicalFrameId,
+    pub(crate) generation: EditGeneration,
+    pub(crate) evaluation: Option<EvaluationTraceId>,
+    pub(crate) phase: Option<FramePhase>,
+    pub(crate) quality: Option<PreviewQuality>,
+    pub(crate) intent: Option<GpuEvaluationIntent>,
+    pub(crate) duration: Option<Duration>,
+    pub(crate) gpu_stats: Option<terra_gpu::GpuEvalStats>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct LatencySummary {
+    pub(crate) count: usize,
+    pub(crate) p50_us: u64,
+    pub(crate) p95_us: u64,
+    pub(crate) max_us: u64,
+}
+
+#[derive(Debug)]
+pub(crate) struct FrameTraceRecorder {
+    next_evaluation: u64,
+    events: VecDeque<FrameTraceEvent>,
+    input_to_visible_us: VecDeque<u64>,
+    refinement_us: VecDeque<u64>,
+    release_to_follow_up_press_us: VecDeque<u64>,
+    pending_input_receipt: Option<(Instant, EditGeneration)>,
+    pending_release: Option<(Instant, EditGeneration)>,
+}
+
+impl Default for FrameTraceRecorder {
+    fn default() -> Self {
+        Self {
+            next_evaluation: 0,
+            events: VecDeque::with_capacity(EVENT_CAPACITY),
+            input_to_visible_us: VecDeque::with_capacity(SAMPLE_CAPACITY),
+            refinement_us: VecDeque::with_capacity(SAMPLE_CAPACITY),
+            release_to_follow_up_press_us: VecDeque::with_capacity(SAMPLE_CAPACITY),
+            pending_input_receipt: None,
+            pending_release: None,
+        }
+    }
+}
+
+impl FrameTraceRecorder {
+    pub(crate) fn next_evaluation_id(&mut self) -> EvaluationTraceId {
+        self.next_evaluation = self
+            .next_evaluation
+            .checked_add(1)
+            .expect("evaluation trace id exhausted");
+        EvaluationTraceId(self.next_evaluation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record(
+        &mut self,
+        now: Instant,
+        kind: FrameTraceEventKind,
+        identity: Option<FrameIdentity>,
+        phase: Option<FramePhase>,
+        evaluation: Option<EvaluationTraceId>,
+        quality: Option<PreviewQuality>,
+        intent: Option<GpuEvaluationIntent>,
+        duration: Option<Duration>,
+    ) {
+        let identity = identity.unwrap_or(FrameIdentity {
+            id: LogicalFrameId::default(),
+            generation_at_start: EditGeneration::default(),
+            generation: EditGeneration::default(),
+        });
+        push_bounded(
+            &mut self.events,
+            EVENT_CAPACITY,
+            FrameTraceEvent {
+                at: now,
+                kind,
+                frame: identity.id,
+                generation: identity.generation,
+                evaluation,
+                phase,
+                quality,
+                intent,
+                duration,
+                gpu_stats: None,
+            },
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_evaluation_submission(
+        &mut self,
+        now: Instant,
+        identity: Option<FrameIdentity>,
+        phase: Option<FramePhase>,
+        evaluation: EvaluationTraceId,
+        quality: PreviewQuality,
+        intent: GpuEvaluationIntent,
+        duration: Duration,
+        stats: terra_gpu::GpuEvalStats,
+    ) {
+        self.record(
+            now,
+            FrameTraceEventKind::QueueSubmitted,
+            identity,
+            phase,
+            Some(evaluation),
+            Some(quality),
+            Some(intent),
+            Some(duration),
+        );
+        if let Some(event) = self.events.back_mut() {
+            event.gpu_stats = Some(stats);
+        }
+    }
+
+    pub(crate) fn note_input_receipt(&mut self, now: Instant, generation: EditGeneration) {
+        self.pending_input_receipt = Some((now, generation));
+    }
+
+    pub(crate) fn note_release(&mut self, now: Instant, generation: EditGeneration) {
+        self.pending_release = Some((now, generation));
+    }
+
+    pub(crate) fn note_follow_up_press(&mut self, now: Instant) -> bool {
+        let Some((released, _)) = self.pending_release.take() else {
+            return false;
+        };
+        push_bounded(
+            &mut self.release_to_follow_up_press_us,
+            SAMPLE_CAPACITY,
+            micros(now.saturating_duration_since(released)),
+        );
+        true
+    }
+
+    pub(crate) fn note_surface_presented(&mut self, now: Instant, generation: EditGeneration) {
+        if let Some((received, expected)) = self.pending_input_receipt {
+            if expected == generation {
+                push_bounded(
+                    &mut self.input_to_visible_us,
+                    SAMPLE_CAPACITY,
+                    micros(now.saturating_duration_since(received)),
+                );
+                self.pending_input_receipt = None;
+            }
+        }
+        if let Some((released, expected)) = self.pending_release {
+            if expected == generation {
+                push_bounded(
+                    &mut self.refinement_us,
+                    SAMPLE_CAPACITY,
+                    micros(now.saturating_duration_since(released)),
+                );
+                self.pending_release = None;
+            }
+        }
+    }
+
+    pub(crate) fn input_to_visible_summary(&self) -> LatencySummary {
+        summarize(&self.input_to_visible_us)
+    }
+
+    pub(crate) fn refinement_summary(&self) -> LatencySummary {
+        summarize(&self.refinement_us)
+    }
+
+    pub(crate) fn follow_up_press_summary(&self) -> LatencySummary {
+        summarize(&self.release_to_follow_up_press_us)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn events(&self) -> &VecDeque<FrameTraceEvent> {
+        &self.events
+    }
+}
+
+fn micros(duration: Duration) -> u64 {
+    duration.as_micros().min(u128::from(u64::MAX)) as u64
+}
+
+fn push_bounded<T>(queue: &mut VecDeque<T>, capacity: usize, value: T) {
+    if queue.len() == capacity {
+        queue.pop_front();
+    }
+    queue.push_back(value);
+}
+
+fn summarize(samples: &VecDeque<u64>) -> LatencySummary {
+    if samples.is_empty() {
+        return LatencySummary::default();
+    }
+    let mut sorted: Vec<_> = samples.iter().copied().collect();
+    sorted.sort_unstable();
+    let percentile = |numerator: usize| {
+        let rank = (numerator * sorted.len()).div_ceil(100).max(1);
+        sorted[rank.saturating_sub(1).min(sorted.len() - 1)]
+    };
+    LatencySummary {
+        count: sorted.len(),
+        p50_us: percentile(50),
+        p95_us: percentile(95),
+        max_us: *sorted.last().expect("non-empty samples"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn percentile_summary_uses_nearest_rank() {
+        let samples = VecDeque::from([1, 2, 3, 4, 100]);
+        assert_eq!(
+            summarize(&samples),
+            LatencySummary {
+                count: 5,
+                p50_us: 3,
+                p95_us: 100,
+                max_us: 100,
+            }
+        );
+    }
+
+    #[test]
+    fn records_are_bounded() {
+        let mut trace = FrameTraceRecorder::default();
+        for _ in 0..EVENT_CAPACITY + 7 {
+            trace.record(
+                Instant::now(),
+                FrameTraceEventKind::OsInputReceipt,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        assert_eq!(trace.events().len(), EVENT_CAPACITY);
+    }
+
+    #[test]
+    fn visible_latency_only_closes_on_the_matching_generation() {
+        let started = Instant::now();
+        let mut trace = FrameTraceRecorder::default();
+        trace.note_input_receipt(started, EditGeneration::new(7));
+        trace.note_release(started, EditGeneration::new(7));
+
+        trace.note_surface_presented(started + Duration::from_millis(2), EditGeneration::new(6));
+        assert_eq!(trace.input_to_visible_summary().count, 0);
+        assert_eq!(trace.refinement_summary().count, 0);
+
+        trace.note_surface_presented(started + Duration::from_millis(5), EditGeneration::new(7));
+        assert_eq!(trace.input_to_visible_summary().p50_us, 5_000);
+        assert_eq!(trace.refinement_summary().p50_us, 5_000);
+    }
+
+    #[test]
+    fn follow_up_press_preempts_the_pending_refinement_sample() {
+        let released = Instant::now();
+        let mut trace = FrameTraceRecorder::default();
+        trace.note_release(released, EditGeneration::new(3));
+        assert!(trace.note_follow_up_press(released + Duration::from_millis(7)));
+        assert_eq!(trace.follow_up_press_summary().p95_us, 7_000);
+
+        trace.note_surface_presented(released + Duration::from_millis(20), EditGeneration::new(3));
+        assert_eq!(trace.refinement_summary().count, 0);
+        assert!(!trace.note_follow_up_press(released + Duration::from_millis(30)));
+    }
+}

@@ -1,5 +1,6 @@
 use bytemuck::{Pod, Zeroable};
 use std::collections::HashMap;
+use std::cell::{Cell, RefCell};
 use terra_core::ids::OutputId;
 use terra_core::layer::BlendMode;
 use terra_core::mask::{Distribution, MaskAsset, MaskCombine, MaskOp, MaskSource};
@@ -122,6 +123,9 @@ pub struct GpuPlanOperations {
     aux: Pipe,
     mask_bake: Pipe,
     mask_program: Pipe,
+    mask_scratch: RefCell<Option<MaskScratchSet>>,
+    mask_scratch_allocations: Cell<u32>,
+    mask_scratch_reuses: Cell<u32>,
 }
 
 impl GpuPlanOperations {
@@ -189,7 +193,22 @@ impl GpuPlanOperations {
                     storage_write_entry(3),
                 ],
             ),
+            mask_scratch: RefCell::new(None),
+            mask_scratch_allocations: Cell::new(0),
+            mask_scratch_reuses: Cell::new(0),
         }
+    }
+
+    pub(crate) fn begin_evaluation(&self) {
+        self.mask_scratch_allocations.set(0);
+        self.mask_scratch_reuses.set(0);
+    }
+
+    pub(crate) fn mask_scratch_stats(&self) -> (u32, u32) {
+        (
+            self.mask_scratch_allocations.get(),
+            self.mask_scratch_reuses.get(),
+        )
     }
 
     pub fn seed_field(
@@ -306,12 +325,24 @@ impl GpuPlanOperations {
 
         let key = resources.key();
         let region = normalized_region(key.width, key.height, region);
-        let [accum_a, accum_b, work_a, work_b] = [
-            scalar_scratch(device, "compiled-plan-mask-accum-a", key.width, key.height),
-            scalar_scratch(device, "compiled-plan-mask-accum-b", key.width, key.height),
-            scalar_scratch(device, "compiled-plan-mask-work-a", key.width, key.height),
-            scalar_scratch(device, "compiled-plan-mask-work-b", key.width, key.height),
-        ];
+        {
+            let mut scratch = self.mask_scratch.borrow_mut();
+            if scratch.as_ref().is_none_or(|scratch| {
+                scratch.width != key.width || scratch.height != key.height
+            }) {
+                *scratch = Some(MaskScratchSet::new(device, key.width, key.height));
+                self.mask_scratch_allocations.set(4);
+            } else {
+                self.mask_scratch_reuses
+                    .set(self.mask_scratch_reuses.get().saturating_add(1));
+            }
+        }
+        let scratch = self.mask_scratch.borrow();
+        let scratch = scratch.as_ref().expect("mask scratch was realized");
+        let accum_a = &scratch.accum_a;
+        let accum_b = &scratch.accum_b;
+        let work_a = &scratch.work_a;
+        let work_b = &scratch.work_b;
         record_fill_view_region(
             device,
             encoder,
@@ -768,6 +799,28 @@ impl GpuPlanOperations {
 struct ScratchTexture {
     _texture: wgpu::Texture,
     view: wgpu::TextureView,
+}
+
+struct MaskScratchSet {
+    width: u32,
+    height: u32,
+    accum_a: ScratchTexture,
+    accum_b: ScratchTexture,
+    work_a: ScratchTexture,
+    work_b: ScratchTexture,
+}
+
+impl MaskScratchSet {
+    fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
+        Self {
+            width,
+            height,
+            accum_a: scalar_scratch(device, "compiled-plan-mask-accum-a", width, height),
+            accum_b: scalar_scratch(device, "compiled-plan-mask-accum-b", width, height),
+            work_a: scalar_scratch(device, "compiled-plan-mask-work-a", width, height),
+            work_b: scalar_scratch(device, "compiled-plan-mask-work-b", width, height),
+        }
+    }
 }
 
 fn scalar_scratch(device: &wgpu::Device, label: &str, width: u32, height: u32) -> ScratchTexture {

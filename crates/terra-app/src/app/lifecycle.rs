@@ -18,20 +18,60 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use super::helpers::{search_character, ui_tool_search_focused};
+use super::frame_trace::FrameTraceEventKind;
 use super::input::{InputEvent, InputModifiers, PointerCancelReason};
-use super::logical_frame::{EditGeneration, FramePhase, FrameRequestReason};
+use super::logical_frame::{
+    EditGeneration, FrameIdentity, FramePhase, FrameRequestReason, LogicalFrameId,
+};
 use super::{
     quality_in_flight_progress, quality_stage_progress, AppScreen, TerraApp, EDIT_DEBOUNCE_MS,
-    FULL_FIELD_REFINE_MS, REFINE_INTERVAL_MS,
+    FULL_FIELD_REFINE_MS, POST_INPUT_REFINE_GRACE_MS, REFINE_INTERVAL_MS,
 };
 
 impl TerraApp {
     fn queue_input(&mut self, event: InputEvent) {
-        self.input.record(event, Instant::now());
+        let now = Instant::now();
+        let generation = EditGeneration::new(self.eval_token);
+        self.input.record(event, now);
         self.logical_frames.request(
             EditGeneration::new(self.eval_token),
             FrameRequestReason::Input,
         );
+        let identity = self.logical_frames.pending_identity();
+        self.frame_trace.record(
+            now,
+            FrameTraceEventKind::OsInputReceipt,
+            identity,
+            Some(FramePhase::CollectingInput),
+            None,
+            None,
+            None,
+            None,
+        );
+        if matches!(
+            event,
+            InputEvent::PointerButton {
+                state: ElementState::Pressed,
+                button: MouseButton::Left,
+            }
+        ) && self.frame_trace.note_follow_up_press(now)
+        {
+            self.frame_trace.record(
+                now,
+                FrameTraceEventKind::FollowUpPressReceipt,
+                identity,
+                Some(FramePhase::CollectingInput),
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        if matches!(event, InputEvent::PointerButton { button: MouseButton::Left, .. }) {
+            self.optional_refine_not_before =
+                now.checked_add(Duration::from_millis(POST_INPUT_REFINE_GRACE_MS));
+            self.optional_refine_generation = generation.get();
+        }
     }
 
     /// Seal and replay one immutable input snapshot. Events queued after `seal`
@@ -49,6 +89,8 @@ impl TerraApp {
         let snapshot = self.input.seal();
         let event_count = snapshot.len();
         let pointer_samples = snapshot.pointer_sample_count();
+        let first_primary_press = snapshot.first_primary_press_receipt();
+        let has_primary_edge = snapshot.has_primary_pointer_edge();
         self.logical_frames
             .begin(Instant::now(), event_count, pointer_samples);
         self.logical_frames.transition(FramePhase::SealingInput);
@@ -62,6 +104,44 @@ impl TerraApp {
         }
         self.logical_frames
             .update_generation(EditGeneration::new(self.eval_token));
+        let identity = self.logical_frames.active_identity();
+        self.frame_trace.record(
+            Instant::now(),
+            FrameTraceEventKind::SnapshotSealed,
+            identity,
+            Some(FramePhase::SealingInput),
+            None,
+            None,
+            None,
+            first_receipt.map(|receipt| receipt.elapsed()),
+        );
+        self.frame_trace.record(
+            Instant::now(),
+            FrameTraceEventKind::ToolUpdateComplete,
+            identity,
+            Some(FramePhase::ApplicationUpdate),
+            None,
+            None,
+            None,
+            None,
+        );
+        if let Some(received_at) = first_primary_press {
+            let generation = EditGeneration::new(self.eval_token);
+            self.frame_trace.note_input_receipt(received_at, generation);
+            self.frame_trace.record(
+                Instant::now(),
+                FrameTraceEventKind::FollowUpPressSealed,
+                identity,
+                Some(FramePhase::ApplicationUpdate),
+                None,
+                None,
+                None,
+                Some(received_at.elapsed()),
+            );
+        }
+        if has_primary_edge {
+            self.optional_refine_generation = self.eval_token;
+        }
         self.logical_frames
             .transition(FramePhase::RequiredInteractiveWork);
         if let (Some(identity), Some(received_at), Some(sequence)) = (
@@ -326,6 +406,22 @@ impl TerraApp {
             if self.pending_eval {
                 self.force_draft = true;
             }
+            let now = Instant::now();
+            let generation = EditGeneration::new(self.eval_token);
+            self.optional_refine_not_before =
+                now.checked_add(Duration::from_millis(POST_INPUT_REFINE_GRACE_MS));
+            self.optional_refine_generation = self.eval_token;
+            self.frame_trace.note_release(now, generation);
+            self.frame_trace.record(
+                now,
+                FrameTraceEventKind::StrokeRelease,
+                self.logical_frames.active_identity(),
+                self.logical_frames.active_phase(),
+                None,
+                None,
+                None,
+                None,
+            );
         }
     }
 
@@ -626,13 +722,87 @@ impl ApplicationHandler for TerraApp {
                 }
             }
             WindowEvent::RedrawRequested => {
-                if let Some(identity) = self.logical_frames.take_presentation_identity() {
+                let presentation_identity = self.logical_frames.take_presentation_identity();
+                if let Some(identity) = presentation_identity {
                     self.ui_state.profile.logical_frame_id = identity.id.get();
                     self.ui_state.profile.edit_generation = identity.generation.get();
                     self.ui_state.profile.presented_generation =
                         self.last_complete_generation.get();
+                    if let Some(renderer) = self.renderer.as_mut() {
+                        renderer.set_presentation_trace_context(
+                            terra_render::GpuPresentationTraceContext {
+                                frame_id: identity.id.get(),
+                                generation: self.last_complete_generation.get(),
+                                evaluation_id: self.last_accepted_evaluation_id,
+                            },
+                        );
+                    }
                 }
                 self.redraw();
+                if let Some(timings) = self.renderer.as_ref().map(|renderer| renderer.last_gpu_timings)
+                {
+                    let newly_resolved =
+                        timings.source_frame > self.last_reported_presentation_timing_frame;
+                    if newly_resolved {
+                        self.last_reported_presentation_timing_frame = timings.source_frame;
+                    }
+                    if newly_resolved && timings.context.frame_id != 0 {
+                        let gpu_us = timings
+                            .terrain_us
+                            .saturating_add(timings.shadow_us)
+                            .saturating_add(timings.path_trace_us)
+                            .saturating_add(timings.temporal_us)
+                            .saturating_add(timings.denoise_us);
+                        self.frame_trace.record(
+                            Instant::now(),
+                            FrameTraceEventKind::GpuPresentationResolved,
+                            Some(FrameIdentity {
+                                id: LogicalFrameId::new(timings.context.frame_id),
+                                generation_at_start: EditGeneration::new(
+                                    timings.context.generation,
+                                ),
+                                generation: EditGeneration::new(timings.context.generation),
+                            }),
+                            None,
+                            Some(super::frame_trace::EvaluationTraceId::new(
+                                timings.context.evaluation_id,
+                            )),
+                            None,
+                            None,
+                            Some(Duration::from_micros(gpu_us)),
+                        );
+                    }
+                }
+                if let Some(identity) = presentation_identity {
+                    let now = Instant::now();
+                    self.frame_trace.note_surface_presented(
+                        now,
+                        self.last_complete_generation,
+                    );
+                    let input_visible = self.frame_trace.input_to_visible_summary();
+                    let refinement = self.frame_trace.refinement_summary();
+                    let follow_up_press = self.frame_trace.follow_up_press_summary();
+                    self.ui_state.profile.brush_trace_samples = input_visible.count;
+                    self.ui_state.profile.input_visible_p50_us = input_visible.p50_us;
+                    self.ui_state.profile.input_visible_p95_us = input_visible.p95_us;
+                    self.ui_state.profile.input_visible_max_us = input_visible.max_us;
+                    self.ui_state.profile.refinement_p50_us = refinement.p50_us;
+                    self.ui_state.profile.refinement_p95_us = refinement.p95_us;
+                    self.ui_state.profile.refinement_max_us = refinement.max_us;
+                    self.ui_state.profile.follow_up_press_p50_us = follow_up_press.p50_us;
+                    self.ui_state.profile.follow_up_press_p95_us = follow_up_press.p95_us;
+                    self.ui_state.profile.follow_up_press_max_us = follow_up_press.max_us;
+                    self.frame_trace.record(
+                        now,
+                        FrameTraceEventKind::SurfacePresented,
+                        Some(identity),
+                        Some(FramePhase::PresentationRequest),
+                        None,
+                        Some(self.scheduler.quality),
+                        None,
+                        None,
+                    );
+                }
             }
             _ => {}
         }
@@ -665,6 +835,33 @@ impl ApplicationHandler for TerraApp {
                 ));
             }
             return;
+        }
+
+        let completed_gpu_evaluations = if let (Some(engine), Some(gpu)) =
+            (self.gpu_engine.as_mut(), self.gpu.as_ref())
+        {
+            engine.poll_evaluation_timings(&gpu.device, &gpu.queue)
+        } else {
+            Vec::new()
+        };
+        for timing in completed_gpu_evaluations {
+            self.ui_state.profile.gpu_evaluation_us = timing.gpu_us;
+            self.frame_trace.record(
+                Instant::now(),
+                FrameTraceEventKind::GpuEvaluationResolved,
+                Some(FrameIdentity {
+                    id: LogicalFrameId::new(timing.context.frame_id),
+                    generation_at_start: EditGeneration::new(timing.context.generation),
+                    generation: EditGeneration::new(timing.context.generation),
+                }),
+                None,
+                Some(super::frame_trace::EvaluationTraceId::new(
+                    timing.context.evaluation_id,
+                )),
+                None,
+                None,
+                Some(Duration::from_micros(timing.gpu_us)),
+            );
         }
 
         let input_frame_processed = self.process_pending_input_frame();
@@ -999,6 +1196,16 @@ impl ApplicationHandler for TerraApp {
                 self.logical_frames
                     .transition(FramePhase::PresentationRequest);
                 self.logical_frames.mark_presentation_requested();
+                self.frame_trace.record(
+                    Instant::now(),
+                    FrameTraceEventKind::PresentationRequested,
+                    self.logical_frames.active_identity(),
+                    Some(FramePhase::PresentationRequest),
+                    None,
+                    Some(self.scheduler.quality),
+                    None,
+                    None,
+                );
                 if let Some(window) = &self.window {
                     window.request_redraw();
                 }
@@ -1011,6 +1218,11 @@ impl ApplicationHandler for TerraApp {
             // CPU worker is only for unsupported suffixes / export oracle.
             if !stall_refine
                 && self.logical_frames.can_start_optional(Instant::now())
+                && !self.input.has_pending()
+                && self.optional_refine_generation == self.eval_token
+                && self
+                    .optional_refine_not_before
+                    .is_none_or(|deadline| Instant::now() >= deadline)
                 && self.ui_state.refining
                 && !self.pending_eval
                 && !self.worker_refine_pending
@@ -1020,6 +1232,7 @@ impl ApplicationHandler for TerraApp {
                     .is_none_or(|deadline| Instant::now() >= deadline)
                 && self.last_refine.elapsed().as_millis() >= REFINE_INTERVAL_MS
             {
+                self.optional_refine_not_before = None;
                 self.full_field_refine_not_before = None;
                 if self.scheduler.advance_quality() {
                     // HD preview: skip Medium so Camera/Zone sees Full carve sooner.
@@ -1160,6 +1373,18 @@ impl ApplicationHandler for TerraApp {
                 diagnostics.pointer_samples,
                 diagnostics.elapsed.as_micros()
             );
+            if diagnostics.elapsed > Duration::from_millis(super::LOGICAL_FRAME_HOST_BUDGET_MS) {
+                self.frame_trace.record(
+                    Instant::now(),
+                    FrameTraceEventKind::HeartbeatOverBudget,
+                    Some(diagnostics.identity),
+                    Some(diagnostics.phase),
+                    None,
+                    None,
+                    None,
+                    Some(diagnostics.elapsed),
+                );
+            }
         }
     }
 }

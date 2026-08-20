@@ -13,6 +13,9 @@ use crate::compiled_plan::{
     GpuPlanResourceKey,
 };
 use crate::effect_filter::{effect_filter_gpu_spec, EffectFilterGpuPasses};
+use crate::evaluation_timing::{
+    GpuEvaluationTimer, GpuEvaluationTiming, GpuEvaluationTraceContext,
+};
 use crate::graph::{
     compile_gpu_graph, expand_dirty_rect, gpu_blend_mode, GpuComputeGraph, GpuDirtyPolicy,
     GpuFallbackCode, GpuFallbackDiagnostic, GpuFallbackReason, GpuKernel, GpuLayerPlan,
@@ -602,6 +605,14 @@ struct SculptReconcileU {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GpuEvalStats {
+    pub resolution: u32,
+    pub cold_execution: bool,
+    pub selected_operations: u32,
+    pub dirty_texels: u64,
+    pub resource_prepare_us: u64,
+    pub capability_preflight_us: u64,
+    pub command_encode_us: u64,
+    pub queue_submit_us: u64,
     pub used_layer_zero_region: bool,
     pub sculpt_resampled_texels: u64,
     pub upload_bytes: u64,
@@ -627,6 +638,10 @@ pub struct GpuEvalStats {
     pub plan_workgroups: u64,
     /// Dense height bytes copied back to the CPU by this evaluation.
     pub readback_bytes: u64,
+    /// Per-evaluation mask scratch texture churn. Warm executions should report
+    /// zero allocations and one or more cache reuses when masks are evaluated.
+    pub mask_scratch_texture_allocations: u32,
+    pub mask_scratch_reuses: u32,
 }
 
 impl GpuEvalStats {
@@ -1570,6 +1585,8 @@ pub struct GpuTerrainEngine {
     executed_kernels: Vec<GpuKernel>,
     last_eval_stats: GpuEvalStats,
     last_plan_operation_trace: Vec<GpuPlanOperationTrace>,
+    evaluation_timer: Option<GpuEvaluationTimer>,
+    pending_evaluation_trace: Option<GpuEvaluationTraceContext>,
     #[cfg(test)]
     executed_plan_operations: Vec<PlanOpId>,
 }
@@ -2110,6 +2127,8 @@ impl GpuTerrainEngine {
             executed_kernels: Vec::new(),
             last_eval_stats: GpuEvalStats::default(),
             last_plan_operation_trace: Vec::new(),
+            evaluation_timer: GpuEvaluationTimer::try_new(device),
+            pending_evaluation_trace: None,
             #[cfg(test)]
             executed_plan_operations: Vec::new(),
         }
@@ -2117,6 +2136,23 @@ impl GpuTerrainEngine {
 
     pub fn last_eval_stats(&self) -> GpuEvalStats {
         self.last_eval_stats
+    }
+
+    pub fn set_evaluation_trace_context(&mut self, context: GpuEvaluationTraceContext) {
+        self.pending_evaluation_trace = Some(context);
+    }
+
+    /// Advances timestamp readbacks without waiting for GPU completion.
+    pub fn poll_evaluation_timings(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> Vec<GpuEvaluationTiming> {
+        let Some(timer) = self.evaluation_timer.as_mut() else {
+            return Vec::new();
+        };
+        timer.poll(device, queue.get_timestamp_period());
+        timer.take_completed()
     }
 
     pub fn last_plan_operation_trace(&self) -> &[GpuPlanOperationTrace] {
@@ -5192,9 +5228,12 @@ impl GpuTerrainEngine {
             });
         }
 
+        self.last_eval_stats = GpuEvalStats::default();
+        self.last_eval_stats.resolution = metrics.width.max(metrics.height);
+        let resource_prepare_started = std::time::Instant::now();
         self.ensure_size(device, metrics);
         self.uniform_pool.reset();
-        self.last_eval_stats = GpuEvalStats::default();
+        self.plan_operations.begin_evaluation();
         self.last_plan_operation_trace.clear();
         let quality_changed = self.last_quality.replace(quality) != Some(quality);
         #[cfg(test)]
@@ -5223,6 +5262,10 @@ impl GpuTerrainEngine {
         } else {
             None
         };
+        self.last_eval_stats.cold_execution = cold;
+        self.last_eval_stats.resource_prepare_us =
+            resource_prepare_started.elapsed().as_micros() as u64;
+        let capability_preflight_started = std::time::Instant::now();
 
         let mut requested: Vec<PlanOpId> = if cold {
             plan.operations()
@@ -5449,9 +5492,17 @@ impl GpuTerrainEngine {
                 .take_current()
                 .expect("compatible warm realization checked above")
         });
+        self.last_eval_stats.selected_operations = selected.len() as u32;
+        self.last_eval_stats.capability_preflight_us =
+            capability_preflight_started.elapsed().as_micros() as u64;
+        let command_encode_started = std::time::Instant::now();
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("compiled-terrain-plan"),
         });
+        let evaluation_timing_slot = self
+            .evaluation_timer
+            .as_mut()
+            .and_then(|timer| timer.begin(&mut encoder));
 
         let mut last_height = None;
         let published_output_slots: HashMap<_, _> = plan
@@ -5769,7 +5820,24 @@ impl GpuTerrainEngine {
             metrics.height,
             present_region,
         );
+        let (mask_scratch_texture_allocations, mask_scratch_reuses) =
+            self.plan_operations.mask_scratch_stats();
+        self.last_eval_stats.mask_scratch_texture_allocations =
+            mask_scratch_texture_allocations;
+        self.last_eval_stats.mask_scratch_reuses = mask_scratch_reuses;
+        self.last_eval_stats.dirty_texels =
+            u64::from(present_region.2).saturating_mul(u64::from(present_region.3));
+        if let (Some(timer), Some(slot), Some(context)) = (
+            self.evaluation_timer.as_mut(),
+            evaluation_timing_slot,
+            self.pending_evaluation_trace.take(),
+        ) {
+            timer.finish(&mut encoder, slot, context);
+        }
+        self.last_eval_stats.command_encode_us = command_encode_started.elapsed().as_micros() as u64;
+        let queue_submit_started = std::time::Instant::now();
         queue.submit(Some(encoder.finish()));
+        self.last_eval_stats.queue_submit_us = queue_submit_started.elapsed().as_micros() as u64;
         self.current = 0;
         self.last_dirty_rect = None;
         if warm_execution {
@@ -9188,6 +9256,7 @@ mod smoke_tests {
                 .expect("supported GPU mask");
             assert!(result.fully_gpu);
             assert_eq!(result.resume_cpu_from, None);
+            assert_eq!(engine.last_eval_stats().mask_scratch_texture_allocations, 4);
             let actual = result.cpu.expect("GPU mask readback");
             let max_error = actual
                 .to_dense()
@@ -9199,6 +9268,24 @@ mod smoke_tests {
                 max_error <= 1.0e-3,
                 "GPU mask exceeded documented tolerance: {max_error}"
             );
+
+            engine.mark_dirty(base_id);
+            let warm = engine
+                .evaluate(
+                    &gpu.device,
+                    &gpu.queue,
+                    &stack,
+                    std::slice::from_ref(&asset),
+                    metrics,
+                    PreviewQuality::Draft,
+                    false,
+                    None,
+                )
+                .expect("warm supported GPU mask");
+            assert!(warm.fully_gpu);
+            let warm_stats = engine.last_eval_stats();
+            assert_eq!(warm_stats.mask_scratch_texture_allocations, 0);
+            assert_eq!(warm_stats.mask_scratch_reuses, 1);
         }
     }
 
@@ -11593,7 +11680,7 @@ mod smoke_tests {
     /// Manual release probe for the acceptance resolutions. Adapter timing is
     /// reported, not asserted, because CI hardware is intentionally variable.
     #[test]
-    #[ignore = "run in release mode to record #150 adapter timings"]
+    #[ignore = "run in release mode to record #150/#152 adapter timings"]
     fn untitled6_release_timing_probe_2048_4096() {
         let Some(gpu) = terra_test_gpu::headless() else {
             return;
@@ -11685,9 +11772,150 @@ mod smoke_tests {
             assert!(warm_result.fully_gpu);
             assert!(warm_result.cpu_fallback.is_none());
             assert_eq!(warm_stats.readback_bytes, 0);
+
+            let mut transition_full_ms = Vec::with_capacity(10);
+            for sample in 0..10 {
+                let draft = engine
+                    .evaluate_compiled_with_intent(
+                        &gpu.device,
+                        &gpu.queue,
+                        &document.stack,
+                        &document.masks,
+                        cache.current_plan().unwrap(),
+                        cache.structure_revision(),
+                        &PlanInvalidation::default(),
+                        document.metrics,
+                        PreviewQuality::Draft,
+                        false,
+                        GpuEvaluationIntent::Complete,
+                    )
+                    .unwrap();
+                let _ = gpu.device.poll(wgpu::Maintain::Wait);
+                assert!(draft.fully_gpu);
+                document
+                    .stack
+                    .find_mut(ids.base)
+                    .unwrap()
+                    .apply_brush(
+                        SculptStrokeKind::Raise,
+                        BrushDab {
+                            u: 0.40 + sample as f32 * 0.002,
+                            v: 0.5,
+                            radius_uv: 0.01,
+                            radius_m: 40.0,
+                            strength: 0.25,
+                            target_height: 0.0,
+                            falloff: 0.5,
+                            continuing: false,
+                        },
+                    );
+                let transition_invalidation = cache
+                    .update(
+                        &document.stack,
+                        &document.masks,
+                        &[TerrainEditClass::Content {
+                            owner: NodeRef::Layer(ids.base),
+                            fields: vec![FieldId::Height],
+                            scope: PlanDirtyScope::Region(UvRect::from_center_radius(
+                                0.40 + sample as f32 * 0.002,
+                                0.5,
+                                0.01,
+                            )),
+                        }],
+                    )
+                    .unwrap();
+                let started = std::time::Instant::now();
+                let full = engine
+                    .evaluate_compiled_with_intent(
+                        &gpu.device,
+                        &gpu.queue,
+                        &document.stack,
+                        &document.masks,
+                        cache.current_plan().unwrap(),
+                        cache.structure_revision(),
+                        &transition_invalidation,
+                        document.metrics,
+                        PreviewQuality::Full,
+                        false,
+                        GpuEvaluationIntent::Complete,
+                    )
+                    .unwrap();
+                let _ = gpu.device.poll(wgpu::Maintain::Wait);
+                assert!(full.fully_gpu);
+                transition_full_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+            }
+            transition_full_ms.sort_by(f64::total_cmp);
+            let transition_p50 =
+                transition_full_ms[(transition_full_ms.len() * 50).div_ceil(100) - 1];
+            let transition_p95 =
+                transition_full_ms[(transition_full_ms.len() * 95).div_ceil(100) - 1];
+            let transition_max = *transition_full_ms.last().unwrap();
+
+            let mut full_ms = Vec::with_capacity(20);
+            for sample in 0..20 {
+                document
+                    .stack
+                    .find_mut(ids.base)
+                    .unwrap()
+                    .apply_brush(
+                        SculptStrokeKind::Raise,
+                        BrushDab {
+                            u: 0.45 + sample as f32 * 0.002,
+                            v: 0.5,
+                            radius_uv: 0.01,
+                            radius_m: 40.0,
+                            strength: 0.25,
+                            target_height: 0.0,
+                            falloff: 0.5,
+                            continuing: false,
+                        },
+                    );
+                let full_invalidation = cache
+                    .update(
+                        &document.stack,
+                        &document.masks,
+                        &[TerrainEditClass::Content {
+                            owner: NodeRef::Layer(ids.base),
+                            fields: vec![FieldId::Height],
+                            scope: PlanDirtyScope::Region(UvRect::from_center_radius(
+                                0.45 + sample as f32 * 0.002,
+                                0.5,
+                                0.01,
+                            )),
+                        }],
+                    )
+                    .unwrap();
+                let started = std::time::Instant::now();
+                let full = engine
+                    .evaluate_compiled_with_intent(
+                        &gpu.device,
+                        &gpu.queue,
+                        &document.stack,
+                        &document.masks,
+                        cache.current_plan().unwrap(),
+                        cache.structure_revision(),
+                        &full_invalidation,
+                        document.metrics,
+                        PreviewQuality::Full,
+                        false,
+                        GpuEvaluationIntent::Complete,
+                    )
+                    .unwrap();
+                let _ = gpu.device.poll(wgpu::Maintain::Wait);
+                assert!(full.fully_gpu);
+                assert_eq!(engine.last_eval_stats().readback_bytes, 0);
+                full_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+            }
+            full_ms.sort_by(f64::total_cmp);
+            let p50 = full_ms[(full_ms.len() * 50).div_ceil(100) - 1];
+            let p95 = full_ms[(full_ms.len() * 95).div_ceil(100) - 1];
+            let max = *full_ms.last().unwrap();
             println!(
-                "issue150 resolution={res} adapter={:?} cold_ms={cold_ms:.3} warm_ms={warm_ms:.3} cold_stats={cold_stats:?} warm_stats={warm_stats:?} cold_plan_stats={cold_plan_stats:?} warm_plan_stats={warm_plan_stats:?}",
+                "issue150_152 resolution={res} adapter={:?} cold_ms={cold_ms:.3} warm_ms={warm_ms:.3} transition_n={} transition_full_p50_ms={transition_p50:.3} transition_full_p95_ms={transition_p95:.3} transition_full_max_ms={transition_max:.3} resident_n={} resident_full_p50_ms={p50:.3} resident_full_p95_ms={p95:.3} resident_full_max_ms={max:.3} cold_stats={cold_stats:?} warm_stats={warm_stats:?} full_stats={:?} cold_plan_stats={cold_plan_stats:?} warm_plan_stats={warm_plan_stats:?}",
                 gpu.adapter_info,
+                transition_full_ms.len(),
+                full_ms.len(),
+                engine.last_eval_stats(),
             );
         }
     }

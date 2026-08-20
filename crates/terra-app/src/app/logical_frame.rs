@@ -6,6 +6,10 @@ use std::time::{Duration, Instant};
 pub(crate) struct LogicalFrameId(u64);
 
 impl LogicalFrameId {
+    pub(crate) const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
     pub(crate) const fn get(self) -> u64 {
         self.0
     }
@@ -67,7 +71,7 @@ pub(crate) enum FrameRequestReason {
     ScheduledWork,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct FrameIdentity {
     pub(crate) id: LogicalFrameId,
     pub(crate) generation_at_start: EditGeneration,
@@ -81,6 +85,7 @@ pub(crate) struct FrameWorkBudget {
 }
 
 impl FrameWorkBudget {
+    #[cfg(test)]
     pub(crate) fn unbounded(started_at: Instant) -> Self {
         Self {
             started_at,
@@ -88,7 +93,6 @@ impl FrameWorkBudget {
         }
     }
 
-    #[cfg(test)]
     fn bounded(started_at: Instant, duration: Duration) -> Self {
         Self {
             started_at,
@@ -181,7 +185,10 @@ impl LogicalFrameCoordinator {
             reason,
             input_events,
             pointer_samples,
-            budget: FrameWorkBudget::unbounded(now),
+            budget: FrameWorkBudget::bounded(
+                now,
+                Duration::from_millis(super::LOGICAL_FRAME_HOST_BUDGET_MS),
+            ),
         });
         Some(identity)
     }
@@ -219,6 +226,14 @@ impl LogicalFrameCoordinator {
 
     pub(crate) fn active_phase(&self) -> Option<FramePhase> {
         self.active.map(|active| active.phase)
+    }
+
+    pub(crate) fn pending_identity(&self) -> Option<FrameIdentity> {
+        self.pending.map(|(id, generation, _)| FrameIdentity {
+            id,
+            generation_at_start: generation,
+            generation,
+        })
     }
 
     pub(crate) fn can_start_optional(&self, now: Instant) -> bool {

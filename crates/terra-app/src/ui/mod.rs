@@ -1268,6 +1268,16 @@ pub struct FrameProfile {
     /// Interaction/generation observability required by #148.
     pub first_visible_preview_us: u64,
     pub settled_authoritative_us: u64,
+    pub brush_trace_samples: usize,
+    pub input_visible_p50_us: u64,
+    pub input_visible_p95_us: u64,
+    pub input_visible_max_us: u64,
+    pub refinement_p50_us: u64,
+    pub refinement_p95_us: u64,
+    pub refinement_max_us: u64,
+    pub follow_up_press_p50_us: u64,
+    pub follow_up_press_p95_us: u64,
+    pub follow_up_press_max_us: u64,
     pub plan: terra_core::terrain_plan::PlanCacheStatsSnapshot,
     pub gpu: terra_gpu::GpuEvalStats,
     pub cpu_worker: terra_core::eval::EvalWorkerStatsSnapshot,
@@ -1288,6 +1298,8 @@ pub struct FrameProfile {
     pub tile_uploads_pending: usize,
     /// GPU terrain pass microseconds (0 if TIMESTAMP_QUERY unsupported).
     pub gpu_terrain_us: u64,
+    /// Compiled terrain evaluation GPU microseconds (delayed timestamp readback).
+    pub gpu_evaluation_us: u64,
     /// GPU shadow pass microseconds.
     pub gpu_shadow_us: u64,
     pub gpu_timestamps_supported: bool,

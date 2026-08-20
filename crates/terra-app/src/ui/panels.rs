@@ -572,6 +572,30 @@ fn profiler_panel(ui: &mut GuiContext<'_>, ui_state: &UiState) {
     label(ui, &format!("Generation ID: {}", p.gen_id));
     label(
         ui,
+        &format!(
+            "Base trace (n={}): input-visible p50/p95/max {} / {} / {} us",
+            p.brush_trace_samples,
+            p.input_visible_p50_us,
+            p.input_visible_p95_us,
+            p.input_visible_max_us
+        ),
+    );
+    label(
+        ui,
+        &format!(
+            "Release-refined p50/p95/max {} / {} / {} us",
+            p.refinement_p50_us, p.refinement_p95_us, p.refinement_max_us
+        ),
+    );
+    label(
+        ui,
+        &format!(
+            "Release-next press p50/p95/max {} / {} / {} us",
+            p.follow_up_press_p50_us, p.follow_up_press_p95_us, p.follow_up_press_max_us
+        ),
+    );
+    label(
+        ui,
         &format!("Quality: {}  |  Tex {}x{}", p.quality, p.tex_w, p.tex_h),
     );
     label(
@@ -602,6 +626,10 @@ fn profiler_panel(ui: &mut GuiContext<'_>, ui_state: &UiState) {
     label(ui, &format!("Layer eval:  {:>6} us", p.eval_us));
     label(
         ui,
+        &format!("GPU eval:    {:>6} us (delayed)", p.gpu_evaluation_us),
+    );
+    label(
+        ui,
         &format!(
             "Visible/settled: {:>6} / {:>6} us",
             p.first_visible_preview_us, p.settled_authoritative_us
@@ -627,6 +655,27 @@ fn profiler_panel(ui: &mut GuiContext<'_>, ui_state: &UiState) {
             p.gpu.operations_reused,
             p.gpu.operations_deferred,
             p.gpu.plan_workgroups
+        ),
+    );
+    label(
+        ui,
+        &format!(
+            "Eval prep/preflight/encode/submit: {}/{}/{}/{} us  |  {} {}² ops {} dirty {} texels",
+            p.gpu.resource_prepare_us,
+            p.gpu.capability_preflight_us,
+            p.gpu.command_encode_us,
+            p.gpu.queue_submit_us,
+            if p.gpu.cold_execution { "cold" } else { "warm" },
+            p.gpu.resolution,
+            p.gpu.selected_operations,
+            p.gpu.dirty_texels
+        ),
+    );
+    label(
+        ui,
+        &format!(
+            "Mask scratch alloc/reuse: {}/{}",
+            p.gpu.mask_scratch_texture_allocations, p.gpu.mask_scratch_reuses
         ),
     );
     label(
