@@ -8771,9 +8771,9 @@ mod smoke_tests {
         assert_eq!(engine.last_quality, None);
     }
 
-    /// Revert check for #47: solo filtering is a tree operation, not a flat GPU stack.
+    /// #146: solo filtering is compiled as tree selection and executes without fallback.
     #[test]
-    fn solo_stack_requires_cpu_tree_evaluation() {
+    fn solo_stack_executes_compiled_tree_plan() {
         let Some(gpu) = terra_test_gpu::headless() else {
             return;
         };
@@ -8789,23 +8789,33 @@ mod smoke_tests {
         stack.push(solo);
         let mut sibling = Layer::new("Sibling", LayerKind::Flat(FlatParams { height: 50.0 }));
         sibling.common.blend = BlendMode::Add;
+        sibling
+            .common
+            .param_bindings
+            .push(ParamBinding::new("height", BindingSource::Constant(0.5)));
         stack.push(sibling);
 
         let expected = cpu_oracle(&stack, metrics);
         assert!((expected.get(8, 8) - 20.0).abs() < 1.0e-4);
 
         let mut engine = GpuTerrainEngine::new(&gpu.device, metrics.width);
-        let result = engine.evaluate(
-            &gpu.device,
-            &gpu.queue,
-            &stack,
-            &[],
-            metrics,
-            PreviewQuality::Draft,
-            true,
-            None,
-        );
-        assert!(matches!(result, Err(GpuError::RequiresCpu(_))));
+        let result = engine
+            .evaluate(
+                &gpu.device,
+                &gpu.queue,
+                &stack,
+                &[],
+                metrics,
+                PreviewQuality::Draft,
+                true,
+                None,
+            )
+            .expect("compiled solo plan should execute on the GPU");
+        assert!(result.fully_gpu);
+        assert_eq!(result.cpu_fallback, None);
+        assert_eq!(result.resume_cpu_from, None);
+        let actual = result.cpu.expect("GPU readback");
+        assert!((actual.get(8, 8) - expected.get(8, 8)).abs() < 0.01);
     }
 
     #[test]

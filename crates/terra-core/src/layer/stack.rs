@@ -15,6 +15,20 @@ pub enum StackNode {
     Group(LayerGroup),
 }
 
+impl StackNode {
+    /// Whether this node is, or contains, an authored solo layer.
+    ///
+    /// Enabled state is intentionally ignored. Solo filtering is selected at a
+    /// sibling boundary before disabled nodes are treated as identity work, which
+    /// matches the authoritative tree evaluator.
+    pub fn contains_solo(&self) -> bool {
+        match self {
+            Self::Layer(layer) => layer.common.solo,
+            Self::Group(group) => group.children.iter().any(Self::contains_solo),
+        }
+    }
+}
+
 /// Composition unit: children evaluate as a subtree, then (for isolated groups)
 /// the result is mixed onto the parent stack with opacity × group masks.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -575,7 +589,7 @@ impl LayerStack {
     /// Scoped groups compose their children as a unit, while solo mode filters sibling
     /// nodes at each tree level. Neither contract can be represented by a flattened suffix.
     pub fn requires_tree_evaluation(&self) -> bool {
-        self.has_scoped_groups() || self.flatten_layers().iter().any(|layer| layer.common.solo)
+        self.has_scoped_groups() || self.nodes.iter().any(StackNode::contains_solo)
     }
 
     pub fn index_of(&self, id: LayerId) -> Option<usize> {

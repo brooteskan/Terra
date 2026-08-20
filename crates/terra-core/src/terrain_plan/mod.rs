@@ -37,4 +37,6 @@ pub use ir::{
     CompiledTerrainPlan, GroupAuxComposite, GroupCompositeMode, LogicalField, LogicalFieldKind,
     PlanBuildError, PlanOrigin, SeedSource, TerrainOp, TerrainOpKind, TerrainPlanBuilder,
 };
-pub use provenance::{OutputProvenance, PlanAuthoredDependency, PlanOpSpan, PlanProvenance};
+pub use provenance::{
+    OutputProvenance, PlanAuthoredDependency, PlanNodeSelection, PlanOpSpan, PlanProvenance,
+};

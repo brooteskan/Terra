@@ -7,12 +7,12 @@ use terra_core::layer::{
     BindingSource, BlendMode, BlurParams, CanyonParams, DomainWarpParams, DuneParams,
     EffectFilterKind, EffectFilterParams, FbmParams, FlatParams, FractalNoiseType,
     HydraulicErosionParams, ImportHeightmapParams, IslandParams, LandscapeEvolutionParams, Layer,
-    LayerKind, LayerStack, MesaParams, MountainParams, MultiScaleAmplifyParams, NoiseParams,
-    ParamBinding, PathNode, PathParams, PlateauParams, PolygonHeightMode, PolygonHeightParams,
-    ProceduralGenerator, ProceduralShapeParams, RampParams, RiverCarveParams, SculptParams,
-    SculptPoint, SculptStroke, SculptStrokeKind, SculptStrokeParams, Stamp2dParams,
-    StreamPowerParams, TerraceParams, ThermalErosionParams, UpliftParams, VolcanoParams,
-    VoronoiParams,
+    LayerGroup, LayerKind, LayerStack, MesaParams, MountainParams, MultiScaleAmplifyParams,
+    NoiseParams, ParamBinding, PathNode, PathParams, PlateauParams, PolygonHeightMode,
+    PolygonHeightParams, ProceduralGenerator, ProceduralShapeParams, RampParams, RiverCarveParams,
+    SculptParams, SculptPoint, SculptStroke, SculptStrokeKind, SculptStrokeParams, StackNode,
+    Stamp2dParams, StreamPowerParams, TerraceParams, ThermalErosionParams, UpliftParams,
+    VolcanoParams, VoronoiParams,
 };
 use terra_core::mask::{bake_mask_assets, MaskAsset, MaskId, MaskRef, MaskSource};
 use terra_gpu::parity::{
@@ -154,6 +154,101 @@ fn gpu_required_authored_stack_matches_cpu_with_named_tolerance() {
     let cpu = cpu_oracle(&stack, std::slice::from_ref(&mask), metrics);
     let gpu = gpu_eval(&stack, std::slice::from_ref(&mask), metrics);
     assert_field_parity("stack.flat-ramp-constant-mask", &gpu, &cpu, EXACT_HEIGHT);
+}
+
+#[test]
+fn gpu_required_solo_tree_matrix_matches_cpu_oracle() {
+    let metrics = HeightfieldMetrics::new(24, 24, 240.0, 240.0);
+    let additive = |name: &str, height: f32, solo: bool| {
+        let mut layer = Layer::new(name, LayerKind::Flat(FlatParams { height }));
+        layer.common.blend = BlendMode::Add;
+        layer.common.solo = solo;
+        layer
+    };
+    let mut fixtures = Vec::new();
+
+    let mut root = LayerStack::new();
+    root.push(Layer::new(
+        "excluded base",
+        LayerKind::Flat(FlatParams { height: 100.0 }),
+    ));
+    root.push(additive("root solo", 20.0, true));
+    root.push(additive("excluded sibling", 50.0, false));
+    fixtures.push(("solo.root", root));
+
+    let mut folder = LayerGroup::new("Folder");
+    folder
+        .children
+        .push(StackNode::Layer(additive("excluded child", 11.0, false)));
+    folder
+        .children
+        .push(StackNode::Layer(additive("folder solo", 7.0, true)));
+    let mut pass_through = LayerStack::new();
+    pass_through.push(additive("excluded root", 90.0, false));
+    pass_through.push_group(folder);
+    fixtures.push(("solo.pass-through", pass_through));
+
+    let mut isolated = LayerGroup::isolated("Isolated");
+    isolated.opacity = 0.5;
+    isolated
+        .children
+        .push(StackNode::Layer(additive("excluded private", 70.0, false)));
+    isolated
+        .children
+        .push(StackNode::Layer(additive("isolated solo", 30.0, true)));
+    let mut isolated_stack = LayerStack::new();
+    isolated_stack.push(additive("excluded parent", 10.0, false));
+    isolated_stack.push_group(isolated);
+    fixtures.push(("solo.isolated", isolated_stack));
+
+    let mut first = LayerGroup::new("First");
+    first
+        .children
+        .push(StackNode::Layer(additive("first solo", 2.0, true)));
+    first
+        .children
+        .push(StackNode::Layer(additive("first excluded", 3.0, false)));
+    let mut second = LayerGroup::new("Second");
+    second
+        .children
+        .push(StackNode::Layer(additive("second excluded", 6.0, false)));
+    second
+        .children
+        .push(StackNode::Layer(additive("second solo", 5.0, true)));
+    let mut multiple = LayerStack::new();
+    multiple.push_group(first);
+    multiple.push(additive("root excluded", 100.0, false));
+    multiple.push_group(second);
+    fixtures.push(("solo.multiple", multiple));
+
+    let mut inner = LayerGroup::new("Inner");
+    inner
+        .children
+        .push(StackNode::Layer(additive("inner excluded", 8.0, false)));
+    inner
+        .children
+        .push(StackNode::Layer(additive("inner solo", 4.0, true)));
+    let mut outer = LayerGroup::new("Outer");
+    outer
+        .children
+        .push(StackNode::Layer(additive("outer solo", 3.0, true)));
+    outer.children.push(StackNode::Group(inner));
+    let mut nested = LayerStack::new();
+    nested.push_group(outer);
+    fixtures.push(("solo.nested", nested));
+
+    let mut disabled = additive("disabled solo", 25.0, true);
+    disabled.common.enabled = false;
+    let mut disabled_stack = LayerStack::new();
+    disabled_stack.push(additive("excluded by disabled solo", 100.0, false));
+    disabled_stack.push(disabled);
+    fixtures.push(("solo.disabled", disabled_stack));
+
+    for (name, stack) in fixtures {
+        let cpu = cpu_oracle(&stack, &[], metrics);
+        let gpu = gpu_eval(&stack, &[], metrics);
+        assert_field_parity(name, &gpu, &cpu, EXACT_HEIGHT);
+    }
 }
 
 #[test]

@@ -1,6 +1,6 @@
 //! Recursive lowering from the authored layer tree into the terrain-plan IR.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::deps::NodeRef;
 use crate::field_data::FieldId;
@@ -16,8 +16,8 @@ use crate::mask::{
 
 use super::{
     CompiledTerrainPlan, FieldSlot, GroupAuxComposite, GroupCompositeMode, LogicalFieldKind,
-    PlanBuildError, PlanOrigin, SeedSource, TerrainOp, TerrainOpKind, TerrainPlanBuilder,
-    TerrainPlanStamp,
+    PlanBuildError, PlanNodeSelection, PlanOrigin, SeedSource, TerrainOp, TerrainOpKind,
+    TerrainPlanBuilder, TerrainPlanStamp,
 };
 
 /// A source-owned problem that prevents deterministic plan lowering.
@@ -33,8 +33,6 @@ pub enum TerrainPlanDiagnostic {
     MissingOutput { owner: NodeRef, output: OutputId },
     #[error("{owner:?} cannot publish unavailable field {field:?}")]
     UnavailableField { owner: NodeRef, field: FieldId },
-    #[error("solo layer {layer:?} is deferred to the solo-plan compiler")]
-    UnsupportedSolo { layer: LayerId },
     #[error("selected-field input for group {group:?} is deferred to cross-edge compilation")]
     UnsupportedSelectedField { group: LayerId },
     #[error("output binding on {owner:?} is deferred to cross-edge compilation")]
@@ -48,8 +46,8 @@ pub enum TerrainPlanDiagnostic {
 /// Compile one authored stack for a particular structural revision.
 ///
 /// The compiler reads payload metadata but stores no CPU fields or backend
-/// resources. Disabled nodes emit no operations. Solo and selected-field
-/// semantics fail explicitly until their dedicated compiler phases land.
+/// resources. Disabled and solo-excluded nodes emit no operations. Selected-field
+/// semantics fail explicitly until their dedicated compiler phase lands.
 pub fn compile_terrain_plan(
     stack: &LayerStack,
     mask_assets: &[MaskAsset],
@@ -60,9 +58,15 @@ pub fn compile_terrain_plan(
         return Err(diagnostics);
     }
 
+    let selection = collect_plan_node_selection(&stack.nodes);
+    let mut builder = TerrainPlanBuilder::new(stamp);
+    for (owner, node_selection) in &selection {
+        builder.record_node_selection(*owner, *node_selection);
+    }
     let mut compiler = Compiler {
-        builder: TerrainPlanBuilder::new(stamp),
+        builder,
         mask_assets,
+        selection: selection.into_iter().collect(),
     };
     let root = compiler
         .builder
@@ -131,6 +135,7 @@ impl PlanState {
 struct Compiler<'a> {
     builder: TerrainPlanBuilder,
     mask_assets: &'a [MaskAsset],
+    selection: HashMap<NodeRef, PlanNodeSelection>,
 }
 
 impl Compiler<'_> {
@@ -140,6 +145,16 @@ impl Compiler<'_> {
         state: &mut PlanState,
     ) -> Result<(), TerrainPlanDiagnostic> {
         for node in nodes {
+            let owner = node_ref(node);
+            if !self
+                .selection
+                .get(&owner)
+                .copied()
+                .unwrap_or(PlanNodeSelection::Unfiltered)
+                .participates()
+            {
+                continue;
+            }
             match node {
                 StackNode::Layer(layer) if layer.common.enabled => {
                     self.compile_layer(layer, state)?
@@ -560,6 +575,42 @@ fn collect_node_masks(node: &DistNode, masks: &mut Vec<MaskId>) {
     }
 }
 
+fn collect_plan_node_selection(nodes: &[StackNode]) -> Vec<(NodeRef, PlanNodeSelection)> {
+    fn walk(
+        nodes: &[StackNode],
+        ancestor_participates: bool,
+        selection: &mut Vec<(NodeRef, PlanNodeSelection)>,
+    ) {
+        let soloing = ancestor_participates && nodes.iter().any(StackNode::contains_solo);
+        for node in nodes {
+            let node_selection = if !ancestor_participates {
+                PlanNodeSelection::ExcludedBySolo
+            } else if !soloing {
+                PlanNodeSelection::Unfiltered
+            } else if node.contains_solo() {
+                PlanNodeSelection::IncludedBySolo
+            } else {
+                PlanNodeSelection::ExcludedBySolo
+            };
+            selection.push((node_ref(node), node_selection));
+            if let StackNode::Group(group) = node {
+                walk(&group.children, node_selection.participates(), selection);
+            }
+        }
+    }
+
+    let mut selection = Vec::new();
+    walk(nodes, true, &mut selection);
+    selection
+}
+
+fn node_ref(node: &StackNode) -> NodeRef {
+    match node {
+        StackNode::Layer(layer) => NodeRef::Layer(layer.id()),
+        StackNode::Group(group) => NodeRef::Group(group.id),
+    }
+}
+
 fn preflight(stack: &LayerStack, mask_assets: &[MaskAsset]) -> Vec<TerrainPlanDiagnostic> {
     let known_masks: HashSet<_> = mask_assets.iter().map(|asset| asset.id).collect();
     let mut node_ids = HashSet::new();
@@ -618,9 +669,6 @@ fn collect_reference_diagnostics(
         match node {
             StackNode::Layer(layer) if layer.common.enabled => {
                 let owner = NodeRef::Layer(layer.id());
-                if layer.common.solo {
-                    diagnostics.push(TerrainPlanDiagnostic::UnsupportedSolo { layer: layer.id() });
-                }
                 validate_distribution(owner, &layer.common.masks, known_masks, diagnostics);
                 for binding in &layer.common.param_bindings {
                     match binding.source {

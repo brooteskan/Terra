@@ -7,8 +7,8 @@ use terra_core::layer::{
 };
 use terra_core::mask::{DistNode, MaskAsset, MaskId, MaskRef, MaskSource};
 use terra_core::terrain_plan::{
-    compile_terrain_plan, GroupCompositeMode, PlanStructureRevision, SeedSource, TerrainOpKind,
-    TerrainPlanDiagnostic, TerrainPlanStamp,
+    compile_terrain_plan, GroupCompositeMode, PlanNodeSelection, PlanStructureRevision, SeedSource,
+    TerrainOpKind, TerrainPlanDiagnostic, TerrainPlanStamp,
 };
 
 fn stamp() -> TerrainPlanStamp {
@@ -293,28 +293,180 @@ fn parameter_changes_preserve_signature_but_reordering_changes_it() {
 }
 
 #[test]
-fn deferred_semantics_and_broken_nested_mask_refs_are_diagnostic() {
-    let missing = MaskId::new();
-    let mut solo = flat(70, 1.0);
+fn root_solo_filters_siblings_and_records_selection_provenance() {
+    let base = flat(70, 100.0);
+    let base_id = base.id();
+    let mut solo = flat(71, 20.0);
     solo.common.solo = true;
-    solo.common
+    let solo_id = solo.id();
+    let sibling = flat(72, 50.0);
+    let sibling_id = sibling.id();
+    let mut stack = LayerStack::new();
+    stack.push(base);
+    stack.push(solo);
+    stack.push(sibling);
+
+    let plan = compile_terrain_plan(&stack, &[], stamp()).expect("solo plan");
+    assert_eq!(
+        shape(&plan),
+        ["seed:Zero", "kernel:flat", "mask", "layer-composite"]
+    );
+    assert_eq!(
+        plan.provenance().selection_for(NodeRef::Layer(solo_id)),
+        Some(PlanNodeSelection::IncludedBySolo)
+    );
+    for excluded in [base_id, sibling_id] {
+        let owner = NodeRef::Layer(excluded);
+        assert_eq!(
+            plan.provenance().selection_for(owner),
+            Some(PlanNodeSelection::ExcludedBySolo)
+        );
+        assert!(plan.provenance().operations_for(owner).is_empty());
+        assert!(plan.provenance().fields_for(owner).is_empty());
+    }
+}
+
+#[test]
+fn solo_paths_preserve_pass_through_and_isolated_ancestors() {
+    let mut selected = flat(83, 25.0);
+    selected.common.solo = true;
+    let selected_id = selected.id();
+    let excluded_id = LayerId::from_u128(84);
+    let mut folder = LayerGroup::new("Folder");
+    folder.id = LayerId::from_u128(82);
+    folder.children.push(StackNode::Layer(selected));
+    folder.children.push(StackNode::Layer(flat(84, 50.0)));
+    let mut isolated = LayerGroup::isolated("Isolated");
+    isolated.id = LayerId::from_u128(81);
+    isolated.children.push(StackNode::Group(folder));
+    let mut stack = LayerStack::new();
+    stack.push(flat(80, 10.0));
+    stack.push_group(isolated);
+
+    let plan = compile_terrain_plan(&stack, &[], stamp()).expect("nested solo plan");
+    assert_eq!(
+        plan.operations()
+            .iter()
+            .filter(|operation| matches!(operation.kind, TerrainOpKind::CompositeGroup { .. }))
+            .count(),
+        1
+    );
+    for owner in [
+        NodeRef::Group(LayerId::from_u128(81)),
+        NodeRef::Group(LayerId::from_u128(82)),
+        NodeRef::Layer(selected_id),
+    ] {
+        assert_eq!(
+            plan.provenance().selection_for(owner),
+            Some(PlanNodeSelection::IncludedBySolo)
+        );
+        assert!(!plan.provenance().spans_for(owner).is_empty());
+    }
+    assert_eq!(
+        plan.provenance().selection_for(NodeRef::Layer(excluded_id)),
+        Some(PlanNodeSelection::ExcludedBySolo)
+    );
+}
+
+#[test]
+fn multiple_solo_branches_compile_in_authored_order() {
+    let mut first_solo = flat(92, 2.0);
+    first_solo.common.solo = true;
+    let mut first = LayerGroup::new("First");
+    first.id = LayerId::from_u128(91);
+    first.children.push(StackNode::Layer(first_solo));
+    first.children.push(StackNode::Layer(flat(93, 3.0)));
+
+    let mut second_solo = flat(95, 5.0);
+    second_solo.common.solo = true;
+    let mut second = LayerGroup::new("Second");
+    second.id = LayerId::from_u128(94);
+    second.children.push(StackNode::Layer(flat(96, 6.0)));
+    second.children.push(StackNode::Layer(second_solo));
+
+    let mut stack = LayerStack::new();
+    stack.push_group(first);
+    stack.push(flat(90, 1.0));
+    stack.push_group(second);
+    let first = compile_terrain_plan(&stack, &[], stamp()).expect("multiple solo plan");
+    let second = compile_terrain_plan(&stack, &[], stamp()).expect("deterministic solo plan");
+    let kernels: Vec<_> = first
+        .operations()
+        .iter()
+        .filter_map(|operation| match operation.kind {
+            TerrainOpKind::RunLayerKernel { layer, .. } => Some(layer),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(kernels, [LayerId::from_u128(92), LayerId::from_u128(95)]);
+    assert_eq!(first.structure_signature(), second.structure_signature());
+    assert_eq!(first.operations(), second.operations());
+}
+
+#[test]
+fn disabled_solo_nodes_select_but_emit_no_work() {
+    let mut disabled_solo = flat(101, 10.0);
+    disabled_solo.common.enabled = false;
+    disabled_solo.common.solo = true;
+    let disabled_id = disabled_solo.id();
+    let mut stack = LayerStack::new();
+    stack.push(flat(100, 1.0));
+    stack.push(disabled_solo);
+    let plan = compile_terrain_plan(&stack, &[], stamp()).expect("disabled solo plan");
+    assert_eq!(shape(&plan), ["seed:Zero"]);
+    assert_eq!(
+        plan.provenance().selection_for(NodeRef::Layer(disabled_id)),
+        Some(PlanNodeSelection::IncludedBySolo)
+    );
+
+    let mut nested_solo = flat(104, 4.0);
+    nested_solo.common.solo = true;
+    let mut disabled_group = LayerGroup::isolated("Disabled solo group");
+    disabled_group.id = LayerId::from_u128(103);
+    disabled_group.enabled = false;
+    disabled_group.children.push(StackNode::Layer(nested_solo));
+    let mut nested_stack = LayerStack::new();
+    nested_stack.push(flat(102, 2.0));
+    nested_stack.push_group(disabled_group);
+    let nested = compile_terrain_plan(&nested_stack, &[], stamp()).expect("disabled group plan");
+    assert_eq!(shape(&nested), ["seed:Zero"]);
+    assert_eq!(
+        nested
+            .provenance()
+            .selection_for(NodeRef::Group(LayerId::from_u128(103))),
+        Some(PlanNodeSelection::IncludedBySolo)
+    );
+}
+
+#[test]
+fn solo_toggle_changes_selection_signature_even_when_operations_do_not() {
+    let mut stack = LayerStack::new();
+    stack.push(flat(110, 1.0));
+    let unfiltered = compile_terrain_plan(&stack, &[], stamp()).expect("unfiltered plan");
+    stack.find_mut(LayerId::from_u128(110)).unwrap().common.solo = true;
+    let solo = compile_terrain_plan(&stack, &[], stamp()).expect("solo plan");
+    assert_eq!(unfiltered.operations(), solo.operations());
+    assert_ne!(unfiltered.structure_signature(), solo.structure_signature());
+}
+
+#[test]
+fn deferred_cross_edges_and_broken_nested_mask_refs_are_diagnostic() {
+    let missing = MaskId::new();
+    let mut layer = flat(120, 1.0);
+    layer
+        .common
         .masks
         .push_node(DistNode::mask_ref(MaskRef::new(missing)));
-    let solo_id = solo.id();
     let mut selected = LayerGroup::isolated("Selected");
-    selected.id = LayerId::from_u128(71);
+    selected.id = LayerId::from_u128(121);
     selected.input_mode = GroupInputMode::SelectedField(
         terra_core::layer::SelectedGroupInput::Field(terra_core::field_data::FieldId::Height),
     );
     let mut stack = LayerStack::new();
-    stack.push(solo);
+    stack.push(layer);
     stack.push_group(selected);
 
     let diagnostics = compile_terrain_plan(&stack, &[], stamp()).expect_err("must diagnose");
-    assert!(diagnostics.iter().any(|diagnostic| matches!(
-        diagnostic,
-        TerrainPlanDiagnostic::UnsupportedSolo { layer } if *layer == solo_id
-    )));
     assert!(diagnostics.iter().any(|diagnostic| matches!(
         diagnostic,
         TerrainPlanDiagnostic::MissingMask { mask, .. } if *mask == missing
@@ -322,6 +474,6 @@ fn deferred_semantics_and_broken_nested_mask_refs_are_diagnostic() {
     assert!(diagnostics.iter().any(|diagnostic| matches!(
         diagnostic,
         TerrainPlanDiagnostic::UnsupportedSelectedField { group }
-            if *group == LayerId::from_u128(71)
+            if *group == LayerId::from_u128(121)
     )));
 }

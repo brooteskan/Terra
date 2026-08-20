@@ -4,8 +4,8 @@ use std::hash::{Hash, Hasher};
 
 use super::{
     analysis::validate_and_analyze, ExpectedFieldKind, FieldSlot, PlanAnalysis,
-    PlanAuthoredDependency, PlanOpId, PlanOpSpan, PlanProvenance, PlanStructureRevision,
-    PlanStructureSignature, TerrainPlanStamp,
+    PlanAuthoredDependency, PlanNodeSelection, PlanOpId, PlanOpSpan, PlanProvenance,
+    PlanStructureRevision, PlanStructureSignature, TerrainPlanStamp,
 };
 use crate::deps::{DepKind, NodeRef};
 use crate::field_data::FieldId;
@@ -311,6 +311,7 @@ pub struct TerrainPlanBuilder {
     stamp: TerrainPlanStamp,
     fields: Vec<LogicalField>,
     operations: Vec<TerrainOp>,
+    node_selection: Vec<(NodeRef, PlanNodeSelection)>,
     owner_spans: Vec<(NodeRef, PlanOpSpan)>,
     owner_fields: Vec<(NodeRef, FieldSlot)>,
     output_owners: Vec<(OutputId, NodeRef)>,
@@ -323,6 +324,7 @@ impl TerrainPlanBuilder {
             stamp,
             fields: Vec::new(),
             operations: Vec::new(),
+            node_selection: Vec::new(),
             owner_spans: Vec::new(),
             owner_fields: Vec::new(),
             output_owners: Vec::new(),
@@ -344,6 +346,10 @@ impl TerrainPlanBuilder {
 
     pub fn operation_count(&self) -> usize {
         self.operations.len()
+    }
+
+    pub fn record_node_selection(&mut self, owner: NodeRef, selection: PlanNodeSelection) {
+        self.node_selection.push((owner, selection));
     }
 
     pub fn record_owner_span(&mut self, owner: NodeRef, start: usize, end_exclusive: usize) {
@@ -390,6 +396,9 @@ impl TerrainPlanBuilder {
         check_slot(final_height, field_count)?;
 
         let mut provenance = PlanProvenance::with_capacities(self.operations.len(), field_count);
+        for (owner, selection) in &self.node_selection {
+            provenance.record_node_selection(*owner, *selection);
+        }
         for field in &self.fields {
             provenance.record_field(field.slot, field.origin.authored());
         }
@@ -432,15 +441,7 @@ impl TerrainPlanBuilder {
 
         let analysis =
             validate_and_analyze(&self.fields, &self.operations, &provenance, final_height)?;
-        let structure_signature = structure_signature(
-            &self.fields,
-            &self.operations,
-            &self.owner_spans,
-            &self.owner_fields,
-            &self.output_owners,
-            &self.dependencies,
-            final_height,
-        );
+        let structure_signature = structure_signature(&self, final_height);
         Ok(CompiledTerrainPlan {
             stamp: self.stamp,
             structure_signature,
@@ -454,15 +455,17 @@ impl TerrainPlanBuilder {
 }
 
 fn structure_signature(
-    fields: &[LogicalField],
-    operations: &[TerrainOp],
-    owner_spans: &[(NodeRef, PlanOpSpan)],
-    owner_fields: &[(NodeRef, FieldSlot)],
-    output_owners: &[(OutputId, NodeRef)],
-    dependencies: &[PlanAuthoredDependency],
+    builder: &TerrainPlanBuilder,
     final_height: FieldSlot,
 ) -> PlanStructureSignature {
     let mut hasher = StablePlanHasher::default();
+    let fields = &builder.fields;
+    let operations = &builder.operations;
+    let node_selection = &builder.node_selection;
+    let owner_spans = &builder.owner_spans;
+    let owner_fields = &builder.owner_fields;
+    let output_owners = &builder.output_owners;
+    let dependencies = &builder.dependencies;
     fields.len().hash(&mut hasher);
     for field in fields {
         field.slot.hash(&mut hasher);
@@ -473,6 +476,11 @@ fn structure_signature(
     for operation in operations {
         operation.origin.hash(&mut hasher);
         hash_operation_kind(&operation.kind, &mut hasher);
+    }
+    node_selection.len().hash(&mut hasher);
+    for (owner, selection) in node_selection {
+        owner.hash(&mut hasher);
+        selection.hash(&mut hasher);
     }
     owner_spans.len().hash(&mut hasher);
     for (owner, span) in owner_spans {

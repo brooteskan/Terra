@@ -612,10 +612,10 @@ impl StackEvaluator {
         input: &Heightfield,
     ) -> Result<Heightfield, EvalError> {
         let mut current = input.clone();
-        let soloing = nodes.iter().any(node_contains_solo);
+        let soloing = nodes.iter().any(StackNode::contains_solo);
         for node in nodes {
             ctx.check_cancelled()?;
-            if soloing && !node_contains_solo(node) {
+            if soloing && !node.contains_solo() {
                 continue;
             }
             match node {
@@ -1296,9 +1296,9 @@ fn collect_descendant_layer_ids_into(nodes: &[StackNode], out: &mut Vec<LayerId>
 }
 
 fn record_subtree_cache_hits(ctx: &mut EvalContext, nodes: &[StackNode]) {
-    let soloing = nodes.iter().any(node_contains_solo);
+    let soloing = nodes.iter().any(StackNode::contains_solo);
     for node in nodes {
-        if soloing && !node_contains_solo(node) {
+        if soloing && !node.contains_solo() {
             continue;
         }
         match node {
@@ -1355,13 +1355,6 @@ fn record_reused_layer(ctx: &mut EvalContext, layer: &Layer) {
         tiles_recomputed: None,
         strokes_restamped,
     });
-}
-
-fn node_contains_solo(node: &StackNode) -> bool {
-    match node {
-        StackNode::Layer(layer) => layer.common.solo,
-        StackNode::Group(group) => group.children.iter().any(node_contains_solo),
-    }
 }
 
 fn refresh_point_of_use_masks(ctx: &mut EvalContext, input: &Heightfield) {

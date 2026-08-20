@@ -8,6 +8,26 @@ use crate::ids::OutputId;
 
 use super::{FieldSlot, PlanOpId};
 
+/// How an authored node participates in the compiled solo projection.
+///
+/// This is separate from authored enabled state: a disabled solo node still
+/// participates in selection even though it emits no operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PlanNodeSelection {
+    /// No solo exists at this sibling level, so the node is included normally.
+    Unfiltered,
+    /// A solo exists at this sibling level and this node is on a participating path.
+    IncludedBySolo,
+    /// A solo exists at this or an ancestor sibling level and excludes this node.
+    ExcludedBySolo,
+}
+
+impl PlanNodeSelection {
+    pub const fn participates(self) -> bool {
+        !matches!(self, Self::ExcludedBySolo)
+    }
+}
+
 /// Half-open lexical operation span belonging to an authored layer/group.
 ///
 /// For a group this includes nested child work. Exact operations directly
@@ -38,6 +58,7 @@ pub struct PlanAuthoredDependency {
 /// Stable authored provenance for plan-local operations and logical fields.
 #[derive(Debug, Clone, Default)]
 pub struct PlanProvenance {
+    node_selection: HashMap<NodeRef, PlanNodeSelection>,
     authored_to_ops: HashMap<NodeRef, Vec<PlanOpId>>,
     op_to_authored: Vec<Option<NodeRef>>,
     authored_to_fields: HashMap<NodeRef, Vec<FieldSlot>>,
@@ -50,6 +71,10 @@ pub struct PlanProvenance {
 }
 
 impl PlanProvenance {
+    pub fn selection_for(&self, owner: NodeRef) -> Option<PlanNodeSelection> {
+        self.node_selection.get(&owner).copied()
+    }
+
     pub fn operations_for(&self, owner: NodeRef) -> &[PlanOpId] {
         self.authored_to_ops
             .get(&owner)
@@ -107,6 +132,7 @@ impl PlanProvenance {
 
     pub(crate) fn with_capacities(operation_count: usize, field_count: usize) -> Self {
         Self {
+            node_selection: HashMap::new(),
             authored_to_ops: HashMap::new(),
             op_to_authored: Vec::with_capacity(operation_count),
             authored_to_fields: HashMap::new(),
@@ -117,6 +143,10 @@ impl PlanProvenance {
             authored_consumers: HashMap::new(),
             dependencies: Vec::new(),
         }
+    }
+
+    pub(crate) fn record_node_selection(&mut self, owner: NodeRef, selection: PlanNodeSelection) {
+        self.node_selection.insert(owner, selection);
     }
 
     pub(crate) fn record_operation(&mut self, operation: PlanOpId, owner: Option<NodeRef>) {

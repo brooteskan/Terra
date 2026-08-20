@@ -194,7 +194,7 @@ fn assert_cpu_parity(stack: LayerStack) {
     let planned = plan_interpret(&stack, &plan, metrics);
     let mut context = EvalContext::new(metrics);
     let oracle = StackEvaluator::new()
-        .rebuild_all(&stack, &mut context)
+        .evaluate_nodes(&stack.nodes, &mut context, &Heightfield::zeros(metrics))
         .expect("CPU oracle");
     let max_error = planned
         .to_dense()
@@ -252,4 +252,86 @@ fn nested_and_masked_biome_plan_matches_cpu_oracle() {
     stack.push(flat(19, 30.0));
     stack.push_group(outer_folder);
     assert_cpu_parity(stack);
+}
+
+#[test]
+fn root_and_pass_through_solo_plans_match_cpu_oracle() {
+    let mut root_solo = flat(31, 20.0);
+    root_solo.common.solo = true;
+    root_solo.common.blend = terra_core::layer::BlendMode::Add;
+    let mut root = LayerStack::new();
+    root.push(flat(30, 100.0));
+    root.push(root_solo);
+    root.push(flat(32, 50.0));
+    assert_cpu_parity(root);
+
+    let mut child_solo = flat(35, 7.0);
+    child_solo.common.solo = true;
+    child_solo.common.blend = terra_core::layer::BlendMode::Add;
+    let mut folder = LayerGroup::new("Folder");
+    folder.id = LayerId::from_u128(34);
+    folder.children.push(StackNode::Layer(flat(36, 11.0)));
+    folder.children.push(StackNode::Layer(child_solo));
+    let mut nested = LayerStack::new();
+    nested.push(flat(33, 90.0));
+    nested.push_group(folder);
+    assert_cpu_parity(nested);
+}
+
+#[test]
+fn isolated_and_multiple_solo_branches_match_cpu_oracle() {
+    let mut isolated_solo = flat(42, 30.0);
+    isolated_solo.common.solo = true;
+    let mut isolated = LayerGroup::isolated("Isolated");
+    isolated.id = LayerId::from_u128(41);
+    isolated.input_mode = GroupInputMode::EmptyHeight;
+    isolated.opacity = 0.5;
+    isolated.children.push(StackNode::Layer(flat(43, 70.0)));
+    isolated.children.push(StackNode::Layer(isolated_solo));
+    let mut isolated_stack = LayerStack::new();
+    isolated_stack.push(flat(40, 10.0));
+    isolated_stack.push_group(isolated);
+    assert_cpu_parity(isolated_stack);
+
+    let mut first_solo = flat(52, 2.0);
+    first_solo.common.solo = true;
+    first_solo.common.blend = terra_core::layer::BlendMode::Add;
+    let mut first = LayerGroup::new("First");
+    first.id = LayerId::from_u128(51);
+    first.children.push(StackNode::Layer(first_solo));
+    first.children.push(StackNode::Layer(flat(53, 3.0)));
+    let mut second_solo = flat(55, 5.0);
+    second_solo.common.solo = true;
+    second_solo.common.blend = terra_core::layer::BlendMode::Add;
+    let mut second = LayerGroup::new("Second");
+    second.id = LayerId::from_u128(54);
+    second.children.push(StackNode::Layer(flat(56, 6.0)));
+    second.children.push(StackNode::Layer(second_solo));
+    let mut multiple = LayerStack::new();
+    multiple.push_group(first);
+    multiple.push(flat(50, 100.0));
+    multiple.push_group(second);
+    assert_cpu_parity(multiple);
+}
+
+#[test]
+fn disabled_solo_nodes_match_cpu_oracle() {
+    let mut disabled = flat(61, 25.0);
+    disabled.common.enabled = false;
+    disabled.common.solo = true;
+    let mut disabled_layer = LayerStack::new();
+    disabled_layer.push(flat(60, 100.0));
+    disabled_layer.push(disabled);
+    assert_cpu_parity(disabled_layer);
+
+    let mut nested_solo = flat(64, 15.0);
+    nested_solo.common.solo = true;
+    let mut group = LayerGroup::isolated("Disabled");
+    group.id = LayerId::from_u128(63);
+    group.enabled = false;
+    group.children.push(StackNode::Layer(nested_solo));
+    let mut disabled_group = LayerStack::new();
+    disabled_group.push(flat(62, 100.0));
+    disabled_group.push_group(group);
+    assert_cpu_parity(disabled_group);
 }

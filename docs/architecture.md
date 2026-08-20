@@ -75,7 +75,10 @@ Before a plan becomes executable, validation builds immutable def-use metadata,
 checks field kinds and production order, rejects dependency cycles, and derives
 operation/field liveness plus logical field lifetimes. Provenance is bidirectional:
 authored layers and groups map to their operation spans and fields, named outputs map
-to fields and publisher operations, and operations map back to authored owners.
+to fields and publisher operations, and operations map back to authored owners. The
+plan also records every authored node's solo selection state, including ancestor paths
+and excluded nodes that intentionally own no operations, so diagnostics remain tied to
+stable authoring identities.
 
 `TerrainPlanCache` owns the authored structural revision and the last successfully
 compiled plan. Add/remove/reorder, enable/solo, dependency-placement, and operation
@@ -140,10 +143,13 @@ LayerStack (authored source)
 The plan IR and recursive `LayerStack` compiler are present. The compiler preserves
 bottom-to-top order, pass-through folders, private `CopyInput` / `EmptyHeight` group
 fields, group composites, point-of-use mask operations, explicit auxiliary merges,
-and authored provenance. Solo filtering and selected/cross-tree fields remain explicit
-compile diagnostics until their dedicated compiler phases land. Incremental GPU work
-is selected from plan invalidation and persistent field checkpoints; incremental CPU
-rebuild continues to use `LayerCache` + `mark_dirty_from`.
+and authored provenance. Solo is compiled as a sibling-level tree selection: when a
+sibling list contains a solo descendant, only participating paths are lowered, while
+ancestor containers remain present and disabled participants emit no work. Selected
+and cross-tree fields remain explicit compile diagnostics until their dedicated compiler
+phase lands. Incremental GPU work is selected from plan invalidation and persistent
+field checkpoints; incremental CPU rebuild continues to use `LayerCache` +
+`mark_dirty_from`.
 Progressive preview walks `Draft → Medium → Full`: the app advances the quality ladder
 held on `EvalScheduler` and runs each authoritative CPU pass on the background
 `EvalWorker`.

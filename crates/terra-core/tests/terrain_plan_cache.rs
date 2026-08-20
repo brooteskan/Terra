@@ -6,7 +6,7 @@ use terra_core::ids::LayerId;
 use terra_core::layer::{FlatParams, Layer, LayerKind, LayerStack};
 use terra_core::mask::{MaskId, MaskRef};
 use terra_core::terrain_plan::{
-    PlanDirtyScope, TerrainEditClass, TerrainPlanCache, TerrainPlanDiagnostic,
+    PlanDirtyScope, PlanNodeSelection, TerrainEditClass, TerrainPlanCache, TerrainPlanDiagnostic,
 };
 use terra_core::tiling::UvRect;
 
@@ -164,6 +164,13 @@ fn editor_commands_define_the_structural_revision_boundary() {
         TerrainEditClass::Structure
     );
 
+    let solo = EditorCommand::SetSolo {
+        id,
+        solo: true,
+        previous: false,
+    };
+    assert_eq!(solo.terrain_edit_class(&stack), TerrainEditClass::Structure);
+
     let rename = EditorCommand::Rename {
         id,
         name: "Renamed".into(),
@@ -173,4 +180,76 @@ fn editor_commands_define_the_structural_revision_boundary() {
         rename.terrain_edit_class(&stack),
         TerrainEditClass::ViewOnly
     );
+}
+
+#[test]
+fn solo_toggles_compile_one_transactional_replacement_each() {
+    let solo_id = LayerId::from_u128(22);
+    let mut stack = LayerStack::new();
+    stack.push(flat(21, 10.0));
+    stack.push(flat(22, 20.0));
+    let mut cache = TerrainPlanCache::new();
+    let original_signature = cache
+        .acquire(&stack, &[])
+        .expect("initial plan")
+        .structure_signature();
+
+    stack.find_mut(solo_id).unwrap().common.solo = true;
+    cache
+        .update(&stack, &[], &[TerrainEditClass::Structure])
+        .expect("solo replacement");
+    let solo_plan = cache.current_plan().expect("current solo plan");
+    assert_ne!(solo_plan.structure_signature(), original_signature);
+    assert_eq!(
+        solo_plan
+            .provenance()
+            .selection_for(NodeRef::Layer(solo_id)),
+        Some(PlanNodeSelection::IncludedBySolo)
+    );
+    assert_eq!(cache.stats().snapshot().plan_compiles, 2);
+
+    stack.find_mut(solo_id).unwrap().common.solo = false;
+    cache
+        .update(&stack, &[], &[TerrainEditClass::Structure])
+        .expect("unsolo replacement");
+    assert_eq!(
+        cache
+            .current_plan()
+            .unwrap()
+            .provenance()
+            .selection_for(NodeRef::Layer(solo_id)),
+        Some(PlanNodeSelection::Unfiltered)
+    );
+    assert_eq!(cache.stats().snapshot().plan_compiles, 3);
+    assert_eq!(cache.stats().snapshot().successful_compiles, 3);
+}
+
+#[test]
+fn invalid_solo_candidate_retains_the_last_good_plan() {
+    let solo_id = LayerId::from_u128(32);
+    let mut stack = LayerStack::new();
+    stack.push(flat(31, 10.0));
+    stack.push(flat(32, 20.0));
+    let mut cache = TerrainPlanCache::new();
+    let original_signature = cache
+        .acquire(&stack, &[])
+        .expect("initial plan")
+        .structure_signature();
+
+    let authored = stack.find_mut(solo_id).unwrap();
+    authored.common.solo = true;
+    authored.common.masks.push(MaskRef::new(MaskId::new()));
+    let diagnostics = cache
+        .update(&stack, &[], &[TerrainEditClass::Structure])
+        .expect_err("invalid solo replacement");
+    assert!(diagnostics
+        .iter()
+        .any(|diagnostic| matches!(diagnostic, TerrainPlanDiagnostic::MissingMask { .. })));
+    assert!(cache.current_plan().is_err());
+    assert_eq!(
+        cache.last_good_plan().unwrap().structure_signature(),
+        original_signature
+    );
+    assert_eq!(cache.stats().snapshot().plan_compiles, 2);
+    assert_eq!(cache.stats().snapshot().successful_compiles, 1);
 }
