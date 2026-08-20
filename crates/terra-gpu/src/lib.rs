@@ -3,6 +3,7 @@
 //! Interactive hard rules: GPU-resident heightfields, no UI-thread readback, no mesh rebuild,
 //! dirty-tile compute, incomplete GPU prefixes are never treated as finished Draft.
 
+pub mod compiled_plan;
 pub mod derivatives;
 pub mod effect_filter;
 pub mod engine;

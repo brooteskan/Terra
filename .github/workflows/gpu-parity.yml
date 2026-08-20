@@ -29,4 +29,4 @@ jobs:
       - name: Adapter-independent support matrix
         run: cargo test -p terra-gpu --test support_matrix
       - name: Required GPU parity matrix
-        run: cargo test -p terra-gpu --test parity_matrix
+        run: cargo test -p terra-gpu --features gpu-parity --test parity_matrix

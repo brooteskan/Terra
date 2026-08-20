@@ -90,6 +90,29 @@ a full field. Unobserved auxiliary branches therefore do not globalize an otherw
 height-only suffix. Cache counters expose compiles, hits, patched/reached operations,
 and full-field escalation reasons for tests and profiling.
 
+`terra-gpu::compiled_plan` realizes the validated logical fields as R32Float wgpu
+textures. Final, named-output, root, and reusable composite/aux checkpoints are
+persistent; layer candidates, masks, and isolated-group private slices are transient.
+Transient allocation uses the plan's inclusive operation lifetimes, so storage is
+reused only when `previous.last_operation < next.first_operation`. Inputs and outputs
+used by the same operation therefore never alias, nested private groups remain
+isolated, and disjoint sibling groups can reuse compatible backing storage.
+
+Backend materialization is distinct from semantic dirtiness: when a selected dirty
+operation reads transient scratch, the GPU layout walks backward to reconstruct that
+scratch and stops at persistent checkpoints. Resource realizations are keyed by plan
+structure, extent, scalar format, and device generation. Resolution/resource changes
+re-realize the compatible semantic plan rather than recompiling it. Execution may be
+recorded into a staged resource set and committed only after successful validation and
+submission; dropping a failed candidate leaves the active last-good textures intact.
+
+The field-addressable backend implements zero/copy seeds, supported Constant/Height/
+Slope distributions, standard group blends, biome CopyInput height-delta composition,
+and explicit masked auxiliary publication. Selected fields, distribution nodes, and
+cross-output/observed auxiliary mask inputs remain gated for their dedicated phase.
+The production `GpuTerrainEngine` still uses the flat planner until #144 adopts these
+resources and operations and removes the categorical tree preflight fallback.
+
 ## Evaluation
 
 ```

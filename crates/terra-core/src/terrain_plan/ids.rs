@@ -70,7 +70,11 @@ impl PlanStructureSignature {
 pub struct PlanOpId(u32);
 
 impl PlanOpId {
-    pub(crate) fn from_index(index: usize) -> Self {
+    /// Construct a plan-local operation id while iterating a validated plan.
+    ///
+    /// Backends use this to address immutable analysis tables in the same plan;
+    /// callers must not carry the id across structure revisions.
+    pub fn from_index(index: usize) -> Self {
         Self(u32::try_from(index).expect("terrain plan operation count exceeds u32"))
     }
 
