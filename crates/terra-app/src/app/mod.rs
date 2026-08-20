@@ -3,7 +3,9 @@
 mod actions;
 mod eval;
 mod helpers;
+mod input;
 mod lifecycle;
+mod logical_frame;
 mod paint;
 pub mod prefs;
 mod project;
@@ -193,6 +195,12 @@ pub struct TerraApp {
     /// Dedicated CPU evaluator for Medium/Full progressive refinement.
     eval_worker: EvalWorker,
     eval_token: u64,
+    /// OS events accumulated until the next event-loop scheduling boundary.
+    input: input::InputAccumulator,
+    /// Logical scheduling/diagnostic lifecycle; deliberately app-owned and non-global.
+    logical_frames: logical_frame::LogicalFrameCoordinator,
+    /// Most recent complete terrain generation made available for presentation.
+    last_complete_generation: logical_frame::EditGeneration,
     /// A matching Medium/Full job is queued or executing on the worker.
     worker_refine_pending: bool,
     /// Earliest edited layer not yet communicated to the persistent worker cache.
@@ -279,6 +287,11 @@ pub struct TerraApp {
     gui_backspace: bool,
     gui_escape: bool,
     gui_enter: bool,
+    /// Pointer edges accumulated from sealed input snapshots until GUI presentation.
+    gui_primary_pressed: bool,
+    gui_primary_released: bool,
+    gui_secondary_pressed: bool,
+    gui_secondary_released: bool,
     /// Last frame: custom UI captured the pointer (blocks camera/paint).
     gui_wants_pointer: bool,
     /// Quit requested from the custom caption close button.
@@ -383,6 +396,9 @@ impl Default for TerraApp {
             runtime_started: now,
             eval_worker: EvalWorker::spawn(),
             eval_token: 0,
+            input: input::InputAccumulator::default(),
+            logical_frames: logical_frame::LogicalFrameCoordinator::default(),
+            last_complete_generation: logical_frame::EditGeneration::default(),
             worker_refine_pending: false,
             worker_dirty_from: None,
             worker_dirty_region: None,
@@ -434,6 +450,10 @@ impl Default for TerraApp {
             gui_backspace: false,
             gui_escape: false,
             gui_enter: false,
+            gui_primary_pressed: false,
+            gui_primary_released: false,
+            gui_secondary_pressed: false,
+            gui_secondary_released: false,
             gui_wants_pointer: false,
             pending_exit: false,
             startup_failure: None,

@@ -259,14 +259,26 @@ impl TerraApp {
 
     pub(crate) fn evaluation_log_context(&self, token: u64, quality: PreviewQuality) -> String {
         let current = token == self.eval_token;
-        OperationContext::evaluation(token, quality)
+        let operation = OperationContext::evaluation(token, quality)
             .with_layer(
                 current
                     .then_some(self.ui_state.refining_layer_name.as_deref())
                     .flatten(),
             )
             .with_project_path(current.then_some(self.project_path.as_deref()).flatten())
-            .to_string()
+            .to_string();
+        match (
+            self.logical_frames.active_identity(),
+            self.logical_frames.active_phase(),
+        ) {
+            (Some(identity), Some(phase)) => format!(
+                "{operation}; logical_frame={}; edit_generation={}; phase={}",
+                identity.id.get(),
+                identity.generation.get(),
+                phase.label()
+            ),
+            _ => operation,
+        }
     }
 
     pub(crate) fn handle_evaluation_failure_details(
@@ -875,6 +887,8 @@ impl TerraApp {
                                 // GPU present owns the viewport — don't let a stale CPU
                                 // upload from a prior job clobber it on the next redraw.
                                 self.needs_height_upload = false;
+                                self.last_complete_generation =
+                                    super::logical_frame::EditGeneration::new(token);
                             } else {
                                 let _ = engine.take_dirty_region(1);
                             }

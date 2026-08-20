@@ -18,10 +18,413 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use super::helpers::{search_character, ui_tool_search_focused};
+use super::input::{InputEvent, InputModifiers, PointerCancelReason};
+use super::logical_frame::{EditGeneration, FramePhase, FrameRequestReason};
 use super::{
     quality_in_flight_progress, quality_stage_progress, AppScreen, TerraApp, EDIT_DEBOUNCE_MS,
     FULL_FIELD_REFINE_MS, REFINE_INTERVAL_MS,
 };
+
+impl TerraApp {
+    fn queue_input(&mut self, event: InputEvent) {
+        self.input.record(event, Instant::now());
+        self.logical_frames.request(
+            EditGeneration::new(self.eval_token),
+            FrameRequestReason::Input,
+        );
+    }
+
+    /// Seal and replay one immutable input snapshot. Events queued after `seal`
+    /// remain in the accumulator and already own a distinct follow-up frame ID.
+    fn process_pending_input_frame(&mut self) -> bool {
+        if !self.input.has_pending() {
+            return false;
+        }
+        if !self.logical_frames.has_pending() {
+            self.logical_frames.request(
+                EditGeneration::new(self.eval_token),
+                FrameRequestReason::Input,
+            );
+        }
+        let snapshot = self.input.seal();
+        let event_count = snapshot.len();
+        let pointer_samples = snapshot.pointer_sample_count();
+        self.logical_frames
+            .begin(Instant::now(), event_count, pointer_samples);
+        self.logical_frames.transition(FramePhase::SealingInput);
+        self.logical_frames
+            .transition(FramePhase::ApplicationUpdate);
+        let first_receipt = snapshot.events().first().map(|event| event.received_at());
+        let last_sequence = snapshot.events().last().map(|event| event.sequence());
+        let mut want_redraw = false;
+        for event in snapshot.events() {
+            want_redraw |= self.apply_input_event(event.event());
+        }
+        self.logical_frames
+            .update_generation(EditGeneration::new(self.eval_token));
+        self.logical_frames
+            .transition(FramePhase::RequiredInteractiveWork);
+        if let (Some(identity), Some(received_at), Some(sequence)) = (
+            self.logical_frames.active_identity(),
+            first_receipt,
+            last_sequence,
+        ) {
+            log::debug!(
+                target: "terra_app::logical_frame",
+                "frame={} generation={} sealed_events={} pointer_samples={} last_sequence={} receipt_to_seal_us={}",
+                identity.id.get(),
+                identity.generation.get(),
+                event_count,
+                pointer_samples,
+                sequence,
+                received_at.elapsed().as_micros()
+            );
+        }
+        want_redraw || event_count > 0
+    }
+
+    fn begin_scheduled_frame_if_needed(&mut self) {
+        if self.logical_frames.active_identity().is_some() {
+            return;
+        }
+        let known_work = self.pending_eval
+            || self.worker_refine_pending
+            || self.ui_state.refining
+            || self.deferred_full_field.is_some()
+            || !self.pending_tile_uploads.is_empty();
+        if !known_work {
+            return;
+        }
+        self.logical_frames.request(
+            EditGeneration::new(self.eval_token),
+            FrameRequestReason::ScheduledWork,
+        );
+        self.logical_frames.begin(Instant::now(), 0, 0);
+        self.logical_frames
+            .transition(FramePhase::RequiredInteractiveWork);
+    }
+
+    fn apply_input_event(&mut self, event: InputEvent) -> bool {
+        match event {
+            InputEvent::Keyboard { code, state } => self.apply_keyboard_input(code, state),
+            InputEvent::Modifiers(modifiers) => {
+                self.modifiers_shift = modifiers.shift;
+                self.modifiers_alt = modifiers.alt;
+                self.modifiers_ctrl = modifiers.ctrl;
+                self.modifiers_super = modifiers.super_key;
+                self.ui_state.shift_context = modifiers.shift;
+                true
+            }
+            InputEvent::PointerButton { state, button } => self.apply_pointer_button(state, button),
+            InputEvent::PointerMoved { x, y } => self.apply_pointer_motion(x, y),
+            InputEvent::Wheel { delta } => self.apply_wheel(delta),
+            InputEvent::Focused(focused) => {
+                if !focused {
+                    self.camera_keys = super::CameraKeys::default();
+                }
+                true
+            }
+            InputEvent::CursorEntered | InputEvent::CursorLeft => true,
+            InputEvent::PointerCancelled(PointerCancelReason::FocusLost) => {
+                self.cancel_pointer_gesture()
+            }
+        }
+    }
+
+    fn apply_keyboard_input(&mut self, code: Option<KeyCode>, state: ElementState) -> bool {
+        let Some(code) = code else {
+            return false;
+        };
+        let pressed = state == ElementState::Pressed;
+        self.camera_keys.set(code, pressed);
+        if !pressed {
+            return false;
+        }
+
+        let wants_chars = self.gui_state.wants_text_input()
+            || self.ui_state.show_quick_add
+            || self.ui_state.show_command_palette
+            || self.inspector_gui.rename_buffer.is_some()
+            || ui_tool_search_focused(&self.ui_state, &self.gui_state);
+        let bookmark = match code {
+            KeyCode::Digit1 => Some(0usize),
+            KeyCode::Digit2 => Some(1),
+            KeyCode::Digit3 => Some(2),
+            KeyCode::Digit4 => Some(3),
+            KeyCode::Digit5 => Some(4),
+            KeyCode::Digit6 => Some(5),
+            KeyCode::Digit7 => Some(6),
+            KeyCode::Digit8 => Some(7),
+            KeyCode::Digit9 => Some(8),
+            _ => None,
+        };
+        if let Some(index) = bookmark {
+            if self.screen == AppScreen::Editor {
+                if self.modifiers_ctrl && !self.modifiers_alt {
+                    self.save_camera_bookmark(index);
+                } else if self.modifiers_alt {
+                    self.recall_camera_bookmark(index);
+                }
+            }
+        }
+        let chord = ShortcutChord::new(
+            code,
+            ShortcutModifiers {
+                ctrl: self.modifiers_ctrl,
+                shift: self.modifiers_shift,
+                alt: self.modifiers_alt,
+                super_key: self.modifiers_super,
+            },
+        );
+        if let Some(command) = resolve_shortcut_for_input(chord, wants_chars) {
+            self.dispatch_command(command);
+        }
+        match code {
+            KeyCode::Backspace
+                if self.gui_state.wants_text_input()
+                    || self.ui_state.show_quick_add
+                    || self.ui_state.show_command_palette
+                    || !self.ui_state.tool_search.is_empty()
+                    || self.inspector_gui.rename_buffer.is_some() =>
+            {
+                self.gui_backspace = true;
+            }
+            KeyCode::Escape
+                if self.gui_state.wants_text_input()
+                    || self.ui_state.show_quick_add
+                    || self.ui_state.show_command_palette
+                    || self.ui_state.viewport_context_menu.is_some()
+                    || self.inspector_gui.rename_buffer.is_some()
+                    || self.pending_project_action.is_some()
+                    || self.show_new_template_picker
+                    || self.ui_state.is_mask_view() =>
+            {
+                if self.ui_state.viewport_context_menu.is_some() {
+                    self.ui_state.viewport_context_menu = None;
+                } else {
+                    self.gui_escape = true;
+                }
+            }
+            KeyCode::Enter | KeyCode::NumpadEnter
+                if self.gui_state.wants_text_input()
+                    || self.inspector_gui.rename_buffer.is_some() =>
+            {
+                self.gui_enter = true;
+            }
+            KeyCode::Enter | KeyCode::NumpadEnter
+                if self.ui_state.biome_paint_tool
+                    == terra_core::biome_paint::BiomePaintTool::PolygonFill
+                    && self.biome_polygon_points.len() >= 3
+                    && self.session.document.active_biome.is_some() =>
+            {
+                self.commit_biome_polygon_fill();
+            }
+            _ => {}
+        }
+        if !self.modifiers_ctrl && wants_chars {
+            if let Some(ch) = search_character(code, self.modifiers_shift) {
+                self.gui_text.push(ch);
+            }
+        }
+        true
+    }
+
+    fn apply_pointer_button(&mut self, state: ElementState, button: MouseButton) -> bool {
+        match (button, state) {
+            (MouseButton::Left, ElementState::Pressed) => self.gui_primary_pressed = true,
+            (MouseButton::Left, ElementState::Released) => self.gui_primary_released = true,
+            (MouseButton::Right, ElementState::Pressed) => self.gui_secondary_pressed = true,
+            (MouseButton::Right, ElementState::Released) => self.gui_secondary_released = true,
+            _ => {}
+        }
+        let in_viewport = self.cursor_in_viewport();
+        let painting = button == MouseButton::Left
+            && self.viewport_paint_active()
+            && in_viewport
+            && !self.modifiers_alt
+            && !self.gui_wants_pointer;
+        if state == ElementState::Pressed {
+            self.mouse_pressed = Some(button);
+            self.mouse_press_cursor = self.last_cursor;
+            if button == MouseButton::Right {
+                self.right_drag_distance = 0.0;
+            }
+            if painting {
+                self.paint_at_cursor();
+            } else if button == MouseButton::Left
+                && self.ui_state.editor_tool.is_place_point()
+                && in_viewport
+                && !self.modifiers_alt
+                && !self.gui_wants_pointer
+            {
+                self.place_point_at_cursor();
+            } else if button == MouseButton::Left
+                && in_viewport
+                && !self.modifiers_alt
+                && !self.gui_wants_pointer
+                && !(self.ui_state.editor_tool.is_move()
+                    && matches!(
+                        self.ui_state.app_workspace,
+                        crate::ui::AppWorkspace::Layout | crate::ui::AppWorkspace::Review
+                    ))
+            {
+                let _ = self.try_pick_shape_at_cursor();
+            }
+        } else {
+            self.finish_pointer_release(button, in_viewport, false);
+        }
+        true
+    }
+
+    fn finish_pointer_release(&mut self, button: MouseButton, in_viewport: bool, cancelled: bool) {
+        let press_pos = self.mouse_press_cursor.take();
+        let was_right = button == MouseButton::Right;
+        let right_drag = self.right_drag_distance;
+        self.mouse_pressed = None;
+        if !cancelled
+            && was_right
+            && in_viewport
+            && !self.gui_wants_pointer
+            && right_drag < 6.0
+            && self.screen != AppScreen::Home
+        {
+            let (sx, sy) = self.cursor_logical().unwrap_or((0.0, 0.0));
+            let uv = self.pick_paint_uv();
+            self.ui_state.viewport_context_menu = Some(crate::ui::ViewportContextMenu {
+                x: sx,
+                y: sy,
+                uv,
+                locked_owner: None,
+                picking_owner_for: None,
+                owner_override: None,
+            });
+            let _ = press_pos;
+        }
+        if button != MouseButton::Left {
+            return;
+        }
+        self.end_shape_point_drag();
+        self.end_layer_point_drag();
+        let was_biome_paint = self.ui_state.editor_tool == crate::ui::EditorTool::PaintBiome
+            && self.last_paint_uv.is_some();
+        self.last_paint_uv = None;
+        if was_biome_paint {
+            self.apply_actions(vec![PanelAction::EndBiomePaintStroke]);
+        }
+        if self.ui_state.editor_tool == crate::ui::EditorTool::PaintMask {
+            self.commit_mask_paint_stroke();
+        }
+        if self.sculpt_stroke_active {
+            self.session.history.push_executed(EditorCommand::Annotate {
+                label: "Shape stroke (draft → full on refine)".into(),
+            });
+            self.sculpt_stroke_active = false;
+            self.mark_shape_dependents_outdated();
+            self.ui_state.shape_commit_full = true;
+            // The required-work phase below performs the final Draft. Release is
+            // intentionally bounded to state finalization and a work request.
+            if self.pending_eval {
+                self.force_draft = true;
+            }
+        }
+    }
+
+    fn cancel_pointer_gesture(&mut self) -> bool {
+        if let Some(button) = self.mouse_pressed {
+            self.finish_pointer_release(button, false, true);
+        }
+        self.camera_keys = super::CameraKeys::default();
+        true
+    }
+
+    fn apply_pointer_motion(&mut self, x: f64, y: f64) -> bool {
+        let previous = self.last_cursor;
+        self.last_cursor = Some((x, y));
+        let mut want_redraw = false;
+        if self.dragging_shape_point.is_some() && self.mouse_pressed == Some(MouseButton::Left) {
+            self.update_shape_point_drag();
+        }
+        if self.dragging_layer_point.is_some() && self.mouse_pressed == Some(MouseButton::Left) {
+            self.update_layer_point_drag();
+            want_redraw = true;
+        }
+        let painting = self.mouse_pressed == Some(MouseButton::Left)
+            && self.viewport_paint_active()
+            && self.cursor_in_viewport()
+            && !self.modifiers_alt
+            && (!self.gui_wants_pointer || self.sculpt_stroke_active);
+        if painting {
+            self.paint_at_cursor();
+            want_redraw = true;
+        } else if self.mouse_pressed.is_some() && self.viewport_camera_active() {
+            if let (Some(button), Some((last_x, last_y)), Some(renderer)) =
+                (self.mouse_pressed, previous, self.renderer.as_mut())
+            {
+                let dx = (x - last_x) as f32;
+                let dy = (y - last_y) as f32;
+                match button {
+                    MouseButton::Left => {
+                        let speed = self.ui_state.camera_speed.max(0.05);
+                        if self.modifiers_alt {
+                            renderer.camera.orbit(dx * speed, dy * speed);
+                        } else {
+                            renderer.camera.look(dx * speed, dy * speed);
+                        }
+                        renderer.camera.clamp_to_world(renderer.heights.world_size);
+                    }
+                    MouseButton::Right | MouseButton::Middle => {
+                        let speed = self.ui_state.camera_speed.max(0.05);
+                        let dx = dx * speed;
+                        let dy = dy * speed;
+                        if button == MouseButton::Right {
+                            self.right_drag_distance += dx.abs() + dy.abs();
+                        }
+                        renderer.camera.pan(dx, dy);
+                        renderer.camera.clamp_to_world(renderer.heights.world_size);
+                    }
+                    _ => {}
+                }
+                want_redraw = true;
+            }
+        } else if (self.viewport_paint_tool_armed() && self.cursor_in_viewport())
+            || self.gui_wants_pointer
+            || self.screen == AppScreen::Home
+        {
+            want_redraw = true;
+        }
+        want_redraw
+    }
+
+    fn apply_wheel(&mut self, delta: f32) -> bool {
+        let over_chrome = self.cursor_logical().is_some_and(|(x, y)| {
+            let viewport = &self.viewport_rect;
+            y < viewport.min_y || y >= viewport.max_y || x < viewport.min_x || x >= viewport.max_x
+        });
+        if over_chrome || self.gui_wants_pointer {
+            self.gui_scroll_delta += delta;
+            return true;
+        }
+        if self.viewport_paint_tool_armed() && !self.modifiers_alt {
+            self.ui_state.ensure_sculpt_defaults();
+            let step = if delta.abs() >= 1.0 {
+                delta.signum() * 0.008
+            } else {
+                delta * 0.008
+            };
+            self.ui_state.sculpt_radius = (self.ui_state.sculpt_radius + step).clamp(0.005, 0.25);
+            return true;
+        }
+        if self.viewport_camera_active() {
+            if let Some(renderer) = self.renderer.as_mut() {
+                renderer
+                    .camera
+                    .zoom(delta * 40.0 * self.ui_state.camera_speed.max(0.05));
+                return true;
+            }
+        }
+        false
+    }
+}
 
 impl ApplicationHandler for TerraApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
@@ -149,317 +552,89 @@ impl ApplicationHandler for TerraApp {
             }
         }
 
-        let mut want_redraw = false;
+        // Input callbacks are deliberately capture-only. Application/tool mutation
+        // happens from an immutable snapshot at `about_to_wait`, before required
+        // interactive work and optional refinement are considered.
+        let event = match event {
+            WindowEvent::KeyboardInput { event, .. } => {
+                let code = match event.physical_key {
+                    PhysicalKey::Code(code) => Some(code),
+                    _ => None,
+                };
+                self.queue_input(InputEvent::Keyboard {
+                    code,
+                    state: event.state,
+                });
+                return;
+            }
+            WindowEvent::ModifiersChanged(modifiers) => {
+                let state = modifiers.state();
+                self.queue_input(InputEvent::Modifiers(InputModifiers {
+                    shift: state.shift_key(),
+                    alt: state.alt_key(),
+                    ctrl: state.control_key(),
+                    super_key: state.super_key(),
+                }));
+                return;
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                self.queue_input(InputEvent::PointerButton { state, button });
+                return;
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.queue_input(InputEvent::PointerMoved {
+                    x: position.x,
+                    y: position.y,
+                });
+                return;
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let delta = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y,
+                    MouseScrollDelta::PixelDelta(position) => position.y as f32 / 40.0,
+                };
+                self.queue_input(InputEvent::Wheel { delta });
+                return;
+            }
+            WindowEvent::Focused(focused) => {
+                self.queue_input(InputEvent::Focused(focused));
+                if !focused {
+                    self.queue_input(InputEvent::PointerCancelled(PointerCancelReason::FocusLost));
+                }
+                return;
+            }
+            WindowEvent::CursorEntered { .. } => {
+                self.queue_input(InputEvent::CursorEntered);
+                return;
+            }
+            WindowEvent::CursorLeft { .. } => {
+                self.queue_input(InputEvent::CursorLeft);
+                return;
+            }
+            event => event,
+        };
+
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
-                if let Some(r) = self.renderer.as_mut() {
-                    r.resize(size);
+                if let Some(renderer) = self.renderer.as_mut() {
+                    renderer.resize(size);
                 }
                 self.refresh_viewport_rect();
-                want_redraw = true;
-            }
-            WindowEvent::RedrawRequested => self.redraw(),
-            WindowEvent::KeyboardInput { event, .. } => {
-                if let PhysicalKey::Code(code) = event.physical_key {
-                    let pressed = event.state == ElementState::Pressed;
-                    // Always track fly keys so release isn't missed while UI steals focus.
-                    self.camera_keys.set(code, pressed);
-                }
-                if event.state == ElementState::Pressed {
-                    if let PhysicalKey::Code(code) = event.physical_key {
-                        let wants_chars = self.gui_state.wants_text_input()
-                            || self.ui_state.show_quick_add
-                            || self.ui_state.show_command_palette
-                            || self.inspector_gui.rename_buffer.is_some()
-                            || ui_tool_search_focused(&self.ui_state, &self.gui_state);
-                        let bookmark = match code {
-                            KeyCode::Digit1 => Some(0usize),
-                            KeyCode::Digit2 => Some(1),
-                            KeyCode::Digit3 => Some(2),
-                            KeyCode::Digit4 => Some(3),
-                            KeyCode::Digit5 => Some(4),
-                            KeyCode::Digit6 => Some(5),
-                            KeyCode::Digit7 => Some(6),
-                            KeyCode::Digit8 => Some(7),
-                            KeyCode::Digit9 => Some(8),
-                            _ => None,
-                        };
-                        if let Some(index) = bookmark {
-                            if self.screen == AppScreen::Editor {
-                                if self.modifiers_ctrl && !self.modifiers_alt {
-                                    self.save_camera_bookmark(index);
-                                } else if self.modifiers_alt {
-                                    self.recall_camera_bookmark(index);
-                                }
-                            }
-                        }
-                        let chord = ShortcutChord::new(
-                            code,
-                            ShortcutModifiers {
-                                ctrl: self.modifiers_ctrl,
-                                shift: self.modifiers_shift,
-                                alt: self.modifiers_alt,
-                                super_key: self.modifiers_super,
-                            },
-                        );
-                        if let Some(command) = resolve_shortcut_for_input(chord, wants_chars) {
-                            self.dispatch_command(command);
-                        }
-                        match code {
-                            KeyCode::Backspace
-                                if self.gui_state.wants_text_input()
-                                    || self.ui_state.show_quick_add
-                                    || self.ui_state.show_command_palette
-                                    || !self.ui_state.tool_search.is_empty()
-                                    || self.inspector_gui.rename_buffer.is_some() =>
-                            {
-                                self.gui_backspace = true;
-                            }
-                            KeyCode::Escape
-                                if self.gui_state.wants_text_input()
-                                    || self.ui_state.show_quick_add
-                                    || self.ui_state.show_command_palette
-                                    || self.ui_state.viewport_context_menu.is_some()
-                                    || self.inspector_gui.rename_buffer.is_some()
-                                    || self.pending_project_action.is_some()
-                                    || self.show_new_template_picker
-                                    || self.ui_state.is_mask_view() =>
-                            {
-                                if self.ui_state.viewport_context_menu.is_some() {
-                                    self.ui_state.viewport_context_menu = None;
-                                } else {
-                                    self.gui_escape = true;
-                                }
-                            }
-                            KeyCode::Enter | KeyCode::NumpadEnter
-                                if self.gui_state.wants_text_input()
-                                    || self.inspector_gui.rename_buffer.is_some() =>
-                            {
-                                self.gui_enter = true;
-                            }
-                            KeyCode::Enter | KeyCode::NumpadEnter
-                                if self.ui_state.biome_paint_tool
-                                    == terra_core::biome_paint::BiomePaintTool::PolygonFill
-                                    && self.biome_polygon_points.len() >= 3
-                                    && self.session.document.active_biome.is_some() =>
-                            {
-                                self.commit_biome_polygon_fill();
-                            }
-                            _ => {}
-                        }
-                        if !self.modifiers_ctrl && wants_chars {
-                            if let Some(ch) = search_character(code, self.modifiers_shift) {
-                                self.gui_text.push(ch);
-                            }
-                        }
-                        want_redraw = true;
-                    }
+                if let Some(window) = &self.window {
+                    window.request_redraw();
                 }
             }
-            WindowEvent::ModifiersChanged(m) => {
-                self.modifiers_shift = m.state().shift_key();
-                self.modifiers_alt = m.state().alt_key();
-                self.modifiers_ctrl = m.state().control_key();
-                self.modifiers_super = m.state().super_key();
-                self.ui_state.shift_context = self.modifiers_shift;
-            }
-            WindowEvent::MouseInput { state, button, .. } => {
-                let in_viewport = self.cursor_in_viewport();
-                let painting = button == MouseButton::Left
-                    && self.viewport_paint_active()
-                    && in_viewport
-                    && !self.modifiers_alt
-                    && !self.gui_wants_pointer;
-                if state == ElementState::Pressed {
-                    self.mouse_pressed = Some(button);
-                    self.mouse_press_cursor = self.last_cursor;
-                    if button == MouseButton::Right {
-                        self.right_drag_distance = 0.0;
-                    }
-                    if painting {
-                        self.paint_at_cursor();
-                    } else if button == MouseButton::Left
-                        && self.ui_state.editor_tool.is_place_point()
-                        && in_viewport
-                        && !self.modifiers_alt
-                        && !self.gui_wants_pointer
-                    {
-                        self.place_point_at_cursor();
-                    } else if button == MouseButton::Left
-                        && in_viewport
-                        && !self.modifiers_alt
-                        && !self.gui_wants_pointer
-                    {
-                        if self.ui_state.editor_tool.is_move()
-                            && matches!(
-                                self.ui_state.app_workspace,
-                                crate::ui::AppWorkspace::Layout | crate::ui::AppWorkspace::Review
-                            )
-                        {
-                        } else {
-                            let _ = self.try_pick_shape_at_cursor();
-                        }
-                    }
-                } else if state == ElementState::Released {
-                    let press_pos = self.mouse_press_cursor.take();
-                    let was_right = button == MouseButton::Right;
-                    let right_drag = self.right_drag_distance;
-                    self.mouse_pressed = None;
-                    if was_right
-                        && in_viewport
-                        && !self.gui_wants_pointer
-                        && right_drag < 6.0
-                        && self.screen != AppScreen::Home
-                    {
-                        let (sx, sy) = self.cursor_logical().unwrap_or((0.0, 0.0));
-                        let uv = self.pick_paint_uv();
-                        self.ui_state.viewport_context_menu =
-                            Some(crate::ui::ViewportContextMenu {
-                                x: sx,
-                                y: sy,
-                                uv,
-                                locked_owner: None,
-                                picking_owner_for: None,
-                                owner_override: None,
-                            });
-                        let _ = press_pos;
-                    }
-                    if button == MouseButton::Left {
-                        self.end_shape_point_drag();
-                        self.end_layer_point_drag();
-                        let was_biome_paint = self.ui_state.editor_tool
-                            == crate::ui::EditorTool::PaintBiome
-                            && self.last_paint_uv.is_some();
-                        self.last_paint_uv = None;
-                        if was_biome_paint {
-                            self.apply_actions(vec![PanelAction::EndBiomePaintStroke]);
-                        }
-                        // Mask paint: commit stroke undo; defer/coalesce terrain rebuild.
-                        if self.ui_state.editor_tool == crate::ui::EditorTool::PaintMask {
-                            self.commit_mask_paint_stroke();
-                        }
-                        if self.sculpt_stroke_active {
-                            // Non-destructive Shape history â€” undoable via layer/command history later.
-                            self.session.history.push_executed(EditorCommand::Annotate {
-                                label: "Shape stroke (draft â†’ full on refine)".into(),
-                            });
-                            self.sculpt_stroke_active = false;
-                            // Mark dependents outdated without forcing sim rebuilds now.
-                            self.mark_shape_dependents_outdated();
-                            self.ui_state.shape_commit_full = true;
-                            // One final Draft; full quality follows when requested / idle refine.
-                            self.flush_live_paint_preview();
-                        }
-                    }
+            WindowEvent::RedrawRequested => {
+                if let Some(identity) = self.logical_frames.take_presentation_identity() {
+                    self.ui_state.profile.logical_frame_id = identity.id.get();
+                    self.ui_state.profile.edit_generation = identity.generation.get();
+                    self.ui_state.profile.presented_generation =
+                        self.last_complete_generation.get();
                 }
-                want_redraw = true;
-            }
-            WindowEvent::CursorMoved { position, .. } => {
-                let previous = self.last_cursor;
-                self.last_cursor = Some((position.x, position.y));
-                if self.dragging_shape_point.is_some()
-                    && self.mouse_pressed == Some(MouseButton::Left)
-                {
-                    self.update_shape_point_drag();
-                }
-                if self.dragging_layer_point.is_some()
-                    && self.mouse_pressed == Some(MouseButton::Left)
-                {
-                    self.update_layer_point_drag();
-                    want_redraw = true;
-                }
-                let painting = self.mouse_pressed == Some(MouseButton::Left)
-                    && self.viewport_paint_active()
-                    && self.cursor_in_viewport()
-                    && !self.modifiers_alt
-                    && (!self.gui_wants_pointer || self.sculpt_stroke_active);
-                if painting {
-                    self.paint_at_cursor();
-                    want_redraw = true;
-                } else if self.mouse_pressed.is_some() && self.viewport_camera_active() {
-                    if let (Some(btn), Some((lx, ly)), Some(r)) =
-                        (self.mouse_pressed, previous, self.renderer.as_mut())
-                    {
-                        let dx = (position.x - lx) as f32;
-                        let dy = (position.y - ly) as f32;
-                        match btn {
-                            MouseButton::Left => {
-                                let speed = self.ui_state.camera_speed.max(0.05);
-                                let dx = dx * speed;
-                                let dy = dy * speed;
-                                // Game-engine look: rotate around the camera eye.
-                                // Alt+LMB keeps classic orbit around the look-at target
-                                // (Alt already unlocks camera while a brush is armed).
-                                if self.modifiers_alt {
-                                    r.camera.orbit(dx, dy);
-                                } else {
-                                    r.camera.look(dx, dy);
-                                }
-                                r.camera.clamp_to_world(r.heights.world_size);
-                            }
-                            MouseButton::Right | MouseButton::Middle => {
-                                let speed = self.ui_state.camera_speed.max(0.05);
-                                let dx = dx * speed;
-                                let dy = dy * speed;
-                                if btn == MouseButton::Right {
-                                    self.right_drag_distance += dx.abs() + dy.abs();
-                                }
-                                r.camera.pan(dx, dy);
-                                r.camera.clamp_to_world(r.heights.world_size);
-                            }
-                            _ => {}
-                        }
-                        want_redraw = true;
-                    }
-                } else if self.viewport_paint_tool_armed() && self.cursor_in_viewport() {
-                    // Keep brush gizmo tracking the cursor.
-                    want_redraw = true;
-                } else if self.gui_wants_pointer || self.screen == AppScreen::Home {
-                    // Home is all chrome under ControlFlow::Wait: without a move redraw,
-                    // hover/`hot` never establishes (chicken-and-egg with gui_wants_pointer).
-                    want_redraw = true;
-                }
-            }
-            WindowEvent::MouseWheel { delta, .. } => {
-                let d = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => y,
-                    MouseScrollDelta::PixelDelta(p) => p.y as f32 / 40.0,
-                };
-                // Prefer terra-gui scroll over left/right chrome (or any hot widget).
-                let over_chrome = self.cursor_logical().is_some_and(|(x, y)| {
-                    let vp = &self.viewport_rect;
-                    y < vp.min_y || y >= vp.max_y || x < vp.min_x || x >= vp.max_x
-                });
-                if over_chrome || self.gui_wants_pointer {
-                    self.gui_scroll_delta += d;
-                    want_redraw = true;
-                } else if self.viewport_paint_tool_armed() && !self.modifiers_alt {
-                    // Brush tools: wheel adjusts radius; Alt falls through to zoom.
-                    self.ui_state.ensure_sculpt_defaults();
-                    let step = if d.abs() >= 1.0 {
-                        d.signum() * 0.008
-                    } else {
-                        d * 0.008
-                    };
-                    self.ui_state.sculpt_radius =
-                        (self.ui_state.sculpt_radius + step).clamp(0.005, 0.25);
-                    want_redraw = true;
-                } else if self.viewport_camera_active() {
-                    if let Some(r) = self.renderer.as_mut() {
-                        let speed = self.ui_state.camera_speed.max(0.05);
-                        r.camera.zoom(d * 40.0 * speed);
-                        want_redraw = true;
-                    }
-                }
+                self.redraw();
             }
             _ => {}
-        }
-
-        if want_redraw {
-            if let Some(w) = &self.window {
-                w.request_redraw();
-            }
         }
     }
 
@@ -491,6 +666,9 @@ impl ApplicationHandler for TerraApp {
             }
             return;
         }
+
+        let input_frame_processed = self.process_pending_input_frame();
+        self.begin_scheduled_frame_if_needed();
 
         // One registry tick pumps the background subsystems (export, project IO,
         // tool thumbnails) and folds their pending/wake facts together. The Arc
@@ -640,6 +818,7 @@ impl ApplicationHandler for TerraApp {
                         self.worker_dirty_from = None;
                         self.worker_dirty_region = None;
                         self.worker_cache_res = Some(height.metrics.width);
+                        self.last_complete_generation = EditGeneration::new(result.token);
                         self.ui_state.profile.eval_us = result.eval_us;
                         self.ui_state.profile.tex_w =
                             self.last_height.as_ref().unwrap().metrics.width;
@@ -813,10 +992,25 @@ impl ApplicationHandler for TerraApp {
                 }
             }
 
+            // Required input/evaluation work gets a presentation request before
+            // optional refinement is allowed to start. The actual surface present
+            // occurs on the following RedrawRequested callback.
+            if input_frame_processed || did_eval || self.needs_height_upload {
+                self.logical_frames
+                    .transition(FramePhase::PresentationRequest);
+                self.logical_frames.mark_presentation_requested();
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
+            self.logical_frames
+                .transition(FramePhase::OptionalRefinement);
+
             // Progressive refine — one quality step per interval, never while interacting.
             // WC path: stay GPU-resident when the last Draft/Medium was fully_gpu.
             // CPU worker is only for unsupported suffixes / export oracle.
             if !stall_refine
+                && self.logical_frames.can_start_optional(Instant::now())
                 && self.ui_state.refining
                 && !self.pending_eval
                 && !self.worker_refine_pending
@@ -936,10 +1130,36 @@ impl ApplicationHandler for TerraApp {
             event_loop.set_control_flow(ControlFlow::Wait);
         }
 
-        if did_eval || export_busy || self.needs_height_upload || jobs.redraw || camera_flying {
+        if did_eval
+            || input_frame_processed
+            || export_busy
+            || self.needs_height_upload
+            || jobs.redraw
+            || camera_flying
+        {
+            self.logical_frames.mark_presentation_requested();
             if let Some(w) = &self.window {
                 w.request_redraw();
             }
+        }
+        if let Some(diagnostics) = self.logical_frames.complete(Instant::now()) {
+            self.ui_state.profile.logical_frame_id = diagnostics.identity.id.get();
+            self.ui_state.profile.edit_generation = diagnostics.identity.generation.get();
+            self.ui_state.profile.logical_phase = diagnostics.phase.label();
+            self.ui_state.profile.input_event_count = diagnostics.input_events;
+            self.ui_state.profile.pointer_sample_count = diagnostics.pointer_samples;
+            self.ui_state.profile.input_frame_pending = self.logical_frames.has_pending();
+            log::debug!(
+                target: "terra_app::logical_frame",
+                "frame={} generation={} phase={} reason={:?} events={} pointer_samples={} elapsed_us={}",
+                diagnostics.identity.id.get(),
+                diagnostics.identity.generation.get(),
+                diagnostics.phase.label(),
+                diagnostics.reason,
+                diagnostics.input_events,
+                diagnostics.pointer_samples,
+                diagnostics.elapsed.as_micros()
+            );
         }
     }
 }

@@ -542,6 +542,33 @@ fn preview_panel(ui: &mut GuiContext<'_>, ui_state: &mut UiState) {
 
 fn profiler_panel(ui: &mut GuiContext<'_>, ui_state: &UiState) {
     let p = &ui_state.profile;
+    label(
+        ui,
+        &format!(
+            "Logical frame: {}  |  Phase: {}",
+            p.logical_frame_id,
+            if p.logical_phase.is_empty() {
+                "idle"
+            } else {
+                p.logical_phase
+            }
+        ),
+    );
+    label(
+        ui,
+        &format!(
+            "Edit/present generation: {}/{}  |  Input events/samples: {}/{}{}",
+            p.edit_generation,
+            p.presented_generation,
+            p.input_event_count,
+            p.pointer_sample_count,
+            if p.input_frame_pending {
+                "  (next pending)"
+            } else {
+                ""
+            }
+        ),
+    );
     label(ui, &format!("Generation ID: {}", p.gen_id));
     label(
         ui,

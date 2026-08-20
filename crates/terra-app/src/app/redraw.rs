@@ -184,6 +184,10 @@ impl TerraApp {
         let backspace_pressed = std::mem::take(&mut self.gui_backspace);
         let escape_pressed = std::mem::take(&mut self.gui_escape);
         let enter_pressed = std::mem::take(&mut self.gui_enter);
+        let primary_pressed = std::mem::take(&mut self.gui_primary_pressed);
+        let primary_released = std::mem::take(&mut self.gui_primary_released);
+        let secondary_pressed = std::mem::take(&mut self.gui_secondary_pressed);
+        let secondary_released = std::mem::take(&mut self.gui_secondary_released);
         let pixels_per_point = window.scale_factor() as f32;
 
         // Brush ring tracks the cursor on the height surface while sculpt/mask tools are armed.
@@ -424,13 +428,16 @@ impl TerraApp {
                 GuiInput {
                     pointer,
                     primary_down,
+                    primary_pressed,
+                    primary_released,
                     secondary_down,
+                    secondary_pressed,
+                    secondary_released,
                     scroll_delta,
                     text,
                     backspace_pressed,
                     escape_pressed,
                     enter_pressed,
-                    ..Default::default()
                 },
                 &mut self.gui_state,
             );

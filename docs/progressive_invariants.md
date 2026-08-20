@@ -4,6 +4,10 @@ Rules that must hold on every shipping build. Violations are release blockers.
 
 ## NEVER
 
+- NEVER perform terrain evaluation or other substantial editor work directly in
+  a winit input callback; record input and request a logical frame.
+- NEVER coalesce ordered pointer samples, button edges, modifier transitions, or
+  cancellation across logical input snapshots.
 - NEVER reset progressive accumulation on UI chrome hover, panel focus, or menu open alone.
 - NEVER block the viewport on CPU terrain evaluation — last-good GPU textures stay visible.
 - NEVER treat mouse-button-down without a scene change as meaningful interaction for refinement.
@@ -15,6 +19,10 @@ Rules that must hold on every shipping build. Violations are release blockers.
 
 ## ALWAYS
 
+- ALWAYS consume sealed input and required interactive Draft work before optional
+  Medium/Full refinement.
+- ALWAYS retain input received after snapshot sealing for a follow-up logical frame.
+- ALWAYS return the event loop to `ControlFlow::Wait` when no logical frame work remains.
 - ALWAYS bump the correct scene version counter for each invalidation reason.
 - ALWAYS call `notify_invalidation` when terrain, materials, geometry, lighting, or viewport mode changes.
 - ALWAYS drive `EditorRefinementState` from meaningful scene changes (camera, terrain, lighting, edits).

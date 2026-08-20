@@ -34,6 +34,30 @@ becoming a second mutation path or catalog of domain truth.
 
 ## Frame composition
 
+Terra's editor loop is event-driven. OS input is accumulated promptly and is
+sealed into an immutable snapshot at the next `about_to_wait` scheduling
+boundary. A logical frame then advances through application/tool update,
+required interactive work, a presentation request, and optional refinement.
+Logical frames are demand-driven scheduling and diagnostic lifecycles, not a
+fixed-timestep simulation and not a promise of a particular refresh rate.
+
+Logical frame IDs and terrain edit generations are intentionally distinct.
+Several logical frames may observe the same generation; an edit may advance the
+generation during application update and supersede work submitted by an older
+frame. Ordered pointer samples and button/modifier transitions are never
+coalesced. Input recorded after a snapshot is sealed is retained for a new
+logical frame.
+
+Required Draft work has priority over optional Medium/Full refinement. A frame
+budget hook decides only whether optional work may start; it does not cancel or
+preempt GPU commands after submission. With no input, animation, background
+completion, or scheduled terrain work, the winit loop returns to
+`ControlFlow::Wait`.
+
+The surface presentation path remains last-complete: pending or stale-generation
+terrain candidates do not replace the renderer's current complete textures.
+The swapchain composition inside a requested presentation is:
+
 `terra-app` composes terrain and UI into one swapchain frame:
 
 1. `TerrainRenderer::render_terrain` acquires the surface texture, submits the

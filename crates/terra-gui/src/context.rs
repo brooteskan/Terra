@@ -135,10 +135,10 @@ impl<'a> GuiContext<'a> {
         mut input: GuiInput,
         state: &'a mut GuiState,
     ) -> Self {
-        input.primary_pressed = input.primary_down && !state.was_primary_down;
-        input.primary_released = !input.primary_down && state.was_primary_down;
-        input.secondary_pressed = input.secondary_down && !state.was_secondary_down;
-        input.secondary_released = !input.secondary_down && state.was_secondary_down;
+        input.primary_pressed |= input.primary_down && !state.was_primary_down;
+        input.primary_released |= !input.primary_down && state.was_primary_down;
+        input.secondary_pressed |= input.secondary_down && !state.was_secondary_down;
+        input.secondary_released |= !input.secondary_down && state.was_secondary_down;
         // Fresh hover each frame (last-wins as widgets run).
         state.hot = None;
         let pixels_per_point = pixels_per_point.max(0.5);
@@ -1279,4 +1279,28 @@ fn image_content_key(width: u32, height: u32, rgba: &[u8]) -> u64 {
         }
     }
     h
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_pointer_edges_survive_same_frame_press_and_release() {
+        let mut state = GuiState::default();
+        let context = GuiContext::begin(
+            100.0,
+            100.0,
+            1.0,
+            GuiInput {
+                primary_down: false,
+                primary_pressed: true,
+                primary_released: true,
+                ..GuiInput::default()
+            },
+            &mut state,
+        );
+        assert!(context.input.primary_pressed);
+        assert!(context.input.primary_released);
+    }
 }

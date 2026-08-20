@@ -1245,6 +1245,13 @@ impl EditorTool {
 /// Per-frame timings in microseconds for the profiler overlay.
 #[derive(Debug, Clone, Default)]
 pub struct FrameProfile {
+    pub logical_frame_id: u64,
+    pub edit_generation: u64,
+    pub presented_generation: u64,
+    pub logical_phase: &'static str,
+    pub input_event_count: usize,
+    pub pointer_sample_count: usize,
+    pub input_frame_pending: bool,
     pub eval_us: u64,
     pub upload_us: u64,
     pub render_us: u64,
