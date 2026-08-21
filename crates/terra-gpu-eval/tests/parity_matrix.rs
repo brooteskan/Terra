@@ -28,7 +28,7 @@ use terra_gpu::parity::{
     STREAM_POWER_DINFINITY_PREVIEW, TERRACE_PREVIEW, THERMAL_PREVIEW, UPLIFT_PREVIEW,
     VALUE_NOISE_PREVIEW, VOLCANIC_ISLAND_PREVIEW, VOLCANO_PREVIEW, VORONOI_REGIONS_PREVIEW,
 };
-use terra_gpu::GpuTerrainEngine;
+use terra_gpu_eval::GpuTerrainEngine;
 
 const QUALITY: PreviewQuality = PreviewQuality::Draft;
 

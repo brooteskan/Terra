@@ -257,7 +257,8 @@ fn gpu_mask_supported(layer: &Layer, assets: &[MaskAsset]) -> Result<(), GpuFall
 ///
 /// Returning `None` is deliberate: unsupported equations must select the CPU
 /// oracle instead of being approximated by a different GPU blend operation.
-pub(crate) fn gpu_blend_mode(mode: BlendMode) -> Option<u32> {
+/// Return the shader blend-mode identifier for a GPU-supported blend.
+pub fn gpu_blend_mode(mode: BlendMode) -> Option<u32> {
     match mode {
         BlendMode::Normal | BlendMode::Replace | BlendMode::Interpolate => Some(0),
         BlendMode::Add => Some(1),

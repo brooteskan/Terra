@@ -13,6 +13,7 @@ path = "src/main.rs"
 terra-core = { workspace = true }
 terra-jobs = { workspace = true }
 terra-gpu = { workspace = true }
+terra-gpu-eval = { workspace = true }
 terra-render = { workspace = true }
 terra-gui = { workspace = true }
 terra-io = { workspace = true }

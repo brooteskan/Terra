@@ -1280,7 +1280,7 @@ pub struct FrameProfile {
     pub follow_up_press_p95_us: u64,
     pub follow_up_press_max_us: u64,
     pub plan: terra_core::terrain_plan::PlanCacheStatsSnapshot,
-    pub gpu: terra_gpu::GpuEvalStats,
+    pub gpu: terra_gpu_eval::GpuEvalStats,
     pub cpu_worker: terra_core::eval::EvalWorkerStatsSnapshot,
     pub cpu_published: u64,
     pub terrain_grid_size: u32,

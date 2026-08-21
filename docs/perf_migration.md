@@ -9,7 +9,7 @@
 ## Interactive path at the time of migration
 
 ```
-UI edit → mark_dirty_from → debounce → GpuTerrainEngine (WGSL)
+UI edit → mark_dirty_from → debounce → terra-gpu-eval::GpuTerrainEngine (WGSL)
   → layer cache textures → ping-pong thermal/hydraulic
   → dirty tile bounds → region copy + region normals → swap
   → clipmap nested grids sample height (camera-centered LOD)

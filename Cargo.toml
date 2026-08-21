@@ -4,6 +4,7 @@ members = [
     "crates/terra-core",
     "crates/terra-jobs",
     "crates/terra-gpu",
+    "crates/terra-gpu-eval",
     "crates/terra-render",
     "crates/terra-gui",
     "crates/terra-io",
@@ -23,6 +24,7 @@ repository = "https://github.com/brooteskan/Terra"
 terra-core = { path = "crates/terra-core" }
 terra-jobs = { path = "crates/terra-jobs" }
 terra-gpu = { path = "crates/terra-gpu" }
+terra-gpu-eval = { path = "crates/terra-gpu-eval" }
 terra-render = { path = "crates/terra-render" }
 terra-gui = { path = "crates/terra-gui" }
 terra-io = { path = "crates/terra-io" }

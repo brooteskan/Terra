@@ -7,7 +7,7 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use terra_core::eval::PreviewQuality;
-use terra_gpu::GpuEvaluationIntent;
+use terra_gpu_eval::GpuEvaluationIntent;
 
 use super::logical_frame::{EditGeneration, FrameIdentity, FramePhase, LogicalFrameId};
 
@@ -76,7 +76,7 @@ pub(crate) struct FrameTraceEvent {
     pub(crate) quality: Option<PreviewQuality>,
     pub(crate) intent: Option<GpuEvaluationIntent>,
     pub(crate) duration: Option<Duration>,
-    pub(crate) gpu_stats: Option<terra_gpu::GpuEvalStats>,
+    pub(crate) gpu_stats: Option<terra_gpu_eval::GpuEvalStats>,
     pub(crate) refinement_job: Option<u64>,
     pub(crate) completed_units: usize,
     pub(crate) total_units: usize,
@@ -229,7 +229,7 @@ impl FrameTraceRecorder {
         quality: PreviewQuality,
         intent: GpuEvaluationIntent,
         duration: Duration,
-        stats: terra_gpu::GpuEvalStats,
+        stats: terra_gpu_eval::GpuEvalStats,
     ) {
         if !self.record(
             now,

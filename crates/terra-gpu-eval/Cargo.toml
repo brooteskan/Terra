@@ -1,0 +1,31 @@
+[package]
+name = "terra-gpu-eval"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Stateful GPU terrain evaluation lifecycle"
+
+[dependencies]
+terra-core = { workspace = true }
+terra-gpu = { workspace = true }
+wgpu = { workspace = true }
+bytemuck = { workspace = true }
+profiling = { workspace = true }
+
+[dev-dependencies]
+terra-test-gpu = { workspace = true }
+image = { workspace = true }
+
+[features]
+default = []
+# The full GPU/CPU numerical matrix takes several minutes. Keep it out of
+# ordinary package/workspace tests; the dedicated GPU job enables it explicitly.
+gpu-parity = []
+
+[[test]]
+name = "parity_matrix"
+path = "tests/parity_matrix.rs"
+required-features = ["gpu-parity"]
+
+[lints]
+workspace = true

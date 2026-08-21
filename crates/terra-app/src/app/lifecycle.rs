@@ -8,7 +8,8 @@ use crate::ui::{
 };
 use terra_core::command::EditorCommand;
 use terra_core::eval::{EvalWorkerEvent, PreviewQuality};
-use terra_gpu::{GpuEvaluationIntent, GpuTerrainEngine, GpuTileAtlas};
+use terra_gpu::GpuTileAtlas;
+use terra_gpu_eval::{GpuEvaluationIntent, GpuTerrainEngine};
 use terra_gui::{Color, GuiContext, GuiInput, GuiRenderer, GuiState, Rect};
 use terra_render::{GpuContext, TerrainRenderer};
 use winit::application::ApplicationHandler;

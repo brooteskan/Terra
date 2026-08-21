@@ -10,14 +10,16 @@ design was reached, but they do not override this document.
 |-------|----------------|
 | `terra-core` | Domain model: heightfields, layer stack, masks, biomes, CPU evaluation, and editor commands |
 | `terra-jobs` | Cancellation primitive (`CancelToken`) and cancellable parallel-fill helpers shared by CPU eval; a leaf crate below `terra-core` |
-| `terra-gpu` | GPU compute for supported terrain generators, filters, and simulations |
+| `terra-gpu` | Reusable GPU kernels, capability descriptions, compiled-plan resources, derivatives, and tile caching |
+| `terra-gpu-eval` | Stateful GPU terrain evaluation, refinement jobs, timing, submission, and output lifecycle |
 | `terra-render` | wgpu terrain viewport, clipmaps, camera, lighting, and terrain render pass |
 | `terra-gui` | Reusable, domain-neutral immediate-mode wgpu UI toolkit and design system |
 | `terra-io` | Project JSON, import/export, GeoTIFF bridge, and export packages |
 | `terra-app` | Application shell: winit event loop, editor panels and tools, `PanelAction` dispatch, and renderer integration |
 | `terra-test-gpu` | Non-published headless GPU harness used by render and UI tests |
 
-`terra-core` must stay free of `wgpu` and UI crates. `terra-gui` must stay free
+`terra-core` must stay free of `wgpu` and UI crates. `terra-gpu-eval` depends on
+`terra-gpu`, never the reverse. `terra-gui` must stay free
 of `terra-core` and other domain types. `terra-render` and `terra-gui` do not
 depend on one another; `terra-app` owns both and integrates them.
 
@@ -155,7 +157,7 @@ Height/Slope and named-output distributions, standard group blends, biome CopyIn
 height-delta composition, and independently live masked auxiliary publication.
 Unsupported distribution nodes, field-backed masks whose producer has no GPU auxiliary
 publication, and dynamic parameter reductions fall back at their exact consumer.
-`GpuTerrainEngine` accepts a revision-matching compiled plan and dispatches these
+`terra-gpu-eval::GpuTerrainEngine` accepts a revision-matching compiled plan and dispatches these
 operations in plan order. Scoped groups no longer trigger a categorical tree fallback;
 unsupported layer configurations or not-yet-resident auxiliary dependencies report the
 precise plan operation and authored owner through provenance. Recording uses staged

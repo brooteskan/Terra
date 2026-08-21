@@ -6,7 +6,8 @@ use terra_core::eval::{EvalWorkRequest, PreviewQuality};
 use terra_core::layer::{LayerId, LayerKind};
 use terra_core::mask::bake_mask_assets;
 use terra_core::tiling::UvRect;
-use terra_gpu::{GpuError, GpuEvaluationIntent, GpuPreviewFreshness, GpuRefinementStep};
+use terra_gpu::GpuError;
+use terra_gpu_eval::{GpuEvaluationIntent, GpuPreviewFreshness, GpuRefinementStep};
 
 use super::frame_trace::FrameTraceEventKind;
 use super::logical_frame::{EditGeneration, FrameDeadlineKind, FrameRequestReason};
@@ -1262,7 +1263,7 @@ impl TerraApp {
                 }
                 let gpu_eval_started = Instant::now();
                 let resolved_trace_identity = trace_identity.unwrap_or_default();
-                engine.set_evaluation_trace_context(terra_gpu::GpuEvaluationTraceContext {
+                engine.set_evaluation_trace_context(terra_gpu_eval::GpuEvaluationTraceContext {
                     frame_id: resolved_trace_identity.id.get(),
                     generation: resolved_trace_identity.generation.get(),
                     evaluation_id: trace_id.get(),
@@ -1853,7 +1854,7 @@ mod tests {
     use terra_core::shape_history::{create_shape_layer, ShapeTool};
     use terra_core::test_fixtures::{untitled6_document, Untitled6Variant};
     use terra_core::tiling::UvRect;
-    use terra_gpu::{GpuEvaluationIntent, GpuTerrainEngine};
+    use terra_gpu_eval::{GpuEvaluationIntent, GpuTerrainEngine};
     use terra_render::{GpuContext, HeightPresentGeom, TerrainRenderer};
 
     use crate::ui::PanelAction;

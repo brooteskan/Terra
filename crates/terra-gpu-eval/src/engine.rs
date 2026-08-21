@@ -8,20 +8,9 @@
 //! Interactive hard rules (WC): no UI-thread height readback, no mesh rebuild,
 //! prefer fully GPU stacks, never present an incomplete prefix as finished Draft.
 
-use crate::compiled_plan::{
-    GpuGroupCompositeParams, GpuPlanOperationError, GpuPlanOperations, GpuPlanResourceBuilder,
-    GpuPlanResourceCache, GpuPlanResourceKey, GpuPlanResources,
-};
-use crate::effect_filter::{effect_filter_gpu_spec, EffectFilterGpuPasses};
 use crate::evaluation_timing::{
     GpuEvaluationTimer, GpuEvaluationTiming, GpuEvaluationTraceContext,
 };
-use crate::graph::{
-    compile_gpu_graph, expand_dirty_rect, gpu_blend_mode, GpuComputeGraph, GpuDirtyPolicy,
-    GpuFallbackCode, GpuFallbackDiagnostic, GpuFallbackReason, GpuKernel, GpuLayerPlan,
-    BLUR_MAX_RADIUS, EFFECT_FILTER_MAX_RADIUS, RIVER_CARVE_MAX_RADIUS,
-};
-use crate::{readback_f32, GpuError};
 use bytemuck::{Pod, Zeroable};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -41,12 +30,23 @@ use terra_core::layer::{
     PolygonHeightMode, PolygonHeightParams, ProceduralGenerator, ProceduralShapeParams,
     SculptParams, SculptStroke, SculptStrokeKind, SculptStrokeParams,
 };
-use terra_core::mask::{Distribution, MaskAsset, MaskCombine, MaskOp, MaskSource};
+use terra_core::mask::{Distribution, MaskAsset, MaskSource};
 use terra_core::terrain_plan::{
     compile_terrain_plan, propagate_plan_edits, CompiledTerrainPlan, GroupCompositeMode,
     PlanDirtyScope, PlanInvalidation, PlanOpId, PlanOrigin, PlanStructureRevision,
     PropagatedDirtyScope, TerrainEditClass, TerrainOpKind, TerrainPlanStamp,
 };
+use terra_gpu::compiled_plan::{
+    GpuGroupCompositeParams, GpuPlanOperationError, GpuPlanOperations, GpuPlanResourceBuilder,
+    GpuPlanResourceCache, GpuPlanResourceKey, GpuPlanResources,
+};
+use terra_gpu::effect_filter::{effect_filter_gpu_spec, EffectFilterGpuPasses};
+use terra_gpu::graph::{
+    compile_gpu_graph, gpu_blend_mode, GpuComputeGraph, GpuFallbackCode, GpuFallbackDiagnostic,
+    GpuFallbackReason, GpuKernel, GpuLayerPlan, BLUR_MAX_RADIUS, EFFECT_FILTER_MAX_RADIUS,
+    RIVER_CARVE_MAX_RADIUS,
+};
+use terra_gpu::{readback_f32, GpuError};
 use wgpu::util::DeviceExt;
 
 fn cpu_required(
@@ -290,72 +290,6 @@ fn plan_operation_fallback(error: CompiledDispatchError) -> GpuFallbackReason {
     }
 }
 
-fn mask_program(
-    width: u32,
-    height: u32,
-    mode: u32,
-    radius: u32,
-    a: f32,
-    b: f32,
-    c: f32,
-) -> MaskProgramU {
-    MaskProgramU {
-        width,
-        height,
-        mode,
-        radius,
-        a,
-        b,
-        c,
-        _pad0: 0.0,
-    }
-}
-
-fn mask_op_program(op: MaskOp, width: u32, height: u32) -> Result<MaskProgramU, GpuError> {
-    let program = match op {
-        MaskOp::Add { amount } => mask_program(width, height, 0, 0, amount, 0.0, 0.0),
-        MaskOp::Subtract { amount } => mask_program(width, height, 1, 0, amount, 0.0, 0.0),
-        MaskOp::Multiply { amount } => mask_program(width, height, 2, 0, amount, 0.0, 0.0),
-        MaskOp::Min { value } => mask_program(width, height, 3, 0, value, 0.0, 0.0),
-        MaskOp::Max { value } => mask_program(width, height, 4, 0, value, 0.0, 0.0),
-        MaskOp::Invert => mask_program(width, height, 5, 0, 0.0, 0.0, 0.0),
-        MaskOp::Clamp { min, max } => mask_program(width, height, 6, 0, min, max, 0.0),
-        MaskOp::Levels {
-            in_black,
-            in_white,
-            gamma,
-        } => mask_program(width, height, 7, 0, in_black, in_white, gamma),
-        MaskOp::Smoothstep { edge0, edge1 } => mask_program(width, height, 8, 0, edge0, edge1, 0.0),
-        MaskOp::Blur { radius } if radius <= 16 => {
-            mask_program(width, height, 9, radius, 0.0, 0.0, 0.0)
-        }
-        MaskOp::Blur { radius } => {
-            return Err(cpu_required(
-                GpuFallbackCode::MaskOperations,
-                "mask",
-                format!("mask blur radius {radius} exceeds the GPU limit of 16 texels"),
-            ));
-        }
-        MaskOp::Remap { out_min, out_max } => {
-            mask_program(width, height, 10, 0, out_min, out_max, 0.0)
-        }
-    };
-    Ok(program)
-}
-
-fn mask_combine_program(mode: MaskCombine, width: u32, height: u32) -> MaskProgramU {
-    let id = match mode {
-        MaskCombine::Multiply => 20,
-        MaskCombine::Add => 21,
-        MaskCombine::Subtract => 22,
-        MaskCombine::Min => 23,
-        MaskCombine::Max => 24,
-        MaskCombine::Replace => 25,
-        MaskCombine::Invert => 26,
-        MaskCombine::PaintOverride => 27,
-    };
-    mask_program(width, height, id, 0, 0.0, 0.0, 0.0)
-}
 use terra_core::tiling::{SampleRect, TileScheduler};
 
 /// Small resident texture extent used while no project is active.
@@ -1079,40 +1013,6 @@ struct EffectRangeU {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct MaskBakeU {
-    width: u32,
-    height: u32,
-    mode: u32,
-    dz: f32,
-    dx: f32,
-    value: f32,
-    range_min: f32,
-    range_max: f32,
-    invert: f32,
-    strength: f32,
-    frequency: f32,
-    seed: f32,
-    region_x: u32,
-    region_y: u32,
-    region_w: u32,
-    region_h: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct MaskProgramU {
-    width: u32,
-    height: u32,
-    mode: u32,
-    radius: u32,
-    a: f32,
-    b: f32,
-    c: f32,
-    _pad0: f32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
 struct HeightmapSampleU {
     width: u32,
     height: u32,
@@ -1140,8 +1040,6 @@ enum TexSlot {
     Pong,
     Layer,
     MaskOnes,
-    MaskWorkA,
-    MaskWorkB,
     UnitMask,
     StampMask,
     Hardness,
@@ -1152,10 +1050,6 @@ enum TexSlot {
     Rainfall,
     LooseSediment,
     SculptStamp,
-    Cache(LayerId),
-    /// Pre-blend layer contribution (noise/shape/flat), reusable when only upstream changed.
-    Contrib(LayerId),
-    ContribMask(LayerId),
 }
 
 struct HeightTex {
@@ -1612,8 +1506,6 @@ pub struct GpuTerrainEngine {
     amplify_upsample_blend: Pipe,
     effect_filter_range: Pipe,
     effect_filter: Pipe,
-    mask_bake: Pipe,
-    mask_program: Pipe,
     sculpt_strokes: Pipe,
     sculpt_strokes_edited: Pipe,
     sculpt_strokes_flatten_reduce: Pipe,
@@ -1627,8 +1519,6 @@ pub struct GpuTerrainEngine {
     pong: HeightTex,
     layer_tex: HeightTex,
     mask_ones: HeightTex,
-    mask_work_a: HeightTex,
-    mask_work_b: HeightTex,
     unit_mask: HeightTex,
     stamp_mask: HeightTex,
     hardness: HeightTex,
@@ -1656,10 +1546,6 @@ pub struct GpuTerrainEngine {
     /// Ordered-f32 min/max written by `effect_filter_range` and read by remap kernels.
     effect_filter_range_buffer: wgpu::Buffer,
     layer_cache: HashMap<LayerId, HeightTex>,
-    /// Pre-blend generator output, keyed by layer id.
-    layer_contrib: HashMap<LayerId, HeightTex>,
-    /// Transform-composited masks paired with cached raster contributions.
-    layer_contrib_mask: HashMap<LayerId, HeightTex>,
     /// Raw normalized source rasters, independent from output-sized contributions.
     source_rasters: HashMap<PathBuf, SourceRasterTex>,
     /// Persistent authored stroke payloads keyed by stable layer identity. Live
@@ -2001,36 +1887,11 @@ impl GpuTerrainEngine {
                 storage_read_buffer_entry(3),
             ],
         });
-        let mask_bake_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("mask-bake-bgl"),
-            entries: &[uniform_entry(0), tex_read_entry(1), storage_write_entry(2)],
-        });
         let effect_filter = make_pipe(
             device,
             "effect-filter",
             include_str!("shaders/effect_filter.wgsl"),
             effect_filter_bgl,
-        );
-        let mask_bake = make_pipe(
-            device,
-            "mask-bake",
-            include_str!("shaders/mask_bake.wgsl"),
-            mask_bake_bgl,
-        );
-        let mask_program_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("mask-program-bgl"),
-            entries: &[
-                uniform_entry(0),
-                tex_read_entry(1),
-                tex_read_entry(2),
-                storage_write_entry(3),
-            ],
-        });
-        let mask_program = make_pipe(
-            device,
-            "mask-program",
-            include_str!("shaders/mask_program.wgsl"),
-            mask_program_bgl,
         );
         let sculpt_strokes_bgl =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -2119,8 +1980,6 @@ impl GpuTerrainEngine {
         let pong = HeightTex::new(device, "pong", w, w);
         let layer_tex = HeightTex::new(device, "layer", w, w);
         let mask_ones = HeightTex::new(device, "mask-ones", w, w);
-        let mask_work_a = HeightTex::new(device, "mask-work-a", w, w);
-        let mask_work_b = HeightTex::new(device, "mask-work-b", w, w);
         let unit_mask = HeightTex::new(device, "unit-mask", w, w);
         let stamp_mask = HeightTex::new(device, "stamp-mask", w, w);
         let sim_side = w;
@@ -2172,8 +2031,6 @@ impl GpuTerrainEngine {
             amplify_upsample_blend,
             effect_filter_range,
             effect_filter,
-            mask_bake,
-            mask_program,
             sculpt_strokes,
             sculpt_strokes_edited,
             sculpt_strokes_flatten_reduce,
@@ -2187,8 +2044,6 @@ impl GpuTerrainEngine {
             pong,
             layer_tex,
             mask_ones,
-            mask_work_a,
-            mask_work_b,
             unit_mask,
             stamp_mask,
             hardness,
@@ -2207,8 +2062,6 @@ impl GpuTerrainEngine {
             sculpt_edited,
             effect_filter_range_buffer,
             layer_cache: HashMap::new(),
-            layer_contrib: HashMap::new(),
-            layer_contrib_mask: HashMap::new(),
             source_rasters: HashMap::new(),
             stroke_runtime: HashMap::new(),
             #[cfg(test)]
@@ -2344,24 +2197,6 @@ impl GpuTerrainEngine {
         }
     }
 
-    /// First flattened index that is dirty (None = all clean).
-    pub fn first_dirty_index(&self, stack: &LayerStack) -> Option<usize> {
-        stack
-            .flatten_layers()
-            .iter()
-            .position(|layer| self.dirty.contains(&layer.id()))
-    }
-
-    pub fn is_dirty(&self, id: LayerId) -> bool {
-        self.dirty.contains(&id)
-    }
-
-    pub fn has_layer_cache(&self, id: LayerId, metrics: HeightfieldMetrics) -> bool {
-        self.layer_cache
-            .get(&id)
-            .is_some_and(|t| t.width == metrics.width && t.height == metrics.height)
-    }
-
     /// Upload a CPU heightfield into the layer cache (WC bridge: bake shapes, keep filters live).
     pub fn ingest_height(
         &mut self,
@@ -2412,48 +2247,6 @@ impl GpuTerrainEngine {
     }
 
     /// Upload a heightfield into the current ping/pong working buffer.
-    fn upload_height_to_current(&mut self, queue: &wgpu::Queue, height: &Heightfield) {
-        let w = self.metrics.width;
-        let h = self.metrics.height;
-        let dense = if height.metrics.width == w && height.metrics.height == h {
-            height.to_dense()
-        } else {
-            resample_height_nearest(height, self.metrics)
-        };
-        let tex = if self.current == 0 {
-            &self.ping.texture
-        } else {
-            &self.pong.texture
-        };
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            bytemuck::cast_slice(&dense),
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(w * 4),
-                rows_per_image: Some(h),
-            },
-            wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-        );
-        let (mut lo, mut hi) = (f32::MAX, f32::MIN);
-        for v in &dense {
-            lo = lo.min(*v);
-            hi = hi.max(*v);
-        }
-        if lo <= hi {
-            self.approx_range = (lo, hi);
-        }
-    }
-
     pub fn mark_all_dirty(&mut self, stack: &LayerStack) {
         for layer in stack.flatten_layers() {
             self.dirty.insert(layer.id());
@@ -2467,14 +2260,12 @@ impl GpuTerrainEngine {
         self.active_plan_revision = None;
         self.deferred_plan_resume = None;
         self.layer_cache.clear();
-        self.layer_contrib.clear();
-        self.layer_contrib_mask.clear();
         self.source_rasters.clear();
         self.stroke_runtime.clear();
         self.dirty.clear();
         self.last_dirty_rect = None;
         self.last_quality = None;
-        self.last_graph = crate::graph::GpuComputeGraph::default();
+        self.last_graph = terra_gpu::graph::GpuComputeGraph::default();
         self.last_eval_stats = GpuEvalStats::default();
         self.last_plan_operation_trace.clear();
         self.tile_sched = TileScheduler::new();
@@ -2538,8 +2329,6 @@ impl GpuTerrainEngine {
         self.pong = HeightTex::new(device, "pong", w, h);
         self.layer_tex = HeightTex::new(device, "layer", w, h);
         self.mask_ones = HeightTex::new(device, "mask-ones", w, h);
-        self.mask_work_a = HeightTex::new(device, "mask-work-a", w, h);
-        self.mask_work_b = HeightTex::new(device, "mask-work-b", w, h);
         self.unit_mask = HeightTex::new(device, "unit-mask", w, h);
         self.stamp_mask = HeightTex::new(device, "stamp-mask", w, h);
         self.hardness = HeightTex::new(device, "hardness", w, h);
@@ -2557,8 +2346,6 @@ impl GpuTerrainEngine {
         self.sculpt_stamp_b = HeightTex::new(device, "sculpt-stamp-b", w, h);
         self.sculpt_edited = HeightTex::new(device, "sculpt-edited", w, h);
         self.layer_cache.clear();
-        self.layer_contrib.clear();
-        self.layer_contrib_mask.clear();
         self.stroke_runtime.clear();
         self.dirty.clear();
     }
@@ -2586,8 +2373,6 @@ impl GpuTerrainEngine {
             TexSlot::Pong => &self.pong.view,
             TexSlot::Layer => &self.layer_tex.view,
             TexSlot::MaskOnes => &self.mask_ones.view,
-            TexSlot::MaskWorkA => &self.mask_work_a.view,
-            TexSlot::MaskWorkB => &self.mask_work_b.view,
             TexSlot::UnitMask => &self.unit_mask.view,
             TexSlot::StampMask => &self.stamp_mask.view,
             TexSlot::Hardness => &self.hardness.view,
@@ -2598,11 +2383,6 @@ impl GpuTerrainEngine {
             TexSlot::Rainfall => &self.rainfall.view,
             TexSlot::LooseSediment => &self.loose_sediment.view,
             TexSlot::SculptStamp => &self.sculpt_stamp.view,
-            TexSlot::Cache(id) => &self.layer_cache.get(&id).expect("cache").view,
-            TexSlot::Contrib(id) => &self.layer_contrib.get(&id).expect("contrib").view,
-            TexSlot::ContribMask(id) => {
-                &self.layer_contrib_mask.get(&id).expect("contrib mask").view
-            }
         }
     }
 
@@ -2738,61 +2518,6 @@ impl GpuTerrainEngine {
                 self.metrics.height.div_ceil(8),
                 1,
             );
-        }
-    }
-
-    fn copy_slots_region(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        encoder: &mut wgpu::CommandEncoder,
-        src: TexSlot,
-        dst: TexSlot,
-        region: (u32, u32, u32, u32),
-    ) {
-        let (region_x, region_y, region_w, region_h) = region;
-        let u = CopyU {
-            width: self.metrics.width,
-            height: self.metrics.height,
-            region_x,
-            region_y,
-            region_w,
-            region_h,
-        };
-        let u_buf = self.write_uniform(device, queue, &u);
-        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("copy-region-bg"),
-            layout: &self.copy.bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: u_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(self.view_of(src)),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(self.view_of(dst)),
-                },
-            ],
-        });
-        let gx = region_w.div_ceil(8).max(1);
-        let gy = region_h.div_ceil(8).max(1);
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("copy-region"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.copy.pipeline);
-            pass.set_bind_group(0, &bg, &[]);
-            pass.dispatch_workgroups(gx, gy, 1);
-        }
-        let groups = u64::from(gx) * u64::from(gy);
-        self.last_eval_stats.copy_workgroups += groups;
-        if matches!(dst, TexSlot::Cache(_)) {
-            self.last_eval_stats.cache_copy_workgroups += groups;
         }
     }
 
@@ -4464,83 +4189,6 @@ impl GpuTerrainEngine {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn blend_slots_region(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        encoder: &mut wgpu::CommandEncoder,
-        base: TexSlot,
-        contribution: TexSlot,
-        masks: [TexSlot; 2],
-        destination: TexSlot,
-        opacity: f32,
-        mode: BlendMode,
-        region: (u32, u32, u32, u32),
-    ) -> Result<(), GpuError> {
-        let (region_x, region_y, region_w, region_h) = region;
-        let u = BlendU {
-            width: self.metrics.width,
-            height: self.metrics.height,
-            opacity,
-            mode: gpu_blend_mode(mode).ok_or_else(|| {
-                cpu_required(
-                    GpuFallbackCode::BlendMode,
-                    "blend",
-                    format!("{mode:?} is not implemented"),
-                )
-            })?,
-            region_x,
-            region_y,
-            region_w,
-            region_h,
-        };
-        let u_buf = self.write_uniform(device, queue, &u);
-        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("blend-region-bg"),
-            layout: &self.blend.bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: u_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(self.view_of(base)),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(self.view_of(contribution)),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(self.view_of(masks[0])),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::TextureView(self.view_of(masks[1])),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: wgpu::BindingResource::TextureView(self.view_of(destination)),
-                },
-            ],
-        });
-        let gx = region_w.div_ceil(8).max(1);
-        let gy = region_h.div_ceil(8).max(1);
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("blend-region"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.blend.pipeline);
-            pass.set_bind_group(0, &bg, &[]);
-            pass.dispatch_workgroups(gx, gy, 1);
-        }
-        self.last_eval_stats.blend_workgroups += u64::from(gx) * u64::from(gy);
-        Ok(())
-    }
-
     fn scale_iters(quality: PreviewQuality, iters: u32) -> u32 {
         match quality {
             // Draft must still read as a real filter change (WC interactive), not a no-op.
@@ -4566,14 +4214,6 @@ impl GpuTerrainEngine {
     /// Executed iteration count for a layer's kernel — the single source of truth
     /// shared by the kernel dispatch and the dirty-region halo sizing so the two
     /// never disagree about how far a filter reaches.
-    fn executed_iterations(quality: PreviewQuality, kind: &LayerKind) -> u32 {
-        match kind {
-            LayerKind::EffectFilter(p) => Self::effect_filter_iters(quality, p),
-            LayerKind::Blur(p) => Self::blur_iters(p),
-            _ => 1,
-        }
-    }
-
     fn dirty_dispatch_extent(&self) -> (u32, u32, u32, u32, u32, u32) {
         // Returns (region_x, region_y, region_w, region_h, groups_x, groups_y).
         // `last_dirty_rect` is already expanded by the plan halo in `evaluate`, so
@@ -4769,434 +4409,6 @@ impl GpuTerrainEngine {
         }
     }
 
-    fn bake_layer_mask_gpu(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        encoder: &mut wgpu::CommandEncoder,
-        layer: &Layer,
-        mask_assets: &[MaskAsset],
-    ) -> Result<(), GpuError> {
-        self.fill_slot(device, queue, encoder, TexSlot::MaskOnes, 1.0);
-        if layer.common.masks.is_empty() {
-            return Ok(());
-        }
-        if !layer.common.masks.nodes.is_empty() {
-            return Err(cpu_required(
-                GpuFallbackCode::MaskNodes,
-                "mask",
-                "distribution nodes are not yet GPU-resident",
-            ));
-        }
-        for entry in &layer.common.masks.entries {
-            let asset = mask_assets
-                .iter()
-                .find(|asset| asset.id == entry.mask.id)
-                .ok_or_else(|| {
-                    cpu_required(
-                        GpuFallbackCode::MissingMaskAsset,
-                        "mask",
-                        "referenced mask asset is missing",
-                    )
-                })?;
-            let (mode, value, range_min, range_max) = match &asset.source {
-                MaskSource::Constant(v) => (0u32, *v, 0.0, 1.0),
-                MaskSource::Height { min, max } => (1u32, 0.0, *min, *max),
-                MaskSource::Slope { min_deg, max_deg } => (2u32, 0.0, *min_deg, *max_deg),
-                _ => {
-                    return Err(cpu_required(
-                        GpuFallbackCode::MaskSource,
-                        "mask",
-                        "mask source is not GPU-resident",
-                    ));
-                }
-            };
-            self.dispatch_mask_bake(
-                device,
-                queue,
-                encoder,
-                TexSlot::MaskWorkA,
-                MaskBakeU {
-                    width: self.metrics.width,
-                    height: self.metrics.height,
-                    mode,
-                    dz: self.metrics.dz(),
-                    dx: self.metrics.dx(),
-                    value,
-                    range_min,
-                    range_max,
-                    invert: if entry.mask.invert { 1.0 } else { 0.0 },
-                    strength: entry.mask.strength,
-                    frequency: 0.0,
-                    seed: 0.0,
-                    region_x: 0,
-                    region_y: 0,
-                    region_w: 0,
-                    region_h: 0,
-                },
-            );
-
-            let mut entry_slot = TexSlot::MaskWorkA;
-            for op in &asset.ops {
-                let output = match entry_slot {
-                    TexSlot::MaskWorkA => TexSlot::MaskWorkB,
-                    _ => TexSlot::MaskWorkA,
-                };
-                let program = mask_op_program(*op, self.metrics.width, self.metrics.height)?;
-                self.dispatch_mask_program(
-                    device,
-                    queue,
-                    encoder,
-                    [entry_slot, entry_slot, output],
-                    program,
-                );
-                entry_slot = output;
-            }
-            let combined = match entry_slot {
-                TexSlot::MaskWorkA => TexSlot::MaskWorkB,
-                _ => TexSlot::MaskWorkA,
-            };
-            self.dispatch_mask_program(
-                device,
-                queue,
-                encoder,
-                [TexSlot::MaskOnes, entry_slot, combined],
-                mask_combine_program(entry.combine, self.metrics.width, self.metrics.height),
-            );
-            self.copy_slots(device, queue, encoder, combined, TexSlot::MaskOnes);
-        }
-        Ok(())
-    }
-
-    fn dispatch_mask_bake(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        encoder: &mut wgpu::CommandEncoder,
-        dst: TexSlot,
-        uniform: MaskBakeU,
-    ) {
-        let u_buf = self.write_uniform(device, queue, &uniform);
-        let height = if self.current == 0 {
-            TexSlot::Ping
-        } else {
-            TexSlot::Pong
-        };
-        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("mask-bake-bg"),
-            layout: &self.mask_bake.bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: u_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(self.view_of(height)),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(self.view_of(dst)),
-                },
-            ],
-        });
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("mask-bake"),
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(&self.mask_bake.pipeline);
-        pass.set_bind_group(0, &bg, &[]);
-        pass.dispatch_workgroups(
-            self.metrics.width.div_ceil(8),
-            self.metrics.height.div_ceil(8),
-            1,
-        );
-    }
-
-    fn dispatch_mask_program(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        encoder: &mut wgpu::CommandEncoder,
-        slots: [TexSlot; 3],
-        uniform: MaskProgramU,
-    ) {
-        let [src_a, src_b, dst] = slots;
-        let u_buf = self.write_uniform(device, queue, &uniform);
-        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("mask-program-bg"),
-            layout: &self.mask_program.bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: u_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(self.view_of(src_a)),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(self.view_of(src_b)),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(self.view_of(dst)),
-                },
-            ],
-        });
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("mask-program"),
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(&self.mask_program.pipeline);
-        pass.set_bind_group(0, &bg, &[]);
-        pass.dispatch_workgroups(
-            self.metrics.width.div_ceil(8),
-            self.metrics.height.div_ceil(8),
-            1,
-        );
-    }
-
-    fn can_evaluate_layer_zero_region(
-        &self,
-        layers: &[&Layer],
-        plans: &[Option<crate::graph::GpuLayerPlan>],
-        quality_changed: bool,
-        prefix_end: usize,
-    ) -> bool {
-        let Some(first) = layers.first() else {
-            return false;
-        };
-        if prefix_end == 0
-            || quality_changed
-            || self.last_dirty_rect.is_none()
-            || !first.common.enabled
-            || !matches!(first.kind, LayerKind::SculptBase(_))
-            || first.common.opacity != 1.0
-            || !matches!(
-                first.common.blend,
-                BlendMode::Normal | BlendMode::Replace | BlendMode::Interpolate
-            )
-            || !first.common.masks.is_empty()
-            || self.dirty.iter().any(|id| {
-                layers
-                    .iter()
-                    .take(prefix_end)
-                    .any(|layer| layer.id() == *id && *id != first.id())
-            })
-            || plans.len() != layers.len()
-            || plans
-                .iter()
-                .zip(layers)
-                .take(prefix_end)
-                .any(|(plan, layer)| {
-                    layer.common.enabled
-                        && plan.is_none_or(|plan| plan.dirty_policy == GpuDirtyPolicy::FullField)
-                })
-        {
-            return false;
-        }
-        if layers.iter().take(prefix_end).any(|layer| {
-            !self.layer_cache.get(&layer.id()).is_some_and(|cache| {
-                cache.width == self.metrics.width && cache.height == self.metrics.height
-            })
-        }) {
-            return false;
-        }
-        layers
-            .iter()
-            .skip(1)
-            .take(prefix_end.saturating_sub(1))
-            .all(|layer| {
-                if !layer.common.enabled {
-                    return true;
-                }
-                if !layer.common.masks.is_empty() || self.dirty.contains(&layer.id()) {
-                    return false;
-                }
-                match &layer.kind {
-                    LayerKind::SculptStrokes(params) => !params
-                        .strokes
-                        .iter()
-                        .any(|stroke| stroke.enabled && stroke.kind == SculptStrokeKind::Flatten),
-                    kind if layer_input_independent(kind) => {
-                        !matches!(kind, LayerKind::ImportHeightmap(_) | LayerKind::Stamp2d(_))
-                            && self.layer_contrib.get(&layer.id()).is_some_and(|cache| {
-                                cache.width == self.metrics.width
-                                    && cache.height == self.metrics.height
-                            })
-                    }
-                    _ => false,
-                }
-            })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn evaluate_layer_zero_region(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        layers: &[&Layer],
-        plans: &[Option<crate::graph::GpuLayerPlan>],
-        quality: PreviewQuality,
-        want_cpu: bool,
-        prefix_end: usize,
-        freshness: GpuPreviewFreshness,
-    ) -> Result<GpuEvalResult, GpuError> {
-        let pending = self
-            .last_dirty_rect
-            .expect("regional admission requires a pending rectangle");
-        let halo = layers
-            .iter()
-            .zip(plans)
-            .take(prefix_end)
-            .filter_map(|(layer, plan)| plan.filter(|_| layer.common.enabled).map(|p| (layer, p)))
-            .fold(0u32, |halo, (layer, plan)| {
-                halo.saturating_add(
-                    plan.halo_texels
-                        .saturating_mul(Self::executed_iterations(quality, &layer.kind)),
-                )
-            });
-        let region = expand_dirty_rect(pending, halo, self.metrics.width, self.metrics.height);
-        self.mark_tiles_overlapping_rect(region);
-        self.last_eval_stats.used_layer_zero_region = true;
-
-        let first = layers[0];
-        let LayerKind::SculptBase(params) = &first.kind else {
-            unreachable!("regional layer-zero admission is SculptBase-only");
-        };
-        if let Some((lo, hi)) = self.upload_sculpt_region(queue, params, region) {
-            self.expand_range(lo, hi);
-        }
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("gpu-layer-zero-region"),
-        });
-        self.copy_slots_region(
-            device,
-            queue,
-            &mut encoder,
-            TexSlot::Layer,
-            TexSlot::Cache(first.id()),
-            region,
-        );
-        #[cfg(test)]
-        self.executed_kernels.push(GpuKernel::Sculpt);
-        self.dirty.remove(&first.id());
-
-        let mut source = TexSlot::Cache(first.id());
-        for layer in layers
-            .iter()
-            .skip(1)
-            .take(prefix_end.saturating_sub(1))
-            .copied()
-        {
-            let id = layer.id();
-            if !layer.common.enabled {
-                self.copy_slots_region(
-                    device,
-                    queue,
-                    &mut encoder,
-                    source,
-                    TexSlot::Cache(id),
-                    region,
-                );
-                source = TexSlot::Cache(id);
-                self.dirty.remove(&id);
-                continue;
-            }
-            match &layer.kind {
-                LayerKind::SculptStrokes(params) => {
-                    #[cfg(test)]
-                    self.executed_kernels.push(GpuKernel::SculptStrokes);
-                    self.run_sculpt_strokes(
-                        device,
-                        queue,
-                        &mut encoder,
-                        id,
-                        params,
-                        source,
-                        region,
-                    );
-                    for stroke in &params.strokes {
-                        if stroke.enabled
-                            && matches!(
-                                stroke.kind,
-                                SculptStrokeKind::HeightStamp | SculptStrokeKind::PlateauStamp
-                            )
-                        {
-                            self.expand_range(stroke.target_height, stroke.target_height);
-                        }
-                    }
-                    self.blend_slots_region(
-                        device,
-                        queue,
-                        &mut encoder,
-                        source,
-                        TexSlot::Layer,
-                        [TexSlot::MaskOnes, TexSlot::UnitMask],
-                        TexSlot::Cache(id),
-                        layer.common.opacity,
-                        layer.common.blend,
-                        region,
-                    )?;
-                }
-                kind if layer_input_independent(kind) => {
-                    self.last_eval_stats.reused_contributions += 1;
-                    self.blend_slots_region(
-                        device,
-                        queue,
-                        &mut encoder,
-                        source,
-                        TexSlot::Contrib(id),
-                        [TexSlot::MaskOnes, TexSlot::UnitMask],
-                        TexSlot::Cache(id),
-                        layer.common.opacity,
-                        layer.common.blend,
-                        region,
-                    )?;
-                }
-                _ => unreachable!("regional admission rejected unsupported downstream layer"),
-            }
-            source = TexSlot::Cache(id);
-            self.dirty.remove(&id);
-        }
-
-        let presentation = if self.current == 0 {
-            TexSlot::Ping
-        } else {
-            TexSlot::Pong
-        };
-        self.copy_slots_region(device, queue, &mut encoder, source, presentation, region);
-        queue.submit(Some(encoder.finish()));
-        self.last_dirty_rect = None;
-        let cpu = if want_cpu {
-            Some(self.readback_current(device, queue)?)
-        } else {
-            None
-        };
-        Ok(GpuEvalResult {
-            width: self.metrics.width,
-            height: self.metrics.height,
-            world_size: (self.metrics.world_size_x, self.metrics.world_size_z),
-            height_range: self.approx_range,
-            fully_gpu: !freshness.is_deferred(),
-            freshness,
-            cpu,
-            resume_cpu_from: None,
-            cpu_fallback: None,
-            did_eval: true,
-        })
-    }
-
-    /// Evaluate the GPU-compatible suffix of a stack, then return a CPU resume point if needed.
-    ///
-    /// `bridge_prefix` is an optional heightfield representing the stack through the layer
-    /// before `first_dirty` (CPU cache / last-good). It lets filters stay live on GPU when
-    /// earlier shape layers are not GPU-supported but already baked.
-    // GPU evaluation entry point: the wgpu context plus the independent inputs a
-    // full evaluation needs (stack, mask assets, metrics, quality, flags,
-    // bridge prefix), each used once. Kept flat.
     #[allow(clippy::too_many_arguments)]
     pub fn evaluate(
         &mut self,
@@ -6636,683 +5848,6 @@ impl GpuTerrainEngine {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
-    #[doc(hidden)]
-    pub fn evaluate_flat_with_intent(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        stack: &LayerStack,
-        mask_assets: &[MaskAsset],
-        metrics: HeightfieldMetrics,
-        quality: PreviewQuality,
-        want_cpu: bool,
-        bridge_prefix: Option<&Heightfield>,
-        intent: GpuEvaluationIntent,
-    ) -> Result<GpuEvalResult, GpuError> {
-        profiling::scope!("gpu_stack_eval");
-        // Flattened GPU evaluation cannot preserve scoped-group composition or solo
-        // filtering. Leave all engine state and the last-good texture untouched so the
-        // app can route the complete tree to its asynchronous CPU worker.
-        if stack.requires_tree_evaluation() {
-            return Err(cpu_required(
-                GpuFallbackCode::UnsupportedOptions,
-                "stack",
-                "scoped groups or solo filtering require the CPU tree evaluator",
-            ));
-        }
-        self.ensure_size(device, metrics);
-        self.uniform_pool.reset();
-        self.last_eval_stats = GpuEvalStats::default();
-        let quality_changed = self.last_quality.replace(quality) != Some(quality);
-
-        let layers = stack.flatten_layers();
-        if quality_changed {
-            // Drop contrib + wrong-size height caches. When a bridge prefix is supplied the
-            // caller already marked the dirty suffix — do not force a full rebuild (that
-            // produces the "weird Draft/zero frame" on filter add).
-            self.layer_contrib.clear();
-            self.layer_contrib_mask.clear();
-            self.layer_cache
-                .retain(|_, tex| tex.width == metrics.width && tex.height == metrics.height);
-            if bridge_prefix.is_none() {
-                self.dirty.extend(layers.iter().map(|layer| layer.id()));
-            }
-        }
-        if layers.is_empty() {
-            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("gpu-empty"),
-            });
-            self.fill_slot(device, queue, &mut encoder, TexSlot::Ping, 0.0);
-            self.current = 0;
-            queue.submit(Some(encoder.finish()));
-            return Ok(GpuEvalResult {
-                width: metrics.width,
-                height: metrics.height,
-                world_size: (metrics.world_size_x, metrics.world_size_z),
-                height_range: (0.0, 0.0),
-                fully_gpu: true,
-                freshness: GpuPreviewFreshness::Current,
-                cpu: if want_cpu {
-                    Some(Heightfield::zeros(metrics))
-                } else {
-                    None
-                },
-                resume_cpu_from: None,
-                cpu_fallback: None,
-                did_eval: true,
-            });
-        }
-
-        let graph = compile_gpu_graph(stack, mask_assets);
-        self.last_graph = graph;
-        // The compiled plan is the sole planning authority for this evaluation: one
-        // slot per flattened layer, indexed here and never re-derived mid-walk.
-        let plans = self.last_graph.plans.clone();
-        #[cfg(test)]
-        self.executed_kernels.clear();
-
-        let first_dirty = layers
-            .iter()
-            .position(|l| self.dirty.contains(&l.id()))
-            .unwrap_or(layers.len());
-
-        // A bounded interactive edit presents the exact local prefix and stops at
-        // the first enabled globally coupled pass. Every later layer is part of
-        // that deferred suffix, including otherwise-local filters.
-        let full_execution_end = if want_cpu {
-            self.last_graph.cpu_from.unwrap_or(layers.len())
-        } else {
-            layers.len()
-        };
-        let bounded_first_dirty = first_dirty.min(full_execution_end);
-        let pass_dirty_rect = self.last_dirty_rect;
-        let deferred_at = if intent == GpuEvaluationIntent::InteractiveLocal
-            && pass_dirty_rect.is_some()
-            && !want_cpu
-        {
-            let boundary = layers
-                .iter()
-                .enumerate()
-                .skip(bounded_first_dirty)
-                .take(full_execution_end.saturating_sub(bounded_first_dirty))
-                .find_map(|(i, layer)| {
-                    plans[i]
-                        .filter(|plan| {
-                            layer.common.enabled && plan.dirty_policy == GpuDirtyPolicy::FullField
-                        })
-                        .map(|_| i)
-                });
-            boundary.filter(|boundary| {
-                layers
-                    .iter()
-                    .enumerate()
-                    .skip(bounded_first_dirty)
-                    .take(boundary.saturating_sub(bounded_first_dirty))
-                    .all(|(index, layer)| !layer.common.enabled || plans[index].is_some())
-            })
-        } else {
-            None
-        };
-        let freshness = deferred_at.map_or(GpuPreviewFreshness::Current, |from_index| {
-            GpuPreviewFreshness::Deferred {
-                from_index,
-                from_layer: layers[from_index].id(),
-                deferred_layers: layers
-                    .iter()
-                    .skip(from_index)
-                    .filter(|layer| layer.common.enabled)
-                    .count(),
-            }
-        });
-        if let Some(index) = deferred_at {
-            self.dirty
-                .extend(layers.iter().skip(index).map(|layer| layer.id()));
-        }
-
-        let prefix_end = deferred_at.unwrap_or(full_execution_end);
-        if deferred_at == Some(bounded_first_dirty) {
-            // The edited layer itself is globally coupled, so there is no exact local
-            // prefix to present. Keep the last complete preview and retain the whole
-            // boundary suffix as dirty for the scheduled completion pass.
-            self.last_dirty_rect = None;
-            return Ok(GpuEvalResult {
-                width: metrics.width,
-                height: metrics.height,
-                world_size: (metrics.world_size_x, metrics.world_size_z),
-                height_range: self.approx_range,
-                fully_gpu: false,
-                freshness,
-                cpu: None,
-                resume_cpu_from: None,
-                cpu_fallback: None,
-                did_eval: false,
-            });
-        }
-        if first_dirty == 0
-            && self.can_evaluate_layer_zero_region(&layers, &plans, quality_changed, prefix_end)
-        {
-            return self.evaluate_layer_zero_region(
-                device, queue, &layers, &plans, quality, want_cpu, prefix_end, freshness,
-            );
-        }
-
-        // All clean and fully GPU-cached: restore top cache (no recompute).
-        let any_enabled_unsupported = layers
-            .iter()
-            .enumerate()
-            .any(|(i, l)| l.common.enabled && plans[i].is_none());
-        if first_dirty >= layers.len() && !any_enabled_unsupported {
-            if let Some(top) = layers.last() {
-                if let Some(cached) = self.layer_cache.get(&top.id()) {
-                    if cached.width == metrics.width && cached.height == metrics.height {
-                        let mut encoder =
-                            device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                                label: Some("gpu-cache-hit"),
-                            });
-                        self.copy_slots(
-                            device,
-                            queue,
-                            &mut encoder,
-                            TexSlot::Cache(top.id()),
-                            TexSlot::Ping,
-                        );
-                        self.current = 0;
-                        queue.submit(Some(encoder.finish()));
-                        let cpu = if want_cpu {
-                            Some(self.readback_current(device, queue)?)
-                        } else {
-                            None
-                        };
-                        return Ok(GpuEvalResult {
-                            width: metrics.width,
-                            height: metrics.height,
-                            world_size: (metrics.world_size_x, metrics.world_size_z),
-                            height_range: self.approx_range,
-                            fully_gpu: true,
-                            freshness: GpuPreviewFreshness::Current,
-                            cpu,
-                            resume_cpu_from: None,
-                            cpu_fallback: None,
-                            did_eval: true,
-                        });
-                    }
-                }
-            }
-        }
-
-        // A real CPU checkpoint stops before the first unsupported layer. Interactive
-        // preview keeps walking the whole suffix so supported filters above an unsupported
-        // layer remain live without forcing a UI-thread readback.
-        let execution_end = prefix_end;
-        let first_dirty = bounded_first_dirty.min(execution_end);
-        // Hybrid resume point (first unsupported we could only passthrough).
-        let mut cpu_from = self.last_graph.cpu_from;
-        let mut hybrid = false;
-
-        // Seed from previous layer cache when possible.
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("gpu-stack"),
-        });
-        self.fill_slot(device, queue, &mut encoder, TexSlot::MaskOnes, 1.0);
-        self.fill_slot(device, queue, &mut encoder, TexSlot::UnitMask, 1.0);
-
-        // A full re-evaluation or quality change affects every sample and needs a
-        // full present. A local sculpt edit (dirty rect, first_dirty > 0) can instead
-        // update just the touched region — but that region must be sized from the
-        // compiled plan: a full-field-coupled pass (thermal/hydraulic/river) invalidates any
-        // local rect, and otherwise the rect expands by each executed local pass's
-        // reach (per-iteration halo x its executed iteration count) so the edit
-        // resolves correctly and the present covers every texel the kernels rewrite.
-        // The expanded rect drives both compute dispatch and presentation — one
-        // region, no drift, and no stale leftover rect from a prior stroke.
-        let mut halo_texels: u32 = 0;
-        let mut force_full_field = false;
-        for (i, layer) in layers
-            .iter()
-            .enumerate()
-            .skip(first_dirty)
-            .take(execution_end.saturating_sub(first_dirty))
-        {
-            let Some(plan) = plans[i].filter(|_| layer.common.enabled) else {
-                continue;
-            };
-            match plan.dirty_policy {
-                GpuDirtyPolicy::FullField => {
-                    force_full_field = true;
-                    break;
-                }
-                GpuDirtyPolicy::Local => {
-                    halo_texels = halo_texels.saturating_add(
-                        plan.halo_texels
-                            .saturating_mul(Self::executed_iterations(quality, &layer.kind)),
-                    );
-                }
-            }
-        }
-        let framed_rect =
-            pass_dirty_rect.filter(|_| first_dirty != 0 && !quality_changed && !force_full_field);
-        if let Some(rect) = framed_rect {
-            let expanded =
-                expand_dirty_rect(rect, halo_texels, self.metrics.width, self.metrics.height);
-            self.mark_tiles_overlapping_rect(expanded);
-            self.last_dirty_rect = Some(expanded);
-        } else {
-            self.mark_all_tiles_dirty();
-            self.last_dirty_rect = None;
-        }
-
-        let mut seeded = false;
-        if first_dirty == 0 {
-            self.fill_slot(device, queue, &mut encoder, TexSlot::Ping, 0.0);
-            self.current = 0;
-            self.approx_range = (0.0, 1.0);
-            seeded = true;
-        } else {
-            let prev_id = layers[first_dirty - 1].id();
-            let cached_ok = self
-                .layer_cache
-                .get(&prev_id)
-                .map(|c| c.width == metrics.width && c.height == metrics.height)
-                .unwrap_or(false);
-            if cached_ok {
-                self.copy_slots(
-                    device,
-                    queue,
-                    &mut encoder,
-                    TexSlot::Cache(prev_id),
-                    TexSlot::Ping,
-                );
-                self.current = 0;
-                // Preserve a sensible range when seeding from cache.
-                if self.approx_range.1 <= self.approx_range.0 {
-                    self.approx_range = (0.0, 120.0);
-                }
-                seeded = true;
-            }
-        }
-
-        if !seeded {
-            // Bridge: upload baked prefix (CPU cache / last-good) so dirty GPU filters run.
-            let bridge_ok = bridge_prefix.is_some_and(|hf| {
-                hf.metrics.width > 0
-                    && hf.metrics.height > 0
-                    && bridge_prefix_safe(&layers, first_dirty)
-            });
-            if bridge_ok {
-                if let Some(hf) = bridge_prefix {
-                    queue.submit(Some(encoder.finish()));
-                    self.current = 0;
-                    self.upload_height_to_current(queue, hf);
-                    if first_dirty > 0 {
-                        // Cache the bridged prefix under the previous layer id.
-                        let mut enc =
-                            device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                                label: Some("gpu-bridge-cache"),
-                            });
-                        self.cache_current(device, queue, &mut enc, layers[first_dirty - 1].id());
-                        queue.submit(Some(enc.finish()));
-                    }
-                    encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                        label: Some("gpu-stack-bridged"),
-                    });
-                    self.fill_slot(device, queue, &mut encoder, TexSlot::MaskOnes, 1.0);
-                    seeded = true;
-                }
-            }
-        }
-
-        if !seeded {
-            // Prefix is GPU-supported: dirty from 0 and re-enter.
-            let prefix_gpu = layers[..first_dirty]
-                .iter()
-                .enumerate()
-                .all(|(i, l)| !l.common.enabled || plans[i].is_some());
-            if prefix_gpu && first_dirty > 0 {
-                drop(encoder);
-                self.dirty.extend(layers.iter().map(|l| l.id()));
-                return self.evaluate_flat_with_intent(
-                    device,
-                    queue,
-                    stack,
-                    mask_assets,
-                    metrics,
-                    quality,
-                    want_cpu,
-                    bridge_prefix,
-                    intent,
-                );
-            }
-            // Cannot seed — keep last-good on screen; async CPU must rebuild.
-            drop(encoder);
-            return Ok(GpuEvalResult {
-                width: metrics.width,
-                height: metrics.height,
-                world_size: (metrics.world_size_x, metrics.world_size_z),
-                height_range: self.approx_range,
-                fully_gpu: false,
-                freshness: GpuPreviewFreshness::Current,
-                cpu: None,
-                resume_cpu_from: Some(0),
-                cpu_fallback: self.last_graph.cpu_fallback.clone().or_else(|| {
-                    layers.first().map(|layer| GpuFallbackDiagnostic {
-                        operation: None,
-                        owner: Some(NodeRef::Layer(layer.id())),
-                        layer_index: 0,
-                        layer_id: layer.id(),
-                        layer_name: layer.common.name.clone(),
-                        reason: GpuFallbackReason::new(
-                            GpuFallbackCode::RuntimeResourceLimit,
-                            "checkpoint",
-                            "GPU preview could not seed the requested dirty suffix",
-                        ),
-                    })
-                }),
-                did_eval: false,
-            });
-        }
-
-        // Walk either the full speculative preview suffix or the exact GPU prefix needed
-        // for CPU resume. Unsupported layers use bake cache or passthrough only in the
-        // speculative path, so EffectFilters above shapes stay live interactively.
-        for (layer_index, layer) in layers
-            .iter()
-            .enumerate()
-            .skip(first_dirty)
-            .take(execution_end.saturating_sub(first_dirty))
-        {
-            if !layer.common.enabled {
-                self.cache_current(device, queue, &mut encoder, layer.id());
-                self.dirty.remove(&layer.id());
-                continue;
-            }
-
-            // Enabled but no compiled plan = not GPU-supported (bake cache or passthrough).
-            if plans[layer_index].is_none() {
-                let cached_ok = self
-                    .layer_cache
-                    .get(&layer.id())
-                    .map(|c| c.width == metrics.width && c.height == metrics.height)
-                    .unwrap_or(false);
-                if cached_ok {
-                    self.copy_slots(
-                        device,
-                        queue,
-                        &mut encoder,
-                        TexSlot::Cache(layer.id()),
-                        TexSlot::Ping,
-                    );
-                    self.current = 0;
-                    self.dirty.remove(&layer.id());
-                } else {
-                    // Uncached ProceduralShape / Stamp / Path / etc.
-                    // Passthrough the working buffer so downstream GPU filters can still
-                    // run, but do **not** cache this as the layer bake and do **not**
-                    // clear dirty — that poisoned shapes as identity and skipped CPU.
-                    hybrid = true;
-                    if cpu_from.is_none() {
-                        cpu_from = Some(layer_index);
-                    }
-                }
-                continue;
-            }
-
-            if layer.common.masks.is_empty() {
-                self.fill_slot(device, queue, &mut encoder, TexSlot::MaskOnes, 1.0);
-            } else {
-                // GPU-resident mask bake from current height prefix — no Maintain::Wait.
-                self.bake_layer_mask_gpu(device, queue, &mut encoder, layer, mask_assets)?;
-            }
-            // Sculpt uploads must land on the queue before later layer_tex fills in this
-            // encoder, otherwise a prior fill would overwrite the stamp buffer.
-            let id = layer.id();
-            let content_dirty = self.dirty.contains(&id);
-            let contrib_ok = self
-                .layer_contrib
-                .get(&id)
-                .map(|c| c.width == metrics.width && c.height == metrics.height)
-                .unwrap_or(false);
-            let raster_layer = matches!(
-                layer.kind,
-                LayerKind::ImportHeightmap(_) | LayerKind::Stamp2d(_)
-            );
-            let contrib_mask_ok = !raster_layer
-                || self
-                    .layer_contrib_mask
-                    .get(&id)
-                    .is_some_and(|c| c.width == metrics.width && c.height == metrics.height);
-            let reuse_contrib = !content_dirty
-                && layer_input_independent(&layer.kind)
-                && contrib_ok
-                && contrib_mask_ok;
-
-            if reuse_contrib {
-                self.copy_slots(
-                    device,
-                    queue,
-                    &mut encoder,
-                    TexSlot::Contrib(id),
-                    TexSlot::Layer,
-                );
-                if raster_layer {
-                    self.copy_slots(
-                        device,
-                        queue,
-                        &mut encoder,
-                        TexSlot::ContribMask(id),
-                        TexSlot::StampMask,
-                    );
-                    self.blend_into_current_with_mask(
-                        device,
-                        queue,
-                        &mut encoder,
-                        layer.common.opacity,
-                        layer.common.blend,
-                        [TexSlot::MaskOnes, TexSlot::StampMask],
-                    )?;
-                } else {
-                    self.blend_into_current(
-                        device,
-                        queue,
-                        &mut encoder,
-                        layer.common.opacity,
-                        layer.common.blend,
-                    )?;
-                }
-            } else {
-                if let LayerKind::SculptBase(params) = &layer.kind {
-                    queue.submit(Some(encoder.finish()));
-                    self.upload_sculpt_to_layer(queue, params);
-                    encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                        label: Some("gpu-stack-sculpt"),
-                    });
-                }
-                let plan =
-                    plans[layer_index].expect("supported layer must retain an executable GPU plan");
-                let runs_in_place = matches!(
-                    plan.kernel,
-                    GpuKernel::Blur
-                        | GpuKernel::EffectFilter
-                        | GpuKernel::Terrace
-                        | GpuKernel::Thermal
-                        | GpuKernel::Hydraulic
-                        | GpuKernel::RiverCarve
-                        | GpuKernel::StreamPower
-                        | GpuKernel::MultiScaleAmplify
-                );
-                if runs_in_place {
-                    let source = if self.current == 0 {
-                        TexSlot::Ping
-                    } else {
-                        TexSlot::Pong
-                    };
-                    self.copy_slots(device, queue, &mut encoder, source, TexSlot::Layer);
-                }
-                self.eval_layer(device, queue, &mut encoder, layer, plan.kernel, quality)?;
-                if runs_in_place {
-                    let filtered = if self.current == 0 {
-                        TexSlot::Ping
-                    } else {
-                        TexSlot::Pong
-                    };
-                    let destination = if self.current == 0 {
-                        TexSlot::Pong
-                    } else {
-                        TexSlot::Ping
-                    };
-                    self.blend_slots_region(
-                        device,
-                        queue,
-                        &mut encoder,
-                        TexSlot::Layer,
-                        filtered,
-                        [TexSlot::MaskOnes, TexSlot::UnitMask],
-                        destination,
-                        layer.common.opacity,
-                        layer.common.blend,
-                        (0, 0, self.metrics.width, self.metrics.height),
-                    )?;
-                    self.swap_current();
-                }
-                if layer_input_independent(&layer.kind) {
-                    let needs_new = self
-                        .layer_contrib
-                        .get(&id)
-                        .map(|t| t.width != metrics.width || t.height != metrics.height)
-                        .unwrap_or(true);
-                    if needs_new {
-                        self.layer_contrib.insert(
-                            id,
-                            HeightTex::new(device, "layer-contrib", metrics.width, metrics.height),
-                        );
-                    }
-                    self.copy_slots(
-                        device,
-                        queue,
-                        &mut encoder,
-                        TexSlot::Layer,
-                        TexSlot::Contrib(id),
-                    );
-                    if raster_layer {
-                        let needs_new = self
-                            .layer_contrib_mask
-                            .get(&id)
-                            .is_none_or(|t| t.width != metrics.width || t.height != metrics.height);
-                        if needs_new {
-                            self.layer_contrib_mask.insert(
-                                id,
-                                HeightTex::new(
-                                    device,
-                                    "layer-contrib-mask",
-                                    metrics.width,
-                                    metrics.height,
-                                ),
-                            );
-                        }
-                        self.copy_slots(
-                            device,
-                            queue,
-                            &mut encoder,
-                            TexSlot::StampMask,
-                            TexSlot::ContribMask(id),
-                        );
-                    }
-                }
-            }
-            self.cache_current(device, queue, &mut encoder, id);
-            self.dirty.remove(&id);
-        }
-
-        queue.submit(Some(encoder.finish()));
-        self.last_dirty_rect = None;
-
-        let fully_gpu = deferred_at.is_none() && cpu_from.is_none() && !hybrid;
-        let resume = if deferred_at.is_some() || fully_gpu {
-            None
-        } else {
-            cpu_from.or(Some(first_dirty))
-        };
-
-        // Interactive path (want_cpu=false): present GPU textures at any quality — no
-        // Maintain::Wait readback. Export/oracle callers pass want_cpu=true.
-        if !want_cpu {
-            return Ok(GpuEvalResult {
-                width: metrics.width,
-                height: metrics.height,
-                world_size: (metrics.world_size_x, metrics.world_size_z),
-                height_range: self.approx_range,
-                fully_gpu,
-                freshness,
-                cpu: None,
-                resume_cpu_from: resume,
-                cpu_fallback: resume.and_then(|_| self.last_graph.cpu_fallback.clone()),
-                did_eval: true,
-            });
-        }
-
-        // Height-only prefixes can resume at their exact boundary. Prefixes that publish
-        // aux or named outputs cannot be represented by this result type, so give the CPU
-        // its canonical layer-zero seed instead of a partial and state-incomplete checkpoint.
-        let resume = match resume {
-            Some(index) if !cpu_resume_prefix_is_height_only(&layers, index) => Some(0),
-            other => other,
-        };
-        let cpu = if resume == Some(0) {
-            Some(Heightfield::zeros(metrics))
-        } else {
-            Some(self.readback_current(device, queue)?)
-        };
-
-        Ok(GpuEvalResult {
-            width: metrics.width,
-            height: metrics.height,
-            world_size: (metrics.world_size_x, metrics.world_size_z),
-            height_range: self.approx_range,
-            fully_gpu: resume.is_none(),
-            freshness: GpuPreviewFreshness::Current,
-            cpu,
-            resume_cpu_from: resume,
-            cpu_fallback: resume.and_then(|_| self.last_graph.cpu_fallback.clone()),
-            did_eval: true,
-        })
-    }
-
-    /// Resample the sculpt paint buffer into `layer_tex` at the current eval resolution.
-    fn upload_sculpt_to_layer(&self, queue: &wgpu::Queue, params: &SculptParams) {
-        let w = self.metrics.width;
-        let h = self.metrics.height;
-        let mut dense = vec![0f32; (w as usize).saturating_mul(h as usize)];
-        for j in 0..h {
-            for i in 0..w {
-                let u = (i as f32 + 0.5) / w as f32;
-                let v = (j as f32 + 0.5) / h as f32;
-                dense[(j * w + i) as usize] = params.sample_bilinear(u, v);
-            }
-        }
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.layer_tex.texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            bytemuck::cast_slice(&dense),
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(w * 4),
-                rows_per_image: Some(h),
-            },
-            wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-        );
-    }
-
-    /// Encode the sculpt upload at the exact plan operation boundary. A direct
-    /// queue write would execute before the whole command buffer and could be
-    /// overwritten by an earlier kernel that reuses `layer_tex`.
     fn record_sculpt_to_layer(
         &mut self,
         device: &wgpu::Device,
@@ -7391,58 +5926,6 @@ impl GpuTerrainEngine {
     /// Resample and upload only a warm edit's destination footprint. Destination
     /// coordinates remain absolute so differing authoring/preview resolutions use
     /// the same bilinear mapping as the full upload.
-    fn upload_sculpt_region(
-        &mut self,
-        queue: &wgpu::Queue,
-        params: &SculptParams,
-        region: (u32, u32, u32, u32),
-    ) -> Option<(f32, f32)> {
-        let (x, y, w, h) = region;
-        if w == 0 || h == 0 {
-            return None;
-        }
-        let full_w = self.metrics.width.max(1);
-        let full_h = self.metrics.height.max(1);
-        let mut dense = Vec::with_capacity((w as usize).saturating_mul(h as usize));
-        let mut lo = f32::INFINITY;
-        let mut hi = f32::NEG_INFINITY;
-        for local_y in 0..h {
-            let dst_y = y + local_y;
-            for local_x in 0..w {
-                let dst_x = x + local_x;
-                let u = (dst_x as f32 + 0.5) / full_w as f32;
-                let v = (dst_y as f32 + 0.5) / full_h as f32;
-                let sample = params.sample_bilinear(u, v);
-                lo = lo.min(sample);
-                hi = hi.max(sample);
-                dense.push(sample);
-            }
-        }
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.layer_tex.texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d { x, y, z: 0 },
-                aspect: wgpu::TextureAspect::All,
-            },
-            bytemuck::cast_slice(&dense),
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(w * 4),
-                rows_per_image: Some(h),
-            },
-            wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-        );
-        let texels = u64::from(w) * u64::from(h);
-        self.last_eval_stats.sculpt_resampled_texels += texels;
-        self.last_eval_stats.upload_bytes += texels * 4;
-        Some((lo, hi))
-    }
-
     fn ensure_source_raster(
         &mut self,
         device: &wgpu::Device,
@@ -8183,71 +6666,6 @@ impl GpuTerrainEngine {
         }
     }
 
-    fn cache_current(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        encoder: &mut wgpu::CommandEncoder,
-        id: LayerId,
-    ) {
-        let w = self.metrics.width;
-        let h = self.metrics.height;
-        let needs_new = self
-            .layer_cache
-            .get(&id)
-            .map(|t| t.width != w || t.height != h)
-            .unwrap_or(true);
-        if needs_new {
-            self.layer_cache
-                .insert(id, HeightTex::new(device, "layer-cache", w, h));
-        }
-        let u = CopyU {
-            width: w,
-            height: h,
-            region_x: 0,
-            region_y: 0,
-            region_w: w,
-            region_h: h,
-        };
-        let u_buf = self.write_uniform(device, queue, &u);
-
-        // Avoid simultaneous borrows: resolve views by current index + cache entry.
-        let src_is_ping = self.current == 0;
-        let src_view = if src_is_ping {
-            &self.ping.view
-        } else {
-            &self.pong.view
-        };
-        let cache = self.layer_cache.get(&id).expect("cache just inserted");
-        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("cache-bg"),
-            layout: &self.copy.bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: u_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(src_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&cache.view),
-                },
-            ],
-        });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("cache-copy"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.copy.pipeline);
-            pass.set_bind_group(0, &bg, &[]);
-            pass.dispatch_workgroups(w.div_ceil(8), h.div_ceil(8), 1);
-        }
-    }
-
     fn eval_layer(
         &mut self,
         device: &wgpu::Device,
@@ -8290,7 +6708,7 @@ impl GpuTerrainEngine {
                 )?;
             }
             (GpuKernel::Sculpt, LayerKind::SculptBase(p)) => {
-                // `layer_tex` was filled by `upload_sculpt_to_layer` just before this call.
+                // `layer_tex` was filled by `record_sculpt_to_layer` before this call.
                 if self.last_dirty_rect.is_none() {
                     let (lo, hi) = p.sample_range();
                     self.expand_range(lo, hi);
@@ -9317,32 +7735,6 @@ impl GpuTerrainEngine {
 
 /// `bridge_prefix` is only safe when it is the height *entering* `first_dirty`
 /// (GPU/CPU cache of the previous layer). Full-stack last_good is never safe.
-fn bridge_prefix_safe(layers: &[&Layer], first_dirty: usize) -> bool {
-    first_dirty > 0 && first_dirty <= layers.len()
-}
-
-fn resample_height_nearest(src: &Heightfield, dst: HeightfieldMetrics) -> Vec<f32> {
-    let w = dst.width as usize;
-    let h = dst.height as usize;
-    let mut out = vec![0.0f32; w.saturating_mul(h)];
-    if src.metrics.width == 0 || src.metrics.height == 0 || w == 0 || h == 0 {
-        return out;
-    }
-    let dense = src.to_dense();
-    let sw = src.metrics.width as usize;
-    let sh = src.metrics.height as usize;
-    for j in 0..h {
-        for i in 0..w {
-            let u = (i as f32 + 0.5) / w as f32;
-            let v = (j as f32 + 0.5) / h as f32;
-            let si = ((u * sw as f32) as usize).min(sw - 1);
-            let sj = ((v * sh as f32) as usize).min(sh - 1);
-            out[j * w + i] = dense[sj * sw + si];
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod smoke_tests {
     use super::*;
@@ -10460,8 +8852,6 @@ mod smoke_tests {
             &engine.pong,
             &engine.layer_tex,
             &engine.mask_ones,
-            &engine.mask_work_a,
-            &engine.mask_work_b,
             &engine.unit_mask,
             &engine.stamp_mask,
             &engine.hardness,
@@ -10504,10 +8894,6 @@ mod smoke_tests {
             cached_id,
             HeightTex::new(&gpu.device, "reset-test-cache", 64, 64),
         );
-        engine.layer_contrib.insert(
-            cached_id,
-            HeightTex::new(&gpu.device, "reset-test-contrib", 64, 64),
-        );
         engine.mark_dirty(cached_id);
 
         engine.reset_project_state(&gpu.device, &gpu.queue);
@@ -10522,7 +8908,6 @@ mod smoke_tests {
             (PROJECT_RESET_TEXTURE_EXTENT, PROJECT_RESET_TEXTURE_EXTENT)
         );
         assert!(engine.layer_cache.is_empty());
-        assert!(engine.layer_contrib.is_empty());
         assert!(engine.dirty.is_empty());
         assert!(engine.dirty_tiles().is_empty());
         assert_eq!(engine.current, 0);
@@ -10892,7 +9277,7 @@ mod smoke_tests {
             .cpu
             .expect("oracle GPU readback");
 
-        let error = crate::parity::max_abs_diff(&incremental.to_dense(), &oracle.to_dense());
+        let error = terra_gpu::parity::max_abs_diff(&incremental.to_dense(), &oracle.to_dense());
         assert!(
             error <= 1.0e-3,
             "cached Voronoi contribution drifted by {error}"
@@ -10984,7 +9369,7 @@ mod smoke_tests {
             .expect("fresh full-field oracle")
             .cpu
             .expect("oracle readback");
-        let error = crate::parity::max_abs_diff(&incremental.to_dense(), &oracle.to_dense());
+        let error = terra_gpu::parity::max_abs_diff(&incremental.to_dense(), &oracle.to_dense());
         let worst = incremental
             .to_dense()
             .iter()
@@ -11738,11 +10123,11 @@ mod smoke_tests {
             .expect("gpu readback");
 
         let cpu = cpu_oracle(&stack, metrics);
-        crate::parity::assert_field_parity(
+        terra_gpu::parity::assert_field_parity(
             "authoring.sculpt-strokes-stacked",
             &gpu_h,
             &cpu,
-            crate::parity::SCULPT_STROKES_PREVIEW,
+            terra_gpu::parity::SCULPT_STROKES_PREVIEW,
         );
     }
 
@@ -11900,7 +10285,7 @@ mod smoke_tests {
             .expect("fresh stroke oracle")
             .cpu
             .expect("oracle readback");
-        let error = crate::parity::max_abs_diff(&incremental.to_dense(), &oracle.to_dense());
+        let error = terra_gpu::parity::max_abs_diff(&incremental.to_dense(), &oracle.to_dense());
         assert!(error <= 1.0e-3, "warm stroke append drifted by {error}");
     }
 
@@ -11989,7 +10374,7 @@ mod smoke_tests {
             .expect("full domain-warp evaluation")
             .cpu
             .expect("oracle readback");
-        let error = crate::parity::max_abs_diff(&incremental.to_dense(), &oracle.to_dense());
+        let error = terra_gpu::parity::max_abs_diff(&incremental.to_dense(), &oracle.to_dense());
         let worst = incremental
             .to_dense()
             .iter()
@@ -12361,11 +10746,11 @@ mod smoke_tests {
                 .readback_current(&gpu.device, &gpu.queue)
                 .expect("settled preview");
             let oracle = cpu_oracle(&document.stack, document.metrics);
-            crate::parity::assert_field_parity(
+            terra_gpu::parity::assert_field_parity(
                 &format!("Untitled6 target_strokes={target_strokes} brush={brush:?}"),
                 &settled,
                 &oracle,
-                crate::parity::UNTITLED6_INTERACTION,
+                terra_gpu::parity::UNTITLED6_INTERACTION,
             );
         }
     }
@@ -12474,11 +10859,11 @@ mod smoke_tests {
         let actual = resumable
             .readback_current(&gpu.device, &gpu.queue)
             .expect("resumable readback");
-        crate::parity::assert_field_parity(
+        terra_gpu::parity::assert_field_parity(
             "resumable Medium vs complete Medium",
             &actual,
             &expected,
-            crate::parity::UNTITLED6_INTERACTION,
+            terra_gpu::parity::UNTITLED6_INTERACTION,
         );
 
         // A stroke arriving after submission abandons the cursor but cannot

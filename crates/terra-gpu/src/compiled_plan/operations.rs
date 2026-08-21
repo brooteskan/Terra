@@ -199,12 +199,14 @@ impl GpuPlanOperations {
         }
     }
 
-    pub(crate) fn begin_evaluation(&self) {
+    /// Reset transient operation statistics before an evaluator records a plan.
+    pub fn begin_evaluation(&self) {
         self.mask_scratch_allocations.set(0);
         self.mask_scratch_reuses.set(0);
     }
 
-    pub(crate) fn mask_scratch_stats(&self) -> (u32, u32) {
+    /// Return mask scratch allocation and reuse counts for the active evaluation.
+    pub fn mask_scratch_stats(&self) -> (u32, u32) {
         (
             self.mask_scratch_allocations.get(),
             self.mask_scratch_reuses.get(),

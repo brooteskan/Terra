@@ -2586,6 +2586,7 @@ dependencies = [
  "serde_json",
  "terra-core",
  "terra-gpu",
+ "terra-gpu-eval",
  "terra-gui",
  "terra-io",
  "terra-jobs",
@@ -2619,12 +2620,24 @@ version = "0.1.0-beta.1"
 dependencies = [
  "bytemuck",
  "glam",
- "image",
  "log",
  "profiling",
  "terra-core",
  "terra-test-gpu",
  "thiserror 2.0.19",
+ "wgpu",
+]
+
+[[package]]
+name = "terra-gpu-eval"
+version = "0.1.0-beta.1"
+dependencies = [
+ "bytemuck",
+ "image",
+ "profiling",
+ "terra-core",
+ "terra-gpu",
+ "terra-test-gpu",
  "wgpu",
 ]
 

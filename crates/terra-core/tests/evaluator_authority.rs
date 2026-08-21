@@ -187,7 +187,7 @@ const APPROVED_EXECUTION_SEAMS: &[ApprovedSeam] = &[
             },
             InternalMethod {
                 method: "evaluate_suffix",
-                justification: "resumes a CPU suffix eval from a GPU checkpoint at a given layer index; public API retained for CPU/GPU parity tests (terra-gpu engine cfg(test) + parity_matrix), production hybrid resume flows through EvalWorker/rebuild_incremental since b82726c",
+                justification: "resumes a CPU suffix eval from a GPU checkpoint at a given layer index; public API retained for CPU/GPU parity tests (terra-gpu-eval engine cfg(test) + parity_matrix), production hybrid resume flows through EvalWorker/rebuild_incremental since b82726c",
             },
         ],
         result_test: ResultTestEvidence {
@@ -265,7 +265,7 @@ const APPROVED_EXECUTION_SEAMS: &[ApprovedSeam] = &[
         entry_points: &[EntryPoint {
             method: "compile_gpu_graph",
             caller: SourceEvidence {
-                path: "crates/terra-gpu/src/engine.rs",
+                path: "crates/terra-gpu-eval/src/engine.rs",
                 needle: "compile_gpu_graph(",
             },
         }],
@@ -348,13 +348,13 @@ const RETIRED_B1_D7_SYMBOLS: &[&str] = &[
 ];
 
 /// Retired from the *CPU* evaluator (`eval/mod.rs`) only — not workspace-wide.
-/// terra-gpu's `GpuTerrainEngine` legitimately keeps a `last_graph`; rather than
+/// terra-gpu-eval's `GpuTerrainEngine` legitimately keeps a `last_graph`; rather than
 /// bless that with a free-text exemption (which is where B1-D6 grew unnoticed),
 /// the GPU graph compiler is discovered by the workspace scan and, since B1-D6
 /// (#90), carries an honest `SeamRole::Planner` entry in `APPROVED_EXECUTION_SEAMS`.
 const RETIRED_EVAL_SYMBOLS: &[&str] = &["last_graph", "compile_graph", "compile_eval_graph"];
 
-/// Retired from the *GPU* engine (`terra-gpu/src/engine.rs`) only. B1-D6 (#90)
+/// Retired from the *GPU* engine (`terra-gpu-eval/src/engine.rs`) only. B1-D6 (#90)
 /// made `compile_gpu_graph`'s plan the single planning authority: the engine walk
 /// indexes `last_graph.plans` and must not re-derive per-layer support or kernels
 /// mid-walk. Referencing either helper from engine production reintroduces the
@@ -520,7 +520,7 @@ fn retired_evaluator_generations_stay_absent() {
         ));
     }
 
-    let gpu_engine_path = root.join("crates/terra-gpu/src/engine.rs");
+    let gpu_engine_path = root.join("crates/terra-gpu-eval/src/engine.rs");
     let gpu_engine_source = production_source(&read(&gpu_engine_path));
     for symbol in RETIRED_GPU_ENGINE_SYMBOLS {
         if contains_ident(&gpu_engine_source, symbol) {
