@@ -4,6 +4,8 @@
 pub mod engine;
 mod evaluation_timing;
 
+#[cfg(feature = "gpu-parity")]
+pub use engine::GpuSimulationStateReadback;
 pub use engine::{
     GpuEvalResult, GpuEvalStats, GpuEvaluationIntent, GpuPreviewFreshness, GpuRefinementJob,
     GpuRefinementPhase, GpuRefinementProgress, GpuRefinementStep, GpuTerrainEngine,

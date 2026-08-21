@@ -555,6 +555,11 @@ impl GpuTerrainEngine {
                 }
             }
             (GpuKernel::Hydraulic, LayerKind::HydraulicErosion(p)) => {
+                queue.write_buffer(
+                    &self.simulation_invalid_state_buffer,
+                    0,
+                    bytemuck::bytes_of(&0u32),
+                );
                 let p = apply_transport_model(p, p.transport_model);
                 self.fill_slot(device, queue, encoder, TexSlot::WaterA, 0.0);
                 self.fill_slot(device, queue, encoder, TexSlot::WaterB, 0.0);
@@ -709,6 +714,10 @@ impl GpuTerrainEngine {
                                 resource: wgpu::BindingResource::TextureView(
                                     &self.loose_sediment.view,
                                 ),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 11,
+                                resource: self.simulation_invalid_state_buffer.as_entire_binding(),
                             },
                         ],
                     });

@@ -34,6 +34,16 @@ struct Uniforms {
 @group(0) @binding(9) var rainfall_map: texture_2d<f32>;
 @group(0) @binding(10) var loose_sediment: texture_2d<f32>;
 
+struct InvalidState {
+    flags: atomic<u32>,
+};
+
+@group(0) @binding(11) var<storage, read_write> invalid_state: InvalidState;
+
+fn finite(value: f32) -> bool {
+    return value == value && abs(value) != bitcast<f32>(0x7f800000u);
+}
+
 fn terrain_slope(p: vec2<i32>, h0: f32) -> f32 {
     var max_drop = 0.0;
     let n0 = vec2<i32>(p.x - 1, p.y);
@@ -170,6 +180,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     w *= (1.0 - u.evaporation);
+    if (!finite(h) || !finite(w) || !finite(s)) {
+        atomicOr(&invalid_state.flags, 1u);
+    }
+    if (w < 0.0 || s < 0.0) {
+        atomicOr(&invalid_state.flags, 2u);
+    }
     // Finite / non-negative clamps (interactive stability).
     h = select(h, 0.0, !((h == h)));
     w = max(select(w, 0.0, !((w == w))), 0.0);

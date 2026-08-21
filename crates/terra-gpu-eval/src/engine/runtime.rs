@@ -155,6 +155,8 @@ pub struct GpuTerrainEngine {
     sculpt_edited: HeightTex,
     /// Ordered-f32 min/max written by `effect_filter_range` and read by remap kernels.
     effect_filter_range_buffer: wgpu::Buffer,
+    /// Hydraulic raw-state invariant flags, written before shader stability clamps.
+    simulation_invalid_state_buffer: wgpu::Buffer,
     layer_cache: HashMap<LayerId, HeightTex>,
     /// Stamp2d transform weights paired with reusable compiled candidates.
     stamp_mask_cache: HashMap<LayerId, HeightTex>,

@@ -7,6 +7,8 @@ mod api;
 mod runtime;
 mod stats;
 
+#[cfg(feature = "gpu-parity")]
+pub use api::GpuSimulationStateReadback;
 pub use api::{
     GpuEvalResult, GpuEvaluationIntent, GpuPreviewFreshness, GpuRefinementJob, GpuRefinementPhase,
     GpuRefinementProgress, GpuRefinementStep,

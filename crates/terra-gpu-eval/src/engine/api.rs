@@ -33,6 +33,25 @@ pub struct GpuEvalResult {
     pub did_eval: bool,
 }
 
+/// Required-GPU numerical diagnostics for simulation scratch state.
+///
+/// This is feature-gated because interactive production evaluation must not add
+/// synchronous readbacks. The C3 simulation guard enables `gpu-parity` and reads
+/// these fields only after a submitted evaluation has completed.
+#[cfg(feature = "gpu-parity")]
+pub struct GpuSimulationStateReadback {
+    /// Raw hydraulic invariant violations observed before final stability clamps.
+    pub invalid_state_bits: u32,
+    pub hardness: Heightfield,
+    pub water_a: Heightfield,
+    pub water_b: Heightfield,
+    pub sediment_a: Heightfield,
+    pub sediment_b: Heightfield,
+    pub redistribution: Heightfield,
+    pub rainfall: Heightfield,
+    pub loose_sediment: Heightfield,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GpuPreviewFreshness {
     Current,

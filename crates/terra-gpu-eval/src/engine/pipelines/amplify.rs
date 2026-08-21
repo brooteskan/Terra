@@ -83,6 +83,11 @@ impl GpuTerrainEngine {
         authored: &MultiScaleAmplifyParams,
         quality: PreviewQuality,
     ) {
+        queue.write_buffer(
+            &self.simulation_invalid_state_buffer,
+            0,
+            bytemuck::bytes_of(&0u32),
+        );
         let mut params = authored.clone();
         match quality {
             PreviewQuality::Draft => {
@@ -514,6 +519,10 @@ impl GpuTerrainEngine {
                                 resource: wgpu::BindingResource::TextureView(
                                     &self.loose_sediment.view,
                                 ),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 11,
+                                resource: self.simulation_invalid_state_buffer.as_entire_binding(),
                             },
                         ],
                     });

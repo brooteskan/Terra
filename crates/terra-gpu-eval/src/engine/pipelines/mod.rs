@@ -740,6 +740,7 @@ impl GpuTerrainEngine {
                 tex_read_entry(8),
                 tex_read_entry(9),
                 tex_read_entry(10),
+                storage_rw_buffer_entry(11),
             ],
         });
         let blur_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1116,6 +1117,14 @@ impl GpuTerrainEngine {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let simulation_invalid_state_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("simulation-invalid-state"),
+            size: 4,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
 
         Self {
             plan_operations: GpuPlanOperations::new(device),
@@ -1174,6 +1183,7 @@ impl GpuTerrainEngine {
             sculpt_stamp_b,
             sculpt_edited,
             effect_filter_range_buffer,
+            simulation_invalid_state_buffer,
             layer_cache: HashMap::new(),
             stamp_mask_cache: HashMap::new(),
             source_rasters: HashMap::new(),

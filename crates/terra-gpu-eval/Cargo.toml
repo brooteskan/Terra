@@ -33,5 +33,10 @@ name = "determinism_tiling"
 path = "tests/determinism_tiling.rs"
 required-features = ["gpu-parity"]
 
+[[test]]
+name = "simulation_edges"
+path = "tests/simulation_edges.rs"
+required-features = ["gpu-parity"]
+
 [lints]
 workspace = true
