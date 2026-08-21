@@ -46,7 +46,7 @@ impl GpuTerrainEngine {
         }
     }
 
-    pub(in super::super) fn reduce_effect_filter_range(
+    pub(in super::super) fn reduce_current_height_range(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -179,7 +179,7 @@ impl GpuTerrainEngine {
         let mode = spec.mode;
         let iters = Self::effect_filter_iters(quality, p);
         if spec.needs_height_range {
-            self.reduce_effect_filter_range(device, queue, encoder);
+            self.reduce_current_height_range(device, queue, encoder);
         }
         let (rx, ry, rw, rh, gx, gy) = self.dirty_dispatch_extent();
         for _ in 0..iters {

@@ -218,10 +218,10 @@ struct TerraceU {
     height: u32,
     levels: u32,
     sharpness: f32,
-    min_h: f32,
-    max_h: f32,
     _p0: f32,
     _p1: f32,
+    _p2: f32,
+    _p3: f32,
 }
 
 #[repr(C)]
@@ -748,7 +748,12 @@ impl GpuTerrainEngine {
         });
         let terrace_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("terrace-bgl"),
-            entries: &[uniform_entry(0), tex_read_entry(1), storage_write_entry(2)],
+            entries: &[
+                uniform_entry(0),
+                tex_read_entry(1),
+                storage_write_entry(2),
+                storage_read_buffer_entry(3),
+            ],
         });
         let ramp_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("ramp-bgl"),

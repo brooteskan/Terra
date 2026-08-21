@@ -950,15 +950,19 @@ impl GpuTerrainEngine {
                 )?;
             }
             (GpuKernel::Terrace, LayerKind::Terrace(p)) => {
+                // Terrace quantization is defined by the range of the field entering
+                // this layer. `approx_range` is deliberately conservative and may
+                // contain unrelated history, so it is not authoritative here.
+                self.reduce_current_height_range(device, queue, encoder);
                 let u = TerraceU {
                     width: self.metrics.width,
                     height: self.metrics.height,
                     levels: p.levels,
                     sharpness: p.sharpness,
-                    min_h: self.approx_range.0 - 1e-3,
-                    max_h: self.approx_range.1 + 1e-3,
                     _p0: 0.0,
                     _p1: 0.0,
+                    _p2: 0.0,
+                    _p3: 0.0,
                 };
                 let u_buf = self.write_uniform(device, queue, &u);
                 let src_ping = self.current == 0;
@@ -982,6 +986,10 @@ impl GpuTerrainEngine {
                         wgpu::BindGroupEntry {
                             binding: 2,
                             resource: wgpu::BindingResource::TextureView(dst),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: self.effect_filter_range_buffer.as_entire_binding(),
                         },
                     ],
                 });

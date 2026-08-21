@@ -83,6 +83,16 @@ fn cpu_oracle(
 fn gpu_eval(stack: &LayerStack, assets: &[MaskAsset], metrics: HeightfieldMetrics) -> Heightfield {
     let gpu = terra_test_gpu::headless_required();
     let mut engine = GpuTerrainEngine::new(&gpu.device, metrics.width);
+    gpu_eval_with_engine(&mut engine, gpu, stack, assets, metrics)
+}
+
+fn gpu_eval_with_engine(
+    engine: &mut GpuTerrainEngine,
+    gpu: &terra_test_gpu::TestGpu,
+    stack: &LayerStack,
+    assets: &[MaskAsset],
+    metrics: HeightfieldMetrics,
+) -> Heightfield {
     engine.mark_all_dirty(stack);
     let result = engine
         .evaluate(
@@ -404,6 +414,71 @@ fn gpu_required_local_filter_stack_matches_cpu() {
     let cpu = cpu_oracle(&stack, &[], metrics);
     let gpu = gpu_eval(&stack, &[], metrics);
     assert_field_parity("stack.sculpt-blur-terrace", &gpu, &cpu, TERRACE_PREVIEW);
+}
+
+#[test]
+fn gpu_required_terrace_is_history_independent_for_negative_height_range() {
+    let metrics = HeightfieldMetrics::new(19, 17, 171.0, 85.0);
+    let samples = (0..metrics.height)
+        .flat_map(|y| {
+            (0..metrics.width).map(move |x| {
+                -84.0
+                    + x as f32 * 1.35
+                    + y as f32 * 0.62
+                    + if (x + 2 * y) % 5 == 0 { 7.5 } else { -2.25 }
+            })
+        })
+        .collect();
+    let mut stack = LayerStack::new();
+    stack.push(Layer::new(
+        "negative pattern",
+        LayerKind::SculptBase(SculptParams {
+            width: metrics.width,
+            height: metrics.height,
+            samples,
+            fill_height: -40.0,
+        }),
+    ));
+    stack.push(Layer::new(
+        "blur",
+        LayerKind::Blur(BlurParams {
+            radius: 2,
+            iterations: 1,
+        }),
+    ));
+    stack.push(Layer::new(
+        "terrace",
+        LayerKind::Terrace(TerraceParams {
+            levels: 9,
+            sharpness: 0.82,
+        }),
+    ));
+
+    let gpu = terra_test_gpu::headless_required();
+    let mut cold_engine = GpuTerrainEngine::new(&gpu.device, metrics.width);
+    let cold = gpu_eval_with_engine(&mut cold_engine, gpu, &stack, &[], metrics);
+
+    let mut pollution = LayerStack::new();
+    pollution.push(Layer::new(
+        "low pollution",
+        LayerKind::Flat(FlatParams { height: -900.0 }),
+    ));
+    pollution.push(Layer::new(
+        "high pollution",
+        LayerKind::Flat(FlatParams { height: 1_400.0 }),
+    ));
+    let mut polluted_engine = GpuTerrainEngine::new(&gpu.device, metrics.width);
+    let _ = gpu_eval_with_engine(&mut polluted_engine, gpu, &pollution, &[], metrics);
+    let polluted = gpu_eval_with_engine(&mut polluted_engine, gpu, &stack, &[], metrics);
+
+    assert_field_parity(
+        "terrace.history-independence",
+        &polluted,
+        &cold,
+        EXACT_HEIGHT,
+    );
+    let cpu = cpu_oracle(&stack, &[], metrics);
+    assert_field_parity("terrace.negative-range", &cold, &cpu, TERRACE_PREVIEW);
 }
 
 #[test]
