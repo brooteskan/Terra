@@ -383,8 +383,9 @@ fn procedural_shape_config_supported(p: &ProceduralShapeParams) -> bool {
 /// supported kinds are pure per-sample maps of the running height (plus the
 /// distance-to-polyline SDF); `Smooth`, `Pinch`, and `Coastline` additionally read a
 /// clamped 3x3 of the layer input (`src`), which the kernel samples directly — `Pinch`
-/// is `Smooth`'s pull at a 1.25 overdrive, `Coastline` a lower-and-blend toward that
-/// mean under a weight gate (#114, #115, #116). `Flatten` needs a per-stroke
+/// is `Smooth`'s pull with a strength-weighted, range-bounded 1.25 gain;
+/// `Coastline` is a lower-and-blend toward that mean under a weight gate
+/// (#114, #115, #116). `Flatten` needs a per-stroke
 /// footprint-mean reduction over the running field; the reduce/resolve passes now
 /// precompute that scalar and the stamp path segments the run around it, so it too
 /// previews on the GPU (#117). The aux-only kinds (`Uplift` / `Hardness` /

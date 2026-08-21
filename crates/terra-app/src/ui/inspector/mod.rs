@@ -1263,7 +1263,7 @@ fn draw_tool_inspector(ui: &mut GuiContext<'_>, doc: &TerrainDocument, ui_state:
         "Drag to author Base heights or semantic world-space strokes.",
     );
     slider_f32(ui, "Radius", &mut ui_state.sculpt_radius, 0.01, 0.2);
-    if ui_state.editor_tool == EditorTool::Smooth {
+    if matches!(ui_state.editor_tool, EditorTool::Smooth | EditorTool::Pinch) {
         let mut s = (ui_state.sculpt_strength / 10.0).clamp(0.05, 1.0);
         if slider_f32(ui, "Strength", &mut s, 0.05, 1.0) {
             ui_state.sculpt_strength = s * 10.0;

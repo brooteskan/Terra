@@ -9,10 +9,10 @@
 // segments. For the whole-set common case the two inputs are the same texture and
 // the range is [0, stroke_count); Flatten (#117) splits the set so its per-stroke
 // footprint-mean target (precomputed into `targets` by the reduce/resolve passes)
-// is measured against the running field before it. Pinch is Smooth's pull at a 1.25
-// overdrive; Coastline lowers the sample and blends it toward that mean under a
-// weight gate. The max brush weight per texel is produced by the separate edited
-// pass (order-independent), not here.
+// is measured against the running field before it. Pinch is a strength-weighted,
+// range-bounded version of Smooth's pull; Coastline lowers the sample and blends
+// it toward that mean under a weight gate. The max brush weight per texel is
+// produced by the separate edited pass (order-independent), not here.
 
 struct Uniforms {
     width: u32,
@@ -248,8 +248,9 @@ fn apply_kind(header: StrokeHeader, h: f32, dist: f32, w: f32, px: i32, py: i32,
         case 12u: {                                                 // SMOOTH — pull toward 3x3 mean of `src`
             return h + (base_neighborhood_average(px, py) - h) * w;  // weight is `w`, not `s`
         }
-        case 13u: {                                                 // PINCH — Smooth's pull at a 1.25 overdrive
-            return h + (base_neighborhood_average(px, py) - h) * w * 1.25;  // weight is `w`, not `s`
+        case 13u: {                                                 // PINCH — bounded, strength-weighted pull
+            let amount = clamp(clamp(header.strength, 0.0, 1.0) * w * 1.25, 0.0, 1.0);
+            return h + (base_neighborhood_average(px, py) - h) * amount;
         }
         case 14u: {                                                 // COASTLINE — lower, blend toward 3x3 mean of `src`, gate by w
             let avg = base_neighborhood_average(px, py);

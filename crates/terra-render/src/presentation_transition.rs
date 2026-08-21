@@ -169,6 +169,43 @@ pub fn validate_transition_shadow(
     None
 }
 
+/// Choose whether a requested regional copy can consume the renderer-local
+/// baseline or must rebuild that baseline from the complete source texture.
+///
+/// A full copy can repair local lineage failures (for example, when an
+/// intermediate GPU evaluation was superseded before presentation). Candidate
+/// failures that a full copy cannot repair remain regional so the original
+/// diagnostic is preserved instead of being disguised as recovery.
+pub fn recoverable_regional_presentation_mode(
+    candidate: GpuTerrainOutputIdentity,
+    baseline: Option<PresentedTerrainBaseline>,
+    expected: TerrainPresentationExpectations,
+    local_slots_coherent: bool,
+) -> TerrainPresentationMode {
+    if !local_slots_coherent {
+        return TerrainPresentationMode::FullCopy;
+    }
+    let regional_diagnostic = validate_transition_shadow(
+        candidate,
+        baseline,
+        expected,
+        TerrainPresentationMode::RegionalCopy,
+    );
+    let full_copy_repairs_transition = regional_diagnostic.is_some()
+        && validate_transition_shadow(
+            candidate,
+            baseline,
+            expected,
+            TerrainPresentationMode::FullCopy,
+        )
+        .is_none();
+    if full_copy_repairs_transition {
+        TerrainPresentationMode::FullCopy
+    } else {
+        TerrainPresentationMode::RegionalCopy
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,6 +339,53 @@ mod tests {
                 "{mode:?} replaces the complete visible source"
             );
         }
+    }
+
+    #[test]
+    fn recoverable_regional_base_gap_promotes_to_full_copy() {
+        let presented = identity(37, GpuOutputCoverage::WholeField);
+        let candidate = identity(
+            39,
+            GpuOutputCoverage::Patch {
+                rect: SampleRect {
+                    x: 8,
+                    y: 8,
+                    w: 4,
+                    h: 4,
+                },
+                expected_base: Some(GpuOutputId(38)),
+            },
+        );
+
+        assert_eq!(
+            recoverable_regional_presentation_mode(
+                candidate,
+                Some(baseline(presented)),
+                expectations(),
+                true,
+            ),
+            TerrainPresentationMode::FullCopy
+        );
+        assert_eq!(
+            recoverable_regional_presentation_mode(
+                identity(
+                    38,
+                    GpuOutputCoverage::Patch {
+                        rect: SampleRect {
+                            x: 8,
+                            y: 8,
+                            w: 4,
+                            h: 4,
+                        },
+                        expected_base: Some(presented.output),
+                    },
+                ),
+                Some(baseline(presented)),
+                expectations(),
+                true,
+            ),
+            TerrainPresentationMode::RegionalCopy
+        );
     }
 
     #[test]

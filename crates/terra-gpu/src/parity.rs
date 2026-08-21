@@ -129,7 +129,7 @@ pub const EFFECT_FILTER_WARP_PREVIEW: ParityTolerance = ParityTolerance::new(5.0
 /// diverge only by transcendental edges (`sqrt` vs `hypot`, `pow` vs `powf`). The
 /// bit-exact `hash_noise` port keeps Noise strokes in the same budget; the base-3x3
 /// pull of Smooth (#114), Pinch (#115), and Coastline (#116) is transcendental-free
-/// (nine same-order adds and a divide, plus a multiply or two for Pinch's 1.25 gain
+/// (nine same-order adds and a divide, plus Pinch's bounded strength/gain blend
 /// and Coastline's lower-and-blend), so none widens the worst case. Flatten (#117)
 /// settles toward a footprint mean the reduce/resolve passes sum in an f32 tree
 /// rather than the CPU's f64 sequential order; because the out-of-footprint texels

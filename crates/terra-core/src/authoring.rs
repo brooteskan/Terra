@@ -939,9 +939,13 @@ fn apply_stroke_sample(
             h - s.abs() * 0.35
         }
         SculptStrokeKind::Pinch => {
-            // Pull heights toward neighbourhood mean (contract detail).
+            // Pull heights toward the neighbourhood mean without crossing it.
+            // The old unbounded 1.25 overdrive overshot sharp pits/peaks on the
+            // first dab, then oscillated toward the mean so later dabs appeared
+            // to do nothing. Strength is unitless for this relaxation brush.
             let avg = neighborhood_average(base, i, j);
-            h + (avg - h) * w * 1.25
+            let amount = (stroke.strength.clamp(0.0, 1.0) * w * 1.25).clamp(0.0, 1.0);
+            h + (avg - h) * amount
         }
         SculptStrokeKind::Inflate => {
             let t = (1.0 - distance / stroke.radius_m.max(1.0)).max(0.0);
@@ -2005,6 +2009,65 @@ mod tests {
         assert!(
             peak_twice <= peak_once + 1e-3,
             "flatten grew on re-apply: {peak_once} -> {peak_twice}"
+        );
+    }
+
+    #[test]
+    fn pinch_is_range_bounded_strength_sensitive_and_repeatable() {
+        let metrics = HeightfieldMetrics::new(17, 17, 170.0, 170.0);
+        let mut input = Heightfield::zeros(metrics);
+        input.set(8, 8, -100.0);
+        let pinch = |strength| SculptStroke {
+            kind: SculptStrokeKind::Pinch,
+            points: vec![SculptPoint {
+                u: 0.5,
+                v: 0.5,
+                pressure: 1.0,
+            }],
+            radius_m: 50.0,
+            strength,
+            target_height: 0.0,
+            falloff: 1.5,
+            enabled: true,
+        };
+        let apply = |strokes| {
+            apply_sculpt_strokes(
+                &input,
+                &SculptStrokeParams {
+                    strokes,
+                    reconcile: 0.0,
+                },
+            )
+            .height
+        };
+
+        let weak = apply(vec![pinch(0.2)]);
+        let strong = apply(vec![pinch(0.8)]);
+        let repeated = apply(vec![pinch(0.2), pinch(0.2)]);
+        for (name, output) in [
+            ("weak", &weak),
+            ("strong", &strong),
+            ("repeated", &repeated),
+        ] {
+            let (lo, hi) = output.min_max();
+            assert!(
+                lo >= -100.0 && hi <= 0.0,
+                "{name} pinch escaped the input range: [{lo}, {hi}]"
+            );
+        }
+        let input_center = input.get(8, 8);
+        let weak_center = weak.get(8, 8);
+        assert!(
+            weak_center > input_center,
+            "a weak pinch must change the pit"
+        );
+        assert!(
+            strong.get(8, 8) > weak_center,
+            "stronger Pinch must move farther toward the neighbourhood mean"
+        );
+        assert!(
+            repeated.get(8, 8) > weak_center,
+            "a later Pinch stroke must continue affecting unconverged terrain"
         );
     }
 

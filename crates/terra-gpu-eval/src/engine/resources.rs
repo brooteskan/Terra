@@ -56,9 +56,10 @@ pub(super) fn stroke_kind_gpu_id(kind: SculptStrokeKind) -> u32 {
         | SculptStrokeKind::Sediment
         | SculptStrokeKind::Protect => 11,
         // Smooth pulls each sample toward the clamped 3x3 mean of the layer input
-        // (`src`); Pinch applies the same pull at a 1.25 overdrive; Coastline lowers
-        // the sample and blends it toward that mean under a weight gate. The stamp
-        // kernel reads that neighborhood directly (#114, #115, #116).
+        // (`src`); Pinch applies a bounded, strength-weighted 1.25 gain;
+        // Coastline lowers the sample and blends it toward that mean under a
+        // weight gate. The stamp kernel reads that neighborhood directly
+        // (#114, #115, #116).
         SculptStrokeKind::Smooth => 12,
         SculptStrokeKind::Pinch => 13,
         SculptStrokeKind::Coastline => 14,

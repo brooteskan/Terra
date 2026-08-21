@@ -13,6 +13,7 @@ use super::logical_frame::{EditGeneration, FrameIdentity, FramePhase, LogicalFra
 
 const EVENT_CAPACITY: usize = 2_048;
 const SAMPLE_CAPACITY: usize = 256;
+const VIOLATION_TRACE_EVENT_LIMIT: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct EvaluationTraceId(u64);
@@ -327,16 +328,7 @@ impl FrameTraceRecorder {
                 output.selected_field.resource_incarnation.0,
                 output.selected_field.physical_allocation,
             );
-            for event in &self.events {
-                log::error!(
-                    target: "terra_app::terrain_transition_trace",
-                    "trace kind={:?} frame={} generation={} evaluation={:?} phase={:?} output={:?} diagnostic={:?}",
-                    event.kind, event.frame.get(), event.generation.get(),
-                    event.evaluation.map(EvaluationTraceId::get), event.phase,
-                    event.output_identity.map(|identity| identity.output.0),
-                    event.diagnostic.map(terra_render::TerrainTransitionDiagnosticCode::as_str),
-                );
-            }
+            self.report_violation_trace_tail();
         }
     }
 
@@ -366,19 +358,7 @@ impl FrameTraceRecorder {
             record.baseline_before.map(|baseline| baseline.identity.output.0),
             record.actual_mode,
         );
-        for event in &self.events {
-            log::error!(
-                target: "terra_app::terrain_transition_trace",
-                "trace kind={:?} frame={} generation={} evaluation={:?} phase={:?} output={:?} diagnostic={:?}",
-                event.kind,
-                event.frame.get(),
-                event.generation.get(),
-                event.evaluation.map(EvaluationTraceId::get),
-                event.phase,
-                event.output_identity.map(|output| output.output.0),
-                event.diagnostic.map(terra_render::TerrainTransitionDiagnosticCode::as_str),
-            );
-        }
+        self.report_violation_trace_tail();
     }
 
     pub(crate) fn record_probe_result(
@@ -420,16 +400,32 @@ impl FrameTraceRecorder {
                 result.expected_base.map(|id| id.0), result.rect, result.max_delta,
                 result.first_failing_probe, result.probes_compared,
             );
-            for event in &self.events {
-                log::error!(
-                    target: "terra_app::terrain_transition_trace",
-                    "trace kind={:?} frame={} generation={} evaluation={:?} phase={:?} output={:?} diagnostic={:?}",
-                    event.kind, event.frame.get(), event.generation.get(),
-                    event.evaluation.map(EvaluationTraceId::get), event.phase,
-                    event.output_identity.map(|identity| identity.output.0),
-                    event.diagnostic.map(terra_render::TerrainTransitionDiagnosticCode::as_str),
-                );
-            }
+            self.report_violation_trace_tail();
+        }
+    }
+
+    fn report_violation_trace_tail(&self) {
+        let omitted = violation_trace_tail_start(self.events.len());
+        if omitted > 0 {
+            log::error!(
+                target: "terra_app::terrain_transition_trace",
+                "trace_tail omitted_events={} retained_events={}",
+                omitted,
+                self.events.len() - omitted,
+            );
+        }
+        for event in self.events.iter().skip(omitted) {
+            log::error!(
+                target: "terra_app::terrain_transition_trace",
+                "trace kind={:?} frame={} generation={} evaluation={:?} phase={:?} output={:?} diagnostic={:?}",
+                event.kind,
+                event.frame.get(),
+                event.generation.get(),
+                event.evaluation.map(EvaluationTraceId::get),
+                event.phase,
+                event.output_identity.map(|output| output.output.0),
+                event.diagnostic.map(terra_render::TerrainTransitionDiagnosticCode::as_str),
+            );
         }
     }
 
@@ -576,6 +572,10 @@ fn push_bounded<T>(queue: &mut VecDeque<T>, capacity: usize, value: T) {
     queue.push_back(value);
 }
 
+fn violation_trace_tail_start(event_count: usize) -> usize {
+    event_count.saturating_sub(VIOLATION_TRACE_EVENT_LIMIT)
+}
+
 fn summarize(samples: &VecDeque<u64>) -> LatencySummary {
     if samples.is_empty() {
         return LatencySummary::default();
@@ -635,6 +635,17 @@ mod tests {
             );
         }
         assert_eq!(trace.events().len(), EVENT_CAPACITY);
+    }
+
+    #[test]
+    fn violation_trace_tail_is_bounded() {
+        assert_eq!(violation_trace_tail_start(12), 0);
+        assert_eq!(violation_trace_tail_start(VIOLATION_TRACE_EVENT_LIMIT), 0);
+        assert_eq!(violation_trace_tail_start(EVENT_CAPACITY), 1_984);
+        assert_eq!(
+            EVENT_CAPACITY - violation_trace_tail_start(EVENT_CAPACITY),
+            64
+        );
     }
 
     /// Manual release-mode measurement used by the issue-168 diagnostic note.

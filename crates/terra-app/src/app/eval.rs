@@ -10,8 +10,8 @@ use terra_cpu_eval::EvalWorkRequest;
 use terra_gpu::GpuError;
 use terra_gpu_eval::{GpuEvaluationIntent, GpuPreviewFreshness, GpuRefinementStep};
 
-use super::frame_trace::FrameTraceEventKind;
-use super::logical_frame::{EditGeneration, FrameDeadlineKind, FrameRequestReason};
+use super::frame_trace::{EvaluationTraceId, FrameTraceEventKind};
+use super::logical_frame::{EditGeneration, FrameDeadlineKind, FrameIdentity, FrameRequestReason};
 use super::refinement_job::{RefinementJob, RefinementPublicationState};
 use super::{quality_stage_progress, DeferredFullField, TerraApp};
 
@@ -37,6 +37,21 @@ fn uv_to_texel_rect(region: UvRect, width: u32, height: u32) -> (u32, u32, u32, 
     let y0 = ((region.min_v.clamp(0.0, 1.0) * height as f32).floor() as u32).min(height - 1);
     let y1 = ((region.max_v.clamp(0.0, 1.0) * height as f32).ceil() as u32).clamp(y0 + 1, height);
     (x0, y0, x1 - x0, y1 - y0)
+}
+
+/// Correlate GPU work with the logical frame that requested it while keeping
+/// publication authority tied to the captured evaluation token. A logical frame
+/// may predate a project reset and therefore carry an older edit generation.
+fn gpu_evaluation_trace_context(
+    logical_frame: Option<FrameIdentity>,
+    publication_generation: u64,
+    evaluation: EvaluationTraceId,
+) -> terra_gpu_eval::GpuEvaluationTraceContext {
+    terra_gpu_eval::GpuEvaluationTraceContext {
+        frame_id: logical_frame.unwrap_or_default().id.get(),
+        generation: publication_generation,
+        evaluation_id: evaluation.get(),
+    }
 }
 
 impl TerraApp {
@@ -227,11 +242,11 @@ impl TerraApp {
         let Some(engine) = self.gpu_engine.as_mut() else {
             return false;
         };
-        engine.set_evaluation_trace_context(terra_gpu_eval::GpuEvaluationTraceContext {
-            frame_id: origin.id.get(),
-            generation: self.eval_token,
-            evaluation_id: evaluation.get(),
-        });
+        engine.set_evaluation_trace_context(gpu_evaluation_trace_context(
+            Some(origin),
+            self.eval_token,
+            evaluation,
+        ));
         let engine_job = match engine.begin_compiled_refinement(
             &gpu.device,
             &preview_stack,
@@ -1143,11 +1158,11 @@ impl TerraApp {
         profiling::scope!("eval_step");
         let t0 = Instant::now();
         let trace_id = self.frame_trace.next_evaluation_id();
-        let trace_identity = self.logical_frames.active_identity();
+        let logical_frame_identity = self.logical_frames.active_identity();
         self.frame_trace.record(
             t0,
             FrameTraceEventKind::EvaluationRequested,
-            trace_identity,
+            logical_frame_identity,
             self.logical_frames.active_phase(),
             Some(trace_id),
             Some(self.scheduler.quality),
@@ -1198,7 +1213,7 @@ impl TerraApp {
         self.frame_trace.record(
             Instant::now(),
             FrameTraceEventKind::EvaluationStarted,
-            trace_identity,
+            logical_frame_identity,
             self.logical_frames.active_phase(),
             Some(trace_id),
             Some(quality),
@@ -1266,7 +1281,7 @@ impl TerraApp {
         self.frame_trace.record(
             Instant::now(),
             FrameTraceEventKind::PlanAcquired,
-            trace_identity,
+            logical_frame_identity,
             self.logical_frames.active_phase(),
             Some(trace_id),
             Some(quality),
@@ -1302,12 +1317,11 @@ impl TerraApp {
                     engine.set_dirty_rect(None);
                 }
                 let gpu_eval_started = Instant::now();
-                let resolved_trace_identity = trace_identity.unwrap_or_default();
-                engine.set_evaluation_trace_context(terra_gpu_eval::GpuEvaluationTraceContext {
-                    frame_id: resolved_trace_identity.id.get(),
-                    generation: trace_identity.map_or(token, |identity| identity.generation.get()),
-                    evaluation_id: trace_id.get(),
-                });
+                engine.set_evaluation_trace_context(gpu_evaluation_trace_context(
+                    logical_frame_identity,
+                    token,
+                    trace_id,
+                ));
                 match engine.evaluate_compiled_with_intent(
                     &gpu.device,
                     &gpu.queue,
@@ -1324,7 +1338,7 @@ impl TerraApp {
                     Ok(result) => {
                         self.frame_trace.record_evaluation_submission(
                             Instant::now(),
-                            trace_identity,
+                            logical_frame_identity,
                             self.logical_frames.active_phase(),
                             trace_id,
                             quality,
@@ -1335,7 +1349,7 @@ impl TerraApp {
                         if let Some(output) = result.output_identity {
                             self.frame_trace.record_evaluation_output(
                                 Instant::now(),
-                                trace_identity,
+                                logical_frame_identity,
                                 self.logical_frames.active_phase(),
                                 trace_id,
                                 output,
@@ -1345,7 +1359,7 @@ impl TerraApp {
                             // Stale generation â€” discard.
                             self.frame_trace.record_candidate_refusal(
                                 Instant::now(),
-                                trace_identity,
+                                logical_frame_identity,
                                 self.logical_frames.active_phase(),
                                 trace_id,
                                 quality,
@@ -1424,7 +1438,7 @@ impl TerraApp {
                                 if let Some(record) = presentation_record {
                                     self.frame_trace.record_presentation(
                                         Instant::now(),
-                                        trace_identity,
+                                        logical_frame_identity,
                                         self.logical_frames.active_phase(),
                                         trace_id,
                                         record,
@@ -1442,7 +1456,7 @@ impl TerraApp {
                                 self.frame_trace.record(
                                     Instant::now(),
                                     FrameTraceEventKind::CandidateAccepted,
-                                    trace_identity,
+                                    logical_frame_identity,
                                     self.logical_frames.active_phase(),
                                     Some(trace_id),
                                     Some(quality),
@@ -1452,7 +1466,7 @@ impl TerraApp {
                             } else {
                                 self.frame_trace.record_candidate_refusal(
                                     Instant::now(),
-                                    trace_identity,
+                                    logical_frame_identity,
                                     self.logical_frames.active_phase(),
                                     trace_id,
                                     quality,
@@ -1944,10 +1958,13 @@ mod tests {
     use terra_gpu_eval::{GpuEvaluationIntent, GpuTerrainEngine};
     use terra_render::{GpuContext, HeightPresentGeom, TerrainRenderer};
 
-    use crate::app::logical_frame::{EditGeneration, FrameRequestReason};
+    use crate::app::frame_trace::{EvaluationTraceId, FrameTraceEventKind};
+    use crate::app::logical_frame::{
+        EditGeneration, FrameIdentity, FrameRequestReason, LogicalFrameId,
+    };
     use crate::ui::PanelAction;
 
-    use super::{uv_to_texel_rect, DeferredFullField, TerraApp};
+    use super::{gpu_evaluation_trace_context, uv_to_texel_rect, DeferredFullField, TerraApp};
 
     fn flat(height: f32) -> Layer {
         Layer::new("Flat", LayerKind::Flat(FlatParams { height }))
@@ -1979,6 +1996,111 @@ mod tests {
             max_v: 1.0,
         };
         assert_eq!(uv_to_texel_rect(region, 512, 256), (0, 0, 512, 256));
+    }
+
+    #[test]
+    fn gpu_output_generation_is_independent_of_logical_frame_generation() {
+        let logical_frame = FrameIdentity {
+            id: LogicalFrameId::new(7),
+            generation_at_start: EditGeneration::new(0),
+            generation: EditGeneration::new(0),
+        };
+        let context =
+            gpu_evaluation_trace_context(Some(logical_frame), 2, EvaluationTraceId::new(11));
+
+        assert_eq!(context.frame_id, 7);
+        assert_eq!(context.generation, 2);
+        assert_eq!(context.evaluation_id, 11);
+        assert_eq!(logical_frame.generation.get(), 0);
+    }
+
+    /// #169 project-entry regression: project initialization can advance the
+    /// publication token while the logical frame that opened it still has the
+    /// pre-entry generation. The first GPU output must use publication authority
+    /// without losing the older frame generation used for trace correlation.
+    #[test]
+    fn first_project_entry_gpu_presentation_uses_evaluation_token() {
+        let Some(gpu) = terra_test_gpu::headless() else {
+            return;
+        };
+        let context = GpuContext {
+            device: gpu.device.clone(),
+            queue: gpu.queue.clone(),
+            surface_format: wgpu::TextureFormat::Rgba8Unorm,
+        };
+        let resolution = 64;
+        let mut stack = LayerStack::new();
+        stack.push(flat(12.0));
+
+        let mut app = TerraApp::default();
+        app.session.document.metrics =
+            HeightfieldMetrics::new(resolution, resolution, 640.0, 640.0);
+        app.session.document.preview_resolution = resolution;
+        app.session.document.stack = stack;
+        app.renderer = Some(TerrainRenderer::new_headless(
+            &context, resolution, resolution,
+        ));
+        app.gpu_engine = Some(GpuTerrainEngine::new(&context.device, resolution));
+        app.gpu = Some(context);
+
+        let frame_started = Instant::now();
+        app.logical_frames.request(
+            EditGeneration::new(app.eval_token),
+            FrameRequestReason::UiActions,
+        );
+        let project_entry_frame = app
+            .logical_frames
+            .begin(frame_started, 0, 0)
+            .expect("project-entry logical frame");
+        assert_eq!(project_entry_frame.generation.get(), 0);
+
+        app.request_rebuild();
+        app.request_rebuild();
+        let publication_generation = app.eval_token;
+        assert_eq!(publication_generation, 2);
+        assert_eq!(
+            app.logical_frames
+                .active_identity()
+                .expect("active project-entry frame")
+                .generation
+                .get(),
+            0
+        );
+
+        app.run_eval_step_with_intent(GpuEvaluationIntent::Complete);
+
+        let output = app
+            .gpu_engine
+            .as_ref()
+            .and_then(GpuTerrainEngine::last_output_identity)
+            .expect("first project-entry GPU output identity");
+        assert_eq!(output.generation, publication_generation);
+        assert_eq!(output.frame_id, project_entry_frame.id.get());
+
+        let output_event = app
+            .frame_trace
+            .events()
+            .iter()
+            .rev()
+            .find(|event| event.kind == FrameTraceEventKind::EvaluationOutputSelected)
+            .expect("evaluation output trace event");
+        assert_eq!(output_event.generation.get(), 0);
+        assert_eq!(
+            output_event
+                .output_identity
+                .expect("traced output identity")
+                .generation,
+            publication_generation
+        );
+        assert_eq!(app.frame_trace.first_violation(), None);
+        assert_eq!(
+            app.renderer
+                .as_ref()
+                .and_then(TerrainRenderer::last_terrain_presentation_record)
+                .expect("first GPU presentation record")
+                .shadow_diagnostic,
+            None
+        );
     }
 
     /// #150 app-path ratchet: the production-shaped document resolves the real

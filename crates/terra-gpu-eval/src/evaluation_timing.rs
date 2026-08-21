@@ -6,7 +6,10 @@ const SLOT_COUNT: usize = 3;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GpuEvaluationTraceContext {
+    /// Logical frame that requested the work, used only for trace correlation.
     pub frame_id: u64,
+    /// Authoritative evaluation/publication token. This is deliberately
+    /// independent of the logical frame's edit generation.
     pub generation: u64,
     pub evaluation_id: u64,
 }

@@ -400,3 +400,113 @@ fn traced_regional_transition_detects_outside_region_corruption_asynchronously()
     assert_eq!(failure.first_failing_probe, Some(0));
     assert!(failure.max_delta > 1_000.0);
 }
+
+#[test]
+fn traced_regional_transition_recovers_after_an_unpresented_output() {
+    let Some(gpu) = terra_test_gpu::headless() else {
+        return;
+    };
+    let ctx = GpuContext {
+        device: gpu.device.clone(),
+        queue: gpu.queue.clone(),
+        surface_format: FORMAT,
+    };
+    let source = HeightSource::new(gpu, 96, 96);
+    let mut actual = renderer(&ctx);
+    let mut oracle = renderer(&ctx);
+
+    // Establish a coherent renderer-local output 37. Output 38 is then written
+    // into the complete engine source but intentionally never presented, matching
+    // an evaluation superseded while the camera/input generation advances.
+    let output_37 = output_identity(37, GpuOutputCoverage::WholeField);
+    let initial = actual.present_gpu_height_region_traced(
+        &source.texture,
+        source.geom(),
+        None,
+        output_37,
+        expectations(),
+    );
+    assert_eq!(
+        initial.actual_mode,
+        terra_render::TerrainPresentationMode::FullCopy
+    );
+
+    let skipped_rect = SampleRect {
+        x: 12,
+        y: 18,
+        w: 19,
+        h: 17,
+    };
+    source.write_patch(gpu, skipped_rect, 125.0);
+    let _unpresented_output_38 = output_identity(
+        38,
+        GpuOutputCoverage::Patch {
+            rect: skipped_rect,
+            expected_base: Some(output_37.output),
+        },
+    );
+
+    let current_rect = SampleRect {
+        x: 65,
+        y: 58,
+        w: 18,
+        h: 21,
+    };
+    source.write_patch(gpu, current_rect, 155.0);
+    let output_39 = output_identity(
+        39,
+        GpuOutputCoverage::Patch {
+            rect: current_rect,
+            expected_base: Some(GpuOutputId(38)),
+        },
+    );
+    let recovered = actual.present_gpu_height_region_traced(
+        &source.texture,
+        source.geom(),
+        Some(current_rect),
+        output_39,
+        expectations(),
+    );
+
+    assert_eq!(
+        recovered.requested_mode,
+        terra_render::TerrainPresentationMode::RegionalCopy
+    );
+    assert_eq!(
+        recovered.actual_mode,
+        terra_render::TerrainPresentationMode::FullCopy
+    );
+    assert_eq!(recovered.shadow_diagnostic, None);
+    assert_eq!(recovered.baseline_after.identity.output, output_39.output);
+
+    oracle.present_gpu_height_shared(&source.texture, &source.view, source.geom(), None);
+    assert_frames_equal(gpu, &mut actual, &mut oracle, "unpresented output recovery");
+
+    // Recovery is one-shot: the next compatible patch returns to the bounded path.
+    let next_rect = SampleRect {
+        x: 42,
+        y: 23,
+        w: 11,
+        h: 13,
+    };
+    source.write_patch(gpu, next_rect, 95.0);
+    let output_40 = output_identity(
+        40,
+        GpuOutputCoverage::Patch {
+            rect: next_rect,
+            expected_base: Some(output_39.output),
+        },
+    );
+    let resumed = actual.present_gpu_height_region_traced(
+        &source.texture,
+        source.geom(),
+        Some(next_rect),
+        output_40,
+        expectations(),
+    );
+    assert_eq!(
+        resumed.actual_mode,
+        terra_render::TerrainPresentationMode::RegionalCopy
+    );
+    assert_eq!(resumed.shadow_diagnostic, None);
+}

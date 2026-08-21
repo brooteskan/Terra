@@ -1519,8 +1519,13 @@ impl TerrainRenderer {
             h: geom.height,
         };
         let requested_is_partial = region.is_some_and(|rect| rect != full);
-        let actual_mode = if requested_is_partial && coherent_before {
-            TerrainPresentationMode::RegionalCopy
+        let actual_mode = if requested_is_partial {
+            presentation_transition::recoverable_regional_presentation_mode(
+                candidate,
+                self.presentation_baseline,
+                expected,
+                coherent_before,
+            )
         } else {
             TerrainPresentationMode::FullCopy
         };
@@ -1529,7 +1534,10 @@ impl TerrainRenderer {
             TerrainPresentationMode::FullCopy => Some(full),
             TerrainPresentationMode::Shared | TerrainPresentationMode::CpuUpload => None,
         };
-        self.present_gpu_height_region(src, geom, region);
+        // Passing the actual rect is essential when identity recovery promotes a
+        // coherent-but-stale local baseline: HeightGpu cannot infer that lineage
+        // gap from its texture-slot state alone.
+        self.present_gpu_height_region(src, geom, actual_rect);
         let record = self.record_gpu_presentation(
             candidate,
             expected,

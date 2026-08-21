@@ -196,10 +196,11 @@ fn supported_stroke_set(reconcile: f32) -> SculptStrokeParams {
                 5.0,
                 0.0,
             ),
-            // Pinch is Smooth's base-3x3 pull at a 1.25 overdrive. Routed across the
-            // Ridge crest (0.4, 0.75), where the running height sits well above `base`,
+            // Pinch is Smooth's base-3x3 pull with a bounded, strength-weighted
+            // 1.25 gain, routed across the Ridge crest (0.4, 0.75), where the
+            // running height sits well above `base`,
             // so a GPU that averaged the running (ridged) height instead of `src`, or
-            // dropped the 1.25 gain, diverges by metres there — far beyond tolerance.
+            // dropped the bounded gain, diverges by metres there — far beyond tolerance.
             // The (0.6, 0.95) endpoint drives the brush onto the bottom border for the
             // clamped-edge taps, an edge the Smooth stroke does not visit.
             stroke(
