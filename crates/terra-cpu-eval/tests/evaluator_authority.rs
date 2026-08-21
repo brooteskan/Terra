@@ -265,7 +265,7 @@ const APPROVED_EXECUTION_SEAMS: &[ApprovedSeam] = &[
         entry_points: &[EntryPoint {
             method: "compile_gpu_graph",
             caller: SourceEvidence {
-                path: "crates/terra-gpu-eval/src/engine.rs",
+                path: "crates/terra-gpu-eval/src/engine/compiled_plan.rs",
                 needle: "compile_gpu_graph(",
             },
         }],
@@ -357,7 +357,8 @@ const RETIRED_B1_D7_SYMBOLS: &[&str] = &[
 /// (#90), carries an honest `SeamRole::Planner` entry in `APPROVED_EXECUTION_SEAMS`.
 const RETIRED_EVAL_SYMBOLS: &[&str] = &["last_graph", "compile_graph", "compile_eval_graph"];
 
-/// Retired from the *GPU* engine (`terra-gpu-eval/src/engine.rs`) only. B1-D6 (#90)
+/// Retired from the *GPU* engine (`engine.rs` facade plus its `engine/` module tree)
+/// only. B1-D6 (#90)
 /// made `compile_gpu_graph`'s plan the single planning authority: the engine walk
 /// indexes `last_graph.plans` and must not re-derive per-layer support or kernels
 /// mid-walk. Referencing either helper from engine production reintroduces the
@@ -523,15 +524,22 @@ fn retired_evaluator_generations_stay_absent() {
         ));
     }
 
-    let gpu_engine_path = root.join("crates/terra-gpu-eval/src/engine.rs");
-    let gpu_engine_source = production_source(&read(&gpu_engine_path));
-    for symbol in RETIRED_GPU_ENGINE_SYMBOLS {
-        if contains_ident(&gpu_engine_source, symbol) {
-            violations.push(format!(
-                "{} references `{symbol}`; the GPU engine must consume compile_gpu_graph's plan \
-                 (last_graph.plans), not re-derive per-layer support or kernels (B1-D6 #90)",
-                gpu_engine_path.display()
-            ));
+    let gpu_engine_root = root.join("crates/terra-gpu-eval/src/engine");
+    let gpu_engine_facade = root.join("crates/terra-gpu-eval/src/engine.rs");
+    let mut gpu_engine_files = source_files_under(&gpu_engine_root, &root);
+    gpu_engine_files.push(SourceFile {
+        path: relative_path(&root, &gpu_engine_facade),
+        production: production_source(&read(&gpu_engine_facade)),
+    });
+    for file in gpu_engine_files {
+        for symbol in RETIRED_GPU_ENGINE_SYMBOLS {
+            if contains_ident(&file.production, symbol) {
+                violations.push(format!(
+                    "{} references `{symbol}`; the GPU engine must consume compile_gpu_graph's plan \
+                     (last_graph.plans), not re-derive per-layer support or kernels (B1-D6 #90)",
+                    file.path
+                ));
+            }
         }
     }
 
