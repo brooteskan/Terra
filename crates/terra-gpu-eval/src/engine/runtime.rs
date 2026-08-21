@@ -56,8 +56,7 @@ use super::stats::{GpuEvalStats, GpuPlanOperationDisposition, GpuPlanOperationTr
 
 #[path = "compiled_plan.rs"]
 mod compiled_plan;
-#[cfg(test)]
-use compiled_plan::cpu_resume_prefix_is_height_only;
+use compiled_plan::{cpu_resume_prefix_is_height_only, BridgePrefix};
 #[path = "dirty.rs"]
 mod dirty_state;
 #[path = "pipelines/mod.rs"]
@@ -227,6 +226,11 @@ impl GpuTerrainEngine {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Evaluate through the compatibility planner.
+    ///
+    /// `bridge_prefix` is the complete height entering the first layer marked
+    /// dirty. It allows a GPU-compatible suffix to resume after a CPU-baked,
+    /// height-only prefix; prefixes carrying auxiliary state are rejected.
     pub fn evaluate(
         &mut self,
         device: &wgpu::Device,
@@ -264,7 +268,7 @@ impl GpuTerrainEngine {
         metrics: HeightfieldMetrics,
         quality: PreviewQuality,
         want_cpu: bool,
-        _bridge_prefix: Option<&Heightfield>,
+        bridge_prefix: Option<&Heightfield>,
         intent: GpuEvaluationIntent,
     ) -> Result<GpuEvalResult, GpuError> {
         let revision = PlanStructureRevision::INITIAL;
@@ -314,7 +318,50 @@ impl GpuTerrainEngine {
                 .collect()
         };
         let invalidation = propagate_plan_edits(&plan, &edits);
-        let result = self.evaluate_compiled_with_intent(
+        let bridge_prefix = bridge_prefix
+            .map(|height| {
+                if height.metrics.width == 0 || height.metrics.height == 0 {
+                    return Err(cpu_required(
+                        GpuFallbackCode::RuntimeResourceLimit,
+                        "bridge prefix",
+                        "the bridge heightfield is empty",
+                    ));
+                }
+                let layers = stack.flatten_layers();
+                let Some((first_dirty_index, first_dirty_layer)) = layers
+                    .iter()
+                    .enumerate()
+                    .find(|(_, layer)| self.dirty.contains(&layer.id()))
+                else {
+                    return Err(cpu_required(
+                        GpuFallbackCode::UnsupportedOptions,
+                        "bridge prefix",
+                        "a bridge prefix requires at least one dirty layer",
+                    ));
+                };
+                if stack.requires_tree_evaluation() {
+                    return Err(cpu_required(
+                        GpuFallbackCode::UnsupportedOptions,
+                        "bridge prefix",
+                        "bridge prefixes currently require a flat authored stack",
+                    ));
+                }
+                if first_dirty_index == 0
+                    || !cpu_resume_prefix_is_height_only(&layers, first_dirty_index)
+                {
+                    return Err(cpu_required(
+                        GpuFallbackCode::AuxiliaryDependency,
+                        "bridge prefix",
+                        "the prefix before the first dirty layer is not a complete height-only checkpoint",
+                    ));
+                }
+                Ok(BridgePrefix {
+                    height,
+                    first_dirty_layer: first_dirty_layer.id(),
+                })
+            })
+            .transpose()?;
+        let result = self.evaluate_compiled_with_bridge(
             device,
             queue,
             stack,
@@ -326,6 +373,7 @@ impl GpuTerrainEngine {
             quality,
             want_cpu,
             intent,
+            bridge_prefix,
         );
         if result
             .as_ref()
@@ -348,8 +396,6 @@ impl GpuTerrainEngine {
     }
 }
 
-/// `bridge_prefix` is only safe when it is the height *entering* `first_dirty`
-/// (GPU/CPU cache of the previous layer). Full-stack last_good is never safe.
 #[cfg(test)]
 #[path = "tests.rs"]
 mod smoke_tests;

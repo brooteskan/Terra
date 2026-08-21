@@ -223,6 +223,51 @@ pub(super) fn cpu_resume_prefix_is_height_only(layers: &[&Layer], resume_index: 
     })
 }
 
+pub(super) struct BridgePrefix<'a> {
+    pub(super) height: &'a Heightfield,
+    pub(super) first_dirty_layer: LayerId,
+}
+
+fn bridge_plan_boundary(
+    plan: &CompiledTerrainPlan,
+    bridge: &BridgePrefix<'_>,
+) -> Option<(PlanOpId, terra_core::terrain_plan::FieldSlot)> {
+    plan.operations()
+        .iter()
+        .enumerate()
+        .find_map(|(index, operation)| match operation.kind {
+            TerrainOpKind::RunLayerKernel {
+                layer,
+                input_height,
+                ..
+            } if layer == bridge.first_dirty_layer => {
+                Some((PlanOpId::from_index(index), input_height))
+            }
+            _ => None,
+        })
+}
+
+fn resample_bridge_prefix(src: &Heightfield, dst: HeightfieldMetrics) -> Vec<f32> {
+    let width = dst.width as usize;
+    let height = dst.height as usize;
+    let mut output = vec![0.0; width.saturating_mul(height)];
+    if src.metrics.width == 0 || src.metrics.height == 0 || width == 0 || height == 0 {
+        return output;
+    }
+    let dense = src.to_dense();
+    let source_width = src.metrics.width as usize;
+    let source_height = src.metrics.height as usize;
+    for y in 0..height {
+        for x in 0..width {
+            let source_x = (((x as f32 + 0.5) / width as f32) * source_width as f32) as usize;
+            let source_y = (((y as f32 + 0.5) / height as f32) * source_height as f32) as usize;
+            output[y * width + x] = dense
+                [source_y.min(source_height - 1) * source_width + source_x.min(source_width - 1)];
+        }
+    }
+    output
+}
+
 impl GpuTerrainEngine {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn record_compiled_operation(
@@ -476,6 +521,38 @@ impl GpuTerrainEngine {
         want_cpu: bool,
         intent: GpuEvaluationIntent,
     ) -> Result<GpuEvalResult, GpuError> {
+        self.evaluate_compiled_with_bridge(
+            device,
+            queue,
+            stack,
+            mask_assets,
+            plan,
+            expected_revision,
+            invalidation,
+            metrics,
+            quality,
+            want_cpu,
+            intent,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn evaluate_compiled_with_bridge(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        stack: &LayerStack,
+        mask_assets: &[MaskAsset],
+        plan: &CompiledTerrainPlan,
+        expected_revision: PlanStructureRevision,
+        invalidation: &PlanInvalidation,
+        metrics: HeightfieldMetrics,
+        quality: PreviewQuality,
+        want_cpu: bool,
+        intent: GpuEvaluationIntent,
+        bridge_prefix: Option<BridgePrefix<'_>>,
+    ) -> Result<GpuEvalResult, GpuError> {
         profiling::scope!("gpu_compiled_plan_eval");
         if !plan.matches_structure_revision(expected_revision) {
             return Err(GpuError::StalePlan {
@@ -523,7 +600,27 @@ impl GpuTerrainEngine {
             resource_prepare_started.elapsed().as_micros() as u64;
         let capability_preflight_started = std::time::Instant::now();
 
-        let mut requested: Vec<PlanOpId> = if cold {
+        let bridge_boundary = bridge_prefix
+            .as_ref()
+            .and_then(|bridge| bridge_plan_boundary(plan, bridge));
+        if bridge_prefix.is_some() && bridge_boundary.is_none() {
+            return Err(cpu_required(
+                GpuFallbackCode::UnsupportedOptions,
+                "bridge prefix",
+                "the first dirty layer has no executable operation in the compiled terrain plan",
+            ));
+        }
+        let mut requested: Vec<PlanOpId> = if let Some((boundary, _)) = bridge_boundary {
+            plan.operations()
+                .iter()
+                .enumerate()
+                .filter_map(|(index, _)| {
+                    let id = PlanOpId::from_index(index);
+                    (index >= boundary.index() && plan.analysis().operation_is_live(id))
+                        .then_some(id)
+                })
+                .collect()
+        } else if cold {
             plan.operations()
                 .iter()
                 .enumerate()
@@ -564,12 +661,15 @@ impl GpuTerrainEngine {
         }
         self.last_eval_stats.reused_contributions = reused_plan_candidates;
         self.last_eval_stats.operations_reused = reused_plan_candidates;
-        let selected = staged_candidate
+        let mut selected = staged_candidate
             .as_ref()
             .map(|candidate| candidate.layout())
             .or_else(|| self.plan_resources.current().map(|active| active.layout()))
             .expect("cold candidate or compatible active plan resources")
             .materialization_operations(plan, &requested);
+        if let Some((boundary, _)) = bridge_boundary {
+            selected.retain(|operation| operation.index() >= boundary.index());
+        }
         let merged_scope = if cold {
             PropagatedDirtyScope::new(PlanDirtyScope::FullField)
         } else {
@@ -748,6 +848,38 @@ impl GpuTerrainEngine {
                 .take_current()
                 .expect("compatible warm realization checked above")
         });
+        if let (Some(bridge), Some((_, input_height))) = (bridge_prefix.as_ref(), bridge_boundary) {
+            let dense = resample_bridge_prefix(bridge.height, metrics);
+            let texture = match candidate.texture(input_height) {
+                Ok(texture) => texture,
+                Err(error) => {
+                    if warm_execution {
+                        self.plan_resources.restore_current(candidate);
+                    }
+                    return Err(GpuError::Wgpu(error.to_string()));
+                }
+            };
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                bytemuck::cast_slice(&dense),
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(metrics.width * 4),
+                    rows_per_image: Some(metrics.height),
+                },
+                wgpu::Extent3d {
+                    width: metrics.width,
+                    height: metrics.height,
+                    depth_or_array_layers: 1,
+                },
+            );
+            self.approx_range = bridge.height.min_max();
+        }
         self.last_eval_stats.selected_operations = selected.len() as u32;
         self.last_eval_stats.capability_preflight_us =
             capability_preflight_started.elapsed().as_micros() as u64;
@@ -760,7 +892,7 @@ impl GpuTerrainEngine {
             .as_mut()
             .and_then(|timer| timer.begin(&mut encoder));
 
-        let mut last_height = None;
+        let mut last_height = bridge_boundary.map(|(_, input_height)| input_height);
         let published_output_slots: HashMap<_, _> = plan
             .operations()
             .iter()

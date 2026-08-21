@@ -104,6 +104,58 @@ fn cpu_resume_prefix_requires_a_complete_height_only_checkpoint() {
     assert!(!cpu_resume_prefix_is_height_only(&stream_power_layers, 1));
 }
 
+#[test]
+fn compatibility_bridge_parameter_stays_connected_to_compiled_execution() {
+    let runtime = include_str!("runtime.rs");
+    assert!(runtime.contains("bridge_prefix: Option<&Heightfield>"));
+    assert!(!runtime.contains("_bridge_prefix"));
+    assert!(runtime.contains("Ok(BridgePrefix {"));
+    assert!(runtime.contains("evaluate_compiled_with_bridge("));
+}
+
+#[test]
+fn compatibility_bridge_seeds_the_first_dirty_layer_input() {
+    let Some(gpu) = terra_test_gpu::headless() else {
+        return;
+    };
+    let metrics = HeightfieldMetrics::new(16, 16, 160.0, 160.0);
+    let mut stack = LayerStack::new();
+    let mut cpu_baked = Layer::new(
+        "CPU-baked prefix",
+        LayerKind::Flat(FlatParams { height: 10.0 }),
+    );
+    cpu_baked
+        .common
+        .param_bindings
+        .push(ParamBinding::new("height", BindingSource::Constant(1.0)));
+    stack.push(cpu_baked);
+    let mut suffix = Layer::new("GPU suffix", LayerKind::Flat(FlatParams { height: 2.0 }));
+    suffix.common.blend = BlendMode::Add;
+    let suffix_id = suffix.id();
+    stack.push(suffix);
+
+    let bridge = Heightfield::filled(metrics, 10.0);
+    let mut engine = GpuTerrainEngine::new(&gpu.device, metrics.width);
+    engine.mark_dirty(suffix_id);
+    let result = engine
+        .evaluate(
+            &gpu.device,
+            &gpu.queue,
+            &stack,
+            &[],
+            metrics,
+            PreviewQuality::Draft,
+            true,
+            Some(&bridge),
+        )
+        .expect("height-only bridge should execute the GPU suffix");
+
+    assert!(result.fully_gpu);
+    assert_eq!(result.resume_cpu_from, None);
+    let actual = result.cpu.expect("bridged suffix readback");
+    assert!((actual.get(8, 8) - 12.0).abs() < 0.01);
+}
+
 /// A precise compiled-plan fallback presents the truthful prefix entering the
 /// unsupported operation, with or without a synchronous CPU checkpoint.
 #[test]
