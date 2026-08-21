@@ -10,7 +10,6 @@ use terra_core::analyze::{
     debris_flow_erode, thermal_erode_layered, thermal_erode_with_hardness, HydraulicErosionCore,
     MassWastingState,
 };
-use terra_core::eval::{EvalContext, StackEvaluator};
 use terra_core::fields::{keys, AuxMaps};
 use terra_core::heightfield::{Heightfield, HeightfieldMetrics};
 use terra_core::hydro::stream_power_erode;
@@ -23,6 +22,7 @@ use terra_core::layer::{
     StreamPowerParams, ThermalErosionParams, TransportModel,
 };
 use terra_core::mask::MaskField;
+use terra_cpu_eval::{EvalContext, StackEvaluator};
 
 fn metrics(resolution: u32) -> HeightfieldMetrics {
     HeightfieldMetrics::new(

@@ -1,9 +1,9 @@
 use super::StackEvaluator;
-use crate::heightfield::Heightfield;
-use crate::mask::MaskField;
-use crate::quality::PreviewQuality;
 use std::collections::HashMap;
 use std::sync::Arc;
+use terra_core::heightfield::Heightfield;
+use terra_core::mask::MaskField;
+use terra_core::quality::PreviewQuality;
 
 /// Per-session evaluation state for the interactive app.
 ///
@@ -25,7 +25,7 @@ pub struct EvalScheduler {
     pub last_good: Option<Arc<Heightfield>>,
     pub last_aux: HashMap<String, MaskField>,
     /// Materials strata preserved across HashMap aux round-trips.
-    pub last_strata: Option<Vec<crate::layer::Stratum>>,
+    pub last_strata: Option<Vec<terra_core::layer::Stratum>>,
     /// Most recent per-layer CPU timing and cache provenance.
     pub last_layer_timings: Vec<super::LayerEvalTiming>,
     pub quality: PreviewQuality,

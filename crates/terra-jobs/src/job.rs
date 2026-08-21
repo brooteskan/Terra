@@ -55,8 +55,8 @@ struct Completion<T> {
 
 /// Recover a human-readable message from a panic payload.
 ///
-/// Mirrors `panic_payload_message` in terra-core's eval module. terra-jobs sits
-/// *below* terra-core in the crate graph and cannot borrow it, so the small
+/// Mirrors `panic_payload_message` in terra-cpu-eval. terra-jobs sits below the
+/// evaluator in the crate graph and cannot borrow it, so the small
 /// helper is duplicated rather than shared. Shared within the crate so the
 /// [`crate::latest_wins`] executor reuses it.
 pub(crate) fn panic_payload_message(payload: Box<dyn Any + Send>) -> String {

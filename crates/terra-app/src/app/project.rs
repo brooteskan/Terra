@@ -15,7 +15,7 @@ use super::{
     default_terra_projects_dir, document_from_world_settings, prepare_project_path,
     project_name_from_path, save_project_prefs, AppScreen, PendingProjectAction, TerraApp,
 };
-use terra_core::eval::PreviewQuality;
+use terra_core::quality::PreviewQuality;
 
 #[cfg(any(target_os = "windows", target_os = "macos", unix))]
 fn open_directory(path: &Path) -> std::io::Result<()> {

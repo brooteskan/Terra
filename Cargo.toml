@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/terra-core",
+    "crates/terra-cpu-eval",
     "crates/terra-jobs",
     "crates/terra-gpu",
     "crates/terra-gpu-eval",
@@ -22,6 +23,7 @@ repository = "https://github.com/brooteskan/Terra"
 
 [workspace.dependencies]
 terra-core = { path = "crates/terra-core" }
+terra-cpu-eval = { path = "crates/terra-cpu-eval" }
 terra-jobs = { path = "crates/terra-jobs" }
 terra-gpu = { path = "crates/terra-gpu" }
 terra-gpu-eval = { path = "crates/terra-gpu-eval" }

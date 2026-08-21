@@ -1,4 +1,3 @@
-use terra_core::eval::{EvalContext, StackEvaluator};
 use terra_core::heightfield::HeightfieldMetrics;
 use terra_core::layer::{
     BindingSource, BiomesParams, BlendMode, CanyonParams, DomainWarpParams, DuneParams,
@@ -10,6 +9,7 @@ use terra_core::layer::{
     UpliftParams, VolcanoParams, VoronoiParams,
 };
 use terra_core::mask::{MaskAsset, MaskId, MaskOp, MaskRef, MaskSource};
+use terra_cpu_eval::{EvalContext, StackEvaluator};
 use terra_gpu::{
     compile_gpu_graph, layer_gpu_supported, GpuDirtyPolicy, GpuFallbackCode, GpuKernel,
 };

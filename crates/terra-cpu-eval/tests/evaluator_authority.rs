@@ -1,7 +1,7 @@
 //! B1 evaluator-authority ratchet (audit B1-G1, extended by B1-G2; protects
 //! B1-D1 through B1-D6).
 //!
-//! `StackEvaluator` is terra-core's sole CPU layer-stack execution authority.
+//! `StackEvaluator` is the workspace's sole CPU layer-stack execution authority.
 //! `EvalWorker` is the approved orchestration wrapper: it may retain state,
 //! schedule work, and route results, but it must delegate terrain production to
 //! `StackEvaluator` rather than own a second dispatcher. (`EvalScheduler` is
@@ -112,7 +112,7 @@ struct DeferredCandidate {
 const APPROVED_EXECUTION_SEAMS: &[ApprovedSeam] = &[
     ApprovedSeam {
         name: "StackEvaluator",
-        definition: "crates/terra-core/src/eval/mod.rs",
+        definition: "crates/terra-cpu-eval/src/lib.rs",
         role: SeamRole::Authority,
         justification: "sole CPU authority; owns ProcessorRegistry and performs the authored LayerStack tree walk",
         entry_points: &[
@@ -133,7 +133,7 @@ const APPROVED_EXECUTION_SEAMS: &[ApprovedSeam] = &[
             EntryPoint {
                 method: "rebuild_incremental",
                 caller: SourceEvidence {
-                    path: "crates/terra-core/src/eval/worker.rs",
+                    path: "crates/terra-cpu-eval/src/worker.rs",
                     needle: "evaluator.rebuild_incremental(",
                 },
             },
@@ -175,7 +175,7 @@ const APPROVED_EXECUTION_SEAMS: &[ApprovedSeam] = &[
             EntryPoint {
                 method: "mark_dirty_from_region",
                 caller: SourceEvidence {
-                    path: "crates/terra-core/src/eval/worker.rs",
+                    path: "crates/terra-cpu-eval/src/worker.rs",
                     needle: "evaluator.mark_dirty_from_region(",
                 },
             },
@@ -191,7 +191,7 @@ const APPROVED_EXECUTION_SEAMS: &[ApprovedSeam] = &[
             },
         ],
         result_test: ResultTestEvidence {
-            path: "crates/terra-core/tests/tropical_island_workflow.rs",
+            path: "crates/terra-cpu-eval/tests/tropical_island_workflow.rs",
             test_name: "tropical_island_evaluates_with_biome_content",
             seam_needle: "StackEvaluator::new",
             result_needle: "height.min_max",
@@ -199,7 +199,7 @@ const APPROVED_EXECUTION_SEAMS: &[ApprovedSeam] = &[
     },
     ApprovedSeam {
         name: "EvalWorker",
-        definition: "crates/terra-core/src/eval/worker.rs",
+        definition: "crates/terra-cpu-eval/src/worker.rs",
         role: SeamRole::Orchestrator,
         justification: "background job transport whose worker thread owns and invokes StackEvaluator",
         entry_points: &[
@@ -251,7 +251,7 @@ const APPROVED_EXECUTION_SEAMS: &[ApprovedSeam] = &[
             justification: "invoked by Drop and restart to stop the worker thread; not an external entry",
         }],
         result_test: ResultTestEvidence {
-            path: "crates/terra-core/src/eval/worker.rs",
+            path: "crates/terra-cpu-eval/src/worker.rs",
             test_name: "worker_height_mask_uses_layer_input_not_previous_frame",
             seam_needle: "EvalWorker::spawn",
             result_needle: "r.height.get",
@@ -288,6 +288,9 @@ const APPROVED_EXECUTION_SEAMS: &[ApprovedSeam] = &[
 const DEFERRED_CANDIDATES: &[DeferredCandidate] = &[];
 
 const RETIRED_PATHS: &[&str] = &[
+    // #159: CPU evaluation belongs to terra-cpu-eval; terra-core must not grow
+    // a compatibility module or a second implementation.
+    "crates/terra-core/src/eval",
     "crates/terra-core/src/terrain_eval",
     "crates/terra-core/src/fields/context.rs",
     "crates/terra-core/src/domain/pipeline.rs",
@@ -347,7 +350,7 @@ const RETIRED_B1_D7_SYMBOLS: &[&str] = &[
     "update_visible_tile_plan",
 ];
 
-/// Retired from the *CPU* evaluator (`eval/mod.rs`) only — not workspace-wide.
+/// Retired from the *CPU* evaluator (`terra-cpu-eval/src/lib.rs`) only — not workspace-wide.
 /// terra-gpu-eval's `GpuTerrainEngine` legitimately keeps a `last_graph`; rather than
 /// bless that with a free-text exemption (which is where B1-D6 grew unnoticed),
 /// the GPU graph compiler is discovered by the workspace scan and, since B1-D6
@@ -441,7 +444,7 @@ fn authority_inventory_is_honest() {
         .collect();
     if authorities != ["StackEvaluator"] {
         violations.push(format!(
-            "terra-core must have exactly one CPU authority named StackEvaluator; inventory has {authorities:?}"
+            "the workspace must have exactly one CPU authority named StackEvaluator; inventory has {authorities:?}"
         ));
     }
 
@@ -503,7 +506,7 @@ fn retired_evaluator_generations_stay_absent() {
         }
     }
 
-    let eval_path = root.join("crates/terra-core/src/eval/mod.rs");
+    let eval_path = root.join("crates/terra-cpu-eval/src/lib.rs");
     let eval_source = production_source(&read(&eval_path));
     for symbol in RETIRED_EVAL_SYMBOLS.iter().copied().chain(["terrain_eval"]) {
         if contains_ident(&eval_source, symbol) {
@@ -660,9 +663,9 @@ fn deferred_candidates_are_honest() {
 }
 
 /// Revert check (b): an authority-shaped type in *any* crate — not just
-/// terra-core — is discovered, now that the scan is workspace-wide.
+/// terra-cpu-eval — is discovered, now that the scan is workspace-wide.
 #[test]
-fn authority_shaped_type_outside_core_is_discovered() {
+fn authority_shaped_type_outside_cpu_eval_is_discovered() {
     let source = r#"
         pub struct RogueTileExecutor;
         impl RogueTileExecutor {
@@ -689,7 +692,7 @@ fn authority_shaped_type_outside_core_is_discovered() {
 fn entry_point_liveness_detects_a_missing_caller() {
     let seam = ApprovedSeam {
         name: "StackEvaluator",
-        definition: "crates/terra-core/src/eval/mod.rs",
+        definition: "crates/terra-cpu-eval/src/lib.rs",
         role: SeamRole::Authority,
         justification: "fixture",
         entry_points: &[EntryPoint {

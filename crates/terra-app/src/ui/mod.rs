@@ -90,9 +90,9 @@ pub use workspace::{
 
 use serde::{Deserialize, Serialize};
 use terra_core::document::TerrainDocument;
-use terra_core::eval::PreviewQuality;
 use terra_core::layer::{LayerId, LayerKind};
 use terra_core::mask::MaskId;
+use terra_core::quality::PreviewQuality;
 use terra_gui::GuiContext;
 
 use crate::ui::chrome_gui::{draw_menu_bar, draw_menu_overlays};
@@ -1281,7 +1281,7 @@ pub struct FrameProfile {
     pub follow_up_press_max_us: u64,
     pub plan: terra_core::terrain_plan::PlanCacheStatsSnapshot,
     pub gpu: terra_gpu_eval::GpuEvalStats,
-    pub cpu_worker: terra_core::eval::EvalWorkerStatsSnapshot,
+    pub cpu_worker: terra_cpu_eval::EvalWorkerStatsSnapshot,
     pub cpu_published: u64,
     pub terrain_grid_size: u32,
     pub tiles_x: u32,
@@ -1332,8 +1332,8 @@ pub struct FrameProfile {
 }
 
 impl FrameProfile {
-    pub fn update_layer_timings(&mut self, timings: &[terra_core::eval::LayerEvalTiming]) {
-        use terra_core::eval::LayerEvalStatus;
+    pub fn update_layer_timings(&mut self, timings: &[terra_cpu_eval::LayerEvalTiming]) {
+        use terra_cpu_eval::LayerEvalStatus;
 
         self.cache_hits = 0;
         self.computed_layers = 0;

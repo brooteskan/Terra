@@ -2,10 +2,10 @@
 
 use std::collections::HashMap;
 use terra_core::document::EditorSession;
-use terra_core::eval::{EvalContext, PreviewQuality, StackEvaluator};
 use terra_core::heightfield::{Heightfield, HeightfieldMetrics};
 use terra_core::layer::{Layer, LayerKind, LayerStack, MaterialsParams, MountainParams, StackNode};
 use terra_core::mask::{bake_mask_assets, CompareOp, ConditionChannel, DistBakeContext};
+use terra_core::quality::PreviewQuality;
 use terra_core::world_rules::{
     beach_preset, builtin_world_rule_presets, cliff_preset, diagnose_world_rule,
     high_altitude_rock_preset, placement_from_conditions, riverbank_preset, snowline_preset,
@@ -13,6 +13,7 @@ use terra_core::world_rules::{
     WorldRuleEffect, WorldRuleEffectKind, WorldRuleLibrary, WorldRulePhase, WorldRuleScope,
 };
 use terra_core::{coastal_wetness_preset, EvalStage};
+use terra_cpu_eval::{EvalContext, StackEvaluator};
 
 fn metrics() -> HeightfieldMetrics {
     HeightfieldMetrics::new(32, 32, 1024.0, 1024.0)

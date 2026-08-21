@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 
 use terra_core::biome_paint::ShapeTransform;
-use terra_core::eval::{EvalContext, PreviewQuality, StackEvaluator};
 use terra_core::heightfield::{Heightfield, HeightfieldMetrics};
 use terra_core::layer::{
     BindingSource, BlendMode, BlurParams, CanyonParams, DomainWarpParams, DuneParams,
@@ -15,6 +14,8 @@ use terra_core::layer::{
     VolcanoParams, VoronoiParams,
 };
 use terra_core::mask::{bake_mask_assets, MaskAsset, MaskId, MaskRef, MaskSource};
+use terra_core::quality::PreviewQuality;
+use terra_cpu_eval::{EvalContext, StackEvaluator};
 use terra_gpu::parity::{
     assert_field_parity, ADD_SET_FILTER_PREVIEW, ARCHIPELAGO_PREVIEW, ATOLL_PREVIEW, BLUR_PREVIEW,
     CANYONS_PREVIEW, CURVE_FILTER_PREVIEW, CUTOFF_FILTER_PREVIEW, DEFLATE_FILTER_PREVIEW,

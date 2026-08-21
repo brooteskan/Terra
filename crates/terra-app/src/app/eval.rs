@@ -2,10 +2,11 @@ use std::time::{Duration, Instant};
 
 use crate::logging::OperationContext;
 use crate::ui::{Preview2dMode, TerrainPreviewFreshness};
-use terra_core::eval::{EvalWorkRequest, PreviewQuality};
 use terra_core::layer::{LayerId, LayerKind};
 use terra_core::mask::bake_mask_assets;
+use terra_core::quality::PreviewQuality;
 use terra_core::tiling::UvRect;
+use terra_cpu_eval::EvalWorkRequest;
 use terra_gpu::GpuError;
 use terra_gpu_eval::{GpuEvaluationIntent, GpuPreviewFreshness, GpuRefinementStep};
 
@@ -1846,11 +1847,11 @@ impl TerraApp {
 mod tests {
     use std::sync::Arc;
 
-    use terra_core::eval::PreviewQuality;
     use terra_core::heightfield::{Heightfield, HeightfieldMetrics};
     use terra_core::layer::{
         FlatParams, Layer, LayerKind, LayerStack, SculptStrokeKind, StreamPowerParams,
     };
+    use terra_core::quality::PreviewQuality;
     use terra_core::shape_history::{create_shape_layer, ShapeTool};
     use terra_core::test_fixtures::{untitled6_document, Untitled6Variant};
     use terra_core::tiling::UvRect;

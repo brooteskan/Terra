@@ -17,9 +17,6 @@
 
 use super::cache::CachedOutput;
 use super::EvalError;
-use crate::heightfield::{Heightfield, HeightfieldMetrics};
-use crate::layer::LayerId;
-use crate::mask::MaskField;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -27,6 +24,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Once};
 use std::time::{Duration, SystemTime};
+use terra_core::heightfield::{Heightfield, HeightfieldMetrics};
+use terra_core::layer::LayerId;
+use terra_core::mask::MaskField;
 
 /// Magic for the single-file bake format introduced by B1-D8. The prior format
 /// used separate `.meta.json` / `.height.bin` / `.aux.*.bin` files; those are
@@ -54,7 +54,7 @@ struct BakeHeader {
     generation: u64,
     aux_names: Vec<String>,
     #[serde(default)]
-    strata: Option<Vec<crate::layer::Stratum>>,
+    strata: Option<Vec<terra_core::layer::Stratum>>,
 }
 
 /// On-disk bake store keyed by [`LayerId`], writing one atomic file per layer.
@@ -331,9 +331,9 @@ fn is_legacy_bake_file(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::field_data::{keys, AuxMaps};
-    use crate::heightfield::HeightfieldMetrics;
     use std::collections::HashMap;
+    use terra_core::field_data::{keys, AuxMaps};
+    use terra_core::heightfield::HeightfieldMetrics;
 
     fn scratch_dir(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("terra_smart_cache_{tag}_{}", uuid::Uuid::new_v4()))

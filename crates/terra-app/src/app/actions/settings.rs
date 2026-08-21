@@ -109,9 +109,9 @@ mod tests {
     use std::collections::HashMap;
 
     use terra_core::analyze::HighDetailMode;
-    use terra_core::eval::CachedOutput;
     use terra_core::heightfield::{Heightfield, HeightfieldMetrics};
     use terra_core::layer::LayerId;
+    use terra_cpu_eval::CachedOutput;
 
     use super::*;
 

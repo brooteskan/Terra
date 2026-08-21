@@ -194,10 +194,10 @@ pub(crate) fn try_apply(
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use terra_core::eval::CachedOutput;
     use terra_core::heightfield::{Heightfield, HeightfieldMetrics};
     use terra_core::layer::{FlatParams, Layer, LayerId, LayerKind, LayerStack, MaterialsParams};
     use terra_core::world_rules::{WorldRule, WorldRuleId, WorldRulePhase};
+    use terra_cpu_eval::CachedOutput;
 
     /// A headless app whose stack is `Base(Flat, Blueprint) → Mats(Materials)` with a
     /// fresh World Rule. A rule with no effects and no phase override resolves to the

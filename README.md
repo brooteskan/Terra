@@ -57,7 +57,8 @@ See the disclaimer above before relying on any of this.
 
 | Crate | Role |
 |-------|------|
-| `terra-core` | Heightfields, layers, masks, biomes, CPU evaluation, commands |
+| `terra-core` | Backend-neutral heightfields, layers, masks, biomes, and commands |
+| `terra-cpu-eval` | Stateful CPU terrain evaluation, caches, scheduling, and worker runtime |
 | `terra-gpu` | Reusable WGSL kernels, compiled-plan resources, derivatives, and tile caching |
 | `terra-gpu-eval` | Stateful GPU terrain evaluation, refinement, timing, and output lifecycle |
 | `terra-render` | wgpu 3D viewport / clipmaps / progressive presentation |

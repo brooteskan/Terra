@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use flexi_logger::{
     DeferredNow, Duplicate, FileSpec, LogSpecification, Logger, LoggerHandle, Record,
 };
-use terra_core::eval::PreviewQuality;
+use terra_core::quality::PreviewQuality;
 
 pub const RETAINED_LOG_FILES: usize = 6;
 pub const DEFAULT_LOG_FILTER: &str = "warn,terra_app=info,terra_core=info,terra_gpu=info,terra_render=info,terra_io=info,terra_gui=info";

@@ -1,18 +1,18 @@
 use super::{EvalContext, EvalError};
-use crate::analyze;
-use crate::authoring;
-use crate::field_data::keys;
-use crate::fields::{
+use terra_core::analyze;
+use terra_core::authoring;
+use terra_core::field_data::keys;
+use terra_core::fields::{
     bake_hardness_from_materials_ex, bake_hardness_from_strata_ex, has_depth_aware_strata,
     resolve_hardness,
 };
-use crate::generators;
-use crate::heightfield::Heightfield;
-use crate::hydro;
-use crate::layer::*;
-use crate::mask::{MaskField, MaskSource};
-use crate::surface;
-use crate::volumetric;
+use terra_core::generators;
+use terra_core::heightfield::Heightfield;
+use terra_core::hydro;
+use terra_core::layer::*;
+use terra_core::mask::{MaskField, MaskSource};
+use terra_core::surface;
+use terra_core::volumetric;
 
 /// Evaluates built-in layer kinds by matching on [`LayerKind`].
 ///
@@ -88,8 +88,8 @@ impl ProcessorRegistry {
                 let weight = ctx.aux_maps.get(keys::CONSTRAINT_WEIGHT).cloned();
                 let mut authored = p.clone();
                 authored.iterations = match ctx.quality {
-                    crate::eval::PreviewQuality::Draft => authored.iterations.min(18),
-                    crate::eval::PreviewQuality::Medium => authored.iterations.min(42),
+                    terra_core::quality::PreviewQuality::Draft => authored.iterations.min(18),
+                    terra_core::quality::PreviewQuality::Medium => authored.iterations.min(42),
                     _ => authored.iterations,
                 }
                 .max(1);
@@ -110,12 +110,13 @@ impl ProcessorRegistry {
                 let precip = ctx.aux_maps.rainfall.clone();
                 let mut authored = p.clone();
                 match ctx.quality {
-                    crate::eval::PreviewQuality::Draft => {
+                    terra_core::quality::PreviewQuality::Draft => {
                         authored.iterations = authored.iterations.min(6);
                         authored.fixed_point_iters = authored.fixed_point_iters.min(3);
-                        authored.solver = crate::landscape_evolution::EvolutionSolverMode::Fast;
+                        authored.solver =
+                            terra_core::landscape_evolution::EvolutionSolverMode::Fast;
                     }
-                    crate::eval::PreviewQuality::Medium => {
+                    terra_core::quality::PreviewQuality::Medium => {
                         authored.iterations = authored.iterations.min(16);
                         authored.fixed_point_iters = authored.fixed_point_iters.min(5);
                     }
@@ -123,15 +124,16 @@ impl ProcessorRegistry {
                 }
                 authored.iterations = authored.iterations.max(1);
                 authored.fixed_point_iters = authored.fixed_point_iters.max(1);
-                let (height, fields) = crate::landscape_evolution::evaluate_landscape_evolution(
-                    input,
-                    &authored,
-                    hardness.as_ref(),
-                    uplift.as_ref(),
-                    protection.as_ref(),
-                    precip.as_ref(),
-                    None,
-                );
+                let (height, fields) =
+                    terra_core::landscape_evolution::evaluate_landscape_evolution(
+                        input,
+                        &authored,
+                        hardness.as_ref(),
+                        uplift.as_ref(),
+                        protection.as_ref(),
+                        precip.as_ref(),
+                        None,
+                    );
                 Ok(publish_authoring(
                     ctx,
                     authoring::AuthoringResult { height, fields },
@@ -143,8 +145,8 @@ impl ProcessorRegistry {
                 let protection = ctx.aux_maps.get(keys::SCULPT_PROTECTION).cloned();
                 let mut authored = p.clone();
                 authored.iterations = match ctx.quality {
-                    crate::eval::PreviewQuality::Draft => authored.iterations.min(3),
-                    crate::eval::PreviewQuality::Medium => authored.iterations.min(6),
+                    terra_core::quality::PreviewQuality::Draft => authored.iterations.min(3),
+                    terra_core::quality::PreviewQuality::Medium => authored.iterations.min(6),
                     _ => authored.iterations,
                 }
                 .max(1);
@@ -289,7 +291,7 @@ impl ProcessorRegistry {
             LayerKind::PolygonHeight(p) => Ok(generators::polygon_height(input, p)),
             LayerKind::ThermalErosion(p) => {
                 let base = match ctx.quality {
-                    crate::eval::PreviewQuality::Draft => {
+                    terra_core::quality::PreviewQuality::Draft => {
                         analyze::draft_sim_levels(ctx.metrics.width)
                     }
                     _ => analyze::default_sim_levels(ctx.metrics.width),
@@ -380,7 +382,7 @@ impl ProcessorRegistry {
             }
             LayerKind::HydraulicErosion(p) => {
                 let base = match ctx.quality {
-                    crate::eval::PreviewQuality::Draft => {
+                    terra_core::quality::PreviewQuality::Draft => {
                         analyze::draft_sim_levels(ctx.metrics.width)
                     }
                     _ => analyze::default_sim_levels(ctx.metrics.width),
@@ -547,12 +549,12 @@ impl ProcessorRegistry {
             LayerKind::StreamPowerErosion(p) => {
                 let mut p = p.clone();
                 match ctx.quality {
-                    crate::eval::PreviewQuality::Draft => {
+                    terra_core::quality::PreviewQuality::Draft => {
                         p.iterations = p.iterations.clamp(1, 8);
                         // Fewer Priority-Flood / D8 barriers between incision steps.
                         p.drainage_reuse_stride = p.drainage_reuse_stride.max(2);
                     }
-                    crate::eval::PreviewQuality::Medium => {
+                    terra_core::quality::PreviewQuality::Medium => {
                         p.iterations = p.iterations.clamp(1, 16);
                         p.drainage_reuse_stride = p.drainage_reuse_stride.max(1);
                     }
@@ -563,7 +565,7 @@ impl ProcessorRegistry {
                 }
                 // SPE stays single-res; author level-step scales K / iters from the schedule.
                 let base = match ctx.quality {
-                    crate::eval::PreviewQuality::Draft => {
+                    terra_core::quality::PreviewQuality::Draft => {
                         analyze::draft_sim_levels(ctx.metrics.width)
                     }
                     _ => analyze::default_sim_levels(ctx.metrics.width),
@@ -625,7 +627,7 @@ impl ProcessorRegistry {
             LayerKind::MultiScaleAmplify(p) => {
                 let mut p = p.clone();
                 match ctx.quality {
-                    crate::eval::PreviewQuality::Draft => {
+                    terra_core::quality::PreviewQuality::Draft => {
                         p.thermal_iters = p.thermal_iters.clamp(1, 6);
                         p.spe_iters = p.spe_iters.min(2);
                         p.level_count = if p.level_count == 0 {
@@ -634,7 +636,7 @@ impl ProcessorRegistry {
                             p.level_count.min(2)
                         };
                     }
-                    crate::eval::PreviewQuality::Medium => {
+                    terra_core::quality::PreviewQuality::Medium => {
                         p.thermal_iters = p.thermal_iters.clamp(1, 10);
                         p.spe_iters = p.spe_iters.min(4);
                     }
@@ -643,7 +645,7 @@ impl ProcessorRegistry {
                 let hardness = bake_layer_hardness(ctx, input, p.hardness, &p.hardness_source);
                 let ridge_lock = bake_optional_mask(ctx, input, &p.ridge_lock);
                 let levels = match ctx.quality {
-                    crate::eval::PreviewQuality::Draft => {
+                    terra_core::quality::PreviewQuality::Draft => {
                         analyze::amplify_sim_levels(ctx.metrics.width, p.level_count.clamp(1, 2))
                     }
                     _ => analyze::amplify_sim_levels(ctx.metrics.width, p.level_count),
@@ -678,16 +680,16 @@ impl ProcessorRegistry {
                 let mut authored = p.clone();
                 let quality_cap = match ctx.quality {
                     // Keep Draft interactive; Medium/Full run on the eval worker.
-                    crate::eval::PreviewQuality::Draft => 32,
-                    crate::eval::PreviewQuality::Medium => 256,
-                    crate::eval::PreviewQuality::Full => authored.iterations.max(1),
-                    crate::eval::PreviewQuality::Export => authored.iterations.max(1),
+                    terra_core::quality::PreviewQuality::Draft => 32,
+                    terra_core::quality::PreviewQuality::Medium => 256,
+                    terra_core::quality::PreviewQuality::Full => authored.iterations.max(1),
+                    terra_core::quality::PreviewQuality::Export => authored.iterations.max(1),
                 };
                 let steps = analyze::transport_steps_for_quality(authored.iterations, quality_cap);
                 // Cap per-step avalanching on Draft so edits stay responsive.
-                if matches!(ctx.quality, crate::eval::PreviewQuality::Draft) {
+                if matches!(ctx.quality, terra_core::quality::PreviewQuality::Draft) {
                     authored.avalanche_iters = authored.avalanche_iters.min(4);
-                } else if matches!(ctx.quality, crate::eval::PreviewQuality::Medium) {
+                } else if matches!(ctx.quality, terra_core::quality::PreviewQuality::Medium) {
                     authored.avalanche_iters = authored.avalanche_iters.min(12);
                 }
                 let aeolian = generators::sand_simulation_full(input, &authored, steps);
@@ -775,7 +777,7 @@ impl ProcessorRegistry {
                 // Optional Cordonnier one-way: roots slightly boost hardness cohesion.
                 if p.root_cohesion > 1e-6 {
                     if let Some(hardness) = ctx.aux_maps.hardness.as_ref() {
-                        let boosted = crate::climate::apply_root_cohesion(
+                        let boosted = terra_core::climate::apply_root_cohesion(
                             hardness,
                             &density,
                             p.root_cohesion,
@@ -827,14 +829,14 @@ fn bake_layer_hardness(
         MaskSource::LayerOutput { output_id } => ctx.published_outputs.get(output_id).cloned(),
         other => {
             // Bake procedural sources against the input heightfield.
-            let baked = crate::mask::bake_mask_assets(
-                &[crate::mask::MaskAsset {
-                    id: crate::mask::MaskId::new(),
+            let baked = terra_core::mask::bake_mask_assets(
+                &[terra_core::mask::MaskAsset {
+                    id: terra_core::mask::MaskId::new(),
                     name: "hardness_tmp".into(),
                     source: other.clone(),
                     ops: Vec::new(),
                     paint: None,
-                    display_color: crate::mask::default_mask_display_color(),
+                    display_color: terra_core::mask::default_mask_display_color(),
                 }],
                 input,
                 input.metrics,
@@ -925,14 +927,14 @@ fn bake_optional_mask(
         MaskSource::LayerOutput { output_id } => ctx.published_outputs.get(output_id).cloned(),
         MaskSource::Named(name) => ctx.aux_maps.get(name).cloned(),
         other => {
-            let baked = crate::mask::bake_mask_assets(
-                &[crate::mask::MaskAsset {
-                    id: crate::mask::MaskId::new(),
+            let baked = terra_core::mask::bake_mask_assets(
+                &[terra_core::mask::MaskAsset {
+                    id: terra_core::mask::MaskId::new(),
                     name: "lock_tmp".into(),
                     source: other.clone(),
                     ops: Vec::new(),
                     paint: None,
-                    display_color: crate::mask::default_mask_display_color(),
+                    display_color: terra_core::mask::default_mask_display_color(),
                 }],
                 input,
                 input.metrics,

@@ -1,10 +1,10 @@
 use crate::IoError;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
-use terra_core::eval::EvalContext;
 use terra_core::fields::keys;
 use terra_core::heightfield::Heightfield;
 use terra_core::mask::MaskField;
+use terra_cpu_eval::EvalContext;
 
 pub struct ExportRequest {
     pub out_dir: PathBuf,

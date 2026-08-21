@@ -13,7 +13,7 @@
 - `SampleRect` / `bounds_from_tiles` feed region GPU upload and normal recompute.
 
 The executable
-[CPU determinism contract](../../crates/terra-core/tests/cpu_determinism_contract.rs)
+[CPU determinism contract](../../crates/terra-cpu-eval/tests/cpu_determinism_contract.rs)
 compares batched tiled stencils with an independent dense oracle and evaluates
 the same authored stack with 16, 32, 256, and full-field tile sizes using exact
 `f32::to_bits` equality.

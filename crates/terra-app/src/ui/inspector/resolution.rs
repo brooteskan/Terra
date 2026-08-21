@@ -411,11 +411,11 @@ fn evaluation_text(doc: &TerrainDocument, ui_state: &UiState) -> String {
 mod tests {
     use super::*;
     use std::cell::Cell;
-    use terra_core::eval::PreviewQuality;
     use terra_core::layer::{
         EffectFilterParams, ImportHeightmapParams, LayerKind, SculptParams, SculptStrokeParams,
         ThermalErosionParams,
     };
+    use terra_core::quality::PreviewQuality;
     use terra_gui::{GuiInput, GuiState};
 
     #[test]

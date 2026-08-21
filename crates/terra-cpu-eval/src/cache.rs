@@ -1,9 +1,9 @@
 use super::smart_cache::DiskSmartCache;
-use crate::heightfield::{Heightfield, HeightfieldMetrics, TileId};
-use crate::layer::LayerId;
-use crate::mask::MaskField;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use terra_core::heightfield::{Heightfield, HeightfieldMetrics, TileId};
+use terra_core::layer::LayerId;
+use terra_core::mask::MaskField;
 
 #[derive(Debug, Clone)]
 pub struct CachedOutput {
@@ -12,7 +12,7 @@ pub struct CachedOutput {
     pub dirty: bool,
     pub aux: HashMap<String, MaskField>,
     /// Materials strata (not stored in the aux HashMap).
-    pub strata: Option<Vec<crate::layer::Stratum>>,
+    pub strata: Option<Vec<terra_core::layer::Stratum>>,
 }
 
 /// Per-tile dirty seed for a layer (#100 phase 2). Distinguishes a clean layer
@@ -400,8 +400,8 @@ impl LayerCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::heightfield::HeightfieldMetrics;
     use std::path::PathBuf;
+    use terra_core::heightfield::HeightfieldMetrics;
 
     fn scratch_dir(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("terra_layer_cache_{tag}_{}", uuid::Uuid::new_v4()))

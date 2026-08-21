@@ -208,28 +208,6 @@ const MODULE_DEPENDENCIES: &[(&str, &[&str])] = &[
         ],
     ),
     (
-        "eval",
-        &[
-            "analyze",
-            "authoring",
-            "climate",
-            "field_data",
-            "fields",
-            "generators",
-            "heightfield",
-            "hydro",
-            "invalidation",
-            "landscape_blueprint",
-            "landscape_evolution",
-            "layer",
-            "mask",
-            "quality",
-            "surface",
-            "tiling",
-            "volumetric",
-        ],
-    ),
-    (
         "field_data",
         &["geology", "heightfield", "mask_field", "spatial_kernels"],
     ),
@@ -323,6 +301,7 @@ const MODULE_DEPENDENCIES: &[(&str, &[&str])] = &[
             "volumetric",
         ],
     ),
+    ("layer_reach", &["invalidation", "layer", "mask"]),
     (
         "mask",
         &[
@@ -363,15 +342,7 @@ const MODULE_DEPENDENCIES: &[(&str, &[&str])] = &[
     ("raster", &[]),
     (
         "realism_benchmark",
-        &[
-            "analyze",
-            "document",
-            "eval",
-            "heightfield",
-            "landscape_style",
-            "layer",
-            "world_archetype",
-        ],
+        &["document", "landscape_style", "layer", "world_archetype"],
     ),
     (
         "rebuild_feedback",

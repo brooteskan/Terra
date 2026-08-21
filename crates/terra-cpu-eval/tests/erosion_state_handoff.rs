@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 
-use terra_core::eval::{EvalContext, StackEvaluator};
 use terra_core::fields::{keys, AuxMaps};
 use terra_core::heightfield::{Heightfield, HeightfieldMetrics};
 use terra_core::layer::{
@@ -8,6 +7,7 @@ use terra_core::layer::{
     ThermalErosionParams, TransportModel,
 };
 use terra_core::mask::MaskField;
+use terra_cpu_eval::{EvalContext, StackEvaluator};
 
 const RESOLUTION: u32 = 16;
 const INITIAL_SEDIMENT: f32 = 1.25;

@@ -4,8 +4,8 @@ use crate::ui::{
     draw_discard_confirm, draw_editor_gui, draw_new_project_templates, draw_project_home,
     DiscardConfirmChoice, NewProjectTemplateChoice,
 };
-use terra_core::eval::PreviewQuality;
 use terra_core::layer::LayerKind;
+use terra_core::quality::PreviewQuality;
 use terra_gui::{GuiContext, GuiInput};
 use winit::event::MouseButton;
 

@@ -2,7 +2,6 @@
 
 use std::collections::HashMap;
 use terra_core::command::{apply, CommandHistory, EditorCommand};
-use terra_core::eval::{EvalContext, PreviewQuality, StackEvaluator};
 use terra_core::heightfield::{Heightfield, HeightfieldMetrics};
 use terra_core::layer::{
     BiomeSection, Layer, LayerGroup, LayerKind, LayerStack, MaterialsParams, MountainParams,
@@ -12,6 +11,8 @@ use terra_core::mask::{bake_mask_assets, DistNode, DistNodeKind};
 use terra_core::operation_placement::{
     create_develop_operation, ApplyWhere, DevelopCategory, OperationPlacement,
 };
+use terra_core::quality::PreviewQuality;
+use terra_cpu_eval::{EvalContext, StackEvaluator};
 
 fn metrics() -> HeightfieldMetrics {
     HeightfieldMetrics::new(32, 32, 1024.0, 1024.0)

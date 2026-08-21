@@ -293,12 +293,12 @@ pub(crate) fn try_apply(
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use terra_core::eval::CachedOutput;
     use terra_core::heightfield::{Heightfield, HeightfieldMetrics};
     use terra_core::layer::{HydraulicErosionParams, Layer, LayerId, LayerKind, LayerStack};
     use terra_core::simulation_scenario::{
         ScenarioPassKind, SimulationScenario, SimulationScenarioId,
     };
+    use terra_cpu_eval::CachedOutput;
 
     /// A headless app whose stack is `Base(Flat) → Hydro(HydraulicErosion)` with a
     /// scenario whose single pass is bound to the Hydro layer. Both layers start

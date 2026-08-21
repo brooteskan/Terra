@@ -2,7 +2,7 @@
 
 use std::time::Instant;
 
-use terra_core::eval::PreviewQuality;
+use terra_core::quality::PreviewQuality;
 use terra_gpu_eval::GpuRefinementJob as EngineRefinementJob;
 
 use super::frame_trace::EvaluationTraceId;

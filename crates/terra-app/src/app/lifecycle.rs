@@ -7,7 +7,8 @@ use crate::ui::{
     TerrainPreviewFreshness,
 };
 use terra_core::command::EditorCommand;
-use terra_core::eval::{EvalWorkerEvent, PreviewQuality};
+use terra_core::quality::PreviewQuality;
+use terra_cpu_eval::EvalWorkerEvent;
 use terra_gpu::GpuTileAtlas;
 use terra_gpu_eval::{GpuEvaluationIntent, GpuTerrainEngine};
 use terra_gui::{Color, GuiContext, GuiInput, GuiRenderer, GuiState, Rect};

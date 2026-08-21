@@ -11,7 +11,6 @@
 //! ```
 
 use std::path::PathBuf;
-use terra_core::eval::{EvalContext, PreviewQuality, StackEvaluator};
 use terra_core::fields::keys;
 use terra_core::geomorph::{accumulate_drainage_area, build_flow_graph, FlowModel, Precipitation};
 use terra_core::heightfield::{Heightfield, HeightfieldMetrics};
@@ -21,6 +20,8 @@ use terra_core::layer::{
     UpliftParams,
 };
 use terra_core::mask::MaskField;
+use terra_core::quality::PreviewQuality;
+use terra_cpu_eval::{EvalContext, StackEvaluator};
 
 fn out_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

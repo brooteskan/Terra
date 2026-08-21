@@ -1,4 +1,4 @@
-//! Terra core: heightfields, layer stack, masks, and CPU evaluation.
+//! Terra core: backend-neutral heightfields, layer stacks, masks, and terrain algorithms.
 //!
 //! This crate must remain free of `wgpu` and UI crates.
 //!
@@ -16,7 +16,6 @@ pub mod contextual_create;
 pub mod deps;
 pub mod document;
 pub mod domain;
-pub mod eval;
 pub mod field_data;
 pub mod fields;
 pub mod filter_params;
@@ -31,6 +30,7 @@ pub mod landscape_blueprint;
 pub mod landscape_evolution;
 pub mod landscape_style;
 pub mod layer;
+pub mod layer_reach;
 pub mod mask;
 pub mod mask_execution;
 pub mod mask_field;
@@ -116,7 +116,7 @@ pub use matter_sim::{
     MatterSimConfig, MatterType,
 };
 pub use realism_benchmark::{
-    measure_document, validate_benchmark_structure, BenchmarkExpectations, RealismBenchmark,
+    validate_benchmark_structure, BenchmarkExpectations, RealismBenchmark,
 };
 pub use shape_object::{ShapeKind, ShapeObject, ShapeObjectId, ShapeObjectStore, WorldBounds};
 pub use simulation_scenario::{

@@ -3,7 +3,7 @@
 use crate::ui::style::{self, FONT_SCALE, PAD, STATUS_STRIP_H, TYPE_LABEL};
 use crate::ui::{TerrainPreviewFreshness, UiState};
 use terra_core::document::TerrainDocument;
-use terra_core::eval::PreviewQuality;
+use terra_core::quality::PreviewQuality;
 use terra_gui::{DrawList, GuiContext, Id, Rect};
 
 #[derive(Debug, Default)]

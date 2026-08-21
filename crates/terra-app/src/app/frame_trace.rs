@@ -6,7 +6,7 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use terra_core::eval::PreviewQuality;
+use terra_core::quality::PreviewQuality;
 use terra_gpu_eval::GpuEvaluationIntent;
 
 use super::logical_frame::{EditGeneration, FrameIdentity, FramePhase, LogicalFrameId};

@@ -9,7 +9,7 @@
 //! counter, so an in-flight job observes cancellation through the [`CancelToken`]
 //! handed to its body.
 //!
-//! This is the eval worker's supersede model lifted out of `terra-core`: the app
+//! This is the eval worker's supersede model used by `terra-cpu-eval`: the app
 //! bumps a token to cancel stale refine work, and the persistent evaluator + its
 //! layer cache live across jobs. Panic containment is by construction — each job
 //! body runs inside [`catch_unwind`](std::panic::catch_unwind), and a panic runs

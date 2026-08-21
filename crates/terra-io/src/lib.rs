@@ -13,8 +13,9 @@ pub use import::{import_heightmap_png, import_heightmap_raw};
 
 use std::path::PathBuf;
 use terra_core::document::TerrainDocument;
-use terra_core::eval::{EvalContext, PreviewQuality, StackEvaluator};
 use terra_core::heightfield::Heightfield;
+use terra_core::quality::PreviewQuality;
+use terra_cpu_eval::{EvalContext, StackEvaluator};
 use terra_jobs::{spawn_one_shot, CancelToken, JobCtx, JobError, JobHandle, Pending, Pollable};
 use thiserror::Error;
 
@@ -39,7 +40,7 @@ pub enum IoError {
 #[derive(Debug, Error)]
 pub enum ExportError {
     #[error(transparent)]
-    Eval(#[from] terra_core::eval::EvalError),
+    Eval(#[from] terra_cpu_eval::EvalError),
     #[error(transparent)]
     Package(#[from] IoError),
     #[error("panicked: {0}")]
@@ -173,7 +174,7 @@ impl BackgroundExporter {
 fn evaluate_document_for_export(
     doc: &TerrainDocument,
     cancel: CancelToken,
-) -> Result<(Heightfield, EvalContext), terra_core::eval::EvalError> {
+) -> Result<(Heightfield, EvalContext), terra_cpu_eval::EvalError> {
     let metrics = doc.metrics.at_resolution(doc.export_resolution)?;
     let mut evaluator = StackEvaluator::new();
     // Export runs a full rebuild from scratch and never reloads its own baked
@@ -444,7 +445,7 @@ mod worker_tests {
         flag.cancel();
         let result = evaluate_document_for_export(&doc, token);
         assert!(
-            matches!(result, Err(terra_core::eval::EvalError::Cancelled)),
+            matches!(result, Err(terra_cpu_eval::EvalError::Cancelled)),
             "a cancelled token must abort export eval"
         );
     }
@@ -457,7 +458,7 @@ mod worker_tests {
         doc.export_resolution = 0;
         let result = evaluate_document_for_export(&doc, CancelToken::never());
         assert!(
-            matches!(result, Err(terra_core::eval::EvalError::InvalidMetrics(_))),
+            matches!(result, Err(terra_cpu_eval::EvalError::InvalidMetrics(_))),
             "an invalid export resolution must abort export eval with a typed error"
         );
     }
@@ -735,7 +736,7 @@ mod worker_tests {
             exporter.job.done && exporter.job.result.is_some()
         });
         match exporter.job.result.take() {
-            Some(Err(ExportError::Eval(terra_core::eval::EvalError::InvalidMetrics(_)))) => {}
+            Some(Err(ExportError::Eval(terra_cpu_eval::EvalError::InvalidMetrics(_)))) => {}
             other => panic!("expected Eval(InvalidMetrics), got: {other:?}"),
         }
     }

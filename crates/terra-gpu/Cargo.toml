@@ -15,6 +15,7 @@ log = { workspace = true }
 profiling = { workspace = true }
 
 [dev-dependencies]
+terra-cpu-eval = { workspace = true }
 terra-test-gpu = { workspace = true }
 
 [lints]

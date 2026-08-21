@@ -18,12 +18,13 @@ use std::collections::HashMap;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use terra_core::eval::{EvalWorkRequest, EvalWorker, EvalWorkerEvent, PreviewQuality};
 use terra_core::generators::VoronoiParams;
 use terra_core::heightfield::HeightfieldMetrics;
 use terra_core::layer::{Layer, LayerKind, LayerStack};
+use terra_core::quality::PreviewQuality;
 use terra_core::shape_history::{create_shape_layer, stamp_stroke, ShapeTool};
 use terra_core::CancelToken;
+use terra_cpu_eval::{EvalWorkRequest, EvalWorker, EvalWorkerEvent};
 
 /// The historical #98 repro stack: a Voronoi base plus a Flatten Shape layer
 /// that contributes real per-pixel CPU work.

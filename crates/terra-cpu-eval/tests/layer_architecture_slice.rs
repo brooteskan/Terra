@@ -2,7 +2,6 @@
 
 use std::collections::HashMap;
 use terra_core::document::TerrainDocument;
-use terra_core::eval::{EvalContext, PreviewQuality, StackEvaluator};
 use terra_core::heightfield::HeightfieldMetrics;
 use terra_core::layer::{
     GroupEvalMode, GroupInputMode, HydraulicErosionParams, Layer, LayerGroup, LayerKind,
@@ -11,6 +10,8 @@ use terra_core::layer::{
 use terra_core::mask::{
     bake_mask_assets, Distribution, MaskAsset, MaskCombine, MaskField, MaskId, MaskRef, MaskSource,
 };
+use terra_core::quality::PreviewQuality;
+use terra_cpu_eval::{EvalContext, StackEvaluator};
 
 fn eval_doc(doc: &TerrainDocument, metrics: HeightfieldMetrics) -> (terra_core::Heightfield, u64) {
     let mut ctx = EvalContext::new(metrics);
@@ -305,8 +306,8 @@ fn registry_creates_and_stage_metadata() {
 
 #[test]
 fn stack_order_and_dirty_suffix() {
-    use terra_core::eval::StackEvaluator;
     use terra_core::layer::LayerStack;
+    use terra_cpu_eval::StackEvaluator;
     let mut stack = LayerStack::new();
     let a = Layer::new(
         "A",

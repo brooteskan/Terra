@@ -1155,12 +1155,12 @@ fn default_kind_like(kind: &LayerKind) -> LayerKind {
     }
 }
 
-fn quality_label(quality: terra_core::eval::PreviewQuality) -> &'static str {
+fn quality_label(quality: terra_core::quality::PreviewQuality) -> &'static str {
     match quality {
-        terra_core::eval::PreviewQuality::Draft => "Draft",
-        terra_core::eval::PreviewQuality::Medium => "Medium",
-        terra_core::eval::PreviewQuality::Full => "Full",
-        terra_core::eval::PreviewQuality::Export => "Export",
+        terra_core::quality::PreviewQuality::Draft => "Draft",
+        terra_core::quality::PreviewQuality::Medium => "Medium",
+        terra_core::quality::PreviewQuality::Full => "Full",
+        terra_core::quality::PreviewQuality::Export => "Export",
     }
 }
 

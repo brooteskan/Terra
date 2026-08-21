@@ -1,15 +1,15 @@
-//! Layer evaluation, caching, and dirty propagation.
+//! Stateful CPU terrain evaluation, caching, scheduling, and worker support.
 
 mod cache;
 mod processors;
-pub mod reach;
+pub mod realism_benchmark;
 mod scheduler;
 mod smart_cache;
 mod worker;
 
-pub use crate::quality::PreviewQuality;
 pub use cache::{CachedOutput, LayerCache, SeedState};
 pub use processors::ProcessorRegistry;
+pub use realism_benchmark::measure_document;
 pub use scheduler::EvalScheduler;
 pub use smart_cache::DiskSmartCache;
 pub use worker::{
@@ -17,14 +17,15 @@ pub use worker::{
     EvalWorkerStatsSnapshot, EvalWorkerSubmitError,
 };
 
-use crate::field_data::AuxMaps;
-use crate::heightfield::{Heightfield, HeightfieldMetrics, TileId};
-use crate::layer::{blend_heights, FractalNoiseType, Layer, LayerId, LayerStack, StackNode};
-use crate::mask::{MaskAsset, MaskField, MaskId};
-use crate::tiling::TileScheduler;
 use std::collections::{HashMap, HashSet};
 use std::sync::{atomic::AtomicU64, Arc};
 use std::time::Instant;
+use terra_core::field_data::AuxMaps;
+use terra_core::heightfield::{Heightfield, HeightfieldMetrics, TileId};
+use terra_core::layer::{blend_heights, FractalNoiseType, Layer, LayerId, LayerStack, StackNode};
+use terra_core::mask::{MaskAsset, MaskField, MaskId};
+use terra_core::quality::PreviewQuality;
+use terra_core::tiling::TileScheduler;
 use terra_jobs::CancelToken;
 use thiserror::Error;
 
@@ -41,7 +42,7 @@ pub enum EvalError {
     #[error("evaluation panicked: {0}")]
     Panicked(String),
     #[error("invalid metrics: {0}")]
-    InvalidMetrics(#[from] crate::heightfield::MetricsError),
+    InvalidMetrics(#[from] terra_core::heightfield::MetricsError),
 }
 
 impl EvalError {
@@ -56,8 +57,8 @@ impl EvalError {
 /// Source-import failures from `generators` surface to evaluator callers as
 /// `Io`, keeping the public `EvalError` surface unchanged. The path/cause detail
 /// carried by `SourceImportError` is preserved in the message.
-impl From<crate::generators::SourceImportError> for EvalError {
-    fn from(err: crate::generators::SourceImportError) -> Self {
+impl From<terra_core::generators::SourceImportError> for EvalError {
+    fn from(err: terra_core::generators::SourceImportError) -> Self {
         Self::Io(err.to_string())
     }
 }
@@ -106,7 +107,7 @@ pub struct EvalContext {
     /// Project-wide progressive evaluation controls. Keeping this on the
     /// context makes CPU, worker, and hybrid evaluation use the document's
     /// authored world scale and level schedule instead of hidden defaults.
-    pub level_steps: crate::analyze::LevelStepSettings,
+    pub level_steps: terra_core::analyze::LevelStepSettings,
     pub masks: HashMap<MaskId, MaskField>,
     pub mask_assets: Vec<MaskAsset>,
     /// Typed aux maps (preferred). Processors should read/write these.
@@ -114,7 +115,7 @@ pub struct EvalContext {
     /// String-key adapter kept in sync with [`Self::aux_maps`] for cache / IO / masks.
     pub aux: HashMap<String, MaskField>,
     /// Stable outputs published by layers already evaluated below the current layer.
-    pub published_outputs: HashMap<crate::layer::OutputId, MaskField>,
+    pub published_outputs: HashMap<terra_core::layer::OutputId, MaskField>,
     pub cancelled: bool,
     /// Cooperative cancel signal. Checked between layers and, since #101, inside
     /// the `fill_world` generators so a superseding edit interrupts a long fill
@@ -141,7 +142,7 @@ impl EvalContext {
     pub fn new(metrics: HeightfieldMetrics) -> Self {
         Self {
             metrics,
-            level_steps: crate::analyze::LevelStepSettings::default(),
+            level_steps: terra_core::analyze::LevelStepSettings::default(),
             masks: HashMap::new(),
             mask_assets: Vec::new(),
             aux_maps: AuxMaps::new(),
@@ -189,11 +190,13 @@ impl EvalContext {
     /// Insert an aux map into both typed and string stores.
     pub fn aux_insert(&mut self, key: impl Into<String>, field: MaskField) {
         let key = key.into();
-        let canonical = crate::field_data::keys::canonical(&key).to_string();
+        let canonical = terra_core::field_data::keys::canonical(&key).to_string();
         self.aux_maps.insert(canonical.clone(), field.clone());
-        if canonical == crate::field_data::keys::SEDIMENT_THICKNESS {
-            self.aux.remove(crate::field_data::keys::SEDIMENT_DEPTH);
-            self.aux.remove(crate::field_data::keys::LOOSE_SEDIMENT);
+        if canonical == terra_core::field_data::keys::SEDIMENT_THICKNESS {
+            self.aux
+                .remove(terra_core::field_data::keys::SEDIMENT_DEPTH);
+            self.aux
+                .remove(terra_core::field_data::keys::LOOSE_SEDIMENT);
         }
         self.aux.insert(canonical, field);
     }
@@ -233,7 +236,7 @@ const SCULPT_PREFIX_BUDGET_BYTES: usize = 1024 * 1024 * 1024;
 /// applies populate it (one entry per layer, keyed by [`LayerId`]); scoped applies
 /// read it without writing. Bounded by [`SCULPT_PREFIX_BUDGET_BYTES`].
 struct SculptPrefixStore {
-    entries: HashMap<LayerId, crate::authoring::SculptPrefixEntry>,
+    entries: HashMap<LayerId, terra_core::authoring::SculptPrefixEntry>,
     budget_bytes: usize,
 }
 
@@ -247,18 +250,18 @@ impl SculptPrefixStore {
 
     /// Remove and return the entry for `id` so a cached apply can consume + rebuild
     /// it; the caller re-inserts via [`Self::put`] on success.
-    fn take(&mut self, id: LayerId) -> Option<crate::authoring::SculptPrefixEntry> {
+    fn take(&mut self, id: LayerId) -> Option<terra_core::authoring::SculptPrefixEntry> {
         self.entries.remove(&id)
     }
 
     /// Read-only lookup for the scoped resume path (never mutates the store).
-    fn get(&self, id: LayerId) -> Option<&crate::authoring::SculptPrefixEntry> {
+    fn get(&self, id: LayerId) -> Option<&terra_core::authoring::SculptPrefixEntry> {
         self.entries.get(&id)
     }
 
     /// Store a rebuilt entry and trim the store back to budget, protecting this
     /// entry's tail.
-    fn put(&mut self, id: LayerId, entry: crate::authoring::SculptPrefixEntry) {
+    fn put(&mut self, id: LayerId, entry: terra_core::authoring::SculptPrefixEntry) {
         self.entries.insert(id, entry);
         self.enforce_budget(id);
     }
@@ -397,7 +400,7 @@ impl StackEvaluator {
     pub fn mark_dirty_from_eval_stage(
         &mut self,
         stack: &LayerStack,
-        stage: crate::landscape_blueprint::EvalStage,
+        stage: terra_core::landscape_blueprint::EvalStage,
     ) {
         let min_order = stage.order();
         for lid in stack.layer_ids() {
@@ -567,7 +570,7 @@ impl StackEvaluator {
             return None;
         }
 
-        let reach = reach::effective_reach(layer, &ctx.mask_assets);
+        let reach = terra_core::layer_reach::effective_reach(layer, &ctx.mask_assets);
         let prev_dims_ok = self.cache.get(layer.id()).is_some_and(|c| {
             c.height.metrics.width == current.metrics.width
                 && c.height.metrics.height == current.metrics.height
@@ -625,7 +628,7 @@ impl StackEvaluator {
                 }
                 StackNode::Group(group) if !group.enabled => {}
                 StackNode::Group(group) => {
-                    use crate::layer::{GroupEvalMode, GroupInputMode};
+                    use terra_core::layer::{GroupEvalMode, GroupInputMode};
 
                     refresh_point_of_use_masks(ctx, &current);
                     let pass_through =
@@ -681,12 +684,12 @@ impl StackEvaluator {
                         //   H = shared + w * (biome_result - shared)
                         // which avoids blending unrelated absolute heights.
                         let mix_opacity =
-                            if matches!(group.group_kind, crate::layer::GroupKind::Biome) {
+                            if matches!(group.group_kind, terra_core::layer::GroupKind::Biome) {
                                 group.opacity * group.filter_blending
                             } else {
                                 group.opacity
                             };
-                        current = if matches!(group.group_kind, crate::layer::GroupKind::Biome)
+                        current = if matches!(group.group_kind, terra_core::layer::GroupKind::Biome)
                             && matches!(group.input_mode, GroupInputMode::CopyInput)
                         {
                             mix_height_delta(
@@ -750,7 +753,7 @@ impl StackEvaluator {
         &mut self,
         id: LayerId,
         height: &Heightfield,
-        child_aux: &crate::field_data::AuxMaps,
+        child_aux: &terra_core::field_data::AuxMaps,
         input: &Heightfield,
         _ctx: &EvalContext,
         baked: bool,
@@ -824,7 +827,7 @@ impl StackEvaluator {
         // resumes an earlier stamp instead of re-stamping the whole stroke set.
         // Every other kind dispatches through the stateless registry as before.
         let generated = match &bound_layer.kind {
-            crate::layer::LayerKind::SculptStrokes(p) => {
+            terra_core::layer::LayerKind::SculptStrokes(p) => {
                 self.eval_sculpt_strokes_cached(ctx, input, p, layer.id())?
             }
             _ => self.registry.evaluate(ctx, input, &bound_layer)?,
@@ -835,7 +838,8 @@ impl StackEvaluator {
         // Gate materials / vegetation aux by local placement (Biome × Local at group+layer).
         if matches!(
             layer.kind,
-            crate::layer::LayerKind::Materials(_) | crate::layer::LayerKind::Vegetation(_)
+            terra_core::layer::LayerKind::Materials(_)
+                | terra_core::layer::LayerKind::Vegetation(_)
         ) {
             gate_aux_by_mask(ctx, &mask);
         }
@@ -867,11 +871,12 @@ impl StackEvaluator {
         &mut self,
         ctx: &mut EvalContext,
         input: &Heightfield,
-        p: &crate::authoring::SculptStrokeParams,
+        p: &terra_core::authoring::SculptStrokeParams,
         layer_id: LayerId,
     ) -> Result<Heightfield, EvalError> {
         let mut slot = self.sculpt_prefix.take(layer_id);
-        let (result, stats) = crate::authoring::apply_sculpt_strokes_cached(input, p, &mut slot);
+        let (result, stats) =
+            terra_core::authoring::apply_sculpt_strokes_cached(input, p, &mut slot);
         if let Some(entry) = slot {
             self.sculpt_prefix.put(layer_id, entry);
         }
@@ -987,14 +992,14 @@ impl StackEvaluator {
         layer: &Layer,
         scope: &[TileId],
     ) -> Result<Heightfield, EvalError> {
-        use crate::layer::LayerKind;
+        use terra_core::layer::LayerKind;
         let metrics = ctx.metrics;
         match &layer.kind {
             LayerKind::SculptBase(p) => {
                 let mut g = Heightfield::zeros(metrics);
                 for &id in scope {
                     if let Some(dst) = g.tile_mut(id) {
-                        *dst = crate::generators::sculpt_base_tile(metrics, p, id);
+                        *dst = terra_core::generators::sculpt_base_tile(metrics, p, id);
                     }
                 }
                 Ok(g)
@@ -1002,7 +1007,7 @@ impl StackEvaluator {
             LayerKind::PolygonHeight(p) => {
                 let mut g = input.clone();
                 for &id in scope {
-                    if let Some(tile) = crate::generators::polygon_height_tile(input, p, id) {
+                    if let Some(tile) = terra_core::generators::polygon_height_tile(input, p, id) {
                         if let Some(dst) = g.tile_mut(id) {
                             *dst = tile;
                         }
@@ -1014,7 +1019,7 @@ impl StackEvaluator {
                 let mut g = input.clone();
                 for &id in scope {
                     if let Some(dst) = g.tile_mut(id) {
-                        dst.map_interior(|h| crate::generators::plateau_sample(p, h));
+                        dst.map_interior(|h| terra_core::generators::plateau_sample(p, h));
                     }
                 }
                 Ok(g)
@@ -1023,7 +1028,7 @@ impl StackEvaluator {
                 let mut g = input.clone();
                 for &id in scope {
                     if let Some(dst) = g.tile_mut(id) {
-                        dst.map_interior(|h| crate::generators::coastal_sample(p, h));
+                        dst.map_interior(|h| terra_core::generators::coastal_sample(p, h));
                     }
                 }
                 Ok(g)
@@ -1039,73 +1044,79 @@ impl StackEvaluator {
             // a cancel maps to `EvalError::Cancelled`.
             LayerKind::NoiseValue(p) => {
                 Self::scoped_generate(metrics, scope, &ctx.cancel_token(), |g, t, c| {
-                    crate::generators::noise_field_tiles(g, t, c, p, FractalNoiseType::Value)
+                    terra_core::generators::noise_field_tiles(g, t, c, p, FractalNoiseType::Value)
                 })
             }
             LayerKind::NoisePerlin(p) => {
                 Self::scoped_generate(metrics, scope, &ctx.cancel_token(), |g, t, c| {
-                    crate::generators::noise_field_tiles(g, t, c, p, FractalNoiseType::Perlin)
+                    terra_core::generators::noise_field_tiles(g, t, c, p, FractalNoiseType::Perlin)
                 })
             }
             LayerKind::NoiseOpenSimplex(p) => {
                 Self::scoped_generate(metrics, scope, &ctx.cancel_token(), |g, t, c| {
-                    crate::generators::noise_field_tiles(g, t, c, p, FractalNoiseType::OpenSimplex)
+                    terra_core::generators::noise_field_tiles(
+                        g,
+                        t,
+                        c,
+                        p,
+                        FractalNoiseType::OpenSimplex,
+                    )
                 })
             }
             LayerKind::NoiseWorley(p) => {
                 Self::scoped_generate(metrics, scope, &ctx.cancel_token(), |g, t, c| {
-                    crate::generators::worley_field_tiles(g, t, c, p)
+                    terra_core::generators::worley_field_tiles(g, t, c, p)
                 })
             }
             LayerKind::Fbm(p) => {
                 Self::scoped_generate(metrics, scope, &ctx.cancel_token(), |g, t, c| {
-                    crate::generators::fbm_field_tiles(g, t, c, p)
+                    terra_core::generators::fbm_field_tiles(g, t, c, p)
                 })
             }
             LayerKind::Ridged(p) => {
                 Self::scoped_generate(metrics, scope, &ctx.cancel_token(), |g, t, c| {
-                    crate::generators::ridged_field_tiles(g, t, c, p)
+                    terra_core::generators::ridged_field_tiles(g, t, c, p)
                 })
             }
             LayerKind::DomainWarp(p) => {
                 Self::scoped_generate(metrics, scope, &ctx.cancel_token(), |g, t, c| {
-                    crate::generators::domain_warp_field_tiles(g, t, c, p)
+                    terra_core::generators::domain_warp_field_tiles(g, t, c, p)
                 })
             }
             LayerKind::Mesa(p) => {
                 Self::scoped_generate(metrics, scope, &ctx.cancel_token(), |g, t, c| {
-                    crate::generators::mesa_tiles(g, t, c, p)
+                    terra_core::generators::mesa_tiles(g, t, c, p)
                 })
             }
             LayerKind::Mountains(p) => {
                 Self::scoped_generate(metrics, scope, &ctx.cancel_token(), |g, t, c| {
-                    crate::generators::mountains_tiles(g, t, c, p)
+                    terra_core::generators::mountains_tiles(g, t, c, p)
                 })
             }
             LayerKind::Volcano(p) => {
                 Self::scoped_generate(metrics, scope, &ctx.cancel_token(), |g, t, c| {
-                    crate::generators::volcano_tiles(g, t, c, p)
+                    terra_core::generators::volcano_tiles(g, t, c, p)
                 })
             }
             LayerKind::Uplift(p) => {
                 Self::scoped_generate(metrics, scope, &ctx.cancel_token(), |g, t, c| {
-                    crate::generators::uplift_tiles(g, t, c, p)
+                    terra_core::generators::uplift_tiles(g, t, c, p)
                 })
             }
             LayerKind::Canyons(p) => {
                 Self::scoped_generate(metrics, scope, &ctx.cancel_token(), |g, t, c| {
-                    crate::generators::canyons_tiles(g, t, c, p)
+                    terra_core::generators::canyons_tiles(g, t, c, p)
                 })
             }
             LayerKind::VoronoiRegions(p) => {
                 Self::scoped_generate(metrics, scope, &ctx.cancel_token(), |g, t, c| {
-                    crate::generators::voronoi_regions_tiles(g, t, c, p)
+                    terra_core::generators::voronoi_regions_tiles(g, t, c, p)
                 })
             }
             LayerKind::ProceduralShape(p) => {
                 let cancel = ctx.cancel_token();
                 let mut g = Heightfield::zeros(metrics);
-                match crate::generators::procedural_shape_tiles(&mut g, scope, &cancel, p) {
+                match terra_core::generators::procedural_shape_tiles(&mut g, scope, &cancel, p) {
                     Some(true) => Ok(g),
                     Some(false) => Err(EvalError::Cancelled),
                     // Dunes/Crater have no tile-sliced fill: whole-field generate,
@@ -1143,11 +1154,11 @@ impl StackEvaluator {
         &self,
         ctx: &mut EvalContext,
         input: &Heightfield,
-        p: &crate::layer::PathParams,
+        p: &terra_core::layer::PathParams,
         layer_id: LayerId,
         scope: &[TileId],
     ) -> Result<Heightfield, EvalError> {
-        use crate::field_data::keys;
+        use terra_core::field_data::keys;
         let metrics = ctx.metrics;
         let mut g = input.clone();
         // Wetness entering from below (already in ctx), and the previous merged
@@ -1160,8 +1171,8 @@ impl StackEvaluator {
             .and_then(|c| c.aux.get(keys::WETNESS).cloned())
             .unwrap_or_else(|| below.clone().unwrap_or_else(|| MaskField::zeros(metrics)));
         for &id in scope {
-            let Some(crate::generators::PathStampTile { height, wetness }) =
-                crate::generators::path_stamp_tile(input, p, id)
+            let Some(terra_core::generators::PathStampTile { height, wetness }) =
+                terra_core::generators::path_stamp_tile(input, p, id)
             else {
                 continue;
             };
@@ -1195,7 +1206,7 @@ impl StackEvaluator {
         &self,
         ctx: &mut EvalContext,
         input: &Heightfield,
-        p: &crate::authoring::SculptStrokeParams,
+        p: &terra_core::authoring::SculptStrokeParams,
         layer_id: LayerId,
         scope: &[TileId],
     ) -> Result<Heightfield, EvalError> {
@@ -1204,7 +1215,7 @@ impl StackEvaluator {
         // available (#123): seed the working rect from the checkpoint and stamp
         // only the changed suffix over it. Read-only store access — scoped runs
         // never store (a result restricted to `S` is not a whole-field checkpoint).
-        let result = crate::authoring::apply_sculpt_strokes_scoped_resumed(
+        let result = terra_core::authoring::apply_sculpt_strokes_scoped_resumed(
             input,
             p,
             scope,
@@ -1262,7 +1273,7 @@ impl StackEvaluator {
         ctx: &EvalContext,
         descendant_ids: &[LayerId],
         input: &Heightfield,
-    ) -> Option<(Heightfield, crate::field_data::AuxMaps)> {
+    ) -> Option<(Heightfield, terra_core::field_data::AuxMaps)> {
         if self.cache.is_dirty(group_id) {
             return None;
         }
@@ -1273,7 +1284,7 @@ impl StackEvaluator {
         if cached.generation != height_fingerprint(input) {
             return None;
         }
-        let child_aux = crate::field_data::AuxMaps::from_hashmap_preserving_strata(
+        let child_aux = terra_core::field_data::AuxMaps::from_hashmap_preserving_strata(
             &cached.aux,
             cached.strata.clone(),
         );
@@ -1371,7 +1382,7 @@ fn refresh_point_of_use_masks(ctx: &mut EvalContext, input: &Heightfield) {
     if assets.is_empty() {
         return;
     }
-    let rebaked = crate::mask::bake_mask_assets_resolved(
+    let rebaked = terra_core::mask::bake_mask_assets_resolved(
         &assets,
         input,
         input.metrics,
@@ -1381,8 +1392,8 @@ fn refresh_point_of_use_masks(ctx: &mut EvalContext, input: &Heightfield) {
     ctx.masks.extend(rebaked);
 }
 
-fn mask_source_is_point_of_use(source: &crate::mask::MaskSource) -> bool {
-    use crate::mask::MaskSource::*;
+fn mask_source_is_point_of_use(source: &terra_core::mask::MaskSource) -> bool {
+    use terra_core::mask::MaskSource::*;
     matches!(
         source,
         Height { .. }
@@ -1429,8 +1440,8 @@ fn apply_param_bindings(ctx: &EvalContext, layer: &Layer) -> Layer {
     out
 }
 
-fn sample_binding_source(ctx: &EvalContext, source: &crate::layer::BindingSource) -> f32 {
-    use crate::layer::BindingSource;
+fn sample_binding_source(ctx: &EvalContext, source: &terra_core::layer::BindingSource) -> f32 {
+    use terra_core::layer::BindingSource;
     match source {
         BindingSource::Constant(v) => v.clamp(0.0, 1.0),
         BindingSource::Mask(id) => mean_mask(ctx.masks.get(id)),
@@ -1477,37 +1488,37 @@ fn layer_with_world_scale(layer: &Layer, world_scale: f32) -> Layer {
         return layer.clone();
     }
     let mut layer = layer.clone();
-    let scale_noise = |noise: &mut crate::layer::NoiseParams| {
+    let scale_noise = |noise: &mut terra_core::layer::NoiseParams| {
         noise.frequency /= scale;
         noise.offset_x *= scale;
         noise.offset_z *= scale;
     };
     match &mut layer.kind {
-        crate::layer::LayerKind::NoiseValue(p)
-        | crate::layer::LayerKind::NoisePerlin(p)
-        | crate::layer::LayerKind::NoiseOpenSimplex(p) => scale_noise(p),
-        crate::layer::LayerKind::NoiseWorley(p) => scale_noise(&mut p.base),
-        crate::layer::LayerKind::Fbm(p) | crate::layer::LayerKind::Ridged(p) => {
+        terra_core::layer::LayerKind::NoiseValue(p)
+        | terra_core::layer::LayerKind::NoisePerlin(p)
+        | terra_core::layer::LayerKind::NoiseOpenSimplex(p) => scale_noise(p),
+        terra_core::layer::LayerKind::NoiseWorley(p) => scale_noise(&mut p.base),
+        terra_core::layer::LayerKind::Fbm(p) | terra_core::layer::LayerKind::Ridged(p) => {
             scale_noise(&mut p.base)
         }
-        crate::layer::LayerKind::DomainWarp(p) => {
+        terra_core::layer::LayerKind::DomainWarp(p) => {
             scale_noise(&mut p.base);
             p.warp_frequency /= scale;
         }
-        crate::layer::LayerKind::Mountains(p) => scale_noise(&mut p.base),
-        crate::layer::LayerKind::Dunes(p) => {
+        terra_core::layer::LayerKind::Mountains(p) => scale_noise(&mut p.base),
+        terra_core::layer::LayerKind::Dunes(p) => {
             scale_noise(&mut p.base);
             p.wave_frequency /= scale;
         }
-        crate::layer::LayerKind::Uplift(p) => {
+        terra_core::layer::LayerKind::Uplift(p) => {
             p.frequency /= scale;
             p.detail_frequency /= scale;
         }
-        crate::layer::LayerKind::Island(p) => {
+        terra_core::layer::LayerKind::Island(p) => {
             p.coastline_frequency /= scale;
             p.ridge_frequency /= scale;
         }
-        crate::layer::LayerKind::VoronoiRegions(p) => scale_noise(&mut p.base),
+        terra_core::layer::LayerKind::VoronoiRegions(p) => scale_noise(&mut p.base),
         _ => {}
     }
     layer
@@ -1519,14 +1530,14 @@ fn publish_layer_outputs(ctx: &mut EvalContext, layer: &Layer, height: &Heightfi
 
 fn publish_named_outputs(
     ctx: &mut EvalContext,
-    outputs: &[crate::layer::NamedOutputDecl],
+    outputs: &[terra_core::layer::NamedOutputDecl],
     height: &Heightfield,
 ) {
     for output in outputs {
         if !output.enabled {
             continue;
         }
-        let field = if output.field == crate::field_data::FieldId::Height {
+        let field = if output.field == terra_core::field_data::FieldId::Height {
             MaskField::from_raw(height.metrics, &height.to_dense())
         } else {
             let key = output.field.cache_key();
@@ -1542,11 +1553,13 @@ fn publish_named_outputs(
 fn selected_group_seed(
     ctx: &EvalContext,
     current: &Heightfield,
-    selected: &crate::layer::SelectedGroupInput,
+    selected: &terra_core::layer::SelectedGroupInput,
 ) -> Heightfield {
-    use crate::layer::SelectedGroupInput;
+    use terra_core::layer::SelectedGroupInput;
     let source = match selected {
-        SelectedGroupInput::Field(crate::field_data::FieldId::Height) => return current.clone(),
+        SelectedGroupInput::Field(terra_core::field_data::FieldId::Height) => {
+            return current.clone()
+        }
         SelectedGroupInput::Field(field) => ctx.aux_maps.get(&field.cache_key()),
         SelectedGroupInput::Output(output) => ctx.published_outputs.get(output),
     };
@@ -1568,7 +1581,7 @@ fn selected_group_seed(
 fn mix_heightfields(
     h_in: &Heightfield,
     h_layer: &Heightfield,
-    blend: crate::layer::BlendMode,
+    blend: terra_core::layer::BlendMode,
     opacity: f32,
     mask: &MaskField,
 ) -> Heightfield {
@@ -1635,7 +1648,7 @@ fn mask_at(mask: &MaskField, target: HeightfieldMetrics) -> std::borrow::Cow<'_,
 /// Merge child aux maps into the parent context, weighted by the group mask.
 fn merge_aux_masked(
     ctx: &mut EvalContext,
-    child: &crate::field_data::AuxMaps,
+    child: &terra_core::field_data::AuxMaps,
     mask: &MaskField,
     opacity: f32,
 ) {
@@ -1667,10 +1680,10 @@ fn merge_aux_masked(
 
 fn composite_distribution(
     ctx: &EvalContext,
-    dist: &crate::mask::Distribution,
+    dist: &terra_core::mask::Distribution,
     input: &Heightfield,
 ) -> MaskField {
-    use crate::mask::DistBakeContext;
+    use terra_core::mask::DistBakeContext;
     let slope = ctx.aux.get("slope").map(|m| m.data());
     let curv = ctx.aux.get("curvature").map(|m| m.data());
     let flow = ctx
@@ -1686,13 +1699,13 @@ fn composite_distribution(
         masks: &ctx.masks,
         aux: Some(&ctx.aux),
     };
-    crate::mask::bake_distribution_with_context(dist, input.metrics, &bake_ctx)
+    terra_core::mask::bake_distribution_with_context(dist, input.metrics, &bake_ctx)
 }
 
 /// Effective contribution mask from the layer's local distribution.
 fn effective_layer_mask(ctx: &EvalContext, layer: &Layer, input: &Heightfield) -> MaskField {
     let mut mask = composite_distribution(ctx, &layer.common.masks, input);
-    let crate::layer::LayerKind::Stamp2d(_) = layer.kind else {
+    let terra_core::layer::LayerKind::Stamp2d(_) = layer.kind else {
         return mask;
     };
     let Some(transform) = layer.common.shape_transform.as_ref() else {
@@ -1753,7 +1766,7 @@ fn height_fingerprint(h: &Heightfield) -> u64 {
 
 /// Multiply recent materials / vegetation aux fields by a placement mask.
 fn gate_aux_by_mask(ctx: &mut EvalContext, mask: &MaskField) {
-    use crate::field_data::keys;
+    use terra_core::field_data::keys;
     let mul = |field: &mut MaskField| {
         // Match the mask to this field's grid so `get` stays in-range by local
         // construction rather than depending on the producer's metrics (#94).
@@ -1786,8 +1799,8 @@ fn gate_aux_by_mask(ctx: &mut EvalContext, mask: &MaskField) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layer::{BlendMode, FlatParams, LayerKind, NoiseParams};
     use std::collections::HashSet;
+    use terra_core::layer::{BlendMode, FlatParams, LayerKind, NoiseParams};
 
     /// Layer ids from `from` to the top of the stack (inclusive). Test-only
     /// mirror of the dirty suffix `mark_dirty_from` propagates over.
@@ -1807,7 +1820,7 @@ mod tests {
     /// keep the mask world-aligned. Reverting the `mask_at` guard fails this.
     #[test]
     fn gate_aux_by_mask_survives_smaller_mask() {
-        use crate::field_data::keys;
+        use terra_core::field_data::keys;
         let metrics = HeightfieldMetrics::new(8, 8, 80.0, 80.0);
         let mut ctx = EvalContext::new(metrics);
         ctx.aux_insert(keys::MATERIALS, MaskField::ones(metrics));
@@ -1833,7 +1846,7 @@ mod tests {
     /// `ctx.metrics` panicked before the resample; all three are hardened here.
     #[test]
     fn merge_aux_masked_survives_mismatched_mask_child_and_parent_aux() {
-        use crate::field_data::keys;
+        use terra_core::field_data::keys;
         let metrics = HeightfieldMetrics::new(8, 8, 80.0, 80.0);
         let small = HeightfieldMetrics::new(4, 4, 80.0, 80.0);
         let mut ctx = EvalContext::new(metrics);
@@ -1863,7 +1876,7 @@ mod tests {
 
     #[test]
     fn source_import_error_maps_to_io_keeping_path_and_cause() {
-        let src = crate::generators::SourceImportError::Image {
+        let src = terra_core::generators::SourceImportError::Image {
             path: "textures/ridge.png".into(),
             message: "decode failed".into(),
         };
@@ -2063,7 +2076,7 @@ mod tests {
 
     #[test]
     fn add_blend_merges_with_base() {
-        use crate::layer::BlendMode;
+        use terra_core::layer::BlendMode;
         let metrics = HeightfieldMetrics::new(16, 16, 64.0, 64.0);
         let mut stack = LayerStack::new();
         stack.push(Layer::new(
@@ -2121,7 +2134,7 @@ mod tests {
 
     #[test]
     fn normal_blend_replaces_base() {
-        use crate::layer::BlendMode;
+        use terra_core::layer::BlendMode;
         let metrics = HeightfieldMetrics::new(16, 16, 64.0, 64.0);
         let mut stack = LayerStack::new();
         stack.push(Layer::new(
@@ -2189,7 +2202,7 @@ mod tests {
 
     #[test]
     fn height_mask_is_rebaked_against_the_owning_layers_input() {
-        use crate::mask::{bake_mask_assets, MaskAsset, MaskId, MaskRef, MaskSource};
+        use terra_core::mask::{bake_mask_assets, MaskAsset, MaskId, MaskRef, MaskSource};
 
         let metrics = HeightfieldMetrics::new(16, 16, 160.0, 160.0);
         let mask_id = MaskId::new();
@@ -2233,8 +2246,8 @@ mod tests {
 
     #[test]
     fn scoped_group_mask_limits_child_normal_filter() {
-        use crate::layer::LayerGroup;
-        use crate::mask::{bake_mask_assets, MaskAsset, MaskId, MaskRef, MaskSource};
+        use terra_core::layer::LayerGroup;
+        use terra_core::mask::{bake_mask_assets, MaskAsset, MaskId, MaskRef, MaskSource};
 
         let metrics = HeightfieldMetrics::new(32, 32, 320.0, 320.0);
         let mask_id = MaskId::new();
@@ -2247,7 +2260,7 @@ mod tests {
             },
             ops: Vec::new(),
             paint: None,
-            display_color: crate::mask::default_mask_display_color(),
+            display_color: terra_core::mask::default_mask_display_color(),
         };
         let mut reference = Heightfield::zeros(metrics);
         for j in 0..32 {
@@ -2280,8 +2293,11 @@ mod tests {
         );
     }
 
-    fn push_flat_to_biome_filters(biome: &mut crate::layer::LayerGroup, height: f32) -> LayerId {
-        use crate::layer::{BiomeSection, FlatParams, LayerKind};
+    fn push_flat_to_biome_filters(
+        biome: &mut terra_core::layer::LayerGroup,
+        height: f32,
+    ) -> LayerId {
+        use terra_core::layer::{BiomeSection, FlatParams, LayerKind};
         biome.ensure_biome_sections();
         let layer = Layer::new("Flat", LayerKind::Flat(FlatParams { height }));
         let id = layer.id();
@@ -2295,7 +2311,7 @@ mod tests {
 
     #[test]
     fn incremental_scoped_groups_reuse_clean_sibling_biome() {
-        use crate::layer::LayerGroup;
+        use terra_core::layer::LayerGroup;
 
         let metrics = HeightfieldMetrics::new(16, 16, 160.0, 160.0);
         let mut stack = LayerStack::new();
@@ -2350,8 +2366,10 @@ mod tests {
     /// rebuild of the appended stack.
     #[test]
     fn appended_stroke_restamps_one_and_matches_cold_rebuild() {
-        use crate::authoring::{SculptPoint, SculptStroke, SculptStrokeKind, SculptStrokeParams};
-        use crate::layer::{Layer, SculptParams};
+        use terra_core::authoring::{
+            SculptPoint, SculptStroke, SculptStrokeKind, SculptStrokeParams,
+        };
+        use terra_core::layer::{Layer, SculptParams};
 
         let m = HeightfieldMetrics::new(96, 96, 1500.0, 1500.0);
         let mut sculpt = SculptParams::filled(96, 0.0);
@@ -2437,7 +2455,7 @@ mod tests {
     /// tail checkpoint (the O(1)-append seed).
     #[test]
     fn sculpt_prefix_store_evicts_untouched_but_keeps_touched_tail() {
-        use crate::authoring::{
+        use terra_core::authoring::{
             apply_sculpt_strokes_cached, SculptPoint, SculptStroke, SculptStrokeKind,
             SculptStrokeParams,
         };

@@ -4,13 +4,13 @@
 //! Interactive Draft prefers GPU present; jobs are cancelled by bumping `current_token`.
 
 use super::{EvalContext, EvalError, PreviewQuality, StackEvaluator};
-use crate::heightfield::{Heightfield, HeightfieldMetrics};
-use crate::layer::{LayerId, LayerStack};
-use crate::mask::{bake_mask_assets, MaskAsset, MaskField};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
+use terra_core::heightfield::{Heightfield, HeightfieldMetrics};
+use terra_core::layer::{LayerId, LayerStack};
+use terra_core::mask::{bake_mask_assets, MaskAsset, MaskField};
 use terra_jobs::{CancelToken, JobError, JobEvent, LatestWins};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -37,12 +37,12 @@ pub struct EvalWorkRequest {
     pub stack: LayerStack,
     pub masks: Vec<MaskAsset>,
     pub base_metrics: HeightfieldMetrics,
-    pub level_steps: crate::analyze::LevelStepSettings,
+    pub level_steps: terra_core::analyze::LevelStepSettings,
     pub preview_res: u32,
     pub export_res: u32,
     pub aux: HashMap<String, MaskField>,
     /// Depth-aware Materials strata (not representable in the aux HashMap).
-    pub strata: Option<Vec<crate::layer::Stratum>>,
+    pub strata: Option<Vec<terra_core::layer::Stratum>>,
     /// Prior composed height for baking height/slope/curvature masks.
     /// Falls back to zeros only on the first build of a generation.
     pub mask_reference: Option<std::sync::Arc<Heightfield>>,
@@ -53,7 +53,7 @@ pub struct EvalWorkRequest {
     /// resolution and drives a tile-scoped `mark_dirty_from_region` (#100 phase
     /// 4); `None` keeps whole-field per-layer marks, exactly as before. UV rather
     /// than texels/tiles because the worker recomputes its resolution independently.
-    pub dirty_region: Option<crate::tiling::UvRect>,
+    pub dirty_region: Option<terra_core::tiling::UvRect>,
     pub mark_all_dirty: bool,
 }
 
@@ -63,7 +63,7 @@ pub struct EvalWorkResult {
     pub quality: PreviewQuality,
     pub height: Heightfield,
     pub aux: HashMap<String, MaskField>,
-    pub strata: Option<Vec<crate::layer::Stratum>>,
+    pub strata: Option<Vec<terra_core::layer::Stratum>>,
     pub eval_us: u64,
     pub layer_timings: Vec<super::LayerEvalTiming>,
 }
@@ -300,7 +300,7 @@ fn run_cpu_job(
         // next job's marks union into the seeds these leave behind.
         match job.dirty_region {
             Some(region) => {
-                let tiles = crate::tiling::tiles_for_uv_rect(&metrics, region);
+                let tiles = terra_core::tiling::tiles_for_uv_rect(&metrics, region);
                 evaluator.mark_dirty_from_region(&job.stack, id, &tiles);
             }
             None => evaluator.mark_dirty_from(&job.stack, id),
@@ -381,7 +381,7 @@ fn resample_height_nearest(src: &Heightfield, dst: HeightfieldMetrics) -> Height
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layer::{BlendMode, EffectFilterParams, FlatParams, Layer, LayerKind};
+    use terra_core::layer::{BlendMode, EffectFilterParams, FlatParams, Layer, LayerKind};
 
     #[test]
     fn worker_produces_heightfield() {
@@ -399,7 +399,7 @@ mod tests {
                 stack,
                 masks: Vec::new(),
                 base_metrics: HeightfieldMetrics::preview_default(),
-                level_steps: crate::analyze::LevelStepSettings::default(),
+                level_steps: terra_core::analyze::LevelStepSettings::default(),
                 preview_res: 256,
                 export_res: 1024,
                 aux: HashMap::new(),
@@ -433,7 +433,7 @@ mod tests {
 
     #[test]
     fn worker_height_mask_uses_layer_input_not_previous_frame() {
-        use crate::mask::{MaskAsset, MaskId, MaskRef, MaskSource};
+        use terra_core::mask::{MaskAsset, MaskId, MaskRef, MaskSource};
 
         let metrics = HeightfieldMetrics::new(32, 32, 320.0, 320.0);
         // Deliberately stale prior DEM. Point-of-use evaluation must follow the
@@ -450,7 +450,7 @@ mod tests {
             },
             ops: Vec::new(),
             paint: None,
-            display_color: crate::mask::default_mask_display_color(),
+            display_color: terra_core::mask::default_mask_display_color(),
         };
 
         let mut stack = LayerStack::new();
@@ -476,7 +476,7 @@ mod tests {
                 stack,
                 masks: vec![asset],
                 base_metrics: metrics,
-                level_steps: crate::analyze::LevelStepSettings::default(),
+                level_steps: terra_core::analyze::LevelStepSettings::default(),
                 preview_res: 32,
                 export_res: 32,
                 aux: HashMap::new(),
@@ -510,7 +510,7 @@ mod tests {
 
     #[test]
     fn draft_aux_mask_is_resampled_before_full_crater_composite() {
-        use crate::mask::{MaskAsset, MaskId, MaskRef, MaskSource};
+        use terra_core::mask::{MaskAsset, MaskId, MaskRef, MaskSource};
 
         let source_metrics = HeightfieldMetrics::new(512, 512, 1024.0, 1024.0);
         let mask_id = MaskId::new();
@@ -535,7 +535,7 @@ mod tests {
                 stack: stack.clone(),
                 masks: vec![asset.clone()],
                 base_metrics: source_metrics,
-                level_steps: crate::analyze::LevelStepSettings::default(),
+                level_steps: terra_core::analyze::LevelStepSettings::default(),
                 preview_res: 1024,
                 export_res: 1024,
                 aux: HashMap::from([("wetness".into(), MaskField::filled(source_metrics, 0.75))]),
@@ -557,7 +557,7 @@ mod tests {
                 stack,
                 masks: vec![asset],
                 base_metrics: source_metrics,
-                level_steps: crate::analyze::LevelStepSettings::default(),
+                level_steps: terra_core::analyze::LevelStepSettings::default(),
                 preview_res: 1024,
                 export_res: 1024,
                 aux: draft.aux,
@@ -612,7 +612,7 @@ mod tests {
             stack,
             masks: Vec::new(),
             base_metrics: metrics,
-            level_steps: crate::analyze::LevelStepSettings::default(),
+            level_steps: terra_core::analyze::LevelStepSettings::default(),
             preview_res: 32,
             export_res: 32,
             aux: HashMap::new(),
@@ -654,8 +654,8 @@ mod tests {
     /// per-texel suffix where scoped and whole-field are bit-exact.)
     #[test]
     fn scoped_dirty_region_request_matches_whole_field_and_recomputes_bounded_tiles() {
-        use crate::layer::{CoastalParams, PlateauParams, SculptParams};
-        use crate::tiling::UvRect;
+        use terra_core::layer::{CoastalParams, PlateauParams, SculptParams};
+        use terra_core::tiling::UvRect;
 
         // 128^2 over 32-sample tiles = a 4x4 grid. A SculptBase with a varying paint
         // buffer (so tiles genuinely differ) feeding two per-texel passes.
@@ -712,7 +712,7 @@ mod tests {
             stack,
             masks: Vec::new(),
             base_metrics,
-            level_steps: crate::analyze::LevelStepSettings::default(),
+            level_steps: terra_core::analyze::LevelStepSettings::default(),
             preview_res: res,
             export_res: res,
             aux: HashMap::new(),
@@ -817,11 +817,13 @@ mod tests {
     /// `generate_scoped_sculpt` path, not just `apply_sculpt_strokes`.
     #[test]
     fn scoped_stroke_edit_matches_whole_field() {
-        use crate::authoring::{
+        use terra_core::authoring::{
             sculpt_edit_footprint, SculptPoint, SculptStroke, SculptStrokeKind, SculptStrokeParams,
         };
-        use crate::layer::{EffectFilterKind, EffectFilterParams, PlateauParams, SculptParams};
-        use crate::tiling::UvRect;
+        use terra_core::layer::{
+            EffectFilterKind, EffectFilterParams, PlateauParams, SculptParams,
+        };
+        use terra_core::tiling::UvRect;
 
         // 128^2 over 32-sample tiles = a 4x4 grid, Full quality.
         let res = 128u32;
@@ -904,7 +906,7 @@ mod tests {
             stack,
             masks: Vec::new(),
             base_metrics,
-            level_steps: crate::analyze::LevelStepSettings::default(),
+            level_steps: terra_core::analyze::LevelStepSettings::default(),
             preview_res: res,
             export_res: res,
             aux: HashMap::new(),
@@ -1005,11 +1007,11 @@ mod tests {
     #[test]
     #[ignore = "perf measurement; run with `--ignored --nocapture` to see the numbers"]
     fn perf_scoped_full_resubmit_is_well_below_whole_field() {
-        use crate::authoring::SculptStrokeKind;
-        use crate::layer::{SculptParams, VoronoiParams};
-        use crate::shape_history::{create_shape_layer, stamp_stroke};
-        use crate::tiling::UvRect;
         use std::time::Instant;
+        use terra_core::authoring::SculptStrokeKind;
+        use terra_core::layer::{SculptParams, VoronoiParams};
+        use terra_core::shape_history::{create_shape_layer, stamp_stroke};
+        use terra_core::tiling::UvRect;
 
         // 512^2 over 128-sample tiles = a 4x4 grid, Full quality.
         let res = 512u32;
@@ -1062,7 +1064,7 @@ mod tests {
             stack: stack.clone(),
             masks: Vec::new(),
             base_metrics,
-            level_steps: crate::analyze::LevelStepSettings::default(),
+            level_steps: terra_core::analyze::LevelStepSettings::default(),
             preview_res: res,
             export_res: res,
             aux: HashMap::new(),
@@ -1150,7 +1152,7 @@ mod tests {
 
     #[test]
     fn layer_panic_becomes_failure_and_worker_accepts_later_job() {
-        use crate::mask::{MaskAsset, MaskId, MaskRef, MaskSource};
+        use terra_core::mask::{MaskAsset, MaskId, MaskRef, MaskSource};
 
         let metrics = HeightfieldMetrics::new(128, 128, 128.0, 128.0);
         let malformed: MaskField = serde_json::from_value(serde_json::json!({
@@ -1180,7 +1182,7 @@ mod tests {
                 stack: crashing_stack,
                 masks: vec![asset],
                 base_metrics: metrics,
-                level_steps: crate::analyze::LevelStepSettings::default(),
+                level_steps: terra_core::analyze::LevelStepSettings::default(),
                 preview_res: 128,
                 export_res: 128,
                 aux: HashMap::from([("wetness".into(), malformed)]),
@@ -1221,7 +1223,7 @@ mod tests {
                 stack: valid_stack,
                 masks: Vec::new(),
                 base_metrics: metrics,
-                level_steps: crate::analyze::LevelStepSettings::default(),
+                level_steps: terra_core::analyze::LevelStepSettings::default(),
                 preview_res: 128,
                 export_res: 128,
                 aux: HashMap::new(),
@@ -1261,7 +1263,7 @@ mod tests {
                 stack: base_stack.clone(),
                 masks: Vec::new(),
                 base_metrics: metrics,
-                level_steps: crate::analyze::LevelStepSettings::default(),
+                level_steps: terra_core::analyze::LevelStepSettings::default(),
                 preview_res: 128,
                 export_res: 128,
                 aux: HashMap::new(),
@@ -1295,7 +1297,7 @@ mod tests {
                 stack: junk_stack,
                 masks: Vec::new(),
                 base_metrics: metrics,
-                level_steps: crate::analyze::LevelStepSettings::default(),
+                level_steps: terra_core::analyze::LevelStepSettings::default(),
                 preview_res: 128,
                 export_res: 128,
                 aux: HashMap::from([("junk".into(), malformed)]),
@@ -1334,7 +1336,7 @@ mod tests {
                 stack: base_stack,
                 masks: Vec::new(),
                 base_metrics: metrics,
-                level_steps: crate::analyze::LevelStepSettings::default(),
+                level_steps: terra_core::analyze::LevelStepSettings::default(),
                 preview_res: 128,
                 export_res: 128,
                 aux: HashMap::new(),
@@ -1380,7 +1382,7 @@ mod tests {
             stack: LayerStack::new(),
             masks: Vec::new(),
             base_metrics: HeightfieldMetrics::preview_default(),
-            level_steps: crate::analyze::LevelStepSettings::default(),
+            level_steps: terra_core::analyze::LevelStepSettings::default(),
             preview_res: 256,
             export_res: 1024,
             aux: HashMap::new(),
@@ -1406,7 +1408,7 @@ mod tests {
                 stack,
                 masks: Vec::new(),
                 base_metrics: HeightfieldMetrics::preview_default(),
-                level_steps: crate::analyze::LevelStepSettings::default(),
+                level_steps: terra_core::analyze::LevelStepSettings::default(),
                 preview_res: 128,
                 export_res: 128,
                 aux: HashMap::new(),

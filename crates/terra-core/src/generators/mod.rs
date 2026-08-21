@@ -189,7 +189,7 @@ pub fn plateau(input: &Heightfield, p: &PlateauParams) -> Heightfield {
 
 /// One-sample plateau remap. Pure `f32 -> f32`, so the whole-field [`plateau`]
 /// pass and the tile-scoped recompute (#100 phase 2) share identical arithmetic.
-pub(crate) fn plateau_sample(p: &PlateauParams, h: f32) -> f32 {
+pub fn plateau_sample(p: &PlateauParams, h: f32) -> f32 {
     let soft = p.soft.max(1e-3);
     if h < p.low {
         let t = ((h - (p.low - soft)) / soft).clamp(0.0, 1.0);
@@ -1107,7 +1107,7 @@ pub fn voronoi_regions_tiles(
 /// Failure loading an external heightmap image or OBJ mesh for a generator.
 ///
 /// Generator-owned so `generators` need not depend on `eval`; the evaluator
-/// boundary maps this into `EvalError` via `From` (see `eval::EvalError`).
+/// boundary maps this into its `EvalError` via `From`.
 #[derive(Debug, Error)]
 pub enum SourceImportError {
     #[error("failed to load heightmap image \"{path}\": {message}")]
@@ -1600,7 +1600,7 @@ pub fn coastal(input: &Heightfield, p: &CoastalParams) -> Heightfield {
 
 /// One-sample coastal remap. Pure `f32 -> f32`, shared by the whole-field
 /// [`coastal`] pass and the tile-scoped recompute (#100 phase 2).
-pub(crate) fn coastal_sample(p: &CoastalParams, h: f32) -> f32 {
+pub fn coastal_sample(p: &CoastalParams, h: f32) -> f32 {
     if p.flatten_below && h < p.sea_level {
         if p.shelf_depth <= 0.0 {
             p.sea_level

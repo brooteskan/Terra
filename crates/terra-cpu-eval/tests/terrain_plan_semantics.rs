@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 
 use terra_core::deps::NodeRef;
-use terra_core::eval::{EvalContext, ProcessorRegistry, StackEvaluator};
 use terra_core::field_data::FieldId;
 use terra_core::heightfield::{Heightfield, HeightfieldMetrics};
 use terra_core::ids::LayerId;
@@ -14,6 +13,7 @@ use terra_core::terrain_plan::{
     compile_terrain_plan, CompiledTerrainPlan, FieldSlot, GroupCompositeMode, PlanOrigin,
     PlanStructureRevision, SeedSource, TerrainOpKind, TerrainPlanStamp,
 };
+use terra_cpu_eval::{EvalContext, ProcessorRegistry, StackEvaluator};
 
 fn flat(id: u128, height: f32) -> Layer {
     let mut layer = Layer::new("Flat", LayerKind::Flat(FlatParams { height }));

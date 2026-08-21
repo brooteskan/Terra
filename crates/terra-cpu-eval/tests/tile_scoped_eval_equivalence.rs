@@ -23,7 +23,6 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use terra_core::authoring::SculptStrokeKind;
-use terra_core::eval::{EvalContext, EvalError, LayerEvalTiming, PreviewQuality, StackEvaluator};
 use terra_core::field_data::keys;
 use terra_core::heightfield::{Heightfield, HeightfieldMetrics, TileId};
 use terra_core::layer::{
@@ -31,8 +30,10 @@ use terra_core::layer::{
     MountainParams, PathNode, PathParams, PlateauParams, ProceduralGenerator,
     ProceduralShapeParams, SculptParams, VoronoiParams,
 };
+use terra_core::quality::PreviewQuality;
 use terra_core::shape_history::{create_shape_layer, stamp_stroke};
 use terra_core::tiling::measure_seams;
+use terra_cpu_eval::{EvalContext, EvalError, LayerEvalTiming, StackEvaluator};
 
 const TS: u32 = 16;
 

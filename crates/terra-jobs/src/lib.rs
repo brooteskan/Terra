@@ -6,14 +6,14 @@
 //! with panic containment by construction, atomic progress, and cancellation —
 //! the job unit the export, project-IO, and boot subsystems migrate onto. Phase 3
 //! (issue #103) adds [`LatestWins`], a persistent-state, latest-generation-wins
-//! executor that terra-core's `EvalWorker` is re-implemented over. Phase 4 (issue
+//! executor that terra-cpu-eval's `EvalWorker` is re-implemented over. Phase 4 (issue
 //! #104) adds [`Pool`], a fixed-size worker pool, and [`Debounced`], a coalescing
 //! latest-value-wins worker — the tool-thumbnail decoder and the editor-prefs
 //! saver migrate onto them. Phase 5 (issue #105) adds [`JobRegistry`], a per-frame
 //! poll registry that pumps every registered [`Pollable`] subsystem once and
 //! aggregates their wakefulness, collapsing the winit loop's scattered
 //! per-subsystem polling into a single tick. The crate depends only on `rayon`, so
-//! it stays a leaf below `terra-core`.
+//! it stays a leaf below `terra-core` and `terra-cpu-eval`.
 
 mod cancel;
 mod debounced;

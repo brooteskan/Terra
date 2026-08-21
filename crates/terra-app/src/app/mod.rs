@@ -25,10 +25,11 @@ use crate::ui::{
     WindowsGuiState,
 };
 use terra_core::document::EditorSession;
-use terra_core::eval::{EvalScheduler, EvalWorker, PreviewQuality};
 use terra_core::heightfield::{Heightfield, TileId};
 use terra_core::layer::LayerId;
+use terra_core::quality::PreviewQuality;
 use terra_core::tiling::UvRect;
+use terra_cpu_eval::{EvalScheduler, EvalWorker};
 use terra_gpu::GpuTileAtlas;
 use terra_gpu_eval::GpuTerrainEngine;
 use terra_gui::{GuiRenderer, GuiState, Rect, WidgetLabState};

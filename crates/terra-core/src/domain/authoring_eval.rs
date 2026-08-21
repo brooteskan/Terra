@@ -38,7 +38,7 @@ pub fn authoring_order_is_arbitrary() -> bool {
 
 /// Metadata order used for invalidation and optional explicit authoring sorts.
 ///
-/// This does not reorder [`crate::eval::StackEvaluator`] execution.
+/// This does not reorder CPU stack-evaluator execution.
 pub fn evaluation_eval_stage_order() -> &'static [EvalStage] {
     &[
         EvalStage::Blueprint,

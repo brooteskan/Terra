@@ -15,12 +15,13 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use terra_core::eval::{EvalContext, PreviewQuality, StackEvaluator};
 use terra_core::generators::VoronoiParams;
 use terra_core::heightfield::{Heightfield, HeightfieldMetrics};
 use terra_core::layer::{Layer, LayerKind, LayerStack};
 use terra_core::mask::bake_mask_assets;
+use terra_core::quality::PreviewQuality;
 use terra_core::shape_history::{create_shape_layer, stamp_stroke, ShapeTool};
+use terra_cpu_eval::{EvalContext, StackEvaluator};
 
 fn eval_at(stack: &LayerStack, m: HeightfieldMetrics, q: PreviewQuality) {
     let mut ctx = EvalContext::new(m);

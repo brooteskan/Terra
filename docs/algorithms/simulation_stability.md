@@ -1,7 +1,7 @@
 # Simulation stability contract
 
 Terra's CPU erosion oracles share an executable numerical contract in
-[`simulation_numerical_contract.rs`](../../crates/terra-core/tests/simulation_numerical_contract.rs).
+[`simulation_numerical_contract.rs`](../../crates/terra-cpu-eval/tests/simulation_numerical_contract.rs).
 It complements the qualitative landform fixtures; it does not replace them or
 introduce a second evaluator.
 
@@ -77,5 +77,5 @@ cache/hash-map round trip.
 Run the station contract with:
 
 ```text
-cargo test -p terra-core --test simulation_numerical_contract
+cargo test -p terra-cpu-eval --test simulation_numerical_contract
 ```

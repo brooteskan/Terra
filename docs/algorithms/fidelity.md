@@ -2,7 +2,7 @@
 
 ## CPU vs GPU
 
-- **CPU** remains the export oracle (`StackEvaluator` / `terra-io` background export).
+- **CPU** remains the export oracle (`terra-cpu-eval::StackEvaluator` / `terra-io` background export).
 - **GPU** preview supports only configurations covered by the executable matrix below. Generator compositing implements every authored blend equation, including HeightBlend and the smooth Boolean modes.
 - **In-place GPU kernels** (Blur, Terrace, EffectFilter, Thermal, Hydraulic, RiverCarve, StreamPower, and MultiScaleAmplify) preserve their entering height and apply the authored opacity, blend, and layer mask as an outer composite.
 - **GPU masks** execute ordered Constant, Height, and Slope entries with every combine mode and every mask operation. Blur operations are bounded to a 16-texel radius; distribution nodes and nonresident sources remain explicit CPU boundaries.

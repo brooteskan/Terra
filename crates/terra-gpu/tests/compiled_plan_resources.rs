@@ -1,5 +1,4 @@
 use terra_core::deps::NodeRef;
-use terra_core::eval::{EvalContext, StackEvaluator};
 use terra_core::field_data::FieldId;
 use terra_core::heightfield::{Heightfield, HeightfieldMetrics};
 use terra_core::ids::LayerId;
@@ -13,6 +12,7 @@ use terra_core::terrain_plan::{
     PlanStructureRevision, TerrainOpKind, TerrainPlanStamp,
 };
 use terra_core::test_fixtures::{untitled6_document, Untitled6Variant};
+use terra_cpu_eval::{EvalContext, StackEvaluator};
 use terra_gpu::compiled_plan::{
     GpuFieldResidency, GpuGroupCompositeParams, GpuPlanOperations, GpuPlanResourceCache,
     GpuPlanResourceKey, GpuPlanResourceLayout,

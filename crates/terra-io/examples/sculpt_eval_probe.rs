@@ -9,11 +9,12 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use terra_core::authoring::{stroke_footprint_uv, SculptPoint, SculptStroke, SculptStrokeKind};
-use terra_core::eval::{EvalContext, PreviewQuality, StackEvaluator};
 use terra_core::heightfield::Heightfield;
 use terra_core::layer::LayerKind;
 use terra_core::mask::bake_mask_assets;
+use terra_core::quality::PreviewQuality;
 use terra_core::tiling::{tiles_for_uv_rect, UvRect};
+use terra_cpu_eval::{EvalContext, StackEvaluator};
 
 fn print_timings(evaluator_label: &str, us: u128, ctx: &EvalContext) {
     eprintln!("{evaluator_label}: total {:.1} ms", us as f64 / 1000.0);

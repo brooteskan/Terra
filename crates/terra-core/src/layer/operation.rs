@@ -385,7 +385,7 @@ impl LayerKind {
     /// `Local` and be treated as tile-localizable (the #100 correctness hazard).
     /// This is the height kernel only; auxiliary-field coupling is
     /// [`Self::aux_reach`] and the resolved per-config answer is
-    /// [`crate::eval::reach::effective_reach`].
+    /// [`crate::layer_reach::effective_reach`].
     pub fn spatial_dependency(&self) -> DirtyClass {
         match self {
             // --- Input-independent generators: output ignores the composed input
@@ -594,7 +594,7 @@ impl LayerKind {
     ///
     /// Exhaustive by construction (no wildcard): a new `LayerKind` that reads sculpt
     /// aux must opt in here, or its preview could diverge unnoticed. The truth is the
-    /// processor arms in `crate::eval::processors`: an arm reading `aux_maps.hardness`
+    /// CPU processor arms: an arm reading `aux_maps.hardness`
     /// (directly or via `bake_layer_hardness`/`resolve_hardness`), `UPLIFT_RATE`,
     /// `SCULPT_PROTECTION`, `SEDIMENT_THICKNESS`, or `EDIT_REGION` is a consumer.
     pub fn consumes_sculpt_aux(&self) -> bool {

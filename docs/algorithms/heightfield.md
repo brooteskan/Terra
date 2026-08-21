@@ -16,7 +16,7 @@ Before stencil reads (blur, erosion, slope):
 
 Halo width must be ≥ stencil radius for a single pass. Multi-iteration sims either refresh each iteration or use `halo ≥ radius * iterations_per_batch`.
 
-The [CPU determinism contract](../../crates/terra-core/tests/cpu_determinism_contract.rs)
+The [CPU determinism contract](../../crates/terra-cpu-eval/tests/cpu_determinism_contract.rs)
 checks every ghost cell against its global clamped source, including both sides
 of each axis, corners, every configured halo depth, and partial final tiles. It
 also proves that a stale reverse copy is visible before synchronization.

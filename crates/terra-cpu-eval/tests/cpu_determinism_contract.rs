@@ -1,6 +1,5 @@
 //! C2-G1 CPU contract for deterministic evaluation, tiled storage, and halo exchange.
 
-use terra_core::eval::{EvalContext, PreviewQuality, StackEvaluator};
 use terra_core::generators::{
     path_stamp, path_stamp_tile, polygon_height, polygon_height_tile, sculpt_base, sculpt_base_tile,
 };
@@ -10,7 +9,9 @@ use terra_core::layer::{
     PathParams, PolygonHeightMode, PolygonHeightParams, SculptParams,
 };
 use terra_core::noise::{open_simplex2, perlin2, value_noise2, worley2, WorleyMetric};
+use terra_core::quality::PreviewQuality;
 use terra_core::tiling::{map_tiles_batched, measure_seams, TileScheduler};
+use terra_cpu_eval::{EvalContext, StackEvaluator};
 
 const NOISE_POINTS: [(f32, f32); 4] = [
     (0.125, 0.375),

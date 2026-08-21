@@ -2,11 +2,12 @@
 
 use std::collections::HashMap;
 use terra_core::biome_definition::PlacementCombineMode;
-use terra_core::eval::{EvalContext, PreviewQuality, StackEvaluator};
 use terra_core::mask::bake_mask_assets;
+use terra_core::quality::PreviewQuality;
 use terra_core::sparse_paint::SparsePaintChannelKey;
 use terra_core::world_archetype::tropical_island_world;
 use terra_core::TerrainDocument;
+use terra_cpu_eval::{EvalContext, StackEvaluator};
 
 #[test]
 fn tropical_island_workflow_structure() {

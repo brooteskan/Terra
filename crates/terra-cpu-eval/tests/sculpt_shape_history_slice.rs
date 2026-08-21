@@ -3,16 +3,17 @@
 use std::collections::HashMap;
 use terra_core::authoring::{apply_sculpt_strokes, SculptStrokeKind};
 use terra_core::document::{EditorSession, TerrainDocument};
-use terra_core::eval::{EvalContext, PreviewQuality, StackEvaluator};
 use terra_core::heightfield::{Heightfield, HeightfieldMetrics};
 use terra_core::layer::{
     BlendMode, HydraulicErosionParams, Layer, LayerKind, NoiseParams, SculptStrokeParams,
 };
 use terra_core::mask::bake_mask_assets;
+use terra_core::quality::PreviewQuality;
 use terra_core::shape_history::{
     create_shape_layer, editing_target_line, merge_sculpt_stroke_layers, resolve_shape_target,
     stamp_stroke, ShapeEditMode, ShapeTargetDecision, ShapeTool,
 };
+use terra_cpu_eval::{EvalContext, StackEvaluator};
 
 fn metrics() -> HeightfieldMetrics {
     HeightfieldMetrics::new(32, 32, 1024.0, 1024.0)

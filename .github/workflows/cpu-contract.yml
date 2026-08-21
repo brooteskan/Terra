@@ -13,11 +13,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Run CPU determinism contract
-        run: cargo test -p terra-core --test cpu_determinism_contract
+        run: cargo test -p terra-cpu-eval --test cpu_determinism_contract
       - name: Run simulation numerical contract
-        run: cargo test -p terra-core --test simulation_numerical_contract
+        run: cargo test -p terra-cpu-eval --test simulation_numerical_contract
       - name: Run debris-flow numerical regressions
         run: |
           cargo test -p terra-core --lib pick_receiver
           cargo test -p terra-core --test debris_flow_mass
-          cargo test -p terra-core --test erosion_state_handoff
+          cargo test -p terra-cpu-eval --test erosion_state_handoff

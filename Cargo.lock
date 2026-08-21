@@ -2585,6 +2585,7 @@ dependencies = [
  "serde",
  "serde_json",
  "terra-core",
+ "terra-cpu-eval",
  "terra-gpu",
  "terra-gpu-eval",
  "terra-gui",
@@ -2615,6 +2616,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "terra-cpu-eval"
+version = "0.1.0-beta.1"
+dependencies = [
+ "image",
+ "log",
+ "profiling",
+ "serde",
+ "serde_json",
+ "terra-core",
+ "terra-jobs",
+ "thiserror 2.0.19",
+ "uuid",
+]
+
+[[package]]
 name = "terra-gpu"
 version = "0.1.0-beta.1"
 dependencies = [
@@ -2623,6 +2639,7 @@ dependencies = [
  "log",
  "profiling",
  "terra-core",
+ "terra-cpu-eval",
  "terra-test-gpu",
  "thiserror 2.0.19",
  "wgpu",
@@ -2636,6 +2653,7 @@ dependencies = [
  "image",
  "profiling",
  "terra-core",
+ "terra-cpu-eval",
  "terra-gpu",
  "terra-test-gpu",
  "wgpu",
@@ -2666,6 +2684,7 @@ dependencies = [
  "serde",
  "serde_json",
  "terra-core",
+ "terra-cpu-eval",
  "terra-jobs",
  "thiserror 2.0.19",
 ]

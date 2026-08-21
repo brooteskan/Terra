@@ -1,9 +1,9 @@
 //! C2-D1 ratchet: `LayerCommon` must not expose an inert seed override.
 
 use terra_core::document::TerrainDocument;
-use terra_core::eval::{EvalContext, StackEvaluator};
 use terra_core::heightfield::HeightfieldMetrics;
 use terra_core::layer::{Layer, LayerKind, LayerStack, NoiseParams};
+use terra_cpu_eval::{EvalContext, StackEvaluator};
 
 #[test]
 fn layer_common_serializes_without_seed() {
@@ -81,7 +81,7 @@ fn per_kind_seed_remains_output_authority() {
 
 #[test]
 fn layer_common_source_declares_no_seed_field() {
-    let source = include_str!("../src/layer/mod.rs");
+    let source = include_str!("../../terra-core/src/layer/mod.rs");
     let (_, after_name) = source
         .split_once("pub struct LayerCommon")
         .expect("LayerCommon declaration");

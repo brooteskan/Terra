@@ -5,13 +5,14 @@ use terra_core::biome_definition::{BiomeDefinition, BiomePlacementRules};
 use terra_core::biome_paint::BiomeLayer;
 use terra_core::document::TerrainDocument;
 use terra_core::domain::{authoring_order_is_arbitrary, incomplete_project_diagnostics};
-use terra_core::eval::{EvalContext, PreviewQuality, StackEvaluator};
 use terra_core::heightfield::HeightfieldMetrics;
 use terra_core::layer::{
     BlendMode, FlatParams, HydraulicErosionParams, Layer, LayerKind, LayerStack, MaterialsParams,
     NoiseParams, ThermalErosionParams,
 };
 use terra_core::mask::{bake_mask_assets, DistNode};
+use terra_core::quality::PreviewQuality;
+use terra_cpu_eval::{EvalContext, StackEvaluator};
 
 fn metrics() -> HeightfieldMetrics {
     HeightfieldMetrics {

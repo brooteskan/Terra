@@ -2,7 +2,7 @@
 //!
 //! A [`SimulationScenario`] is **not** a second solver. It groups Domain, Sources,
 //! Passes, Quality, and Result Snapshots around existing Simulation Layers executed
-//! by [`crate::eval::StackEvaluator`]. Scenarios may be created, edited, run, frozen,
+//! by the CPU stack evaluator. Scenarios may be created, edited, run, frozen,
 //! or ignored at any time — they are not mandatory workflow steps.
 //!
 //! Three spatial concepts are kept separate:

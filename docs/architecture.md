@@ -8,8 +8,9 @@ design was reached, but they do not override this document.
 
 | Crate | Responsibility |
 |-------|----------------|
-| `terra-core` | Domain model: heightfields, layer stack, masks, biomes, CPU evaluation, and editor commands |
-| `terra-jobs` | Cancellation primitive (`CancelToken`) and cancellable parallel-fill helpers shared by CPU eval; a leaf crate below `terra-core` |
+| `terra-core` | Backend-neutral domain model: heightfields, layer stack, masks, biomes, and editor commands |
+| `terra-cpu-eval` | Stateful CPU terrain evaluation, caches, scheduling, workers, timing, and output lifecycle |
+| `terra-jobs` | Cancellation primitive (`CancelToken`) and cancellable parallel-fill helpers shared by core algorithms and CPU evaluation |
 | `terra-gpu` | Reusable GPU kernels, capability descriptions, compiled-plan resources, derivatives, and tile caching |
 | `terra-gpu-eval` | Stateful GPU terrain evaluation, refinement jobs, timing, submission, and output lifecycle |
 | `terra-render` | wgpu terrain viewport, clipmaps, camera, lighting, and terrain render pass |
@@ -18,7 +19,8 @@ design was reached, but they do not override this document.
 | `terra-app` | Application shell: winit event loop, editor panels and tools, `PanelAction` dispatch, and renderer integration |
 | `terra-test-gpu` | Non-published headless GPU harness used by render and UI tests |
 
-`terra-core` must stay free of `wgpu` and UI crates. `terra-gpu-eval` depends on
+`terra-core` must stay free of evaluator, `wgpu`, and UI crates. `terra-cpu-eval`
+depends on `terra-core`, never the reverse. `terra-gpu-eval` depends on
 `terra-gpu`, never the reverse. `terra-gui` must stay free
 of `terra-core` and other domain types. `terra-render` and `terra-gui` do not
 depend on one another; `terra-app` owns both and integrates them.

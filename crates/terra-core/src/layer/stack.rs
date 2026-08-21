@@ -486,7 +486,7 @@ impl LayerStack {
 
     /// Flatten to layers in bottom→top evaluation order, skipping disabled groups.
     ///
-    /// Prefer tree evaluation ([`crate::eval::StackEvaluator`]) when groups are scoped;
+    /// Prefer CPU tree evaluation when groups are scoped;
     /// flatten remains useful for leaf iteration, dirty ids, and GPU approximate paths.
     pub fn flatten_layers(&self) -> Vec<&Layer> {
         let mut out = Vec::new();

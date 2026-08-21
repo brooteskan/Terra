@@ -11,9 +11,9 @@ use serde::{Deserialize, Serialize};
 use terra_core::biome_definition::BiomeDefinitionId;
 use terra_core::biome_paint::BiomePaintTool;
 use terra_core::domain::DomainRole;
-use terra_core::eval::PreviewQuality;
 use terra_core::layer::{LayerId, StackCategory};
 use terra_core::mask::{MaskId, MaskPaintTool};
+use terra_core::quality::PreviewQuality;
 use terra_gui::{Color, Icon};
 
 use crate::ui::{EditorTool, LightingPreset, Preview2dMode, ViewportOverlayFlags};
