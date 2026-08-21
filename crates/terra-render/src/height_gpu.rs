@@ -959,6 +959,12 @@ impl HeightGpu {
             world_size.1 / h.max(1) as f32,
             SampleRect { x: 0, y: 0, w, h },
         );
+        // Aux maps belong to the document just as much as height does. Reset all
+        // channels immediately so a newly opened project cannot display wetness,
+        // flow, material, or climate results from the previous document while its
+        // CPU evaluation is still running.
+        self.upload_aux_maps_ex(device, queue, AuxMaps::default());
+        self.upload_placement_tint(device, queue, 0, 0, &[]);
     }
 
     pub fn display_normal_view(&self) -> &wgpu::TextureView {
@@ -1153,6 +1159,7 @@ impl HeightGpu {
 mod tests {
     use super::*;
     use terra_core::heightfield::HeightfieldMetrics;
+    use terra_core::mask::MaskField;
 
     fn assert_slot_dimensions(height: &HeightGpu, width: u32, height_px: u32) {
         assert_eq!(height.tex_size, (width, height_px));
@@ -1205,5 +1212,44 @@ mod tests {
 
         assert_slot_dimensions(&height, 32, 48);
         assert_eq!(height.world_size, (320.0, 480.0));
+    }
+
+    #[test]
+    fn project_reset_replaces_aux_maps_with_blank_textures() {
+        let Some(gpu) = terra_test_gpu::headless() else {
+            return;
+        };
+        let mut height = HeightGpu::new(&gpu.device, 64);
+        let metrics = HeightfieldMetrics::new(32, 32, 320.0, 320.0);
+        let wetness = MaskField::filled(metrics, 1.0);
+        height.upload_aux_maps_ex(
+            &gpu.device,
+            &gpu.queue,
+            AuxMaps {
+                wetness: Some(&wetness),
+                ..Default::default()
+            },
+        );
+        assert_eq!((height.wetness.width, height.wetness.height), (32, 32));
+
+        height.reset_project_state(&gpu.device, &gpu.queue, (1000.0, 750.0));
+
+        for map in [
+            &height.materials,
+            &height.wetness,
+            &height.vegetation,
+            &height.flow,
+            &height.temperature,
+            &height.rainfall,
+            &height.snow,
+            &height.soil_moisture,
+            &height.biomes,
+        ] {
+            assert_eq!((map.width, map.height), (1, 1));
+        }
+        assert_eq!(
+            (height.placement_tint.width, height.placement_tint.height),
+            (1, 1)
+        );
     }
 }

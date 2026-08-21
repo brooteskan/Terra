@@ -268,10 +268,12 @@ impl LayerKind {
             ],
             LayerKind::HydraulicErosion(_) => vec![
                 FieldId::Height,
+                FieldId::Hardness,
                 FieldId::Wetness,
                 FieldId::Sediment,
                 FieldId::Erosion,
                 FieldId::Deposition,
+                FieldId::Materials,
                 FieldId::Water,
                 FieldId::WaterVelocity,
                 FieldId::FlowAccumulation,

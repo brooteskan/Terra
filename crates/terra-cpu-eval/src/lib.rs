@@ -320,6 +320,12 @@ pub struct StackEvaluator {
     /// Prefix-checkpoint cache for `SculptStrokes` layers (#123). Survives across
     /// edits so an interactive stroke resumes an earlier stamp.
     sculpt_prefix: SculptPrefixStore,
+    /// Auxiliary outputs owned by the last stack that completed successfully.
+    /// A structural rebuild must remove these from the previous final aux map:
+    /// unlike external inputs, they are derived state that the new stack must
+    /// publish again. Keeping this ownership set also lets deletion unpublish a
+    /// field even though the deleted layer is absent from the incoming stack.
+    last_stack_aux_outputs: HashSet<String>,
 }
 
 impl Default for StackEvaluator {
@@ -334,7 +340,36 @@ impl StackEvaluator {
             registry: ProcessorRegistry::builtin(),
             cache: LayerCache::new(),
             sculpt_prefix: SculptPrefixStore::new(),
+            last_stack_aux_outputs: HashSet::new(),
         }
+    }
+
+    /// Remove derived outputs from a previous final aux snapshot before a
+    /// structural rebuild. The union is intentional: previous-stack keys cover
+    /// deleted/disabled producers, while current-stack keys cover reordered or
+    /// newly configured producers. Free-standing aux inputs remain available.
+    fn aux_for_structural_rebuild(
+        &self,
+        stack: &LayerStack,
+        previous: &HashMap<String, MaskField>,
+    ) -> HashMap<String, MaskField> {
+        let current = stack_aux_output_keys(stack);
+        previous
+            .iter()
+            .filter(|(key, _)| {
+                !self.last_stack_aux_outputs.contains(key.as_str())
+                    && !current.contains(key.as_str())
+            })
+            .map(|(key, field)| (key.clone(), field.clone()))
+            .collect()
+    }
+
+    fn structural_rebuild_owns_aux(&self, stack: &LayerStack, key: &str) -> bool {
+        self.last_stack_aux_outputs.contains(key) || stack_aux_output_keys(stack).contains(key)
+    }
+
+    fn note_completed_stack(&mut self, stack: &LayerStack) {
+        self.last_stack_aux_outputs = stack_aux_output_keys(stack);
     }
 
     pub fn mark_dirty_from(&mut self, stack: &LayerStack, id: LayerId) {
@@ -422,6 +457,7 @@ impl StackEvaluator {
     pub fn clear_project_caches(&mut self) {
         self.cache.clear();
         self.sculpt_prefix.clear();
+        self.last_stack_aux_outputs.clear();
     }
 
     /// Full rebuild (Phase 1 path) — tree walk so scoped groups compose correctly.
@@ -1290,6 +1326,16 @@ impl StackEvaluator {
         );
         Some((cached.height.clone(), child_aux))
     }
+}
+
+fn stack_aux_output_keys(stack: &LayerStack) -> HashSet<String> {
+    stack
+        .flatten_layers()
+        .into_iter()
+        .flat_map(|layer| layer.kind.produced_fields())
+        .filter(|field| *field != terra_core::field_data::FieldId::Height)
+        .map(|field| field.cache_key())
+        .collect()
 }
 
 fn collect_descendant_layer_ids(nodes: &[StackNode]) -> Vec<LayerId> {

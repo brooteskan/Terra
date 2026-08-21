@@ -312,9 +312,21 @@ fn run_cpu_job(
     ctx.quality = job.quality;
     ctx.level_steps = job.level_steps.clone();
     ctx.mask_assets = job.masks.clone();
-    ctx.set_aux_hashmap(job.aux.clone());
-    if let Some(strata) = &job.strata {
-        ctx.aux_maps.strata = Some(strata.clone());
+    let initial_aux = if job.mark_all_dirty {
+        evaluator.aux_for_structural_rebuild(&job.stack, &job.aux)
+    } else {
+        job.aux.clone()
+    };
+    ctx.set_aux_hashmap(initial_aux);
+    let rebuilds_strata = job.mark_all_dirty
+        && evaluator.structural_rebuild_owns_aux(
+            &job.stack,
+            terra_core::field_data::keys::STRATA_REFERENCE,
+        );
+    if !rebuilds_strata {
+        if let Some(strata) = &job.strata {
+            ctx.aux_maps.strata = Some(strata.clone());
+        }
     }
     // Bake masks against the prior composed DEM, not zeros.
     let reference;
@@ -349,6 +361,7 @@ fn run_cpu_job(
     }
 
     ctx.sync_aux_hashmap();
+    evaluator.note_completed_stack(&job.stack);
     Ok(EvalWorkResult {
         token: job.token,
         quality: job.quality,
@@ -381,7 +394,9 @@ fn resample_height_nearest(src: &Heightfield, dst: HeightfieldMetrics) -> Height
 #[cfg(test)]
 mod tests {
     use super::*;
-    use terra_core::layer::{BlendMode, EffectFilterParams, FlatParams, Layer, LayerKind};
+    use terra_core::layer::{
+        BlendMode, EffectFilterParams, FlatParams, HydraulicErosionParams, Layer, LayerKind,
+    };
 
     #[test]
     fn worker_produces_heightfield() {
@@ -643,6 +658,62 @@ mod tests {
             1
         );
         assert_eq!(second.height.get(16, 16), 25.0);
+    }
+
+    #[test]
+    fn structural_rebuild_unpublishes_removed_hydraulic_wetness() {
+        let metrics = HeightfieldMetrics::new(16, 16, 160.0, 160.0);
+        let base = Layer::new("Base", LayerKind::Flat(FlatParams { height: 25.0 }));
+        let mut hydraulic = HydraulicErosionParams::default();
+        hydraulic.iterations = 1;
+        hydraulic.level_count = 1;
+
+        let mut with_hydraulic = LayerStack::new();
+        with_hydraulic.push(base.clone());
+        with_hydraulic.push(Layer::new(
+            "Hydraulic",
+            LayerKind::HydraulicErosion(hydraulic),
+        ));
+
+        let live = Arc::new(AtomicU64::new(1));
+        let mut evaluator = StackEvaluator::new();
+        let first_request = EvalWorkRequest {
+            token: 1,
+            quality: PreviewQuality::Full,
+            stack: with_hydraulic,
+            masks: Vec::new(),
+            base_metrics: metrics,
+            level_steps: terra_core::analyze::LevelStepSettings::default(),
+            preview_res: 16,
+            export_res: 16,
+            aux: HashMap::new(),
+            strata: None,
+            mask_reference: None,
+            dirty_from: None,
+            dirty_region: None,
+            mark_all_dirty: true,
+        };
+        let first = run_cpu_job(&mut evaluator, &first_request, &live)
+            .expect("hydraulic build should complete");
+        assert!(first.aux.contains_key("wetness"));
+
+        let mut without_hydraulic = LayerStack::new();
+        without_hydraulic.push(base);
+        live.store(2, Ordering::Release);
+        let second_request = EvalWorkRequest {
+            token: 2,
+            stack: without_hydraulic,
+            aux: first.aux,
+            mask_reference: Some(Arc::new(first.height)),
+            ..first_request
+        };
+        let second = run_cpu_job(&mut evaluator, &second_request, &live)
+            .expect("post-removal build should complete");
+
+        assert!(
+            !second.aux.contains_key("wetness"),
+            "a structural rebuild must not inherit wetness owned by a removed layer"
+        );
     }
 
     /// #100 phase 4: a request's `dirty_region` (normalized UV) is mapped to tiles
