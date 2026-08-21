@@ -1,6 +1,6 @@
 //! GPU evaluator refinement implementation.
 
-use super::compiled_plan::{plan_fallback_diagnostic, plan_operation_fallback};
+use super::compiled_plan_support::{plan_fallback_diagnostic, plan_operation_fallback};
 use super::*;
 
 impl GpuTerrainEngine {

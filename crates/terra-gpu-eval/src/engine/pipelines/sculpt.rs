@@ -266,7 +266,11 @@ impl GpuTerrainEngine {
         let world_x = self.metrics.world_size_x;
         let world_z = self.metrics.world_size_z;
         let n = strokes.len() as u32;
-        let (region_x, region_y, region_w, region_h) = region;
+        // `region` is the rectangle the plan will composite and publish. Reconcile
+        // samples the stamped field one texel beyond it, so stamp into a private
+        // guard domain while keeping the final pass bounded to `region`.
+        let stamp_region = expand_sample_region(region, sculpt_stamp_guard(p), width, height);
+        let (region_x, region_y, region_w, region_h) = stamp_region;
         let gx = region_w.div_ceil(8).max(1);
         let gy = region_h.div_ceil(8).max(1);
         let num_partials = gx * gy;
@@ -427,15 +431,16 @@ impl GpuTerrainEngine {
             region_h,
         };
         let edited_u_buf = self.write_uniform(device, queue, &edited_u);
+        let (output_x, output_y, output_w, output_h) = region;
         let recon_u = SculptReconcileU {
             width,
             height,
             reconcile: p.reconcile,
             _p0: 0.0,
-            region_x,
-            region_y,
-            region_w,
-            region_h,
+            region_x: output_x,
+            region_y: output_y,
+            region_w: output_w,
+            region_h: output_h,
         };
         let recon_u_buf = self.write_uniform(device, queue, &recon_u);
 
@@ -626,7 +631,7 @@ impl GpuTerrainEngine {
             });
             pass.set_pipeline(&self.sculpt_strokes_reconcile.pipeline);
             pass.set_bind_group(0, &recon_bg, &[]);
-            pass.dispatch_workgroups(gx, gy, 1);
+            pass.dispatch_workgroups(output_w.div_ceil(8).max(1), output_h.div_ceil(8).max(1), 1);
         }
     }
 }

@@ -96,12 +96,14 @@ impl GpuTerrainEngine {
                         self.expand_range(stroke.target_height, stroke.target_height);
                     }
                 }
-                self.blend_into_current(
+                self.blend_into_current_with_mask_region(
                     device,
                     queue,
                     encoder,
                     layer.common.opacity,
                     layer.common.blend,
+                    [TexSlot::MaskOnes, TexSlot::UnitMask],
+                    self.last_dirty_rect,
                 )?;
             }
             (GpuKernel::Path, LayerKind::Path(p)) => {

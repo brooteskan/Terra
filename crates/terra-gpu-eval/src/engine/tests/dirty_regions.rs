@@ -623,6 +623,124 @@ fn warm_stroke_append_uploads_only_the_runtime_tail() {
     assert!(error <= 1.0e-3, "warm stroke append drifted by {error}");
 }
 
+/// A warm Pinch drag reads the immutable layer input one sample beyond its stamp
+/// rectangle, then reconcile reads the stamped field one sample farther. Those
+/// guard samples must be refreshed without publishing them; otherwise every
+/// bounded dab leaves a rectangular seam until a later full-field evaluation.
+#[test]
+fn warm_pinch_drag_matches_full_field_before_refinement() {
+    let Some(gpu) = terra_test_gpu::headless() else {
+        return;
+    };
+    let res = 64u32;
+    let metrics = HeightfieldMetrics::new(res, res, 640.0, 640.0);
+    let mut stack = LayerStack::new();
+    stack.push(Layer::new(
+        "varied base",
+        LayerKind::SculptBase(varied_sculpt(res)),
+    ));
+    let strokes = Layer::new(
+        "pinch",
+        LayerKind::SculptStrokes(SculptStrokeParams {
+            strokes: vec![terra_core::layer::SculptStroke {
+                kind: SculptStrokeKind::Pinch,
+                points: vec![terra_core::layer::SculptPoint {
+                    u: 0.44,
+                    v: 0.5,
+                    pressure: 1.0,
+                }],
+                radius_m: 55.0,
+                strength: 0.85,
+                target_height: 0.0,
+                falloff: 0.7,
+                enabled: true,
+            }],
+            reconcile: 0.15,
+        }),
+    );
+    let strokes_id = strokes.id();
+    stack.push(strokes);
+
+    let mut engine = GpuTerrainEngine::new(&gpu.device, res);
+    engine.mark_all_dirty(&stack);
+    engine
+        .evaluate(
+            &gpu.device,
+            &gpu.queue,
+            &stack,
+            &[],
+            metrics,
+            PreviewQuality::Draft,
+            false,
+            None,
+        )
+        .expect("prime pinch field");
+
+    for u in [0.47, 0.50, 0.53, 0.56] {
+        let LayerKind::SculptStrokes(params) =
+            &mut stack.find_mut(strokes_id).expect("pinch layer").kind
+        else {
+            panic!("pinch layer changed kind");
+        };
+        params.strokes[0]
+            .points
+            .push(terra_core::layer::SculptPoint {
+                u,
+                v: 0.5,
+                pressure: 1.0,
+            });
+
+        let center_x = (u * res as f32).floor() as u32;
+        engine.set_dirty_rect(Some((center_x.saturating_sub(7), 25, 15, 15)));
+        engine.mark_dirty(strokes_id);
+        let incremental = engine
+            .evaluate(
+                &gpu.device,
+                &gpu.queue,
+                &stack,
+                &[],
+                metrics,
+                PreviewQuality::Draft,
+                true,
+                None,
+            )
+            .expect("bounded pinch update")
+            .cpu
+            .expect("bounded pinch readback");
+
+        let mut oracle_engine = GpuTerrainEngine::new(&gpu.device, res);
+        let oracle = oracle_engine
+            .evaluate(
+                &gpu.device,
+                &gpu.queue,
+                &stack,
+                &[],
+                metrics,
+                PreviewQuality::Draft,
+                true,
+                None,
+            )
+            .expect("full pinch oracle")
+            .cpu
+            .expect("full pinch readback");
+        let incremental_dense = incremental.to_dense();
+        let oracle_dense = oracle.to_dense();
+        let (max_index, error) = incremental_dense
+            .iter()
+            .zip(&oracle_dense)
+            .enumerate()
+            .map(|(index, (got, want))| (index, (got - want).abs()))
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .expect("non-empty heightfield");
+        assert!(
+            error <= 1.0e-3,
+            "bounded Pinch at u={u} left a rectangular seam at ({}, {}) (max error {error})",
+            max_index % res as usize,
+            max_index / res as usize,
+        );
+    }
+}
+
 /// #125: domain displacement changes only which procedural-noise coordinate is
 /// generated. It never samples a displaced texel from the entering height, so a
 /// bounded upstream edit still passes through its Add blend without a

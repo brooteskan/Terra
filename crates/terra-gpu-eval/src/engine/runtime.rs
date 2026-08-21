@@ -59,9 +59,50 @@ use super::api::{
 };
 use super::stats::{GpuEvalStats, GpuPlanOperationDisposition, GpuPlanOperationTrace};
 
+/// Expand a texel rectangle by `pad` samples on every side, clamped to the
+/// current field. Sculpt uses this to distinguish its published rectangle from
+/// the larger guard domain required by neighborhood reads.
+fn expand_sample_region(
+    (x, y, width, height): (u32, u32, u32, u32),
+    pad: u32,
+    field_width: u32,
+    field_height: u32,
+) -> (u32, u32, u32, u32) {
+    if width == 0 || height == 0 || field_width == 0 || field_height == 0 {
+        return (x, y, width, height);
+    }
+    let x0 = x.saturating_sub(pad);
+    let y0 = y.saturating_sub(pad);
+    let x1 = x.saturating_add(width).saturating_add(pad).min(field_width);
+    let y1 = y
+        .saturating_add(height)
+        .saturating_add(pad)
+        .min(field_height);
+    (x0, y0, x1.saturating_sub(x0), y1.saturating_sub(y0))
+}
+
+fn sculpt_stamp_guard(p: &SculptStrokeParams) -> u32 {
+    u32::from(p.reconcile > 0.0)
+}
+
+fn sculpt_source_guard(p: &SculptStrokeParams) -> u32 {
+    sculpt_stamp_guard(p)
+        + u32::from(p.strokes.iter().any(|stroke| {
+            stroke.enabled
+                && matches!(
+                    stroke.kind,
+                    SculptStrokeKind::Smooth
+                        | SculptStrokeKind::Pinch
+                        | SculptStrokeKind::Coastline
+                )
+        }))
+}
+
 #[path = "compiled_plan.rs"]
 mod compiled_plan;
-use compiled_plan::{cpu_resume_prefix_is_height_only, BridgePrefix};
+#[path = "compiled_plan_support.rs"]
+mod compiled_plan_support;
+use compiled_plan_support::{cpu_resume_prefix_is_height_only, BridgePrefix};
 #[path = "dirty.rs"]
 mod dirty_state;
 #[path = "pipelines/mod.rs"]
