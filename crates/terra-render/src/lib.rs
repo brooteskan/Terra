@@ -57,7 +57,7 @@ pub use adaptive_sampling::{AdaptiveSamplingState, TileState, VarianceTileSummar
 pub use backends::{
     GBufferViews, HdrFrame, PresentationBackendId, ProgressivePostPipeline, ProgressivePtOutput,
 };
-pub use brush::{pick_terrain_uv, pick_terrain_uv_on_surface, BrushGizmo, BrushOverlay};
+pub use brush::{pick_terrain_uv, pick_terrain_uv_on_surface, BrushOverlay, SurfacePick};
 pub use camera::OrbitCamera;
 pub use clipmap::{
     ClipmapConfig, ClipmapPresentPlan, ClipmapRingDraw, ClipmapRingLevel, WorldGridConfig,
@@ -1089,7 +1089,8 @@ impl TerrainRenderer {
             })
             .collect();
         let camera = OrbitCamera::default();
-        let brush = BrushOverlay::new(&device, format);
+        let mut brush = BrushOverlay::new(&device, format);
+        brush.rebind_height(&device, heights.display_height_view());
         let guides = GuideOverlay::new(&device, format);
         let overhang = OverhangOverlay::new(&device, format);
         let vegetation = VegetationOverlay::new(&device, format);
@@ -1786,6 +1787,8 @@ impl TerrainRenderer {
     fn recreate_bind_group(&mut self) {
         self.shadow_map
             .recreate_bind_group(&self.device, self.heights.display_height_view());
+        self.brush
+            .rebind_height(&self.device, self.heights.display_height_view());
         self.bind_group = Self::make_bind_group(
             &self.device,
             &self.bind_group_layout,
@@ -1903,14 +1906,44 @@ impl TerrainRenderer {
         self.notify_invalidation(InvalidationReason::LightingChanged);
     }
 
-    pub fn set_brush_gizmo(&mut self, gizmo: Option<BrushGizmo>) {
-        self.brush.set_gizmo(gizmo);
+    pub fn request_brush_surface_pick(
+        &mut self,
+        cursor: (f32, f32),
+        screen: (f32, f32),
+        radius_uv: f32,
+        color: [f32; 4],
+    ) {
+        let aspect = self.config.width as f32 / self.config.height.max(1) as f32;
+        self.brush.request_surface_pick(
+            &self.device,
+            &self.queue,
+            &self.camera,
+            aspect,
+            cursor,
+            screen,
+            self.heights.world_size,
+            self.heights.height_range,
+            radius_uv,
+            color,
+        );
     }
 
-    /// Update brush ring mesh to match current gizmo + optional ring height samples.
-    pub fn sync_brush_geometry(&mut self, ring_heights: Option<&[f32]>) {
+    pub fn hide_brush_gizmo(&mut self) {
+        self.brush.hide(&self.queue);
+    }
+
+    pub fn poll_brush_surface_pick(&mut self) {
+        self.brush.poll(&self.device);
+    }
+
+    pub fn latest_brush_surface_pick(
+        &self,
+        cursor: (f32, f32),
+        screen: (f32, f32),
+    ) -> Option<SurfacePick> {
+        let aspect = self.config.width as f32 / self.config.height.max(1) as f32;
         self.brush
-            .sync_geometry(&self.queue, self.heights.world_size, ring_heights);
+            .latest_pick_for(&self.camera, aspect, cursor, screen)
     }
 
     /// Upload or clear the Phase J overhang / cave roof proxy mesh.
@@ -2085,6 +2118,7 @@ impl TerrainRenderer {
             "render_to_view target size must match the configured size; call resize() first"
         );
 
+        self.brush.poll(&self.device);
         self.scene_versions.begin_frame();
 
         let aspect = width as f32 / height.max(1) as f32;
@@ -2547,7 +2581,7 @@ impl TerrainRenderer {
                         }
                         self.vegetation.draw(&mut pass);
                         self.overhang.draw(&mut pass);
-                        self.brush.draw(&mut pass);
+                        self.brush.draw(&mut pass, true);
                         self.guides.draw(&mut pass);
                     }
                 }
@@ -2586,29 +2620,47 @@ impl TerrainRenderer {
             );
             if self.frame_graph.schedule.overlays {
                 self.frame_graph.mark(PassKind::Overlays);
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("progressive-overlay-pass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Load,
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                        view: &self.depth,
-                        depth_ops: Some(wgpu::Operations {
-                            load: wgpu::LoadOp::Load,
-                            store: wgpu::StoreOp::Store,
+                {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("progressive-guide-overlay-pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                            view: &self.depth,
+                            depth_ops: Some(wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            }),
+                            stencil_ops: None,
                         }),
-                        stencil_ops: None,
-                    }),
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                });
-                self.brush.draw(&mut pass);
-                self.guides.draw(&mut pass);
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                    });
+                    self.guides.draw(&mut pass);
+                }
+                {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("progressive-brush-overlay-pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                    });
+                    self.brush.draw(&mut pass, false);
+                }
             }
         }
 

@@ -92,6 +92,26 @@ fn raster_frame_covers_offscreen_target() {
     );
     assert_fully_overwritten(&gpu.read_rgba8(&target), "uploaded frame");
 
+    // The brush picker must intersect the same uploaded GPU height texture used
+    // by the frame. Its production path is non-blocking; the explicit waits are
+    // test-only so the asynchronous result can be asserted deterministically.
+    renderer.request_brush_surface_pick(
+        (W as f32 * 0.5, H as f32 * 0.5),
+        (W as f32, H as f32),
+        0.05,
+        [1.0, 1.0, 1.0, 1.0],
+    );
+    let _ = gpu.device.poll(wgpu::Maintain::Wait);
+    renderer.poll_brush_surface_pick();
+    let _ = gpu.device.poll(wgpu::Maintain::Wait);
+    renderer.poll_brush_surface_pick();
+    let pick = renderer
+        .latest_brush_surface_pick((W as f32 * 0.5, H as f32 * 0.5), (W as f32, H as f32))
+        .expect("center cursor should hit the uploaded GPU terrain");
+    assert!((pick.uv.0 - 0.5).abs() < 1.0e-3, "pick={pick:?}");
+    assert!((pick.uv.1 - 0.5).abs() < 1.0e-3, "pick={pick:?}");
+    assert!((pick.height - 25.0).abs() < 1.0e-3, "pick={pick:?}");
+
     // Frame 3: enable raster cast shadows (dormant until wired to shadow_strength)
     // so the directional depth pass actually runs — guard it against validation
     // errors and confirm the frame still fully covers the target.

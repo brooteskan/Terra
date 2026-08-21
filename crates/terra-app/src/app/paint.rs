@@ -1,7 +1,7 @@
 use crate::ui::PanelAction;
 use terra_core::mask::bake_mask_assets;
 use terra_gui::GuiContext;
-use terra_render::{pick_terrain_uv_on_surface, BrushGizmo};
+use terra_render::pick_terrain_uv_on_surface;
 
 use super::{AppScreen, TerraApp};
 impl TerraApp {
@@ -491,7 +491,7 @@ impl TerraApp {
     }
 
     /// Raycast cursor onto the height surface â†’ terrain UV (same mapping as the brush gizmo).
-    pub(crate) fn pick_paint_uv(&self) -> Option<(f32, f32)> {
+    pub(crate) fn pick_paint_uv(&mut self) -> Option<(f32, f32)> {
         let (x, y) = self.cursor_logical()?;
         if !self.viewport_rect.contains(x, y) {
             return None;
@@ -501,13 +501,17 @@ impl TerraApp {
         if self.gui_wants_pointer && !self.sculpt_stroke_active {
             return None;
         }
-        let renderer = self.renderer.as_ref()?;
         let window = self.window.as_ref()?;
         let ppp = window.scale_factor() as f32;
+        let renderer = self.renderer.as_mut()?;
         let (surface_w, surface_h) = renderer.size();
         let screen_w = surface_w as f32 / ppp;
         let screen_h = surface_h as f32 / ppp;
         let aspect = surface_w as f32 / surface_h.max(1) as f32;
+        renderer.poll_brush_surface_pick();
+        if let Some(pick) = renderer.latest_brush_surface_pick((x, y), (screen_w, screen_h)) {
+            return Some(pick.uv);
+        }
         pick_terrain_uv_on_surface(
             &renderer.camera,
             aspect,
@@ -550,8 +554,7 @@ impl TerraApp {
             && !self.modifiers_alt;
         if !show {
             if let Some(renderer) = self.renderer.as_mut() {
-                renderer.set_brush_gizmo(None);
-                renderer.sync_brush_geometry(None);
+                renderer.hide_brush_gizmo();
             }
             return;
         }
@@ -563,34 +566,22 @@ impl TerraApp {
         } else {
             self.ui_state.sculpt_radius.max(0.02)
         };
-        let color = self.brush_gizmo_color();
-        let Some((u, v)) = self.pick_paint_uv() else {
-            if let Some(renderer) = self.renderer.as_mut() {
-                renderer.set_brush_gizmo(None);
-                renderer.sync_brush_geometry(None);
-            }
+        let Some((x, y)) = self.cursor_logical() else {
             return;
         };
-        let world = self
-            .renderer
-            .as_ref()
-            .map(|r| r.heights.world_size)
-            .unwrap_or((4096.0, 4096.0));
-        let ring_y = terra_render::BrushOverlay::sample_ring_heights(
-            self.last_height.as_ref(),
-            world,
-            u,
-            v,
-            radius,
-        );
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        let ppp = window.scale_factor() as f32;
+        let color = self.brush_gizmo_color();
         if let Some(renderer) = self.renderer.as_mut() {
-            renderer.set_brush_gizmo(Some(BrushGizmo {
-                u,
-                v,
-                radius_uv: radius,
+            let (surface_w, surface_h) = renderer.size();
+            renderer.request_brush_surface_pick(
+                (x, y),
+                (surface_w as f32 / ppp, surface_h as f32 / ppp),
+                radius,
                 color,
-            }));
-            renderer.sync_brush_geometry(Some(&ring_y));
+            );
         }
     }
 
