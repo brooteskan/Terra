@@ -1864,10 +1864,19 @@ fn warm_cache_base_edit_reuses_heightmap_contributions_and_source_texture() {
         "import",
         LayerKind::ImportHeightmap(params.clone()),
     ));
-    stack.push(Layer::new(
+    let mut stamp = Layer::new(
         "stamp",
         LayerKind::Stamp2d(Stamp2dParams { heightmap: params }),
-    ));
+    );
+    stamp.common.shape_transform = Some(terra_core::biome_paint::ShapeTransform {
+        offset_x: 18.0,
+        offset_z: -12.0,
+        scale: 0.7,
+        rotation_deg: 27.0,
+        blend_size: 0.2,
+        blend_roundness: 0.35,
+    });
+    stack.push(stamp);
 
     let mut engine = GpuTerrainEngine::new(&gpu.device, metrics.width);
     engine.mark_all_dirty(&stack);
@@ -1894,7 +1903,7 @@ fn warm_cache_base_edit_reuses_heightmap_contributions_and_source_texture() {
     params.samples[16 * 32 + 16] += 3.0;
     engine.set_dirty_rect(Some((16, 16, 1, 1)));
     engine.mark_dirty(base_id);
-    engine
+    let warm = engine
         .evaluate(
             &gpu.device,
             &gpu.queue,
@@ -1902,13 +1911,22 @@ fn warm_cache_base_edit_reuses_heightmap_contributions_and_source_texture() {
             &[],
             metrics,
             PreviewQuality::Draft,
-            false,
+            true,
             None,
         )
         .expect("incremental base edit");
 
     assert_eq!(engine.executed_kernels, vec![GpuKernel::Sculpt]);
     assert_eq!(engine.source_upload_count, 1);
+    let actual = warm.cpu.expect("warm transformed-stamp readback");
+    let expected = cpu_oracle(&stack, metrics);
+    let max_error = actual
+        .to_dense()
+        .iter()
+        .zip(expected.to_dense())
+        .map(|(gpu, cpu)| (gpu - cpu).abs())
+        .fold(0.0f32, f32::max);
+    assert!(max_error < 0.001, "warm Stamp2d max error {max_error}");
     let _ = std::fs::remove_file(path);
 }
 

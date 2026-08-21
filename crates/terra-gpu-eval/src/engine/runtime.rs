@@ -156,6 +156,8 @@ pub struct GpuTerrainEngine {
     /// Ordered-f32 min/max written by `effect_filter_range` and read by remap kernels.
     effect_filter_range_buffer: wgpu::Buffer,
     layer_cache: HashMap<LayerId, HeightTex>,
+    /// Stamp2d transform weights paired with reusable compiled candidates.
+    stamp_mask_cache: HashMap<LayerId, HeightTex>,
     /// Raw normalized source rasters, independent from output-sized contributions.
     source_rasters: HashMap<PathBuf, SourceRasterTex>,
     /// Persistent authored stroke payloads keyed by stable layer identity. Live

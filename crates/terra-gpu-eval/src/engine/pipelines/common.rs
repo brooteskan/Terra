@@ -165,6 +165,22 @@ impl GpuTerrainEngine {
         mode: BlendMode,
         masks: [TexSlot; 2],
     ) -> Result<(), GpuError> {
+        self.blend_into_current_with_mask_region(device, queue, encoder, opacity, mode, masks, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in super::super) fn blend_into_current_with_mask_region(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        opacity: f32,
+        mode: BlendMode,
+        masks: [TexSlot; 2],
+        region: Option<(u32, u32, u32, u32)>,
+    ) -> Result<(), GpuError> {
+        let (region_x, region_y, region_w, region_h) =
+            region.unwrap_or((0, 0, self.metrics.width, self.metrics.height));
         let u = BlendU {
             width: self.metrics.width,
             height: self.metrics.height,
@@ -176,10 +192,10 @@ impl GpuTerrainEngine {
                     format!("{mode:?} is not implemented"),
                 )
             })?,
-            region_x: 0,
-            region_y: 0,
-            region_w: self.metrics.width,
-            region_h: self.metrics.height,
+            region_x,
+            region_y,
+            region_w,
+            region_h,
         };
         let u_buf = self.write_uniform(device, queue, &u);
         let src_ping = self.current == 0;
@@ -225,11 +241,7 @@ impl GpuTerrainEngine {
             });
             pass.set_pipeline(&self.blend.pipeline);
             pass.set_bind_group(0, &bg, &[]);
-            pass.dispatch_workgroups(
-                self.metrics.width.div_ceil(8),
-                self.metrics.height.div_ceil(8),
-                1,
-            );
+            pass.dispatch_workgroups(region_w.div_ceil(8), region_h.div_ceil(8), 1);
         }
         self.swap_current();
         Ok(())

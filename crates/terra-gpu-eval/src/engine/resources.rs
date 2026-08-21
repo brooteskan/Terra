@@ -382,6 +382,7 @@ impl GpuTerrainEngine {
         self.active_plan_revision = None;
         self.deferred_plan_resume = None;
         self.layer_cache.clear();
+        self.stamp_mask_cache.clear();
         self.source_rasters.clear();
         self.stroke_runtime.clear();
         self.dirty.clear();

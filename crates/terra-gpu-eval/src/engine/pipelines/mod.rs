@@ -1170,6 +1170,7 @@ impl GpuTerrainEngine {
             sculpt_edited,
             effect_filter_range_buffer,
             layer_cache: HashMap::new(),
+            stamp_mask_cache: HashMap::new(),
             source_rasters: HashMap::new(),
             stroke_runtime: HashMap::new(),
             #[cfg(test)]

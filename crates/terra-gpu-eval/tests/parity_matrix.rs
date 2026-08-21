@@ -279,39 +279,65 @@ fn gpu_required_import_heightmap_matches_cpu_oracle() {
 fn gpu_required_transformed_stamp2d_matches_cpu_oracle() {
     let source = TempHeightmap::new();
     let metrics = HeightfieldMetrics::new(37, 23, 370.0, 138.0);
-    let mut stack = LayerStack::new();
-    stack.push(Layer::new(
-        "base",
-        LayerKind::Flat(FlatParams { height: 12.0 }),
-    ));
-    let mut stamp = Layer::new(
-        "stamp",
-        LayerKind::Stamp2d(Stamp2dParams {
-            heightmap: ImportHeightmapParams {
-                path: source.path(),
-                height_scale: 91.0,
-                height_offset: 4.0,
-            },
-        }),
-    );
-    stamp.common.shape_transform = Some(ShapeTransform {
-        offset_x: 27.0,
-        offset_z: -9.0,
-        scale: 0.63,
-        rotation_deg: 31.0,
-        blend_size: 0.28,
-        blend_roundness: 0.42,
-    });
-    stamp.common.opacity = 0.73;
-    stack.push(stamp);
-    let cpu = cpu_oracle(&stack, &[], metrics);
-    let gpu = gpu_eval(&stack, &[], metrics);
-    assert_field_parity(
-        "asset.heightmap-sample.stamp2d",
-        &gpu,
-        &cpu,
-        HEIGHTMAP_SAMPLE_PREVIEW,
-    );
+    for blend in [
+        BlendMode::Normal,
+        BlendMode::Replace,
+        BlendMode::Interpolate,
+        BlendMode::Add,
+        BlendMode::Subtract,
+        BlendMode::Multiply,
+        BlendMode::Min,
+        BlendMode::Max,
+        BlendMode::Overlay,
+        BlendMode::HeightBlend,
+        BlendMode::SmoothMaximum,
+        BlendMode::SmoothMinimum,
+        BlendMode::SmoothUnion,
+        BlendMode::SmoothSubtraction,
+    ] {
+        let mut stack = LayerStack::new();
+        stack.push(Layer::new(
+            "base",
+            LayerKind::Flat(FlatParams { height: 12.0 }),
+        ));
+        let mut stamp = Layer::new(
+            "stamp",
+            LayerKind::Stamp2d(Stamp2dParams {
+                heightmap: ImportHeightmapParams {
+                    path: source.path(),
+                    height_scale: 91.0,
+                    height_offset: 4.0,
+                },
+            }),
+        );
+        stamp.common.shape_transform = Some(ShapeTransform {
+            offset_x: 27.0,
+            offset_z: -9.0,
+            scale: 0.63,
+            rotation_deg: 31.0,
+            blend_size: 0.28,
+            blend_roundness: 0.42,
+        });
+        stamp.common.opacity = 0.73;
+        stamp.common.blend = blend;
+        stack.push(stamp);
+
+        let cpu = cpu_oracle(&stack, &[], metrics);
+        let gpu = gpu_eval(&stack, &[], metrics);
+        for (x, y) in [(0, 0), (36, 0), (0, 22), (36, 22)] {
+            assert_eq!(cpu.get(x, y), 12.0, "CPU {blend:?} outside footprint");
+            assert!(
+                (gpu.get(x, y) - 12.0).abs() < 0.001,
+                "GPU {blend:?} changed ({x},{y}) outside footprint"
+            );
+        }
+        assert_field_parity(
+            &format!("asset.heightmap-sample.stamp2d.{blend:?}"),
+            &gpu,
+            &cpu,
+            HEIGHTMAP_SAMPLE_PREVIEW,
+        );
+    }
 }
 
 #[test]

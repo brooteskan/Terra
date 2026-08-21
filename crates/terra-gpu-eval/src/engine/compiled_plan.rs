@@ -269,6 +269,159 @@ fn resample_bridge_prefix(src: &Heightfield, dst: HeightfieldMetrics) -> Vec<f32
 }
 
 impl GpuTerrainEngine {
+    fn cache_compiled_stamp_mask(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        layer: &Layer,
+        region: (u32, u32, u32, u32),
+    ) {
+        if !matches!(layer.kind, LayerKind::Stamp2d(_)) {
+            return;
+        }
+        let id = layer.id();
+        let needs_texture = self.stamp_mask_cache.get(&id).is_none_or(|texture| {
+            texture.width != self.metrics.width || texture.height != self.metrics.height
+        });
+        if needs_texture {
+            self.stamp_mask_cache.insert(
+                id,
+                HeightTex::new(
+                    device,
+                    "compiled-stamp-mask-cache",
+                    self.metrics.width,
+                    self.metrics.height,
+                ),
+            );
+        }
+        let cached = self
+            .stamp_mask_cache
+            .get(&id)
+            .expect("stamp mask cache just ensured");
+        record_copy_views_region(
+            device,
+            encoder,
+            &self.copy,
+            &self.stamp_mask.view,
+            &cached.view,
+            self.metrics.width,
+            self.metrics.height,
+            region,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_compiled_layer_composite(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        resources: &GpuPlanResources,
+        authored: &Layer,
+        base: terra_core::terrain_plan::FieldSlot,
+        layer_candidate: terra_core::terrain_plan::FieldSlot,
+        mask: terra_core::terrain_plan::FieldSlot,
+        output: terra_core::terrain_plan::FieldSlot,
+        region: (u32, u32, u32, u32),
+    ) -> Result<(), CompiledDispatchError> {
+        if matches!(authored.kind, LayerKind::Stamp2d(_)) {
+            // Stamp2d's transform footprint is produced beside the sampled raster
+            // and cached with that reusable candidate. Restore it as a second
+            // outer-composite mask; raw `layer_tex` alone clamps the raster across
+            // the whole field, while shared scratch can belong to another stamp.
+            let cached_mask = self.stamp_mask_cache.get(&authored.id()).ok_or_else(|| {
+                CompiledDispatchError::Gpu(cpu_required(
+                    GpuFallbackCode::RuntimeResourceLimit,
+                    "Stamp2d transform mask",
+                    "compiled Stamp2d candidate has no matching transform-mask cache",
+                ))
+            })?;
+            record_copy_views_region(
+                device,
+                encoder,
+                &self.copy,
+                &cached_mask.view,
+                &self.stamp_mask.view,
+                self.metrics.width,
+                self.metrics.height,
+                region,
+            );
+            for (source, destination) in [
+                (
+                    resources.view(base).map_err(GpuPlanOperationError::from)?,
+                    &self.ping.view,
+                ),
+                (
+                    resources
+                        .view(layer_candidate)
+                        .map_err(GpuPlanOperationError::from)?,
+                    &self.layer_tex.view,
+                ),
+                (
+                    resources.view(mask).map_err(GpuPlanOperationError::from)?,
+                    &self.unit_mask.view,
+                ),
+            ] {
+                record_copy_views_region(
+                    device,
+                    encoder,
+                    &self.copy,
+                    source,
+                    destination,
+                    self.metrics.width,
+                    self.metrics.height,
+                    region,
+                );
+            }
+            self.current = 0;
+            self.blend_into_current_with_mask_region(
+                device,
+                queue,
+                encoder,
+                authored.common.opacity,
+                authored.common.blend,
+                [TexSlot::UnitMask, TexSlot::StampMask],
+                Some(region),
+            )?;
+            let source = if self.current == 0 {
+                &self.ping.view
+            } else {
+                &self.pong.view
+            };
+            record_copy_views_region(
+                device,
+                encoder,
+                &self.copy,
+                source,
+                resources
+                    .view(output)
+                    .map_err(GpuPlanOperationError::from)?,
+                self.metrics.width,
+                self.metrics.height,
+                region,
+            );
+            return Ok(());
+        }
+
+        self.plan_operations.composite_group_region(
+            device,
+            encoder,
+            resources,
+            base,
+            base,
+            layer_candidate,
+            mask,
+            output,
+            GpuGroupCompositeParams {
+                blend: authored.common.blend,
+                opacity: authored.common.opacity,
+                mode: GroupCompositeMode::Standard,
+            },
+            Some(region),
+        )?;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn record_compiled_operation(
         &mut self,
@@ -396,6 +549,7 @@ impl GpuTerrainEngine {
                     kernel.kernel,
                     quality,
                 )?;
+                self.cache_compiled_stamp_mask(device, encoder, authored, region);
                 let source = if runs_in_place {
                     if self.current == 0 {
                         &self.ping.view
@@ -426,21 +580,17 @@ impl GpuTerrainEngine {
                 output,
             } => {
                 let authored = stack.find(*layer).expect("compiled layer owner");
-                self.plan_operations.composite_group_region(
+                self.record_compiled_layer_composite(
                     device,
+                    queue,
                     encoder,
                     candidate,
-                    *base,
+                    authored,
                     *base,
                     *layer_candidate,
                     *mask,
                     *output,
-                    GpuGroupCompositeParams {
-                        blend: authored.common.blend,
-                        opacity: authored.common.opacity,
-                        mode: GroupCompositeMode::Standard,
-                    },
-                    Some(region),
+                    region,
                 )?;
             }
             TerrainOpKind::CompositeGroup {
@@ -1011,6 +1161,7 @@ impl GpuTerrainEngine {
                             kernel.kernel,
                             quality,
                         )?;
+                        self.cache_compiled_stamp_mask(device, &mut encoder, authored, region);
                         let source = if runs_in_place {
                             if self.current == 0 {
                                 &self.ping.view
@@ -1042,21 +1193,17 @@ impl GpuTerrainEngine {
                         output,
                     } => {
                         let authored = stack.find(*layer).expect("compiled layer owner");
-                        self.plan_operations.composite_group_region(
+                        self.record_compiled_layer_composite(
                             device,
+                            queue,
                             &mut encoder,
                             &candidate,
-                            *base,
+                            authored,
                             *base,
                             *layer_candidate,
                             *mask,
                             *output,
-                            GpuGroupCompositeParams {
-                                blend: authored.common.blend,
-                                opacity: authored.common.opacity,
-                                mode: GroupCompositeMode::Standard,
-                            },
-                            Some(region),
+                            region,
                         )?;
                         Ok(())
                     }
