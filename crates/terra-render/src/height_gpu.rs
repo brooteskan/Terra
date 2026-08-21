@@ -221,6 +221,10 @@ pub struct HeightGpu {
 }
 
 impl HeightGpu {
+    pub const fn local_slots_coherent(&self) -> bool {
+        self.local_slots_coherent
+    }
+
     pub fn new(device: &wgpu::Device, initial: u32) -> Self {
         let w = initial.max(PROJECT_RESET_TEXTURE_EXTENT);
         let slots = [HeightSlot::new(device, w, w), HeightSlot::new(device, w, w)];

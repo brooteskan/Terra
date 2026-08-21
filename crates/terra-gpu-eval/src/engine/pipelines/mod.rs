@@ -1129,7 +1129,11 @@ impl GpuTerrainEngine {
         Self {
             plan_operations: GpuPlanOperations::new(device),
             plan_resources: GpuPlanResourceCache::default(),
-            device_generation: 1,
+            device_generation: NEXT_DEVICE_GENERATION.fetch_add(1, Ordering::Relaxed),
+            output_resource_incarnation: GpuResourceIncarnation(1),
+            next_output_id: 1,
+            next_submission_serial: 1,
+            last_output_identity: None,
             active_plan_revision: None,
             deferred_plan_resume: None,
             fill,

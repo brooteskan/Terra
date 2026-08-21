@@ -95,6 +95,17 @@ fn resumable_refinement_is_depth_one_transactional_and_matches_complete_eval() {
         .expect("publish fenced candidate");
     assert!(result.fully_gpu);
     assert_eq!(result.freshness, GpuPreviewFreshness::Current);
+    let identity = result.output_identity.expect("refinement output identity");
+    assert!(identity.is_current_complete_final());
+    assert_eq!(
+        identity.coverage,
+        terra_gpu::output_identity::GpuOutputCoverage::WholeField
+    );
+    assert_eq!(
+        identity.last_write.completion,
+        terra_gpu::output_identity::GpuSubmissionCompletion::KnownComplete
+    );
+    assert!(identity.last_write.serial.0 > 0);
     assert!(resumable.plan_resources.current().is_some());
     assert!(!resumable.last_graph.plans.is_empty());
     assert_eq!(

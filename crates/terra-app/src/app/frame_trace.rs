@@ -40,7 +40,7 @@ pub(crate) enum FrameTraceEventKind {
     PlanAcquired,
     QueueSubmitted,
     CandidateAccepted,
-    CandidateRejectedStale,
+    CandidateRefused,
     PresentationRequested,
     SurfacePresented,
     GpuEvaluationResolved,
@@ -62,6 +62,9 @@ pub(crate) enum FrameTraceEventKind {
     DeviceLost,
     ShutdownRequested,
     FrameAborted,
+    TerrainPresentationTransition,
+    OutsideRegionProbeResolved,
+    EvaluationOutputSelected,
 }
 
 #[derive(Debug, Clone)]
@@ -81,6 +84,11 @@ pub(crate) struct FrameTraceEvent {
     pub(crate) completed_units: usize,
     pub(crate) total_units: usize,
     pub(crate) refinement_submission_depth: u8,
+    pub(crate) output_identity: Option<terra_gpu::output_identity::GpuTerrainOutputIdentity>,
+    pub(crate) presentation: Option<terra_render::TerrainPresentationRecord>,
+    pub(crate) diagnostic: Option<terra_render::TerrainTransitionDiagnosticCode>,
+    pub(crate) candidate_decision: Option<terra_render::TerrainPresentationDecisionCode>,
+    pub(crate) presentation_mode: Option<terra_render::TerrainPresentationMode>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -102,6 +110,7 @@ pub(crate) struct FrameTraceRecorder {
     pending_release: Option<(Instant, EditGeneration)>,
     verbose: bool,
     orphaned_events: u64,
+    first_violation: Option<terra_render::TerrainTransitionDiagnosticCode>,
 }
 
 impl Default for FrameTraceRecorder {
@@ -118,6 +127,7 @@ impl Default for FrameTraceRecorder {
                 || std::env::var("TERRA_FRAME_TRACE")
                     .is_ok_and(|value| value.eq_ignore_ascii_case("verbose")),
             orphaned_events: 0,
+            first_violation: None,
         }
     }
 }
@@ -158,9 +168,6 @@ impl FrameTraceRecorder {
             log::error!(target: "terra_app::logical_frame", "orphaned frame trace event: {kind:?}");
             return false;
         };
-        if !self.verbose {
-            return false;
-        }
         push_bounded(
             &mut self.events,
             EVENT_CAPACITY,
@@ -173,15 +180,264 @@ impl FrameTraceRecorder {
                 phase,
                 quality,
                 intent,
-                duration,
+                duration: if self.verbose { duration } else { None },
                 gpu_stats: None,
                 refinement_job: None,
                 completed_units: 0,
                 total_units: 0,
                 refinement_submission_depth: 0,
+                output_identity: None,
+                presentation: None,
+                diagnostic: None,
+                candidate_decision: None,
+                presentation_mode: None,
             },
         );
         true
+    }
+
+    pub(crate) fn record_presentation(
+        &mut self,
+        now: Instant,
+        identity: Option<FrameIdentity>,
+        phase: Option<FramePhase>,
+        evaluation: EvaluationTraceId,
+        record: terra_render::TerrainPresentationRecord,
+    ) {
+        if !self.record(
+            now,
+            FrameTraceEventKind::TerrainPresentationTransition,
+            identity,
+            phase,
+            Some(evaluation),
+            Some(record.candidate.actual_quality),
+            Some(record.candidate.intent),
+            None,
+        ) {
+            return;
+        }
+        if let Some(event) = self.events.back_mut() {
+            event.output_identity = Some(record.candidate);
+            event.presentation = Some(record);
+            event.diagnostic = record.shadow_diagnostic;
+            event.candidate_decision = Some(record.decision);
+            event.presentation_mode = Some(record.actual_mode);
+        }
+        if let Some(code) = record.shadow_diagnostic {
+            self.report_first_violation(code, record);
+        }
+    }
+
+    pub(crate) fn record_cpu_presentation(
+        &mut self,
+        now: Instant,
+        identity: Option<FrameIdentity>,
+        phase: Option<FramePhase>,
+        evaluation: EvaluationTraceId,
+        quality: PreviewQuality,
+    ) {
+        if !self.record(
+            now,
+            FrameTraceEventKind::TerrainPresentationTransition,
+            identity,
+            phase,
+            Some(evaluation),
+            Some(quality),
+            None,
+            None,
+        ) {
+            return;
+        }
+        if let Some(event) = self.events.back_mut() {
+            event.presentation_mode = Some(terra_render::TerrainPresentationMode::CpuUpload);
+            event.candidate_decision =
+                Some(terra_render::TerrainPresentationDecisionCode::Accepted);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_candidate_refusal(
+        &mut self,
+        now: Instant,
+        identity: Option<FrameIdentity>,
+        phase: Option<FramePhase>,
+        evaluation: EvaluationTraceId,
+        quality: PreviewQuality,
+        intent: GpuEvaluationIntent,
+        output: Option<terra_gpu::output_identity::GpuTerrainOutputIdentity>,
+        decision: terra_render::TerrainPresentationDecisionCode,
+    ) {
+        if !self.record(
+            now,
+            FrameTraceEventKind::CandidateRefused,
+            identity,
+            phase,
+            Some(evaluation),
+            Some(quality),
+            Some(intent),
+            None,
+        ) {
+            return;
+        }
+        if let Some(event) = self.events.back_mut() {
+            event.output_identity = output;
+            event.candidate_decision = Some(decision);
+        }
+    }
+
+    pub(crate) fn record_evaluation_output(
+        &mut self,
+        now: Instant,
+        identity: Option<FrameIdentity>,
+        phase: Option<FramePhase>,
+        evaluation: EvaluationTraceId,
+        output: terra_gpu::output_identity::GpuTerrainOutputIdentity,
+    ) {
+        if !self.record(
+            now,
+            FrameTraceEventKind::EvaluationOutputSelected,
+            identity,
+            phase,
+            Some(evaluation),
+            Some(output.actual_quality),
+            Some(output.intent),
+            None,
+        ) {
+            return;
+        }
+        if let Some(event) = self.events.back_mut() {
+            event.output_identity = Some(output);
+        }
+        if matches!(
+            output.completeness,
+            terra_gpu::output_identity::GpuOutputCompleteness::Complete
+        ) && output.selected_field.selected != output.selected_field.expected_final
+            && self.first_violation.is_none()
+        {
+            let code = terra_render::TerrainTransitionDiagnosticCode::NonFinalCurrentOutput;
+            self.first_violation = Some(code);
+            if let Some(event) = self.events.back_mut() {
+                event.diagnostic = Some(code);
+            }
+            log::error!(
+                target: "terra_app::terrain_transition",
+                "terrain_transition_violation code={} stage=evaluation_output_selection output={} generation={} evaluation={} expected_field={:?} actual_field={:?} source_incarnation={} physical_allocation={}",
+                code.as_str(), output.output.0, output.generation, output.evaluation_id,
+                output.selected_field.expected_final, output.selected_field.selected,
+                output.selected_field.resource_incarnation.0,
+                output.selected_field.physical_allocation,
+            );
+            for event in &self.events {
+                log::error!(
+                    target: "terra_app::terrain_transition_trace",
+                    "trace kind={:?} frame={} generation={} evaluation={:?} phase={:?} output={:?} diagnostic={:?}",
+                    event.kind, event.frame.get(), event.generation.get(),
+                    event.evaluation.map(EvaluationTraceId::get), event.phase,
+                    event.output_identity.map(|identity| identity.output.0),
+                    event.diagnostic.map(terra_render::TerrainTransitionDiagnosticCode::as_str),
+                );
+            }
+        }
+    }
+
+    fn report_first_violation(
+        &mut self,
+        code: terra_render::TerrainTransitionDiagnosticCode,
+        record: terra_render::TerrainPresentationRecord,
+    ) {
+        if self.first_violation.is_some() {
+            return;
+        }
+        self.first_violation = Some(code);
+        log::error!(
+            target: "terra_app::terrain_transition",
+            "terrain_transition_violation code={} output={} generation={}/{} evaluation={} plan_revision={}/{} extent={:?}/{:?} expected_field={:?} actual_field={:?} baseline_before={:?} mode={:?}",
+            code.as_str(),
+            record.candidate.output.0,
+            record.candidate.generation,
+            record.expectations.generation,
+            record.candidate.evaluation_id,
+            record.candidate.plan_revision,
+            record.expectations.plan_revision,
+            record.candidate.extent,
+            record.expectations.extent,
+            record.candidate.selected_field.expected_final,
+            record.candidate.selected_field.selected,
+            record.baseline_before.map(|baseline| baseline.identity.output.0),
+            record.actual_mode,
+        );
+        for event in &self.events {
+            log::error!(
+                target: "terra_app::terrain_transition_trace",
+                "trace kind={:?} frame={} generation={} evaluation={:?} phase={:?} output={:?} diagnostic={:?}",
+                event.kind,
+                event.frame.get(),
+                event.generation.get(),
+                event.evaluation.map(EvaluationTraceId::get),
+                event.phase,
+                event.output_identity.map(|output| output.output.0),
+                event.diagnostic.map(terra_render::TerrainTransitionDiagnosticCode::as_str),
+            );
+        }
+    }
+
+    pub(crate) fn record_probe_result(
+        &mut self,
+        now: Instant,
+        result: terra_render::TerrainIntegrityProbeResult,
+    ) {
+        let output = result.candidate;
+        let identity = FrameIdentity {
+            id: LogicalFrameId::new(output.frame_id),
+            generation_at_start: EditGeneration::new(output.generation),
+            generation: EditGeneration::new(output.generation),
+        };
+        if !self.record(
+            now,
+            FrameTraceEventKind::OutsideRegionProbeResolved,
+            Some(identity),
+            None,
+            Some(EvaluationTraceId::new(output.evaluation_id)),
+            Some(output.actual_quality),
+            Some(output.intent),
+            None,
+        ) {
+            return;
+        }
+        if let Some(event) = self.events.back_mut() {
+            event.output_identity = Some(output);
+            event.diagnostic = (!result.passed).then_some(
+                terra_render::TerrainTransitionDiagnosticCode::OutsideDirtyRegionChanged,
+            );
+        }
+        if !result.passed && self.first_violation.is_none() {
+            let code = terra_render::TerrainTransitionDiagnosticCode::OutsideDirtyRegionChanged;
+            self.first_violation = Some(code);
+            log::error!(
+                target: "terra_app::terrain_transition",
+                "terrain_transition_violation code={} output={} generation={} evaluation={} expected_base={:?} rect={:?} max_delta={} first_probe={:?} compared={}",
+                code.as_str(), output.output.0, output.generation, output.evaluation_id,
+                result.expected_base.map(|id| id.0), result.rect, result.max_delta,
+                result.first_failing_probe, result.probes_compared,
+            );
+            for event in &self.events {
+                log::error!(
+                    target: "terra_app::terrain_transition_trace",
+                    "trace kind={:?} frame={} generation={} evaluation={:?} phase={:?} output={:?} diagnostic={:?}",
+                    event.kind, event.frame.get(), event.generation.get(),
+                    event.evaluation.map(EvaluationTraceId::get), event.phase,
+                    event.output_identity.map(|identity| identity.output.0),
+                    event.diagnostic.map(terra_render::TerrainTransitionDiagnosticCode::as_str),
+                );
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn first_violation(
+        &self,
+    ) -> Option<terra_render::TerrainTransitionDiagnosticCode> {
+        self.first_violation
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -341,6 +597,8 @@ fn summarize(samples: &VecDeque<u64>) -> LatencySummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use terra_core::terrain_plan::FieldSlot;
+    use terra_gpu::output_identity::*;
 
     #[test]
     fn percentile_summary_uses_nearest_rank() {
@@ -379,6 +637,50 @@ mod tests {
         assert_eq!(trace.events().len(), EVENT_CAPACITY);
     }
 
+    /// Manual release-mode measurement used by the issue-168 diagnostic note.
+    #[test]
+    #[ignore = "run explicitly when measuring compact trace overhead"]
+    fn compact_trace_overhead_probe() {
+        const ITERATIONS: u32 = 1_000_000;
+        let identity = FrameIdentity {
+            id: LogicalFrameId::new(1),
+            generation_at_start: EditGeneration::new(1),
+            generation: EditGeneration::new(1),
+        };
+        let baseline_started = Instant::now();
+        for _ in 0..ITERATIONS {
+            std::hint::black_box(Instant::now());
+        }
+        let baseline = baseline_started.elapsed();
+
+        let mut trace = FrameTraceRecorder::default();
+        trace.verbose = false;
+        let traced_started = Instant::now();
+        for _ in 0..ITERATIONS {
+            trace.record(
+                Instant::now(),
+                FrameTraceEventKind::OsInputReceipt,
+                Some(identity),
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        let traced = traced_started.elapsed();
+        let incremental = traced.saturating_sub(baseline);
+        eprintln!(
+            "compact_trace event_bytes={} capacity={} baseline_ns_per_event={:.1} total_ns_per_event={:.1} incremental_ns_per_event={:.1}",
+            std::mem::size_of::<FrameTraceEvent>(),
+            EVENT_CAPACITY,
+            baseline.as_nanos() as f64 / f64::from(ITERATIONS),
+            traced.as_nanos() as f64 / f64::from(ITERATIONS),
+            incremental.as_nanos() as f64 / f64::from(ITERATIONS),
+        );
+        assert_eq!(trace.events().len(), EVENT_CAPACITY);
+    }
+
     #[test]
     fn records_without_a_logical_frame_are_rejected_and_counted() {
         let mut trace = FrameTraceRecorder::default();
@@ -398,7 +700,7 @@ mod tests {
     }
 
     #[test]
-    fn disabled_verbose_wrappers_do_not_annotate_the_previous_event() {
+    fn compact_records_survive_when_verbose_details_are_disabled() {
         let mut trace = FrameTraceRecorder::default();
         let identity = FrameIdentity {
             id: LogicalFrameId::new(2),
@@ -430,8 +732,9 @@ mod tests {
             None,
         );
 
-        assert_eq!(trace.events().len(), 1);
-        assert_eq!(trace.events().back().unwrap().refinement_job, None);
+        assert_eq!(trace.events().len(), 2);
+        assert_eq!(trace.events().back().unwrap().refinement_job, Some(99));
+        assert_eq!(trace.first_violation(), None);
     }
 
     #[test]
@@ -495,5 +798,102 @@ mod tests {
         trace.note_surface_presented(released + Duration::from_millis(20), EditGeneration::new(3));
         assert_eq!(trace.refinement_summary().count, 0);
         assert!(!trace.note_follow_up_press(released + Duration::from_millis(30)));
+    }
+
+    #[test]
+    fn first_transition_violation_is_latched_before_later_pixel_failure() {
+        let identity = FrameIdentity {
+            id: LogicalFrameId::new(9),
+            generation_at_start: EditGeneration::new(3),
+            generation: EditGeneration::new(3),
+        };
+        let output = GpuTerrainOutputIdentity {
+            output: GpuOutputId(4),
+            frame_id: 9,
+            generation: 3,
+            evaluation_id: 7,
+            plan_revision: 5,
+            requested_quality: PreviewQuality::Full,
+            actual_quality: PreviewQuality::Full,
+            intent: GpuEvaluationIntent::InteractiveLocal,
+            selected_field: GpuSelectedFieldIdentity {
+                selected: FieldSlot::from_index(2),
+                expected_final: FieldSlot::from_index(1),
+                resource_incarnation: GpuResourceIncarnation(2),
+                physical_allocation: 0,
+            },
+            output_resource: GpuOutputResourceIdentity {
+                device_generation: 1,
+                incarnation: GpuResourceIncarnation(3),
+                slot: GpuOutputSlot::Ping,
+            },
+            extent: (64, 64),
+            coverage: GpuOutputCoverage::WholeField,
+            completeness: GpuOutputCompleteness::Complete,
+            invalidation: GpuInvalidationKind::Cold,
+            last_write: GpuLastWriteIdentity {
+                serial: GpuSubmissionSerial(8),
+                completion: GpuSubmissionCompletion::Submitted,
+            },
+        };
+        let baseline = terra_render::PresentedTerrainBaseline {
+            identity: output,
+            mode: terra_render::TerrainPresentationMode::Shared,
+            complete: false,
+            local_slots_coherent: false,
+            local_slot_epoch: 1,
+            last_full_generation: Some(3),
+            height_lineage: output.output,
+            normal_lineage: output.output,
+        };
+        let record = terra_render::TerrainPresentationRecord {
+            candidate: output,
+            expectations: terra_render::TerrainPresentationExpectations {
+                plan_revision: 5,
+                generation: 3,
+                extent: (64, 64),
+            },
+            baseline_before: None,
+            baseline_after: baseline,
+            requested_mode: terra_render::TerrainPresentationMode::Shared,
+            actual_mode: terra_render::TerrainPresentationMode::Shared,
+            requested_rect: None,
+            actual_rect: None,
+            local_slots_coherent_before: false,
+            local_slots_coherent_after: false,
+            decision: terra_render::TerrainPresentationDecisionCode::Accepted,
+            shadow_diagnostic: Some(
+                terra_render::TerrainTransitionDiagnosticCode::NonFinalCurrentOutput,
+            ),
+        };
+        let mut trace = FrameTraceRecorder::default();
+        trace.record_presentation(
+            Instant::now(),
+            Some(identity),
+            Some(FramePhase::RequiredInteractiveWork),
+            EvaluationTraceId::new(7),
+            record,
+        );
+        trace.record_probe_result(
+            Instant::now(),
+            terra_render::TerrainIntegrityProbeResult {
+                candidate: output,
+                expected_base: None,
+                rect: terra_core::tiling::SampleRect {
+                    x: 2,
+                    y: 2,
+                    w: 3,
+                    h: 3,
+                },
+                passed: false,
+                max_delta: 4.0,
+                first_failing_probe: Some(0),
+                probes_compared: 64,
+            },
+        );
+        assert_eq!(
+            trace.first_violation(),
+            Some(terra_render::TerrainTransitionDiagnosticCode::NonFinalCurrentOutput)
+        );
     }
 }

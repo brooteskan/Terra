@@ -117,5 +117,7 @@ mod dirty_regions;
 mod execution_resources;
 #[path = "tests/masks_composition.rs"]
 mod masks_composition;
+#[path = "tests/output_identity.rs"]
+mod output_identity;
 #[path = "tests/refinement_performance.rs"]
 mod refinement_performance;

@@ -89,6 +89,10 @@ impl TerraApp {
                         }
                         _ => None,
                     });
+                let presentation_identity = self.logical_frames.active_identity();
+                let presentation_phase = self.logical_frames.active_phase();
+                let presentation_evaluation =
+                    super::frame_trace::EvaluationTraceId::new(self.last_accepted_evaluation_id);
                 if let Some(renderer) = self.renderer.as_mut() {
                     renderer.upload_heightfield(&hf);
                     let ocean_level = if self.ui_state.viewport_overlays.water_level {
@@ -182,6 +186,13 @@ impl TerraApp {
                         self.overhang_upload_fp = overhang_fp;
                     }
                     self.ui_state.profile.upload_us = renderer.last_upload_us;
+                    self.frame_trace.record_cpu_presentation(
+                        std::time::Instant::now(),
+                        presentation_identity,
+                        presentation_phase,
+                        presentation_evaluation,
+                        self.scheduler.quality,
+                    );
                 }
                 self.needs_height_upload = false;
             }

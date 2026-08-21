@@ -378,7 +378,7 @@ impl GpuTerrainEngine {
     /// Drop all project-owned GPU caches and replace project-sized working textures
     /// with the small resident baseline so a new/opened document starts clean.
     pub fn reset_project_state(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
-        self.plan_resources = GpuPlanResourceCache::default();
+        self.plan_resources.clear_current();
         self.active_plan_revision = None;
         self.deferred_plan_resume = None;
         self.layer_cache.clear();
@@ -391,6 +391,7 @@ impl GpuTerrainEngine {
         self.last_graph = terra_gpu::graph::GpuComputeGraph::default();
         self.last_eval_stats = GpuEvalStats::default();
         self.last_plan_operation_trace.clear();
+        self.last_output_identity = None;
         self.tile_sched = TileScheduler::new();
         self.approx_range = (0.0, 1.0);
         self.current = 0;
@@ -450,6 +451,12 @@ impl GpuTerrainEngine {
         self.metrics = metrics;
         self.ping = HeightTex::new(device, "ping", w, h);
         self.pong = HeightTex::new(device, "pong", w, h);
+        self.output_resource_incarnation = GpuResourceIncarnation(
+            self.output_resource_incarnation
+                .0
+                .checked_add(1)
+                .expect("GPU output resource incarnation exhausted"),
+        );
         self.layer_tex = HeightTex::new(device, "layer", w, h);
         self.mask_ones = HeightTex::new(device, "mask-ones", w, h);
         self.unit_mask = HeightTex::new(device, "unit-mask", w, h);

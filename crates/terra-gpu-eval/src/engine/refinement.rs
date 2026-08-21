@@ -147,6 +147,8 @@ impl GpuTerrainEngine {
             resource_prepare_us: 0,
             encode_us: 0,
             range_before: self.approx_range,
+            trace_context: self.pending_evaluation_trace.unwrap_or_default(),
+            final_submission_serial: GpuSubmissionSerial(0),
         })
     }
 
@@ -286,6 +288,10 @@ impl GpuTerrainEngine {
             .saturating_add(encode_started.elapsed().as_micros() as u64);
         let submit_started = Instant::now();
         queue.submit(Some(encoder.finish()));
+        let submission_serial = self.allocate_submission_serial();
+        if job.final_copy_submitted && job.cursor == job.selected.len() {
+            job.final_submission_serial = submission_serial;
+        }
         self.last_eval_stats.queue_submit_us = self
             .last_eval_stats
             .queue_submit_us
@@ -310,6 +316,12 @@ impl GpuTerrainEngine {
             ));
         }
         let candidate = job.candidate.take().expect("completed candidate");
+        let final_field = job.plan.final_height();
+        let final_binding = candidate
+            .layout()
+            .binding(final_field)
+            .expect("refinement final field has a physical binding");
+        let source_resource_incarnation = candidate.incarnation();
         self.plan_resources.commit_candidate(candidate);
         self.last_graph = job.graph;
         self.active_plan_revision = Some(job.expected_revision);
@@ -323,6 +335,37 @@ impl GpuTerrainEngine {
         self.last_eval_stats.command_encode_us = job.encode_us;
         self.last_eval_stats.dirty_texels =
             u64::from(job.metrics.width).saturating_mul(u64::from(job.metrics.height));
+        self.pending_evaluation_trace = None;
+        let output_identity = GpuTerrainOutputIdentity {
+            output: self.allocate_output_id(),
+            frame_id: job.trace_context.frame_id,
+            generation: job.trace_context.generation,
+            evaluation_id: job.trace_context.evaluation_id,
+            plan_revision: job.expected_revision.get(),
+            requested_quality: job.quality,
+            actual_quality: job.quality,
+            intent: GpuEvaluationIntent::Complete,
+            selected_field: terra_gpu::output_identity::GpuSelectedFieldIdentity {
+                selected: final_field,
+                expected_final: final_field,
+                resource_incarnation: source_resource_incarnation,
+                physical_allocation: final_binding.physical.index(),
+            },
+            output_resource: terra_gpu::output_identity::GpuOutputResourceIdentity {
+                device_generation: self.device_generation,
+                incarnation: self.output_resource_incarnation,
+                slot: self.output_slot(),
+            },
+            extent: (job.metrics.width, job.metrics.height),
+            coverage: terra_gpu::output_identity::GpuOutputCoverage::WholeField,
+            completeness: terra_gpu::output_identity::GpuOutputCompleteness::Complete,
+            invalidation: terra_gpu::output_identity::GpuInvalidationKind::Cold,
+            last_write: terra_gpu::output_identity::GpuLastWriteIdentity {
+                serial: job.final_submission_serial,
+                completion: terra_gpu::output_identity::GpuSubmissionCompletion::KnownComplete,
+            },
+        };
+        self.last_output_identity = Some(output_identity);
         Ok(GpuEvalResult {
             width: job.metrics.width,
             height: job.metrics.height,
@@ -334,6 +377,7 @@ impl GpuTerrainEngine {
             resume_cpu_from: None,
             cpu_fallback: None,
             did_eval: !job.selected.is_empty(),
+            output_identity: Some(output_identity),
         })
     }
 

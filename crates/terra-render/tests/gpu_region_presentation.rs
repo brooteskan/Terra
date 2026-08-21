@@ -7,6 +7,8 @@
 //! displacement and lighting normals.
 
 use terra_core::tiling::SampleRect;
+use terra_core::{quality::PreviewQuality, terrain_plan::FieldSlot};
+use terra_gpu::output_identity::*;
 use terra_render::{GpuContext, HeightPresentGeom, TerrainRenderer, ViewportRendererMode};
 
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
@@ -132,6 +134,61 @@ fn renderer(ctx: &GpuContext) -> TerrainRenderer {
     renderer
 }
 
+fn output_identity(id: u64, coverage: GpuOutputCoverage) -> GpuTerrainOutputIdentity {
+    GpuTerrainOutputIdentity {
+        output: GpuOutputId(id),
+        frame_id: id,
+        generation: 7,
+        evaluation_id: id,
+        plan_revision: 11,
+        requested_quality: PreviewQuality::Full,
+        actual_quality: PreviewQuality::Full,
+        intent: GpuEvaluationIntent::InteractiveLocal,
+        selected_field: GpuSelectedFieldIdentity {
+            selected: FieldSlot::from_index(1),
+            expected_final: FieldSlot::from_index(1),
+            resource_incarnation: GpuResourceIncarnation(20),
+            physical_allocation: 0,
+        },
+        output_resource: GpuOutputResourceIdentity {
+            device_generation: 3,
+            incarnation: GpuResourceIncarnation(30),
+            slot: GpuOutputSlot::Ping,
+        },
+        extent: (96, 96),
+        coverage,
+        completeness: GpuOutputCompleteness::Complete,
+        invalidation: GpuInvalidationKind::Regional,
+        last_write: GpuLastWriteIdentity {
+            serial: GpuSubmissionSerial(id),
+            completion: GpuSubmissionCompletion::Submitted,
+        },
+    }
+}
+
+fn expectations() -> terra_render::TerrainPresentationExpectations {
+    terra_render::TerrainPresentationExpectations {
+        plan_revision: 11,
+        generation: 7,
+        extent: (96, 96),
+    }
+}
+
+fn drain_probes(
+    gpu: &terra_test_gpu::TestGpu,
+    renderer: &mut TerrainRenderer,
+) -> Vec<terra_render::TerrainIntegrityProbeResult> {
+    let mut completed = renderer.poll_integrity_probes();
+    for _ in 0..8 {
+        if !completed.is_empty() {
+            break;
+        }
+        let _ = gpu.device.poll(wgpu::Maintain::Wait);
+        completed.extend(renderer.poll_integrity_probes());
+    }
+    completed
+}
+
 fn assert_frames_equal(
     gpu: &terra_test_gpu::TestGpu,
     actual: &mut TerrainRenderer,
@@ -238,4 +295,108 @@ fn gpu_regional_present_matches_full_across_baseline_transitions() {
     actual.present_gpu_height_region(&resized.texture, resized.geom(), Some(resized_dirty));
     oracle.present_gpu_height_shared(&resized.texture, &resized.view, resized.geom(), None);
     assert_frames_equal(gpu, &mut actual, &mut oracle, "resize -> regional");
+}
+
+#[test]
+fn traced_regional_transition_detects_outside_region_corruption_asynchronously() {
+    let Some(gpu) = terra_test_gpu::headless() else {
+        return;
+    };
+    let ctx = GpuContext {
+        device: gpu.device.clone(),
+        queue: gpu.queue.clone(),
+        surface_format: FORMAT,
+    };
+    let source = HeightSource::new(gpu, 96, 96);
+    let mut renderer = renderer(&ctx);
+
+    let full = output_identity(1, GpuOutputCoverage::WholeField);
+    let record = renderer.present_gpu_height_shared_traced(
+        &source.texture,
+        &source.view,
+        source.geom(),
+        None,
+        full,
+        expectations(),
+    );
+    assert_eq!(record.shadow_diagnostic, None);
+    assert!(drain_probes(gpu, &mut renderer)
+        .into_iter()
+        .all(|result| result.passed));
+
+    let west = SampleRect {
+        x: 12,
+        y: 18,
+        w: 19,
+        h: 17,
+    };
+    source.write_patch(gpu, west, 125.0);
+    let first_patch = output_identity(
+        2,
+        GpuOutputCoverage::Patch {
+            rect: west,
+            expected_base: Some(full.output),
+        },
+    );
+    let record = renderer.present_gpu_height_region_traced(
+        &source.texture,
+        source.geom(),
+        Some(west),
+        first_patch,
+        expectations(),
+    );
+    assert_eq!(
+        record.actual_mode,
+        terra_render::TerrainPresentationMode::FullCopy
+    );
+    assert_eq!(record.shadow_diagnostic, None);
+    assert!(drain_probes(gpu, &mut renderer)
+        .into_iter()
+        .all(|result| result.passed));
+
+    let east = SampleRect {
+        x: 65,
+        y: 58,
+        w: 18,
+        h: 21,
+    };
+    source.write_patch(gpu, east, 155.0);
+    // Probe index zero deterministically maps to (31, 61) for a 96x96 field,
+    // outside `east`; corrupt that point after the bounded edit.
+    source.write_rect(
+        gpu,
+        SampleRect {
+            x: 31,
+            y: 61,
+            w: 1,
+            h: 1,
+        },
+        &[10_000.0],
+    );
+    let second_patch = output_identity(
+        3,
+        GpuOutputCoverage::Patch {
+            rect: east,
+            expected_base: Some(first_patch.output),
+        },
+    );
+    let record = renderer.present_gpu_height_region_traced(
+        &source.texture,
+        source.geom(),
+        Some(east),
+        second_patch,
+        expectations(),
+    );
+    assert_eq!(
+        record.actual_mode,
+        terra_render::TerrainPresentationMode::RegionalCopy
+    );
+    assert_eq!(record.shadow_diagnostic, None);
+    let results = drain_probes(gpu, &mut renderer);
+    let failure = results
+        .into_iter()
+        .find(|result| !result.passed)
+        .expect("outside-region corruption must be detected");
+    assert_eq!(failure.first_failing_probe, Some(0));
+    assert!(failure.max_delta > 1_000.0);
 }

@@ -14,6 +14,7 @@ use crate::evaluation_timing::{
 use bytemuck::{Pod, Zeroable};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, TryRecvError};
 use std::time::{Instant, SystemTime};
 use terra_core::analyze::{
@@ -45,6 +46,10 @@ use terra_gpu::graph::{
     compile_gpu_graph, gpu_blend_mode, GpuComputeGraph, GpuFallbackCode, GpuFallbackDiagnostic,
     GpuFallbackReason, GpuKernel, GpuLayerPlan, BLUR_MAX_RADIUS, EFFECT_FILTER_MAX_RADIUS,
     RIVER_CARVE_MAX_RADIUS,
+};
+use terra_gpu::output_identity::{
+    GpuOutputId, GpuOutputSlot, GpuResourceIncarnation, GpuSubmissionSerial,
+    GpuTerrainOutputIdentity,
 };
 use terra_gpu::{readback_f32, GpuError};
 use wgpu::util::DeviceExt;
@@ -87,12 +92,17 @@ use terra_core::tiling::{SampleRect, TileScheduler};
 /// Small resident texture extent used while no project is active.
 /// `ensure_size` restores the next evaluation's document dimensions.
 const PROJECT_RESET_TEXTURE_EXTENT: u32 = 8;
+static NEXT_DEVICE_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 /// GPU stack evaluator for interactive preview.
 pub struct GpuTerrainEngine {
     plan_operations: GpuPlanOperations,
     plan_resources: GpuPlanResourceCache,
     device_generation: u64,
+    output_resource_incarnation: GpuResourceIncarnation,
+    next_output_id: u64,
+    next_submission_serial: u64,
+    last_output_identity: Option<GpuTerrainOutputIdentity>,
     active_plan_revision: Option<PlanStructureRevision>,
     deferred_plan_resume: Option<(PlanStructureRevision, PlanOpId)>,
     fill: Pipe,
@@ -198,6 +208,36 @@ pub struct GpuTerrainEngine {
 }
 
 impl GpuTerrainEngine {
+    fn allocate_output_id(&mut self) -> GpuOutputId {
+        let id = GpuOutputId(self.next_output_id);
+        self.next_output_id = self
+            .next_output_id
+            .checked_add(1)
+            .expect("GPU output identity exhausted");
+        id
+    }
+
+    fn allocate_submission_serial(&mut self) -> GpuSubmissionSerial {
+        let serial = GpuSubmissionSerial(self.next_submission_serial);
+        self.next_submission_serial = self
+            .next_submission_serial
+            .checked_add(1)
+            .expect("GPU submission serial exhausted");
+        serial
+    }
+
+    fn output_slot(&self) -> GpuOutputSlot {
+        if self.current == 0 {
+            GpuOutputSlot::Ping
+        } else {
+            GpuOutputSlot::Pong
+        }
+    }
+
+    pub fn last_output_identity(&self) -> Option<GpuTerrainOutputIdentity> {
+        self.last_output_identity
+    }
+
     pub fn last_eval_stats(&self) -> GpuEvalStats {
         self.last_eval_stats
     }

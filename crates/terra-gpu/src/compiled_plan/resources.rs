@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 
+use crate::output_identity::GpuResourceIncarnation;
 use terra_core::terrain_plan::{
     CompiledTerrainPlan, FieldSlot, PlanOpId, PlanStructureSignature, TerrainOpKind,
 };
@@ -365,6 +366,7 @@ pub struct GpuPlanResources {
     key: GpuPlanResourceKey,
     layout: GpuPlanResourceLayout,
     textures: Vec<ScalarTexture>,
+    incarnation: GpuResourceIncarnation,
 }
 
 /// Incremental realization of one isolated compiled-plan resource set.
@@ -376,6 +378,7 @@ pub struct GpuPlanResourceBuilder {
     key: GpuPlanResourceKey,
     layout: GpuPlanResourceLayout,
     textures: Vec<ScalarTexture>,
+    incarnation: GpuResourceIncarnation,
 }
 
 impl GpuPlanResourceBuilder {
@@ -383,12 +386,14 @@ impl GpuPlanResourceBuilder {
         device: &wgpu::Device,
         plan: &CompiledTerrainPlan,
         key: GpuPlanResourceKey,
+        incarnation: GpuResourceIncarnation,
     ) -> Result<Self, GpuPlanResourceError> {
         validate_resource_key(device, key)?;
         Ok(Self {
             key,
             layout: GpuPlanResourceLayout::build(plan)?,
             textures: Vec::new(),
+            incarnation,
         })
     }
 
@@ -428,6 +433,7 @@ impl GpuPlanResourceBuilder {
             key: self.key,
             layout: self.layout,
             textures: self.textures,
+            incarnation: self.incarnation,
         })
     }
 }
@@ -437,8 +443,9 @@ impl GpuPlanResources {
         device: &wgpu::Device,
         plan: &CompiledTerrainPlan,
         key: GpuPlanResourceKey,
+        incarnation: GpuResourceIncarnation,
     ) -> Result<Self, GpuPlanResourceError> {
-        let mut builder = GpuPlanResourceBuilder::new(device, plan, key)?;
+        let mut builder = GpuPlanResourceBuilder::new(device, plan, key, incarnation)?;
         while !builder.advance(device) {}
         builder.finish()
     }
@@ -449,6 +456,10 @@ impl GpuPlanResources {
 
     pub const fn layout(&self) -> &GpuPlanResourceLayout {
         &self.layout
+    }
+
+    pub const fn incarnation(&self) -> GpuResourceIncarnation {
+        self.incarnation
     }
 
     pub fn view(&self, field: FieldSlot) -> Result<&wgpu::TextureView, GpuPlanResourceError> {
@@ -479,20 +490,40 @@ pub struct GpuPlanResourceCacheStats {
 
 /// Last-good resource owner. Replacement is transactional: a candidate is
 /// fully validated and allocated before `current` is changed.
-#[derive(Default)]
 pub struct GpuPlanResourceCache {
     current: Option<GpuPlanResources>,
     stats: GpuPlanResourceCacheStats,
+    next_incarnation: u64,
+}
+
+impl Default for GpuPlanResourceCache {
+    fn default() -> Self {
+        Self {
+            current: None,
+            stats: GpuPlanResourceCacheStats::default(),
+            next_incarnation: 1,
+        }
+    }
 }
 
 impl GpuPlanResourceCache {
+    fn allocate_incarnation(&mut self) -> GpuResourceIncarnation {
+        let incarnation = GpuResourceIncarnation(self.next_incarnation);
+        self.next_incarnation = self
+            .next_incarnation
+            .checked_add(1)
+            .expect("GPU resource incarnation exhausted");
+        incarnation
+    }
+
     pub fn begin_candidate(
         &mut self,
         device: &wgpu::Device,
         plan: &CompiledTerrainPlan,
         key: GpuPlanResourceKey,
     ) -> Result<GpuPlanResourceBuilder, GpuPlanResourceError> {
-        match GpuPlanResourceBuilder::new(device, plan, key) {
+        let incarnation = self.allocate_incarnation();
+        match GpuPlanResourceBuilder::new(device, plan, key, incarnation) {
             Ok(builder) => {
                 self.stats.staged_candidates += 1;
                 Ok(builder)
@@ -516,7 +547,8 @@ impl GpuPlanResourceCache {
             self.stats.warm_hits += 1;
             return Ok(self.current.as_ref().expect("checked above"));
         }
-        let candidate = match GpuPlanResources::realize(device, plan, key) {
+        let incarnation = self.allocate_incarnation();
+        let candidate = match GpuPlanResources::realize(device, plan, key, incarnation) {
             Ok(candidate) => candidate,
             Err(error) => {
                 self.stats.failed_realizations += 1;
@@ -530,6 +562,11 @@ impl GpuPlanResourceCache {
 
     pub const fn current(&self) -> Option<&GpuPlanResources> {
         self.current.as_ref()
+    }
+
+    /// Drop the active realization without recycling its incarnation sequence.
+    pub fn clear_current(&mut self) {
+        self.current = None;
     }
 
     /// Temporarily transfer ownership of the active realization to an executor.
@@ -554,7 +591,8 @@ impl GpuPlanResourceCache {
         plan: &CompiledTerrainPlan,
         key: GpuPlanResourceKey,
     ) -> Result<GpuPlanResources, GpuPlanResourceError> {
-        match GpuPlanResources::realize(device, plan, key) {
+        let incarnation = self.allocate_incarnation();
+        match GpuPlanResources::realize(device, plan, key, incarnation) {
             Ok(candidate) => {
                 self.stats.staged_candidates += 1;
                 Ok(candidate)

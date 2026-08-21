@@ -88,7 +88,7 @@ impl PlanOpId {
 pub struct FieldSlot(u32);
 
 impl FieldSlot {
-    pub(crate) fn from_index(index: usize) -> Self {
+    pub fn from_index(index: usize) -> Self {
         Self(u32::try_from(index).expect("terrain plan field count exceeds u32"))
     }
 

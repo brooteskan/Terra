@@ -2708,6 +2708,7 @@ dependencies = [
  "pollster",
  "profiling",
  "terra-core",
+ "terra-gpu",
  "terra-test-gpu",
  "thiserror 2.0.19",
  "wgpu",

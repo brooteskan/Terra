@@ -222,9 +222,16 @@ impl TerraApp {
             }
         }
 
+        let origin = self.logical_frames.active_identity().unwrap_or_default();
+        let evaluation = self.frame_trace.next_evaluation_id();
         let Some(engine) = self.gpu_engine.as_mut() else {
             return false;
         };
+        engine.set_evaluation_trace_context(terra_gpu_eval::GpuEvaluationTraceContext {
+            frame_id: origin.id.get(),
+            generation: self.eval_token,
+            evaluation_id: evaluation.get(),
+        });
         let engine_job = match engine.begin_compiled_refinement(
             &gpu.device,
             &preview_stack,
@@ -245,8 +252,6 @@ impl TerraApp {
             }
         };
         self.next_refinement_job_id = self.next_refinement_job_id.wrapping_add(1).max(1);
-        let origin = self.logical_frames.active_identity().unwrap_or_default();
-        let evaluation = self.frame_trace.next_evaluation_id();
         let job = RefinementJob {
             id: self.next_refinement_job_id,
             origin,
@@ -412,6 +417,8 @@ impl TerraApp {
             return false;
         }
         let target_quality = job.target_quality;
+        let refinement_evaluation = job.evaluation;
+        let refinement_origin = job.origin;
         let result = {
             let Some(engine) = self.gpu_engine.as_mut() else {
                 return false;
@@ -424,6 +431,15 @@ impl TerraApp {
                 }
             }
         };
+        if let Some(output) = result.output_identity {
+            self.frame_trace.record_evaluation_output(
+                Instant::now(),
+                Some(refinement_origin),
+                self.logical_frames.active_phase(),
+                refinement_evaluation,
+                output,
+            );
+        }
         if let (Some(engine), Some(renderer)) = (self.gpu_engine.as_ref(), self.renderer.as_mut()) {
             let result_metrics = self
                 .session
@@ -433,19 +449,42 @@ impl TerraApp {
                 .unwrap_or(self.session.document.metrics);
             let dx = result_metrics.dx();
             let dz = result_metrics.dz();
-            renderer.present_gpu_height_shared(
-                engine.output_texture(),
-                engine.output_texture_view(),
-                terra_render::HeightPresentGeom {
-                    width: result.width,
-                    height: result.height,
-                    world_size: result.world_size,
-                    height_range: result.height_range,
-                    dx,
-                    dz,
-                },
-                None,
-            );
+            let geom = terra_render::HeightPresentGeom {
+                width: result.width,
+                height: result.height,
+                world_size: result.world_size,
+                height_range: result.height_range,
+                dx,
+                dz,
+            };
+            if let Some(output) = result.output_identity {
+                let record = renderer.present_gpu_height_shared_traced(
+                    engine.output_texture(),
+                    engine.output_texture_view(),
+                    geom,
+                    None,
+                    output,
+                    terra_render::TerrainPresentationExpectations {
+                        plan_revision: output.plan_revision,
+                        generation: output.generation,
+                        extent: (result.width, result.height),
+                    },
+                );
+                self.frame_trace.record_presentation(
+                    Instant::now(),
+                    Some(refinement_origin),
+                    self.logical_frames.active_phase(),
+                    refinement_evaluation,
+                    record,
+                );
+            } else {
+                renderer.present_gpu_height_shared(
+                    engine.output_texture(),
+                    engine.output_texture_view(),
+                    geom,
+                    None,
+                );
+            }
         }
         self.scheduler.quality = target_quality;
         self.ui_state.quality = target_quality;
@@ -1266,7 +1305,7 @@ impl TerraApp {
                 let resolved_trace_identity = trace_identity.unwrap_or_default();
                 engine.set_evaluation_trace_context(terra_gpu_eval::GpuEvaluationTraceContext {
                     frame_id: resolved_trace_identity.id.get(),
-                    generation: resolved_trace_identity.generation.get(),
+                    generation: trace_identity.map_or(token, |identity| identity.generation.get()),
                     evaluation_id: trace_id.get(),
                 });
                 match engine.evaluate_compiled_with_intent(
@@ -1293,17 +1332,26 @@ impl TerraApp {
                             gpu_eval_started.elapsed(),
                             engine.last_eval_stats(),
                         );
-                        if token != self.eval_token {
-                            // Stale generation â€” discard.
-                            self.frame_trace.record(
+                        if let Some(output) = result.output_identity {
+                            self.frame_trace.record_evaluation_output(
                                 Instant::now(),
-                                FrameTraceEventKind::CandidateRejectedStale,
                                 trace_identity,
                                 self.logical_frames.active_phase(),
-                                Some(trace_id),
-                                Some(quality),
-                                Some(intent),
-                                None,
+                                trace_id,
+                                output,
+                            );
+                        }
+                        if token != self.eval_token {
+                            // Stale generation â€” discard.
+                            self.frame_trace.record_candidate_refusal(
+                                Instant::now(),
+                                trace_identity,
+                                self.logical_frames.active_phase(),
+                                trace_id,
+                                quality,
+                                intent,
+                                result.output_identity,
+                                terra_render::TerrainPresentationDecisionCode::RefusedStaleGeneration,
                             );
                         } else {
                             let dx = metrics.dx();
@@ -1325,7 +1373,7 @@ impl TerraApp {
                                         && r.w == result.width
                                         && r.h == result.height
                                 });
-                                if full_field {
+                                let presentation_record = if full_field {
                                     let geom = terra_render::HeightPresentGeom {
                                         width: result.width,
                                         height: result.height,
@@ -1334,12 +1382,20 @@ impl TerraApp {
                                         dx,
                                         dz,
                                     };
-                                    renderer.present_gpu_height_shared(
-                                        engine.output_texture(),
-                                        engine.output_texture_view(),
-                                        geom,
-                                        None,
-                                    );
+                                    result.output_identity.map(|output| {
+                                        renderer.present_gpu_height_shared_traced(
+                                            engine.output_texture(),
+                                            engine.output_texture_view(),
+                                            geom,
+                                            None,
+                                            output,
+                                            terra_render::TerrainPresentationExpectations {
+                                                plan_revision: plan_revision.get(),
+                                                generation: token,
+                                                extent: (result.width, result.height),
+                                            },
+                                        )
+                                    })
                                 } else if let Some(region) = region {
                                     let geom = terra_render::HeightPresentGeom {
                                         width: result.width,
@@ -1349,10 +1405,29 @@ impl TerraApp {
                                         dx,
                                         dz,
                                     };
-                                    renderer.present_gpu_height_region(
-                                        engine.output_texture(),
-                                        geom,
-                                        Some(region),
+                                    result.output_identity.map(|output| {
+                                        renderer.present_gpu_height_region_traced(
+                                            engine.output_texture(),
+                                            geom,
+                                            Some(region),
+                                            output,
+                                            terra_render::TerrainPresentationExpectations {
+                                                plan_revision: plan_revision.get(),
+                                                generation: token,
+                                                extent: (result.width, result.height),
+                                            },
+                                        )
+                                    })
+                                } else {
+                                    None
+                                };
+                                if let Some(record) = presentation_record {
+                                    self.frame_trace.record_presentation(
+                                        Instant::now(),
+                                        trace_identity,
+                                        self.logical_frames.active_phase(),
+                                        trace_id,
+                                        record,
                                     );
                                 }
                                 self.ui_state.profile.upload_us = renderer.last_upload_us;
@@ -1375,6 +1450,16 @@ impl TerraApp {
                                     Some(t0.elapsed()),
                                 );
                             } else {
+                                self.frame_trace.record_candidate_refusal(
+                                    Instant::now(),
+                                    trace_identity,
+                                    self.logical_frames.active_phase(),
+                                    trace_id,
+                                    quality,
+                                    intent,
+                                    result.output_identity,
+                                    terra_render::TerrainPresentationDecisionCode::RefusedNoOutput,
+                                );
                                 let _ = engine.take_dirty_region(1);
                             }
                             self.ui_state.profile.tex_w = result.width;
@@ -1846,6 +1931,7 @@ impl TerraApp {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::Instant;
 
     use terra_core::heightfield::{Heightfield, HeightfieldMetrics};
     use terra_core::layer::{
@@ -1858,6 +1944,7 @@ mod tests {
     use terra_gpu_eval::{GpuEvaluationIntent, GpuTerrainEngine};
     use terra_render::{GpuContext, HeightPresentGeom, TerrainRenderer};
 
+    use crate::app::logical_frame::{EditGeneration, FrameRequestReason};
     use crate::ui::PanelAction;
 
     use super::{uv_to_texel_rect, DeferredFullField, TerraApp};
@@ -2126,7 +2213,20 @@ mod tests {
             app.ui_state.evaluation_failure
         );
 
-        for stroke in 0..40 {
+        for stroke in 0..72 {
+            let frame_started = Instant::now();
+            app.logical_frames.request(
+                EditGeneration::new(app.eval_token),
+                FrameRequestReason::Input,
+            );
+            app.logical_frames
+                .begin(frame_started, 3, 1)
+                .expect("stroke logical frame");
+            app.frame_trace
+                .note_input_receipt(frame_started, EditGeneration::new(app.eval_token));
+            app.logical_frames
+                .transition(super::super::logical_frame::FramePhase::ApplicationUpdate);
+            app.mouse_pressed = Some(winit::event::MouseButton::Left);
             let u = 0.35 + (stroke % 10) as f32 * 0.03;
             let v = 0.40 + (stroke / 10) as f32 * 0.05;
             app.last_paint_uv = None;
@@ -2139,7 +2239,21 @@ mod tests {
                 stroke_kind: SculptStrokeKind::Raise,
                 target_height: 0.0,
             }]);
+            app.logical_frames
+                .update_generation(EditGeneration::new(app.eval_token));
+            app.logical_frames
+                .transition(super::super::logical_frame::FramePhase::RequiredInteractiveWork);
             app.run_eval_step_with_intent(GpuEvaluationIntent::InteractiveLocal);
+
+            assert_eq!(
+                app.frame_trace.first_violation(),
+                None,
+                "stroke {} emitted a transition violation: {:#?}",
+                stroke + 1,
+                app.renderer
+                    .as_ref()
+                    .and_then(TerrainRenderer::last_terrain_presentation_record)
+            );
 
             assert_eq!(
                 app.scheduler.quality,
@@ -2158,11 +2272,26 @@ mod tests {
                 "Shape Layer edits must remain on the GPU"
             );
             assert!(app.ui_state.profile.gpu_fallback.is_none());
+            app.logical_frames
+                .transition(super::super::logical_frame::FramePhase::PresentationRequest);
+            app.mouse_pressed = None;
+            app.frame_trace
+                .note_release(Instant::now(), EditGeneration::new(app.eval_token));
+            app.logical_frames.complete(Instant::now());
 
             // A background publication switches the renderer back to the engine's
             // shared Full texture. The next regional stroke must retain Full and
             // establish a renderer-local baseline without a Draft replacement.
-            if matches!(stroke, 7 | 15 | 31 | 39) {
+            if matches!(stroke, 7 | 15 | 31 | 63 | 71) {
+                app.logical_frames.request(
+                    EditGeneration::new(app.eval_token),
+                    FrameRequestReason::OptionalRefinement,
+                );
+                app.logical_frames
+                    .begin(Instant::now(), 0, 0)
+                    .expect("refinement publication frame");
+                app.logical_frames
+                    .transition(super::super::logical_frame::FramePhase::OptionalRefinement);
                 app.run_eval_step_with_intent(GpuEvaluationIntent::Complete);
                 assert_eq!(
                     app.scheduler.quality,
@@ -2175,8 +2304,14 @@ mod tests {
                     (resolution, resolution)
                 );
                 assert!(app.last_eval_gpu_supported);
+                app.logical_frames.complete(Instant::now());
             }
         }
+        assert_eq!(
+            app.frame_trace.first_violation(),
+            None,
+            "the warm Shape Layer path must not emit identity/baseline false positives"
+        );
     }
 
     #[test]

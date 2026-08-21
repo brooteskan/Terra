@@ -33,6 +33,7 @@ pub struct GpuEvalStats {
     pub operations_skipped: u32,
     pub operations_reused: u32,
     pub operations_deferred: u32,
+    pub operations_materialized: u32,
     /// One logical 8x8 dispatch footprint per executed plan operation. This is
     /// deliberately separate from multipass kernel-specific counters above.
     pub plan_workgroups: u64,

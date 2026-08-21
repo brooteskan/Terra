@@ -131,6 +131,7 @@ fn plan_fallback_result(
         resume_cpu_from: Some(0),
         cpu_fallback: Some(diagnostic),
         did_eval: false,
+        output_identity: None,
     }
 }
 
@@ -820,6 +821,8 @@ impl GpuTerrainEngine {
         if let Some((boundary, _)) = bridge_boundary {
             selected.retain(|operation| operation.index() >= boundary.index());
         }
+        self.last_eval_stats.operations_materialized =
+            selected.len().saturating_sub(requested.len()) as u32;
         let merged_scope = if cold {
             PropagatedDirtyScope::new(PlanDirtyScope::FullField)
         } else {
@@ -1339,6 +1342,13 @@ impl GpuTerrainEngine {
                 return Err(GpuError::Wgpu(error.to_string()));
             }
         };
+        let presentation_binding = candidate
+            .layout()
+            .binding(presentation_field)
+            .expect("presented field has a physical binding");
+        let source_resource_incarnation = candidate.incarnation();
+        let trace_context = self.pending_evaluation_trace.unwrap_or_default();
+        let expected_base = self.last_output_identity.map(|identity| identity.output);
         record_copy_views_region(
             device,
             &mut encoder,
@@ -1366,6 +1376,7 @@ impl GpuTerrainEngine {
             command_encode_started.elapsed().as_micros() as u64;
         let queue_submit_started = std::time::Instant::now();
         queue.submit(Some(encoder.finish()));
+        let submission_serial = self.allocate_submission_serial();
         self.last_eval_stats.queue_submit_us = queue_submit_started.elapsed().as_micros() as u64;
         self.current = 0;
         self.last_dirty_rect = None;
@@ -1468,6 +1479,62 @@ impl GpuTerrainEngine {
                 })
             })
             .collect();
+        let has_deferred_suffix = deferred_at.is_some();
+        let has_hybrid_prefix = planned_fallback.is_some();
+        let output_identity = GpuTerrainOutputIdentity {
+            output: self.allocate_output_id(),
+            frame_id: trace_context.frame_id,
+            generation: trace_context.generation,
+            evaluation_id: trace_context.evaluation_id,
+            plan_revision: expected_revision.get(),
+            requested_quality: quality,
+            actual_quality: quality,
+            intent,
+            selected_field: terra_gpu::output_identity::GpuSelectedFieldIdentity {
+                selected: presentation_field,
+                expected_final: plan.final_height(),
+                resource_incarnation: source_resource_incarnation,
+                physical_allocation: presentation_binding.physical.index(),
+            },
+            output_resource: terra_gpu::output_identity::GpuOutputResourceIdentity {
+                device_generation: self.device_generation,
+                incarnation: self.output_resource_incarnation,
+                slot: self.output_slot(),
+            },
+            extent: (metrics.width, metrics.height),
+            coverage: if present_scope.is_full() {
+                terra_gpu::output_identity::GpuOutputCoverage::WholeField
+            } else {
+                terra_gpu::output_identity::GpuOutputCoverage::Patch {
+                    rect: terra_core::tiling::SampleRect {
+                        x: present_region.0,
+                        y: present_region.1,
+                        w: present_region.2,
+                        h: present_region.3,
+                    },
+                    expected_base,
+                }
+            },
+            completeness: if has_deferred_suffix {
+                terra_gpu::output_identity::GpuOutputCompleteness::DeferredSuffix
+            } else if has_hybrid_prefix {
+                terra_gpu::output_identity::GpuOutputCompleteness::HybridPrefix
+            } else {
+                terra_gpu::output_identity::GpuOutputCompleteness::Complete
+            },
+            invalidation: if cold {
+                terra_gpu::output_identity::GpuInvalidationKind::Cold
+            } else if present_scope.is_full() {
+                terra_gpu::output_identity::GpuInvalidationKind::FullField
+            } else {
+                terra_gpu::output_identity::GpuInvalidationKind::Regional
+            },
+            last_write: terra_gpu::output_identity::GpuLastWriteIdentity {
+                serial: submission_serial,
+                completion: terra_gpu::output_identity::GpuSubmissionCompletion::Submitted,
+            },
+        };
+        self.last_output_identity = Some(output_identity);
         Ok(GpuEvalResult {
             width: metrics.width,
             height: metrics.height,
@@ -1479,6 +1546,7 @@ impl GpuTerrainEngine {
             resume_cpu_from: fallback_resume,
             cpu_fallback: planned_fallback,
             did_eval: !selected.is_empty(),
+            output_identity: Some(output_identity),
         })
     }
 }

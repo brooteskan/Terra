@@ -40,8 +40,10 @@ pub mod gpu_timing;
 pub mod grid;
 pub mod guides;
 pub mod height_gpu;
+mod integrity_probe;
 pub mod overhang;
 pub mod path_tracer;
+pub mod presentation_transition;
 pub mod progressive;
 pub mod render_quality;
 pub mod retirement;
@@ -65,8 +67,13 @@ pub use gpu_timing::{GpuPresentationTraceContext, GpuTimings};
 pub use grid::TerrainGrid;
 pub use guides::{GuideOverlay, GuideState};
 pub use height_gpu::{AuxMaps, HeightGpu, HeightPresentGeom};
+pub use integrity_probe::TerrainIntegrityProbeResult;
 pub use overhang::OverhangOverlay;
 pub use path_tracer::{PathTraceUniforms, PathTracer};
+pub use presentation_transition::{
+    PresentedTerrainBaseline, TerrainPresentationDecisionCode, TerrainPresentationExpectations,
+    TerrainPresentationMode, TerrainPresentationRecord, TerrainTransitionDiagnosticCode,
+};
 pub use render_quality::{
     QualityPreset, RenderQualityConfig, ViewportQualityManager, ViewportRendererMode,
 };
@@ -210,6 +217,15 @@ impl MaterialPalette {
 /// wgpu/Vulkan drivers often expect uniform bindings sized to 256-byte alignment.
 const FRAME_UNIFORM_BUF_SIZE: u64 = 512;
 
+#[derive(Clone, Copy)]
+struct GpuPresentationAttempt {
+    requested_mode: TerrainPresentationMode,
+    actual_mode: TerrainPresentationMode,
+    requested_rect: Option<SampleRect>,
+    actual_rect: Option<SampleRect>,
+    coherent_before: bool,
+}
+
 pub struct TerrainRenderer {
     /// Presentation surface. `None` for headless renderers built via `new_headless`.
     ///
@@ -258,6 +274,10 @@ pub struct TerrainRenderer {
     /// Last resolved GPU pass timings (0 when TIMESTAMP_QUERY unavailable).
     pub last_gpu_timings: GpuTimings,
     pending_presentation_trace: GpuPresentationTraceContext,
+    presentation_baseline: Option<PresentedTerrainBaseline>,
+    last_presentation_record: Option<TerrainPresentationRecord>,
+    presentation_slot_epoch: u64,
+    integrity_probe: Option<integrity_probe::TerrainIntegrityProbe>,
     /// Terrain mesh resolution drawn last frame (profiler).
     pub last_grid_resolution: u32,
     /// After first height present, leave orbit target alone so uploads don't fight the user.
@@ -871,6 +891,7 @@ impl TerrainRenderer {
         });
 
         let heights = HeightGpu::new(&device, 256);
+        let integrity_probe = integrity_probe::TerrainIntegrityProbe::try_new(&device);
         debug_assert!(std::mem::size_of::<FrameUniforms>() as u64 <= FRAME_UNIFORM_BUF_SIZE);
         let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("frame-u"),
@@ -1115,6 +1136,10 @@ impl TerrainRenderer {
             last_upload_us: 0,
             last_gpu_timings: GpuTimings::default(),
             pending_presentation_trace: GpuPresentationTraceContext::default(),
+            presentation_baseline: None,
+            last_presentation_record: None,
+            presentation_slot_epoch: 0,
+            integrity_probe,
             last_grid_resolution: 0,
             camera_framed: false,
             brush,
@@ -1392,6 +1417,10 @@ impl TerrainRenderer {
             regions,
         );
         self.finish_height_present(t0);
+        // CPU ownership has no GPU output identity. Invalidate the typed GPU
+        // baseline so the next regional GPU request promotes to a full copy.
+        self.presentation_baseline = None;
+        self.last_presentation_record = None;
     }
 
     /// Upload authored tint, roughness, metalness, and optional albedo PNGs.
@@ -1474,6 +1503,55 @@ impl TerrainRenderer {
         self.finish_height_present(t0);
     }
 
+    pub fn present_gpu_height_region_traced(
+        &mut self,
+        src: &wgpu::Texture,
+        geom: HeightPresentGeom,
+        region: Option<SampleRect>,
+        candidate: terra_gpu::output_identity::GpuTerrainOutputIdentity,
+        expected: TerrainPresentationExpectations,
+    ) -> TerrainPresentationRecord {
+        let coherent_before = self.heights.local_slots_coherent();
+        let full = SampleRect {
+            x: 0,
+            y: 0,
+            w: geom.width,
+            h: geom.height,
+        };
+        let requested_is_partial = region.is_some_and(|rect| rect != full);
+        let actual_mode = if requested_is_partial && coherent_before {
+            TerrainPresentationMode::RegionalCopy
+        } else {
+            TerrainPresentationMode::FullCopy
+        };
+        let actual_rect = match actual_mode {
+            TerrainPresentationMode::RegionalCopy => region,
+            TerrainPresentationMode::FullCopy => Some(full),
+            TerrainPresentationMode::Shared | TerrainPresentationMode::CpuUpload => None,
+        };
+        self.present_gpu_height_region(src, geom, region);
+        let record = self.record_gpu_presentation(
+            candidate,
+            expected,
+            GpuPresentationAttempt {
+                requested_mode: if requested_is_partial {
+                    TerrainPresentationMode::RegionalCopy
+                } else {
+                    TerrainPresentationMode::FullCopy
+                },
+                actual_mode,
+                requested_rect: region,
+                actual_rect,
+                coherent_before,
+            },
+        );
+        if self.integrity_probe.is_some() {
+            let source_view = src.create_view(&wgpu::TextureViewDescriptor::default());
+            self.submit_integrity_probe(&source_view, record);
+        }
+        record
+    }
+
     /// Bind a GPU engine height texture directly when formats match (full field).
     /// Partial [`SampleRect`] updates still copy through the double-buffer path; the
     /// first partial after sharing promotes once to a full GPU copy to establish a
@@ -1494,6 +1572,118 @@ impl TerrainRenderer {
         self.heights
             .present_shared_height(&self.device, &self.queue, src_view, geom);
         self.finish_height_present(t0);
+    }
+
+    pub fn present_gpu_height_shared_traced(
+        &mut self,
+        src: &wgpu::Texture,
+        src_view: &wgpu::TextureView,
+        geom: HeightPresentGeom,
+        region: Option<SampleRect>,
+        candidate: terra_gpu::output_identity::GpuTerrainOutputIdentity,
+        expected: TerrainPresentationExpectations,
+    ) -> TerrainPresentationRecord {
+        if region.is_some() {
+            return self.present_gpu_height_region_traced(src, geom, region, candidate, expected);
+        }
+        let coherent_before = self.heights.local_slots_coherent();
+        self.present_gpu_height_shared(src, src_view, geom, None);
+        let record = self.record_gpu_presentation(
+            candidate,
+            expected,
+            GpuPresentationAttempt {
+                requested_mode: TerrainPresentationMode::Shared,
+                actual_mode: TerrainPresentationMode::Shared,
+                requested_rect: None,
+                actual_rect: None,
+                coherent_before,
+            },
+        );
+        self.submit_integrity_probe(src_view, record);
+        record
+    }
+
+    fn record_gpu_presentation(
+        &mut self,
+        candidate: terra_gpu::output_identity::GpuTerrainOutputIdentity,
+        expected: TerrainPresentationExpectations,
+        attempt: GpuPresentationAttempt,
+    ) -> TerrainPresentationRecord {
+        let baseline_before = self.presentation_baseline;
+        let shadow_diagnostic = presentation_transition::validate_transition_shadow(
+            candidate,
+            baseline_before,
+            expected,
+            attempt.actual_mode,
+        );
+        self.presentation_slot_epoch = self.presentation_slot_epoch.saturating_add(1);
+        let coherent_after = self.heights.local_slots_coherent();
+        let last_full_generation = if matches!(
+            attempt.actual_mode,
+            TerrainPresentationMode::Shared | TerrainPresentationMode::FullCopy
+        ) {
+            Some(candidate.generation)
+        } else {
+            baseline_before.and_then(|baseline| baseline.last_full_generation)
+        };
+        let baseline_after = PresentedTerrainBaseline {
+            identity: candidate,
+            mode: attempt.actual_mode,
+            complete: candidate.is_current_complete_final() && shadow_diagnostic.is_none(),
+            local_slots_coherent: coherent_after,
+            local_slot_epoch: self.presentation_slot_epoch,
+            last_full_generation,
+            height_lineage: candidate.output,
+            normal_lineage: candidate.output,
+        };
+        let record = TerrainPresentationRecord {
+            candidate,
+            expectations: expected,
+            baseline_before,
+            baseline_after,
+            requested_mode: attempt.requested_mode,
+            actual_mode: attempt.actual_mode,
+            requested_rect: attempt.requested_rect,
+            actual_rect: attempt.actual_rect,
+            local_slots_coherent_before: attempt.coherent_before,
+            local_slots_coherent_after: coherent_after,
+            decision: TerrainPresentationDecisionCode::Accepted,
+            shadow_diagnostic,
+        };
+        self.presentation_baseline = Some(baseline_after);
+        self.last_presentation_record = Some(record);
+        record
+    }
+
+    pub const fn presented_terrain_baseline(&self) -> Option<PresentedTerrainBaseline> {
+        self.presentation_baseline
+    }
+
+    pub const fn last_terrain_presentation_record(&self) -> Option<TerrainPresentationRecord> {
+        self.last_presentation_record
+    }
+
+    fn submit_integrity_probe(
+        &mut self,
+        source: &wgpu::TextureView,
+        record: TerrainPresentationRecord,
+    ) {
+        if let Some(probe) = self.integrity_probe.as_mut() {
+            probe.submit(
+                &self.device,
+                &self.queue,
+                source,
+                record.candidate,
+                record.actual_mode,
+                record.actual_rect,
+            );
+        }
+    }
+
+    pub fn poll_integrity_probes(&mut self) -> Vec<TerrainIntegrityProbeResult> {
+        self.integrity_probe
+            .as_mut()
+            .map_or_else(Vec::new, |probe| probe.poll(&self.device))
     }
 
     fn finish_height_present(&mut self, t0: std::time::Instant) {
@@ -1755,6 +1945,8 @@ impl TerrainRenderer {
     /// Clear viewport GPU state that belongs to the previous document.
     pub fn reset_project_state(&mut self, world_size: (f32, f32), ocean_level: Option<f32>) {
         self.use_tile_stream = false;
+        self.presentation_baseline = None;
+        self.last_presentation_record = None;
         self.heights
             .reset_project_state(&self.device, &self.queue, world_size);
         // Empty vegetation overlay (no density → clear instances).

@@ -804,6 +804,13 @@ impl ApplicationHandler<RuntimeEvent> for TerraApp {
                     }
                 }
                 self.redraw();
+                let probe_results = self.renderer.as_mut().map_or_else(
+                    Vec::new,
+                    terra_render::TerrainRenderer::poll_integrity_probes,
+                );
+                for result in probe_results {
+                    self.frame_trace.record_probe_result(Instant::now(), result);
+                }
                 if let Some(timings) = self
                     .renderer
                     .as_ref()

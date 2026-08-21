@@ -7,6 +7,7 @@ pub mod compiled_plan;
 pub mod derivatives;
 pub mod effect_filter;
 pub mod graph;
+pub mod output_identity;
 pub mod parity;
 pub mod tile_cache;
 

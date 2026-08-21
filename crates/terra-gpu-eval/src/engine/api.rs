@@ -12,6 +12,9 @@ use terra_core::terrain_plan::{
 };
 use terra_gpu::compiled_plan::{GpuPlanResourceBuilder, GpuPlanResources};
 use terra_gpu::graph::{GpuComputeGraph, GpuFallbackDiagnostic, GpuLayerPlan};
+use terra_gpu::output_identity::GpuTerrainOutputIdentity;
+
+pub use terra_gpu::output_identity::GpuEvaluationIntent;
 
 /// Result of a GPU preview evaluation.
 pub struct GpuEvalResult {
@@ -31,6 +34,9 @@ pub struct GpuEvalResult {
     pub cpu_fallback: Option<GpuFallbackDiagnostic>,
     /// True when the evaluate loop ran (filters may have been applied). False on seed failure.
     pub did_eval: bool,
+    /// Correlated semantic/resource identity for the engine texture. `None` is
+    /// reserved for failures that produced no presentable GPU candidate.
+    pub output_identity: Option<GpuTerrainOutputIdentity>,
 }
 
 /// Required-GPU numerical diagnostics for simulation scratch state.
@@ -70,13 +76,6 @@ impl GpuPreviewFreshness {
 
 /// Per-evaluation execution intent. This is deliberately not a user-facing
 /// policy surface: the editor has one default behavior for bounded local edits.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum GpuEvaluationIntent {
-    InteractiveLocal,
-    #[default]
-    Complete,
-}
-
 /// Observable phase of an optional, resumable compiled-plan refinement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GpuRefinementPhase {
@@ -132,6 +131,8 @@ pub struct GpuRefinementJob {
     pub(super) resource_prepare_us: u64,
     pub(super) encode_us: u64,
     pub(super) range_before: (f32, f32),
+    pub(super) trace_context: crate::evaluation_timing::GpuEvaluationTraceContext,
+    pub(super) final_submission_serial: terra_gpu::output_identity::GpuSubmissionSerial,
 }
 
 impl GpuRefinementJob {
