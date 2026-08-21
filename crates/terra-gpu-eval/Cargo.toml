@@ -28,5 +28,10 @@ name = "parity_matrix"
 path = "tests/parity_matrix.rs"
 required-features = ["gpu-parity"]
 
+[[test]]
+name = "determinism_tiling"
+path = "tests/determinism_tiling.rs"
+required-features = ["gpu-parity"]
+
 [lints]
 workspace = true
