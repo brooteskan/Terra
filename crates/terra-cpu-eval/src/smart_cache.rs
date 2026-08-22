@@ -278,8 +278,10 @@ fn append_f32_le(buf: &mut Vec<u8>, data: &[f32]) {
 
 fn read_f32_le(bytes: &[u8]) -> Vec<f32> {
     bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_bits(u32::from_le_bytes([c[0], c[1], c[2], c[3]])))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|bytes| f32::from_bits(u32::from_le_bytes(*bytes)))
         .collect()
 }
 
