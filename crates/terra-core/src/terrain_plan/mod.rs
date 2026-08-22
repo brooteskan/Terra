@@ -15,6 +15,7 @@ mod analysis;
 mod cache;
 mod compiler;
 mod dirty;
+mod domain;
 mod ids;
 mod impact;
 mod ir;
@@ -26,6 +27,10 @@ pub use compiler::{compile_terrain_plan, TerrainPlanDiagnostic};
 pub use dirty::{
     propagate_plan_edits, FullFieldEscalation, FullFieldReason, PlanDirtyOperation,
     PlanInvalidation,
+};
+pub use domain::{
+    resolve_plan_domain, TerrainPlanDomainRejectReason, TerrainPlanDomainRejection,
+    TerrainPlanDomainSlice,
 };
 pub use ids::{
     FieldSlot, PlanOpId, PlanStructureRevision, PlanStructureSignature, TerrainPlanStamp,

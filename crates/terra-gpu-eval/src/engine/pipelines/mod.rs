@@ -1203,6 +1203,7 @@ impl GpuTerrainEngine {
                 tile_size: w,
                 halo: 0,
             },
+            tile_sample_window: None,
             approx_range: (0.0, 120.0),
             current: 0,
             tile_sched: TileScheduler::new(),

@@ -25,6 +25,7 @@ pub struct TerrainTileWorkKey {
 pub enum TerrainTileWorkSource {
     CpuHeight,
     GpuPyramid,
+    GpuCompiledPlan,
 }
 
 /// One concrete request to publish a height tile from an already existing CPU
@@ -340,6 +341,14 @@ impl TerrainTileWorkScheduler {
 
     pub fn live_content(&self) -> Option<TerrainContentStamp> {
         self.live_content
+    }
+
+    pub fn lease_is_live(&self, id: u64, content: TerrainContentStamp) -> bool {
+        self.live_content == Some(content)
+            && self
+                .in_flight
+                .get(&id)
+                .is_some_and(|entry| entry.request.content == content)
     }
 
     fn trim_to_capacity(&mut self) {

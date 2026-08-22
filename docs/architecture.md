@@ -254,6 +254,17 @@ lease state only: exact-current checks always query `GpuTileAtlas`, and publicat
 revalidates the full content stamp before cache or page-table mutation. See
 [Terrain tile work scheduling](algorithms/terrain_work_scheduling.md).
 
+Eligible height requests can now execute the compiled plan over an isolated
+tile-plus-halo domain. The backend-neutral domain separates the atlas publication
+halo from cumulative operation reach and retains the full-level integer sample
+lattice for deterministic world-space sampling. Tile evaluators own and recycle
+tile-sized plan/scratch resources independently of the complete-field engine.
+No atlas slot is allocated until the GPU suffix completes and its scheduler lease
+and complete content stamp are revalidated. `Reach::Full`, observed global
+auxiliary dependencies, and kernels without a domain-coordinate contract defer
+explicitly to the existing complete-field pyramid. See
+[Compiled tile-domain GPU evaluation](algorithms/compiled_tile_evaluation.md).
+
 Output edits advance `TerrainRuntime::output_revision` through the app's single revision
 boundary, which drops old pyramid content and clears pending uploads, the cache and page
 table, and renderer streaming state. Document reset performs the same retirement while

@@ -33,8 +33,11 @@ This escape plus age promotion prevents stationary-view starvation.
 
 ## Publication and statistics
 
-The only work sources are the two production executors that exist today: CPU
-height-tile upload and immutable GPU-pyramid publication. Atlas publication
+The production work sources are CPU height-tile upload, immutable GPU-pyramid
+publication, and compiled tile-domain GPU evaluation. The compiled source stages
+tile-sized plan resources and becomes publishable only after its complete suffix
+finishes and the scheduler lease remains current. Unsupported or global plans
+defer explicitly to the immutable pyramid. Atlas publication
 compares the complete live content identity before cache or page-table mutation.
 Payload commands precede the valid page-table write, and revision retirement
 disables streaming and queues a page-table clear after older GPU work.
@@ -48,3 +51,6 @@ Snapshots report queued and in-flight counts, deduplication, reprioritization,
 cancellation, stale drops, authoritative-cache skips, submissions, completions,
 failures, budget overruns, estimated dispatched cost, and queue/completion
 latency totals and maxima.
+
+See [Compiled tile-domain GPU evaluation](compiled_tile_evaluation.md) for the
+domain, reach, and atomic-publication contract.

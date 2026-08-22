@@ -2,8 +2,8 @@ use bytemuck::{Pod, Zeroable};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use terra_core::{
-    FieldId, HeightTile, TerrainContentStamp, TerrainPyramid, TerrainTileKey, TileCacheError,
-    TileCacheInsert, TilePageHandle, TileResidencyCache,
+    FieldId, HeightTile, TerrainContentStamp, TerrainEvaluationDomain, TerrainPyramid,
+    TerrainTileKey, TileCacheError, TileCacheInsert, TilePageHandle, TileResidencyCache,
 };
 use thiserror::Error;
 use wgpu::util::DeviceExt;
@@ -139,6 +139,8 @@ pub enum GpuTileCacheError {
     StalePyramid { content: u64, live: u64 },
     #[error("pyramid content identity is stale")]
     StalePyramidIdentity,
+    #[error("evaluated tile content identity is stale")]
+    StaleEvaluatedTileIdentity,
     #[error("tile {0:?} is not addressable by the configured height hierarchy")]
     UnaddressableTile(TerrainTileKey),
     #[error("pyramid tile publication failed: {0}")]
@@ -722,6 +724,148 @@ impl GpuTileAtlas {
                 extent.height,
                 self.halo,
                 identity.content_stamp(),
+                published_frame,
+            ),
+        );
+        if let Some(virtual_index) = self.virtual_index(&key) {
+            self.write_virtual_entry(
+                queue,
+                virtual_index,
+                GpuVirtualPageEntry::resident(insert.handle),
+            );
+        }
+        Ok(GpuTileUpload {
+            handle: insert.handle,
+            evicted: insert
+                .evicted
+                .into_iter()
+                .map(|eviction| eviction.key)
+                .collect(),
+        })
+    }
+
+    /// Publish a completed tile-domain evaluation. Residency is not allocated
+    /// until the complete content stamp has been revalidated by the caller.
+    pub fn publish_evaluated_tile_current_at_frame(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        source: &wgpu::TextureView,
+        domain: &TerrainEvaluationDomain,
+        live_content: TerrainContentStamp,
+        published_frame: u64,
+    ) -> Result<GpuTileUpload, GpuTileCacheError> {
+        if domain.content != live_content {
+            return Err(GpuTileCacheError::StaleEvaluatedTileIdentity);
+        }
+        let hierarchy = self
+            .hierarchy
+            .as_ref()
+            .ok_or_else(|| GpuTileCacheError::UnaddressableTile(domain.key.clone()))?;
+        let expected = hierarchy
+            .tile_extent(domain.key.level, domain.key.tile)
+            .ok_or_else(|| GpuTileCacheError::UnaddressableTile(domain.key.clone()))?;
+        if expected != domain.interior {
+            return Err(GpuTileCacheError::UnaddressableTile(domain.key.clone()));
+        }
+        if expected.width + self.halo * 2 > self.page_extent
+            || expected.height + self.halo * 2 > self.page_extent
+        {
+            return Err(GpuTileCacheError::TileTooLarge {
+                width: expected.width + self.halo * 2,
+                height: expected.height + self.halo * 2,
+                page_extent: self.page_extent,
+            });
+        }
+        if domain.publication_halo < self.halo {
+            return Err(GpuTileCacheError::TileTooLarge {
+                width: expected.width + self.halo * 2,
+                height: expected.height + self.halo * 2,
+                page_extent: expected.width + domain.publication_halo * 2,
+            });
+        }
+
+        let key = domain.key.clone();
+        let insert = self.allocate_page(
+            queue,
+            &key,
+            live_content.output_revision,
+            live_content.content_revision,
+            Some(live_content),
+        )?;
+        self.write_page_entry(
+            queue,
+            insert.handle.slot,
+            GpuPageTableEntry::invalid(insert.handle.generation),
+        );
+        let destination_view = self.texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("terrain-evaluated-atlas-slot-storage"),
+            dimension: Some(wgpu::TextureViewDimension::D2),
+            base_array_layer: insert.handle.slot,
+            array_layer_count: Some(1),
+            ..Default::default()
+        });
+        let interior_local_x = domain.interior.origin_x - domain.evaluation.origin_x;
+        let interior_local_z = domain.interior.origin_z - domain.evaluation.origin_z;
+        let uniforms = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("terrain-evaluated-pack-uniform"),
+            contents: bytemuck::bytes_of(&PackUniforms {
+                source_width: domain.evaluation.width,
+                source_height: domain.evaluation.height,
+                origin_x: interior_local_x,
+                origin_z: interior_local_z,
+                interior_width: expected.width,
+                interior_height: expected.height,
+                halo: self.halo,
+                page_extent: self.page_extent,
+            }),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("terrain-evaluated-pack-bg"),
+            layout: &self.pack_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniforms.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(source),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&destination_view),
+                },
+            ],
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("terrain-evaluated-pack-encoder"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("terrain-evaluated-pack-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pack_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(
+                self.page_extent.div_ceil(8),
+                self.page_extent.div_ceil(8),
+                1,
+            );
+        }
+        queue.submit(Some(encoder.finish()));
+        self.write_page_entry(
+            queue,
+            insert.handle.slot,
+            GpuPageTableEntry::resident(
+                &key,
+                insert.handle,
+                expected.width,
+                expected.height,
+                self.halo,
+                live_content,
                 published_frame,
             ),
         );

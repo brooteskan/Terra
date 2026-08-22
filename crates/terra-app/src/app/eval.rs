@@ -792,7 +792,7 @@ impl TerraApp {
     }
 
     pub(crate) fn queue_final_tile_uploads(&mut self) {
-        self.terrain_tile_scheduler.clear();
+        self.clear_terrain_tile_work();
         self.gpu_height_pyramid = None;
         self.clear_terrain_demand();
         if self.tile_atlas.is_none() {
@@ -896,7 +896,7 @@ impl TerraApp {
                 self.clear_terrain_demand();
                 self.gpu_pyramid_error_readback = Some(error_readback);
                 self.gpu_height_pyramid = Some(pyramid);
-                self.terrain_tile_scheduler.clear();
+                self.clear_terrain_tile_work();
                 let root_metrics = self
                     .terrain_runtime
                     .pyramid
@@ -919,7 +919,7 @@ impl TerraApp {
                                 output_revision: stamp.output_revision,
                             },
                             content: stamp,
-                            source: terra_core::TerrainTileWorkSource::GpuPyramid,
+                            source: terra_core::TerrainTileWorkSource::GpuCompiledPlan,
                             class: terra_core::TerrainDemandClass::CoarseCoverage,
                             visible: true,
                             projected_error_px: f32::MAX,
@@ -1057,7 +1057,7 @@ impl TerraApp {
                         output_revision: stamp.output_revision,
                     },
                     content: stamp,
-                    source: terra_core::TerrainTileWorkSource::GpuPyramid,
+                    source: terra_core::TerrainTileWorkSource::GpuCompiledPlan,
                     class: demand.class,
                     visible: true,
                     projected_error_px: demand.projected_error_px,
@@ -1084,7 +1084,7 @@ impl TerraApp {
             || self.gpu.is_none()
             || (self.last_height.is_none() && self.gpu_height_pyramid.is_none())
         {
-            self.terrain_tile_scheduler.clear();
+            self.clear_terrain_tile_work();
             return 0;
         }
         let Some(live_stamp) = self.terrain_tile_scheduler.live_content() else {
@@ -1094,12 +1094,12 @@ impl TerraApp {
             self.terrain_runtime.refinement.state(),
             self.tile_atlas.as_ref().unwrap().max_pages() as usize,
         );
-        let leases = self.terrain_tile_scheduler.dequeue_budgeted(budget);
         let published_frame = self
             .renderer
             .as_ref()
             .map_or(0, terra_render::TerrainRenderer::global_frame_index);
-        let mut uploaded = 0;
+        let mut uploaded = self.poll_compiled_tile_jobs(live_stamp, published_frame);
+        let leases = self.terrain_tile_scheduler.dequeue_budgeted(budget);
         for lease in leases {
             if lease.request.content != live_stamp {
                 self.terrain_tile_scheduler.fail(lease);
@@ -1114,6 +1114,90 @@ impl TerraApp {
             {
                 self.terrain_tile_scheduler
                     .skip_in_flight_as_resident(lease);
+                continue;
+            }
+            if lease.request.source == terra_core::TerrainTileWorkSource::GpuCompiledPlan {
+                let preview_stack = self.session.document.preview_eval_stack();
+                let plan = self
+                    .terrain_plan_cache
+                    .acquire(&preview_stack, &self.session.document.masks)
+                    .ok()
+                    .cloned();
+                let started_engine = plan.and_then(|plan| {
+                    let slice =
+                        terra_gpu_eval::GpuCompiledTileProducer::analyze(&preview_stack, &plan)
+                            .map_err(|error| {
+                                log::debug!("compiled tile deferred to pyramid: {error:?}");
+                            })
+                            .ok()?;
+                    let domain = terra_core::TerrainEvaluationDomain::for_tile(
+                        &self.terrain_runtime.pyramid,
+                        key.clone(),
+                        self.tile_atlas.as_ref().unwrap().halo(),
+                        slice.operation_halo,
+                        live_stamp,
+                    )
+                    .map_err(|error| {
+                        log::warn!("compiled tile domain rejected: {error:?}");
+                    })
+                    .ok()?;
+                    let invalidation = self.pending_plan_invalidation.clone().unwrap_or_default();
+                    match self.compiled_tile_producer.begin(
+                        &self.gpu.as_ref().unwrap().device,
+                        &self.gpu.as_ref().unwrap().queue,
+                        &preview_stack,
+                        &self.session.document.masks,
+                        &plan,
+                        &invalidation,
+                        PreviewQuality::Full,
+                        domain,
+                    ) {
+                        Ok(engine) => Some(engine),
+                        Err(error) => {
+                            log::debug!("compiled tile deferred to pyramid: {error:?}");
+                            None
+                        }
+                    }
+                });
+                if let Some(engine) = started_engine {
+                    self.compiled_tile_jobs
+                        .push(super::CompiledTileWorkJob { lease, engine });
+                    continue;
+                }
+                // Explicit complete-field fallback for unsupported/global work.
+                let Some(pyramid) = self
+                    .gpu_height_pyramid
+                    .as_ref()
+                    .filter(|pyramid| pyramid.identity().content_stamp() == live_stamp)
+                else {
+                    self.terrain_tile_scheduler.fail(lease);
+                    continue;
+                };
+                let result = self
+                    .tile_atlas
+                    .as_mut()
+                    .unwrap()
+                    .publish_pyramid_tile_current_at_frame(
+                        &self.gpu.as_ref().unwrap().device,
+                        &self.gpu.as_ref().unwrap().queue,
+                        pyramid,
+                        key.clone(),
+                        live_stamp,
+                        published_frame,
+                    );
+                match result {
+                    Ok(_) => {
+                        uploaded += 1;
+                        if key.level == 0 {
+                            let _ = self.tile_atlas.as_mut().unwrap().pin(&key);
+                        }
+                        self.terrain_tile_scheduler.complete(lease, live_stamp);
+                    }
+                    Err(error) => {
+                        log::warn!("terrain tile fallback upload failed: {error}");
+                        self.terrain_tile_scheduler.fail(lease);
+                    }
+                }
                 continue;
             }
             let result = match lease.request.source {
@@ -1158,6 +1242,7 @@ impl TerraApp {
                             published_frame,
                         )
                 }
+                terra_core::TerrainTileWorkSource::GpuCompiledPlan => unreachable!(),
             };
             match result {
                 Ok(_) => {
@@ -1186,6 +1271,68 @@ impl TerraApp {
             .profile
             .update_terrain_tile_work(self.terrain_tile_scheduler.stats());
         uploaded
+    }
+
+    fn poll_compiled_tile_jobs(
+        &mut self,
+        live_stamp: terra_core::TerrainContentStamp,
+        published_frame: u64,
+    ) -> usize {
+        let mut retained = Vec::new();
+        let mut uploaded = 0;
+        for mut work in std::mem::take(&mut self.compiled_tile_jobs) {
+            let fresh = self
+                .terrain_tile_scheduler
+                .lease_is_live(work.lease.id, live_stamp)
+                && work.lease.request.content == live_stamp;
+            if !fresh {
+                self.compiled_tile_producer.cancel(work.engine);
+                continue;
+            }
+            if !self
+                .compiled_tile_producer
+                .poll(&self.gpu.as_ref().unwrap().device, &mut work.engine)
+            {
+                retained.push(work);
+                continue;
+            }
+            let key = work.lease.request.key.tile.clone();
+            let result = self
+                .tile_atlas
+                .as_mut()
+                .unwrap()
+                .publish_evaluated_tile_current_at_frame(
+                    &self.gpu.as_ref().unwrap().device,
+                    &self.gpu.as_ref().unwrap().queue,
+                    work.engine.output_texture_view().expect("completed tile"),
+                    work.engine.domain(),
+                    live_stamp,
+                    published_frame,
+                );
+            self.compiled_tile_producer.recycle(work.engine);
+            match result {
+                Ok(_) => {
+                    uploaded += 1;
+                    if key.level == 0 {
+                        let _ = self.tile_atlas.as_mut().unwrap().pin(&key);
+                    }
+                    self.terrain_tile_scheduler.complete(work.lease, live_stamp);
+                }
+                Err(error) => {
+                    log::warn!("compiled terrain tile publication failed: {error}");
+                    self.terrain_tile_scheduler.fail(work.lease);
+                }
+            }
+        }
+        self.compiled_tile_jobs = retained;
+        uploaded
+    }
+
+    pub(crate) fn clear_terrain_tile_work(&mut self) {
+        for work in std::mem::take(&mut self.compiled_tile_jobs) {
+            self.compiled_tile_producer.cancel(work.engine);
+        }
+        self.terrain_tile_scheduler.clear();
     }
 
     pub(crate) fn sync_tile_stream_to_renderer(&mut self) {
@@ -1270,7 +1417,7 @@ impl TerraApp {
     /// shader's monolithic page-miss fallback until `upload_pending_terrain_tiles` →
     /// `sync_tile_stream_to_renderer` re-enable streaming for the new revision.
     pub(crate) fn retire_streamed_residency(&mut self) {
-        self.terrain_tile_scheduler.clear();
+        self.clear_terrain_tile_work();
         self.ui_state
             .profile
             .update_terrain_tile_work(self.terrain_tile_scheduler.stats());
@@ -2662,7 +2809,7 @@ mod tests {
             .queued_requests()
             .all(|pending| matches!(
                 pending.source,
-                terra_core::TerrainTileWorkSource::GpuPyramid
+                terra_core::TerrainTileWorkSource::GpuCompiledPlan
             )));
 
         let residency_before = app.tile_atlas.as_ref().unwrap().residency().stats();
@@ -2721,7 +2868,14 @@ mod tests {
             "planning demand must not publish or mirror residency"
         );
 
-        let uploaded = app.upload_pending_terrain_tiles();
+        let mut uploaded = app.upload_pending_terrain_tiles();
+        for _ in 0..4 {
+            if uploaded > 0 {
+                break;
+            }
+            app.gpu.as_ref().unwrap().device.poll(wgpu::Maintain::Wait);
+            uploaded += app.upload_pending_terrain_tiles();
+        }
         assert!(uploaded > 0);
         let atlas = app.tile_atlas.as_ref().unwrap();
         let rows = atlas.read_page_table_blocking(

@@ -1538,7 +1538,7 @@ impl TerraApp {
         self.pending_eval = false;
         self.pending_eval_immediate = false;
         self.deferred_full_field = None;
-        self.terrain_tile_scheduler.clear();
+        self.clear_terrain_tile_work();
         self.pending_ui_effects.clear();
         self.input.clear();
         self.pending_surface_resize = None;

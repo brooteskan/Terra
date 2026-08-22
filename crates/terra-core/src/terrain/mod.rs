@@ -3,6 +3,7 @@
 
 mod cache;
 mod demand;
+mod domain;
 mod pyramid;
 mod refinement;
 mod runtime;
@@ -16,6 +17,9 @@ pub use cache::{
 pub use demand::{
     conservative_geometric_errors, TerrainDemandClass, TerrainDemandConfig, TerrainDemandError,
     TerrainDemandPlan, TerrainDemandPlanner, TerrainDemandView, TerrainTileDemand,
+};
+pub use domain::{
+    TerrainDomainError, TerrainEvaluationDomain, TerrainSampleExtent, TerrainWorldTransform,
 };
 pub use pyramid::{
     PyramidConfig, TerrainLevel, TerrainPyramid, TerrainTileExtent, TerrainTileRange,

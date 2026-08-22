@@ -14,4 +14,7 @@ pub use api::{
     GpuRefinementProgress, GpuRefinementStep,
 };
 pub use runtime::GpuTerrainEngine;
+pub use runtime::{
+    GpuCompiledTileProducer, GpuTileEvaluationError, GpuTileEvaluationJob, GpuTileProducerStats,
+};
 pub use stats::{GpuEvalStats, GpuPlanOperationDisposition, GpuPlanOperationTrace};

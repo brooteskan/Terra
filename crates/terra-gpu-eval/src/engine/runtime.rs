@@ -111,6 +111,11 @@ mod pipelines;
 mod readback;
 #[path = "refinement.rs"]
 mod refinement;
+#[path = "tile_domain.rs"]
+mod tile_domain;
+pub use tile_domain::{
+    GpuCompiledTileProducer, GpuTileEvaluationError, GpuTileEvaluationJob, GpuTileProducerStats,
+};
 #[path = "resources.rs"]
 mod resources;
 use pipelines::{record_copy_views_region, Pipe};
@@ -134,6 +139,14 @@ use terra_core::tiling::{SampleRect, TileScheduler};
 /// `ensure_size` restores the next evaluation's document dimensions.
 const PROJECT_RESET_TEXTURE_EXTENT: u32 = 8;
 static NEXT_DEVICE_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Copy)]
+struct TileSampleWindow {
+    origin_x: u32,
+    origin_z: u32,
+    level_width: u32,
+    level_height: u32,
+}
 
 /// GPU stack evaluator for interactive preview.
 pub struct GpuTerrainEngine {
@@ -220,6 +233,7 @@ pub struct GpuTerrainEngine {
     source_upload_count: usize,
     dirty: HashSet<LayerId>,
     metrics: HeightfieldMetrics,
+    tile_sample_window: Option<TileSampleWindow>,
     approx_range: (f32, f32),
     /// Index of texture holding current composed height: 0=ping, 1=pong.
     current: u8,

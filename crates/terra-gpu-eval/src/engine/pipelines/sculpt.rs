@@ -12,6 +12,7 @@ impl GpuTerrainEngine {
     ) {
         let full_width = self.metrics.width;
         let full_height = self.metrics.height;
+        let sample_window = self.tile_sample_window;
         let (origin_x, origin_y, width, height) = region.unwrap_or((0, 0, full_width, full_height));
         let row_bytes = width.saturating_mul(4);
         let padded_row_bytes = row_bytes.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
@@ -25,8 +26,17 @@ impl GpuTerrainEngine {
             for local_x in 0..width {
                 let x = origin_x + local_x;
                 let y = origin_y + local_y;
-                let u = (x as f32 + 0.5) / full_width.max(1) as f32;
-                let v = (y as f32 + 0.5) / full_height.max(1) as f32;
+                let (sample_x, sample_y, sample_width, sample_height) =
+                    sample_window.map_or((x, y, full_width, full_height), |window| {
+                        (
+                            window.origin_x.saturating_add(x),
+                            window.origin_z.saturating_add(y),
+                            window.level_width,
+                            window.level_height,
+                        )
+                    });
+                let u = (sample_x as f32 + 0.5) / sample_width.max(1) as f32;
+                let v = (sample_y as f32 + 0.5) / sample_height.max(1) as f32;
                 let sample = params.sample_bilinear(u, v);
                 lo = lo.min(sample);
                 hi = hi.max(sample);

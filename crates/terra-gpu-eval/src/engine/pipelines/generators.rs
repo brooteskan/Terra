@@ -31,6 +31,15 @@ impl GpuTerrainEngine {
         dispatch: NoiseDispatch,
         destination: TexSlot,
     ) {
+        let (domain_origin_x, domain_origin_z) =
+            self.tile_sample_window.map_or((0.0, 0.0), |window| {
+                (
+                    window.origin_x as f32 * self.metrics.world_size_x
+                        / self.metrics.width.max(1) as f32,
+                    window.origin_z as f32 * self.metrics.world_size_z
+                        / self.metrics.height.max(1) as f32,
+                )
+            });
         let u = NoiseU {
             width: self.metrics.width,
             height: self.metrics.height,
@@ -42,8 +51,11 @@ impl GpuTerrainEngine {
             amplitude: p.amplitude,
             lacunarity: p.lacunarity,
             persistence: p.persistence,
-            offset_x: p.offset_x,
-            offset_z: p.offset_z,
+            // The shader's local world coordinate starts at zero. Shift the
+            // authored offset by the domain origin so tiled and complete-field
+            // dispatches address the same deterministic world lattice.
+            offset_x: p.offset_x + domain_origin_x,
+            offset_z: p.offset_z + domain_origin_z,
             remap_min: p.remap_min,
             remap_max: p.remap_max,
             noise_type: dispatch.noise_type,

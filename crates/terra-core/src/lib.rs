@@ -132,10 +132,11 @@ pub use terrain::{
     conservative_geometric_errors, EditorRefinementState, PyramidConfig, RefinementController,
     RefinementTimings, ResidentTile, TerrainCacheKey, TerrainContentStamp, TerrainDemandClass,
     TerrainDemandConfig, TerrainDemandError, TerrainDemandPlan, TerrainDemandPlanner,
-    TerrainDemandView, TerrainLevel, TerrainPyramid, TerrainRuntime, TerrainTileDemand,
-    TerrainTileExtent, TerrainTileKey, TerrainTileRange, TerrainTileWorkBudget, TerrainTileWorkKey,
-    TerrainTileWorkLease, TerrainTileWorkRequest, TerrainTileWorkScheduler, TerrainTileWorkSource,
-    TerrainTileWorkStats, TileCacheError, TileCacheEviction, TileCacheInsert, TileCacheStats,
+    TerrainDemandView, TerrainDomainError, TerrainEvaluationDomain, TerrainLevel, TerrainPyramid,
+    TerrainRuntime, TerrainSampleExtent, TerrainTileDemand, TerrainTileExtent, TerrainTileKey,
+    TerrainTileRange, TerrainTileWorkBudget, TerrainTileWorkKey, TerrainTileWorkLease,
+    TerrainTileWorkRequest, TerrainTileWorkScheduler, TerrainTileWorkSource, TerrainTileWorkStats,
+    TerrainWorldTransform, TileCacheError, TileCacheEviction, TileCacheInsert, TileCacheStats,
     TilePageHandle, TileResidencyCache,
 };
 pub use world_archetype::{

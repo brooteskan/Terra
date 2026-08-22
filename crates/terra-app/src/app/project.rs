@@ -403,7 +403,7 @@ impl TerraApp {
         self.ui_state.draft_displayed = false;
         self.ui_state.quality = PreviewQuality::Draft;
         self.ui_state.dirty_tile_ids.clear();
-        self.terrain_tile_scheduler.clear();
+        self.clear_terrain_tile_work();
 
         let metrics = self.session.document.metrics;
         self.terrain_runtime

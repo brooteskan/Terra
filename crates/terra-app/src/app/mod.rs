@@ -34,7 +34,7 @@ use terra_gpu::{
     GpuHeightPyramid, GpuHeightPyramidMaterializer, GpuPyramidErrorReadback,
     GpuPyramidPlanningMetadata, GpuTileAtlas,
 };
-use terra_gpu_eval::GpuTerrainEngine;
+use terra_gpu_eval::{GpuCompiledTileProducer, GpuTerrainEngine, GpuTileEvaluationJob};
 use terra_gui::{GuiRenderer, GuiState, Rect, WidgetLabState};
 use terra_io::{BackgroundExporter, BackgroundProjectIo};
 use terra_render::TerrainRenderer;
@@ -50,6 +50,11 @@ pub(crate) const POST_INPUT_REFINE_GRACE_MS: u64 = 80;
 pub(crate) const LOGICAL_FRAME_HOST_BUDGET_MS: u64 = 8;
 pub(crate) const FULL_FIELD_SETTLE_MS: u64 = 75;
 pub(crate) const FULL_FIELD_REFINE_MS: u64 = 225;
+
+struct CompiledTileWorkJob {
+    lease: terra_core::TerrainTileWorkLease,
+    engine: GpuTileEvaluationJob,
+}
 
 #[derive(Debug, Clone)]
 pub enum RuntimeEvent {
@@ -321,6 +326,8 @@ pub struct TerraApp {
     latest_terrain_demand: Option<terra_core::TerrainDemandPlan>,
     /// Bounded, revision-aware demand awaiting concrete CPU/GPU atlas publication.
     terrain_tile_scheduler: terra_core::TerrainTileWorkScheduler,
+    compiled_tile_producer: GpuCompiledTileProducer,
+    compiled_tile_jobs: Vec<CompiledTileWorkJob>,
     /// Monotonic identity for accepted CPU heightfields within an output revision.
     next_cpu_tile_content_revision: u64,
     gui_renderer: Option<GuiRenderer>,
@@ -503,6 +510,8 @@ impl Default for TerraApp {
             terrain_demand_planner: terra_core::TerrainDemandPlanner::default(),
             latest_terrain_demand: None,
             terrain_tile_scheduler: terra_core::TerrainTileWorkScheduler::default(),
+            compiled_tile_producer: GpuCompiledTileProducer::new(),
+            compiled_tile_jobs: Vec::new(),
             next_cpu_tile_content_revision: 0,
             gui_renderer: None,
             gui_state,
