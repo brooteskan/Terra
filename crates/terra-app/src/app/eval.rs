@@ -1352,6 +1352,24 @@ impl TerraApp {
             return;
         };
         let root_required = self.gpu_height_pyramid.is_some();
+        // A new GPU revision initially queues only root coverage while the
+        // geometric-error readback and camera demand are still pending. Enabling
+        // the stream at that point replaces the complete monolithic terrain with
+        // its coarse root ancestor for several frames, which presents as a
+        // whole-terrain flash after a brush stroke. Keep the revision boundary on
+        // the monolithic output until the current camera-demand set (including any
+        // asynchronous compiled-tile jobs) is fully resident, then switch once.
+        let gpu_demand_ready = !root_required
+            || (self.gpu_pyramid_error_readback.is_none()
+                && self.latest_terrain_demand.is_some()
+                && self.terrain_tile_scheduler.is_empty()
+                && self.compiled_tile_jobs.is_empty());
+        if !gpu_demand_ready {
+            if let Some(renderer) = self.renderer.as_mut() {
+                renderer.set_use_tile_stream(false);
+            }
+            return;
+        }
         let root_current = if root_required {
             let root_metrics = self.terrain_runtime.pyramid.level_metrics(0);
             root_metrics.is_some_and(|metrics| {
@@ -2877,6 +2895,14 @@ mod tests {
             uploaded += app.upload_pending_terrain_tiles();
         }
         assert!(uploaded > 0);
+        assert!(
+            !app.terrain_tile_scheduler.is_empty(),
+            "bounded upload should leave part of the camera demand pending"
+        );
+        assert!(
+            !app.renderer.as_ref().unwrap().tile_stream_enabled(),
+            "a partial GPU demand set must not replace the complete monolithic terrain"
+        );
         let atlas = app.tile_atlas.as_ref().unwrap();
         let rows = atlas.read_page_table_blocking(
             &app.gpu.as_ref().unwrap().device,
