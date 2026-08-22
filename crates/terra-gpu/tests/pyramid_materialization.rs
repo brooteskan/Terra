@@ -214,6 +214,49 @@ fn measured_error_is_finite_zero_for_flat_and_increases_for_lost_feature() {
 }
 
 #[test]
+fn planning_metadata_readback_is_async_compact_and_identity_stamped() {
+    let Some(gpu) = terra_test_gpu::headless() else {
+        return;
+    };
+    let mut config = PyramidConfig::new(9, 900.0, 900.0);
+    config.tile_size = 4;
+    let descriptor = TerrainPyramid::new(config);
+    let mut values = vec![0.0; 81];
+    values[40] = 75.0;
+    let source = source_texture(gpu, 9, 9, &values);
+    let pyramid = GpuHeightPyramidMaterializer::new(&gpu.device)
+        .materialize(
+            &gpu.device,
+            &gpu.queue,
+            &descriptor,
+            &source,
+            (9, 9),
+            identity(31, 41),
+        )
+        .unwrap();
+    let expected = pyramid
+        .read_error_bits_blocking(&gpu.device, &gpu.queue)
+        .into_iter()
+        .map(f32::from_bits)
+        .collect::<Vec<_>>();
+
+    let mut readback = pyramid.begin_error_readback(&gpu.device, &gpu.queue);
+    assert_eq!(readback.identity(), pyramid.identity());
+    gpu.device.poll(wgpu::Maintain::Wait);
+    let metadata = readback
+        .poll(&gpu.device)
+        .expect("metadata mapping")
+        .expect("completed after wait");
+    assert_eq!(metadata.identity, pyramid.identity());
+    assert_eq!(metadata.geometric_errors, expected);
+    assert_eq!(
+        metadata.geometric_errors.len(),
+        descriptor.metadata_len() as usize
+    );
+    assert!(readback.poll(&gpu.device).unwrap().is_none());
+}
+
+#[test]
 fn gpu_publication_preserves_neighbor_halos_partial_edges_and_revision_authority() {
     let Some(gpu) = terra_test_gpu::headless() else {
         return;

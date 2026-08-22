@@ -20,6 +20,7 @@ pub use graph::{
 };
 pub use pyramid::{
     GpuHeightPyramid, GpuHeightPyramidMaterializer, GpuPyramidContentIdentity, GpuPyramidError,
+    GpuPyramidErrorReadback, GpuPyramidPlanningMetadata,
 };
 pub use tile_cache::{GpuPageTableEntry, GpuTileAtlas, GpuTileCacheError, GpuTileUpload};
 

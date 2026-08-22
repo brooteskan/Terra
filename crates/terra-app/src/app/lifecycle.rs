@@ -1430,6 +1430,9 @@ impl ApplicationHandler<RuntimeEvent> for TerraApp {
                     Some(quality_in_flight_progress(self.scheduler.quality, t));
                 did_eval = true;
             }
+            if self.refresh_terrain_demand() {
+                did_eval = true;
+            }
             if self.upload_pending_terrain_tiles() > 0 {
                 did_eval = true;
             }
@@ -1439,6 +1442,7 @@ impl ApplicationHandler<RuntimeEvent> for TerraApp {
                 || self.refinement_job.is_some()
                 || self.ui_state.refining
                 || self.deferred_full_field.is_some()
+                || self.gpu_pyramid_error_readback.is_some()
                 || !self.pending_tile_uploads.is_empty()
                 || export_busy
                 || jobs.any_pending;

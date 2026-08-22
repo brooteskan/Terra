@@ -231,6 +231,15 @@ page handles, or copy of the page table. `terra-gpu::GpuHeightPyramid` materiali
 completed GPU result into immutable R32Float level textures and an output-identity-stamped
 dense geometric-error buffer. Those errors describe content, not residency.
 
+`TerrainDemandPlanner` walks that immutable hierarchy from coarse to fine using
+conservative frustum culling and projected screen-space error. The compact error buffer
+is transferred asynchronously once per accepted pyramid identity; height textures remain
+GPU-resident. Planner state contains only prior refinement decisions for hysteresis, and
+its deterministic, bounded output is consumed by the app's tile-upload seam. The planner
+neither queries nor mutates residency. The consumer may skip exact current pages by
+querying `GpuTileAtlas`'s authoritative cache before publication. See
+[Terrain camera demand](algorithms/terrain_demand.md).
+
 Output edits advance `TerrainRuntime::output_revision` through the app's single revision
 boundary, which drops old pyramid content and clears pending uploads, the cache and page
 table, and renderer streaming state. Document reset performs the same retirement while

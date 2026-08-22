@@ -27,7 +27,10 @@ The accepted source texture is copied into an owned finest-level R32Float textur
 identity cannot change beneath the hierarchy. Coarser samples are exact normalized-cell
 area-weighted averages of the next finer level. This rule handles both power-of-two and
 irregular ratios deterministically and preserves constant fields exactly. Production
-materialization submits GPU work only; readback helpers exist solely for tests.
+materialization submits GPU work only. Height readback helpers exist solely for tests.
+After materialization, camera-demand integration asynchronously transfers the compact
+dense geometric-error buffer once for the immutable content identity; it never maps a
+height texture and never blocks the interactive thread.
 
 Each `GpuHeightPyramid` is immutable and stamped with output revision, GPU output ID,
 evaluation generation, and plan revision. The app retains only the latest accepted
@@ -54,3 +57,6 @@ unused texels in a partial physical page are zeroed deterministically.
 Publication compares the immutable pyramid's output revision with the current runtime
 revision before any cache or page-table mutation. Old content cannot be relabeled as a
 current page.
+
+Camera-driven selection of these tiles is described in
+[Terrain camera demand](terrain_demand.md).

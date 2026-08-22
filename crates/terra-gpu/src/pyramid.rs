@@ -1,6 +1,7 @@
 //! Immutable GPU height-pyramid materialization and measured error metadata.
 
 use bytemuck::{Pod, Zeroable};
+use std::sync::mpsc::{self, TryRecvError};
 use terra_core::{TerrainPyramid, TerrainTileKey};
 use thiserror::Error;
 use wgpu::util::DeviceExt;
@@ -23,6 +24,74 @@ pub enum GpuPyramidError {
     LevelMissing(u8),
     #[error("tile {key:?} does not belong to this pyramid")]
     InvalidTile { key: TerrainTileKey },
+    #[error("geometric-error metadata readback failed: {0}")]
+    MetadataReadback(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GpuPyramidPlanningMetadata {
+    pub identity: GpuPyramidContentIdentity,
+    pub geometric_errors: Vec<f32>,
+}
+
+/// One-shot, non-blocking transfer of the compact geometric-error buffer. This
+/// never maps height textures and is polled with `Maintain::Poll` on frame work.
+pub struct GpuPyramidErrorReadback {
+    identity: GpuPyramidContentIdentity,
+    buffer: wgpu::Buffer,
+    len: usize,
+    receiver: Option<mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
+}
+
+impl GpuPyramidErrorReadback {
+    pub fn identity(&self) -> GpuPyramidContentIdentity {
+        self.identity
+    }
+
+    pub fn poll(
+        &mut self,
+        device: &wgpu::Device,
+    ) -> Result<Option<GpuPyramidPlanningMetadata>, GpuPyramidError> {
+        let Some(receiver) = self.receiver.as_ref() else {
+            return Ok(None);
+        };
+        let _ = device.poll(wgpu::Maintain::Poll);
+        match receiver.try_recv() {
+            Ok(Ok(())) => {
+                let mapped = self.buffer.slice(..).get_mapped_range();
+                let bits: &[u32] = bytemuck::cast_slice(&mapped[..self.len * 4]);
+                let geometric_errors = bits
+                    .iter()
+                    .map(|bits| {
+                        let value = f32::from_bits(*bits);
+                        if value.is_finite() && value >= 0.0 {
+                            value
+                        } else {
+                            f32::MAX
+                        }
+                    })
+                    .collect();
+                drop(mapped);
+                self.buffer.unmap();
+                self.receiver = None;
+                Ok(Some(GpuPyramidPlanningMetadata {
+                    identity: self.identity,
+                    geometric_errors,
+                }))
+            }
+            Ok(Err(error)) => {
+                self.receiver = None;
+                Err(GpuPyramidError::MetadataReadback(error.to_string()))
+            }
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Disconnected) => {
+                self.receiver = None;
+                Err(GpuPyramidError::MetadataReadback(
+                    "map callback disconnected".to_string(),
+                ))
+            }
+        }
+    }
 }
 
 struct GpuPyramidLevel {
@@ -81,6 +150,40 @@ impl GpuHeightPyramid {
         self.descriptor
             .tile_metadata_index(key.level, key.tile)
             .ok_or_else(|| GpuPyramidError::InvalidTile { key: key.clone() })
+    }
+
+    /// Begin the compact, once-per-content metadata transfer required by the CPU
+    /// camera-demand walk. Queue ordering makes the copy observe materialization's
+    /// completed error writes without blocking the interactive thread.
+    pub fn begin_error_readback(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> GpuPyramidErrorReadback {
+        let len = self.descriptor.metadata_len() as usize;
+        let size = (len.max(1) * 4) as u64;
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("terrain-pyramid-planning-metadata"),
+            size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("terrain-pyramid-planning-metadata-copy"),
+        });
+        encoder.copy_buffer_to_buffer(&self.error_bits, 0, &buffer, 0, size);
+        queue.submit(Some(encoder.finish()));
+        let slice = buffer.slice(..);
+        let (sender, receiver) = mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
+        });
+        GpuPyramidErrorReadback {
+            identity: self.identity,
+            buffer,
+            len,
+            receiver: Some(receiver),
+        }
     }
 
     /// Test observability only. Production generation and publication never map

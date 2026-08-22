@@ -781,6 +781,7 @@ impl TerraApp {
     pub(crate) fn queue_final_tile_uploads(&mut self) {
         self.pending_tile_uploads.clear();
         self.gpu_height_pyramid = None;
+        self.clear_terrain_demand();
         if self.tile_atlas.is_none() {
             return;
         }
@@ -845,22 +846,26 @@ impl TerraApp {
             );
         match materialized {
             Ok(pyramid) => {
-                let source_level = pyramid.source_level();
                 let source_output = pyramid.identity().output;
+                let error_readback = pyramid.begin_error_readback(&gpu.device, &gpu.queue);
+                self.clear_terrain_demand();
+                self.gpu_pyramid_error_readback = Some(error_readback);
                 self.gpu_height_pyramid = Some(pyramid);
                 self.pending_tile_uploads.clear();
-                let metrics = self
+                let root_metrics = self
                     .terrain_runtime
                     .pyramid
-                    .level_metrics(source_level)
-                    .expect("materialized source level");
+                    .level_metrics(0)
+                    .expect("materialized root level");
                 let revision = self.terrain_runtime.output_revision();
-                for tz in 0..metrics.tiles_z() {
-                    for tx in 0..metrics.tiles_x() {
+                // Bootstrap the fallback chain while the compact metadata copy is
+                // mapping. The completed demand plan replaces this queue.
+                for tz in 0..root_metrics.tiles_z() {
+                    for tx in 0..root_metrics.tiles_x() {
                         self.pending_tile_uploads
                             .push_back(super::PendingTileUpload {
                                 revision,
-                                level: source_level,
+                                level: 0,
                                 tile: terra_core::TileId { tx, tz },
                                 payload: super::PendingTilePayload::GpuPyramid {
                                     output: source_output,
@@ -873,6 +878,137 @@ impl TerraApp {
                 log::warn!(target: "terra_app::evaluation", "GPU pyramid materialization skipped: {error}");
             }
         }
+    }
+
+    fn clear_terrain_demand(&mut self) {
+        self.gpu_pyramid_error_readback = None;
+        self.gpu_pyramid_planning_metadata = None;
+        self.latest_terrain_demand = None;
+        self.terrain_demand_planner.reset();
+    }
+
+    /// Poll the one-shot geometric-error metadata transfer and, once ready,
+    /// refresh the camera-visible demand consumed by the current upload adapter.
+    pub(crate) fn refresh_terrain_demand(&mut self) -> bool {
+        let metadata_result = match (self.gpu.as_ref(), self.gpu_pyramid_error_readback.as_mut()) {
+            (Some(gpu), Some(readback)) => Some(readback.poll(&gpu.device)),
+            _ => None,
+        };
+        if let Some(result) = metadata_result {
+            match result {
+                Ok(Some(metadata)) => {
+                    self.gpu_pyramid_error_readback = None;
+                    let live = self.gpu_height_pyramid.as_ref().is_some_and(|pyramid| {
+                        pyramid.identity() == metadata.identity
+                            && metadata.identity.output_revision
+                                == self.terrain_runtime.output_revision()
+                    });
+                    if live {
+                        let mut metadata = metadata;
+                        let descriptor = self
+                            .gpu_height_pyramid
+                            .as_ref()
+                            .expect("live pyramid checked above")
+                            .descriptor();
+                        match terra_core::conservative_geometric_errors(
+                            descriptor,
+                            &metadata.geometric_errors,
+                        ) {
+                            Ok(errors) => metadata.geometric_errors = errors,
+                            Err(error) => {
+                                log::warn!(target: "terra_app::evaluation", "terrain demand metadata rejected: {error}");
+                                return false;
+                            }
+                        }
+                        self.gpu_pyramid_planning_metadata = Some(metadata);
+                        self.latest_terrain_demand = None;
+                        self.terrain_demand_planner.reset();
+                    }
+                }
+                Ok(None) => return false,
+                Err(error) => {
+                    self.gpu_pyramid_error_readback = None;
+                    log::warn!(target: "terra_app::evaluation", "terrain demand metadata skipped: {error}");
+                    return false;
+                }
+            }
+        }
+
+        let Some(pyramid) = self.gpu_height_pyramid.as_ref() else {
+            return false;
+        };
+        let Some(metadata) = self.gpu_pyramid_planning_metadata.as_ref() else {
+            return false;
+        };
+        if metadata.identity != pyramid.identity()
+            || metadata.identity.output_revision != self.terrain_runtime.output_revision()
+        {
+            return false;
+        }
+        let Some(renderer) = self.renderer.as_ref() else {
+            return false;
+        };
+        let (width, height) = renderer.size();
+        let aspect = width as f32 / height.max(1) as f32;
+        let (min_height, max_height) = renderer.heights.height_range;
+        let view = terra_core::TerrainDemandView {
+            eye: renderer.camera.eye(),
+            view_proj: renderer.camera.view_proj(aspect),
+            fov_y: renderer.camera.fov_y,
+            near: renderer.camera.near,
+            viewport_width_px: width,
+            viewport_height_px: height,
+            min_height,
+            max_height,
+        };
+        let max_pages = self
+            .tile_atlas
+            .as_ref()
+            .map_or(1usize, |atlas| atlas.max_pages() as usize);
+        let config = terra_core::TerrainDemandConfig {
+            max_demand_tiles: max_pages,
+            max_visited_nodes: max_pages.saturating_mul(32).max(64),
+            ..terra_core::TerrainDemandConfig::default()
+        };
+        let plan = match self.terrain_demand_planner.plan(
+            pyramid.descriptor(),
+            &metadata.geometric_errors,
+            view,
+            config,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => {
+                log::warn!(target: "terra_app::evaluation", "terrain demand planning skipped: {error}");
+                return false;
+            }
+        };
+        if self.latest_terrain_demand.as_ref() == Some(&plan) {
+            return false;
+        }
+
+        let identity = pyramid.identity();
+        let revision = identity.output_revision;
+        self.pending_tile_uploads.clear();
+        for demand in &plan.tiles {
+            let resident_current = self
+                .tile_atlas
+                .as_ref()
+                .and_then(|atlas| atlas.residency().peek(&demand.key))
+                .is_some_and(|resident| resident.revision == revision);
+            if !resident_current {
+                self.pending_tile_uploads
+                    .push_back(super::PendingTileUpload {
+                        revision,
+                        level: demand.key.level,
+                        tile: demand.key.tile,
+                        payload: super::PendingTilePayload::GpuPyramid {
+                            output: identity.output,
+                        },
+                    });
+            }
+        }
+        self.latest_terrain_demand = Some(plan);
+        true
     }
 
     pub(crate) fn upload_pending_terrain_tiles(&mut self) -> usize {
@@ -1013,6 +1149,7 @@ impl TerraApp {
     pub(crate) fn retire_streamed_residency(&mut self) {
         self.pending_tile_uploads.clear();
         self.gpu_height_pyramid = None;
+        self.clear_terrain_demand();
         if let (Some(atlas), Some(gpu)) = (self.tile_atlas.as_mut(), self.gpu.as_ref()) {
             atlas.clear(&gpu.queue);
             self.ui_state
@@ -2235,8 +2372,10 @@ mod tests {
 
     /// #173 app-path acceptance: a complete GPU result is materialized and
     /// published without creating a dense CPU heightfield or waking the worker.
+    /// The compact geometric-error metadata transfer drives demand but must not
+    /// mutate atlas residency until the upload consumer runs.
     #[test]
-    fn complete_gpu_output_streams_through_pyramid_without_cpu_readback() {
+    fn complete_gpu_output_streams_from_bounded_demand_without_height_readback() {
         let Some(gpu) = terra_test_gpu::headless() else {
             return;
         };
@@ -2306,6 +2445,62 @@ mod tests {
             &pending.payload,
             super::super::PendingTilePayload::GpuPyramid { .. }
         )));
+
+        let residency_before = app.tile_atlas.as_ref().unwrap().residency().stats();
+        app.gpu.as_ref().unwrap().device.poll(wgpu::Maintain::Wait);
+        assert!(app.refresh_terrain_demand());
+        let demand = app.latest_terrain_demand.as_ref().expect("camera demand");
+        assert!(!demand.tiles.is_empty());
+        assert!(demand.tiles.len() <= app.tile_atlas.as_ref().unwrap().max_pages() as usize);
+        assert!(demand
+            .tiles
+            .windows(2)
+            .all(|pair| pair[0].key.level <= pair[1].key.level));
+
+        // Exercise the production camera adapter with constructed measured-error
+        // metadata: the same immutable pyramid demands deeper tiles when close.
+        app.gpu_pyramid_planning_metadata
+            .as_mut()
+            .unwrap()
+            .geometric_errors
+            .iter_mut()
+            .for_each(|error| *error = 10.0);
+        {
+            let camera = &mut app.renderer.as_mut().unwrap().camera;
+            camera.target = glam::Vec3::new(320.0, 19.0, 320.0);
+            camera.distance = 10_000.0;
+            camera.yaw = 0.7;
+            camera.pitch = 0.7;
+        }
+        app.latest_terrain_demand = None;
+        app.terrain_demand_planner.reset();
+        assert!(app.refresh_terrain_demand());
+        let far_level = app
+            .latest_terrain_demand
+            .as_ref()
+            .unwrap()
+            .tiles
+            .iter()
+            .map(|demand| demand.key.level)
+            .max()
+            .unwrap();
+        app.renderer.as_mut().unwrap().camera.distance = 500.0;
+        assert!(app.refresh_terrain_demand());
+        let near_level = app
+            .latest_terrain_demand
+            .as_ref()
+            .unwrap()
+            .tiles
+            .iter()
+            .map(|demand| demand.key.level)
+            .max()
+            .unwrap();
+        assert!(near_level > far_level);
+        assert_eq!(
+            app.tile_atlas.as_ref().unwrap().residency().stats(),
+            residency_before,
+            "planning demand must not publish or mirror residency"
+        );
 
         let uploaded = app.upload_pending_terrain_tiles();
         assert!(uploaded > 0);

@@ -30,7 +30,10 @@ use terra_core::layer::LayerId;
 use terra_core::quality::PreviewQuality;
 use terra_core::tiling::UvRect;
 use terra_cpu_eval::{EvalScheduler, EvalWorker};
-use terra_gpu::{GpuHeightPyramid, GpuHeightPyramidMaterializer, GpuTileAtlas};
+use terra_gpu::{
+    GpuHeightPyramid, GpuHeightPyramidMaterializer, GpuPyramidErrorReadback,
+    GpuPyramidPlanningMetadata, GpuTileAtlas,
+};
 use terra_gpu_eval::GpuTerrainEngine;
 use terra_gui::{GuiRenderer, GuiState, Rect, WidgetLabState};
 use terra_io::{BackgroundExporter, BackgroundProjectIo};
@@ -326,6 +329,12 @@ pub struct TerraApp {
     /// Immutable GPU content pyramid for the latest accepted complete output.
     gpu_height_pyramid: Option<GpuHeightPyramid>,
     gpu_pyramid_materializer: Option<GpuHeightPyramidMaterializer>,
+    /// Compact measured-error transfer and immutable CPU planning snapshot. These
+    /// describe pyramid content and demand only; neither mirrors atlas residency.
+    gpu_pyramid_error_readback: Option<GpuPyramidErrorReadback>,
+    gpu_pyramid_planning_metadata: Option<GpuPyramidPlanningMetadata>,
+    terrain_demand_planner: terra_core::TerrainDemandPlanner,
+    latest_terrain_demand: Option<terra_core::TerrainDemandPlan>,
     /// Revision/source-stamped tiles awaiting frame-budgeted atlas publication.
     pending_tile_uploads: VecDeque<PendingTileUpload>,
     gui_renderer: Option<GuiRenderer>,
@@ -503,6 +512,10 @@ impl Default for TerraApp {
             tile_atlas: None,
             gpu_height_pyramid: None,
             gpu_pyramid_materializer: None,
+            gpu_pyramid_error_readback: None,
+            gpu_pyramid_planning_metadata: None,
+            terrain_demand_planner: terra_core::TerrainDemandPlanner::default(),
+            latest_terrain_demand: None,
             pending_tile_uploads: VecDeque::new(),
             gui_renderer: None,
             gui_state,
