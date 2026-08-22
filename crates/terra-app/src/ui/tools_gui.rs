@@ -425,16 +425,18 @@ fn tool_card_suggested(
     tool_card(ui, ui_state, doc, actions, id, tool, card);
 }
 
-fn selected_brush_support(
+/// Foundation is the one selection that makes brush availability contextual.
+/// Other selections are not brush targets: arming a brush starts a Semantic
+/// Sculpt session, whose first dab creates a suitable layer.
+fn selected_foundation_brush_support(
     doc: &TerrainDocument,
     brush: Option<SculptStrokeKind>,
 ) -> Option<EditSupport> {
-    brush.map(|brush| {
-        doc.selected
-            .and_then(|id| doc.stack.find(id))
-            .map(|layer| layer.brush_support(brush))
-            .unwrap_or(EditSupport::Unsupported)
-    })
+    let brush = brush?;
+    doc.selected
+        .and_then(|id| doc.stack.find(id))
+        .filter(|layer| layer.kind.is_sculpt_base())
+        .map(|layer| layer.brush_support(brush))
 }
 
 fn draw_group_header(ui: &mut GuiContext<'_>, state: &mut ToolsGuiState, group: ToolGroup) -> bool {
@@ -487,8 +489,8 @@ fn tool_card(
     card: Rect,
 ) {
     let hovered = ui.pointer_in(card);
-    let disabled =
-        selected_brush_support(doc, tool.sculpt_stroke_kind()) == Some(EditSupport::Unsupported);
+    let disabled = selected_foundation_brush_support(doc, tool.sculpt_stroke_kind())
+        == Some(EditSupport::Unsupported);
     let interactive_hovered = hovered && !disabled;
     let selected = !disabled
         && match &tool.action {
@@ -642,7 +644,7 @@ fn tool_card(
     if hovered {
         if disabled {
             let body = format!(
-                "{}\n\nNot supported by the selected layer.",
+                "{}\n\nNot supported by the selected Foundation layer.",
                 tool.description
             );
             ui.queue_tooltip(card, tool.label, &body, tool.shortcut);
@@ -697,8 +699,10 @@ fn apply_sculpt_tool(
     actions: &mut Vec<PanelAction>,
     tool: EditorTool,
 ) {
-    if selected_brush_support(doc, tool.sculpt_stroke_kind()) == Some(EditSupport::Unsupported) {
-        ui_state.status = "That brush isn't supported by the selected layer.".into();
+    if selected_foundation_brush_support(doc, tool.sculpt_stroke_kind())
+        == Some(EditSupport::Unsupported)
+    {
+        ui_state.status = "That brush isn't supported by the selected Foundation layer.".into();
         return;
     }
     ui_state.set_editor_tool(tool);
@@ -828,10 +832,7 @@ fn finish_tool_drag(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use terra_core::layer::{
-        FlatParams, Layer, LayerKind, LayerStack, SculptParams, SculptStrokeParams,
-        TerrainConstraintParams,
-    };
+    use terra_core::layer::{FlatParams, Layer, LayerKind, LayerStack, SculptParams};
 
     fn selected_document(kind: LayerKind) -> TerrainDocument {
         let mut doc = TerrainDocument::default();
@@ -847,61 +848,36 @@ mod tests {
     fn foundation_tool_support_is_contextual() {
         let doc = selected_document(LayerKind::SculptBase(SculptParams::filled(8, 0.0)));
         assert_eq!(
-            selected_brush_support(&doc, Some(SculptStrokeKind::Raise)),
+            selected_foundation_brush_support(&doc, Some(SculptStrokeKind::Raise)),
             Some(EditSupport::Native)
         );
         assert_eq!(
-            selected_brush_support(&doc, Some(SculptStrokeKind::Pinch)),
+            selected_foundation_brush_support(&doc, Some(SculptStrokeKind::Pinch)),
             Some(EditSupport::Approximate)
         );
         assert_eq!(
-            selected_brush_support(&doc, Some(SculptStrokeKind::Terrace)),
+            selected_foundation_brush_support(&doc, Some(SculptStrokeKind::Terrace)),
             Some(EditSupport::Unsupported)
         );
     }
 
     #[test]
-    fn constraint_tool_support_is_contextual() {
-        let doc = selected_document(LayerKind::TerrainConstraints(
-            TerrainConstraintParams::default(),
-        ));
-        assert_eq!(
-            selected_brush_support(&doc, Some(SculptStrokeKind::Ridge)),
-            Some(EditSupport::Native)
-        );
-        assert_eq!(
-            selected_brush_support(&doc, Some(SculptStrokeKind::Hardness)),
-            Some(EditSupport::Approximate)
-        );
-        assert_eq!(
-            selected_brush_support(&doc, Some(SculptStrokeKind::Raise)),
-            Some(EditSupport::Unsupported)
-        );
-    }
-
-    #[test]
-    fn strokes_enable_brushes_and_parametric_layers_disable_them() {
-        let strokes = selected_document(LayerKind::SculptStrokes(SculptStrokeParams::default()));
-        assert_eq!(
-            selected_brush_support(&strokes, Some(SculptStrokeKind::HeightStamp)),
-            Some(EditSupport::Native)
-        );
-
+    fn non_foundation_selections_leave_brushes_available_for_semantic_sculpt() {
         let flat = selected_document(LayerKind::Flat(FlatParams::default()));
         assert_eq!(
-            selected_brush_support(&flat, Some(SculptStrokeKind::Raise)),
-            Some(EditSupport::Unsupported)
+            selected_foundation_brush_support(&flat, Some(SculptStrokeKind::Raise)),
+            None
         );
     }
 
     #[test]
-    fn missing_selection_disables_brushes_but_not_non_brush_tools() {
+    fn missing_selection_leaves_brushes_available_for_semantic_sculpt() {
         let mut doc = TerrainDocument::default();
         doc.selected = None;
         assert_eq!(
-            selected_brush_support(&doc, Some(SculptStrokeKind::Raise)),
-            Some(EditSupport::Unsupported)
+            selected_foundation_brush_support(&doc, Some(SculptStrokeKind::Raise)),
+            None
         );
-        assert_eq!(selected_brush_support(&doc, None), None);
+        assert_eq!(selected_foundation_brush_support(&doc, None), None);
     }
 }

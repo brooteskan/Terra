@@ -190,26 +190,39 @@ pub fn resolve_shape_target(
     tool: ShapeTool,
 ) -> ShapeTargetDecision {
     let brush = tool.stroke_kind();
-    let supports_brush = |id| {
-        stack
-            .find(id)
-            .is_some_and(|layer| layer.brush_support(brush) != EditSupport::Unsupported)
-    };
 
-    // Explicit selection wins when it has a genuine edit path for this brush.
+    // Explicit Semantic Sculpt selection wins so artists can deliberately
+    // continue an existing non-destructive stroke layer. Foundation is the one
+    // other explicit edit target; an unsupported brush stays unavailable rather
+    // than silently redirecting away from the artist's selection.
     if let Some(id) = selected {
-        if supports_brush(id) {
-            return ShapeTargetDecision::UseExisting(id);
+        if let Some(layer) = stack.find(id) {
+            if matches!(layer.kind, LayerKind::SculptStrokes(_)) {
+                return ShapeTargetDecision::UseExisting(id);
+            }
+            if layer.kind.is_sculpt_base() {
+                return if layer.brush_support(brush) == EditSupport::Unsupported {
+                    ShapeTargetDecision::UnavailableOnFoundation { layer: id, tool }
+                } else {
+                    ShapeTargetDecision::UseExisting(id)
+                };
+            }
         }
     }
     if let Some(id) = session_layer {
-        if supports_brush(id) {
+        if stack
+            .find(id)
+            .is_some_and(|layer| matches!(layer.kind, LayerKind::SculptStrokes(_)))
+        {
             return ShapeTargetDecision::UseExisting(id);
         }
     }
     if mode == ShapeEditMode::ContinueSelected {
         if let Some(id) = selected {
-            if supports_brush(id) {
+            if stack
+                .find(id)
+                .is_some_and(|layer| matches!(layer.kind, LayerKind::SculptStrokes(_)))
+            {
                 return ShapeTargetDecision::UseExisting(id);
             }
         }
@@ -223,7 +236,15 @@ pub fn resolve_shape_target(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShapeTargetDecision {
     UseExisting(LayerId),
-    CreateNew { name: String, tool: ShapeTool },
+    CreateNew {
+        name: String,
+        tool: ShapeTool,
+    },
+    /// Foundation was explicitly selected but cannot represent this brush.
+    UnavailableOnFoundation {
+        layer: LayerId,
+        tool: ShapeTool,
+    },
 }
 
 fn unique_shape_name(stack: &LayerStack, base: &str) -> String {
@@ -401,7 +422,7 @@ mod tests {
     }
 
     #[test]
-    fn constraints_keep_supported_brush() {
+    fn constraints_selection_creates_semantic_sculpt_layer() {
         let (stack, id) = constraints_stack();
         let d = resolve_shape_target(
             &stack,
@@ -410,7 +431,7 @@ mod tests {
             None,
             ShapeTool::MountainStamp,
         );
-        assert_eq!(d, ShapeTargetDecision::UseExisting(id));
+        assert!(matches!(d, ShapeTargetDecision::CreateNew { .. }));
     }
 
     #[test]
@@ -427,9 +448,9 @@ mod tests {
     }
 
     #[test]
-    fn foundation_redirects_unsupported_brush_to_new_shape_layer() {
-        // Terrace / Inflate / stamps aren't representable on the foundation raster;
-        // rather than silently raising, the stroke retargets to a Shape Layer (#97).
+    fn foundation_makes_unsupported_brushes_unavailable() {
+        // Foundation is an explicit edit request. Brushes its raster cannot
+        // represent must stay unavailable instead of redirecting elsewhere.
         let (stack, base) = base_stack();
         for tool in [
             ShapeTool::Terrace,
@@ -443,17 +464,15 @@ mod tests {
                 None,
                 tool,
             );
-            match d {
-                ShapeTargetDecision::CreateNew { tool: got, .. } => assert_eq!(got, tool),
-                other => panic!("{tool:?} must create a Shape Layer, got {other:?}"),
-            }
+            assert_eq!(
+                d,
+                ShapeTargetDecision::UnavailableOnFoundation { layer: base, tool }
+            );
         }
     }
 
     #[test]
-    fn foundation_redirect_prefers_live_session_shape_layer() {
-        // With a Shape session layer live, an unsupported foundation brush appends
-        // there instead of spawning yet another layer.
+    fn foundation_restriction_wins_over_live_session_shape_layer() {
         let (mut stack, base) = base_stack();
         let shape = create_shape_layer("Terraces");
         let shape_id = shape.id();
@@ -465,7 +484,13 @@ mod tests {
             Some(shape_id),
             ShapeTool::Terrace,
         );
-        assert_eq!(d, ShapeTargetDecision::UseExisting(shape_id));
+        assert_eq!(
+            d,
+            ShapeTargetDecision::UnavailableOnFoundation {
+                layer: base,
+                tool: ShapeTool::Terrace,
+            }
+        );
     }
 
     #[test]

@@ -42,28 +42,31 @@ impl TerraApp {
         self.modifiers_alt || !self.viewport_paint_active()
     }
 
+    /// Foundation is an explicit brush target; all other selections may begin a
+    /// new Semantic Sculpt session. Keep this runtime check in addition to the
+    /// disabled tool card so a brush armed before selecting Foundation cannot
+    /// redirect a stroke behind the artist's back.
+    fn active_sculpt_brush_available_for_selection(&self) -> bool {
+        use terra_core::layer::{BrushEditable, EditSupport};
+
+        let Some(brush) = self.ui_state.editor_tool.sculpt_stroke_kind() else {
+            return true;
+        };
+        self.session
+            .document
+            .selected
+            .and_then(|id| self.session.document.stack.find(id))
+            .filter(|layer| layer.kind.is_sculpt_base())
+            .is_none_or(|foundation| foundation.brush_support(brush) != EditSupport::Unsupported)
+    }
+
     /// True when left-drag should stamp Base heights or a mask.
     pub(crate) fn viewport_paint_active(&self) -> bool {
         if self.screen != AppScreen::Editor {
             return false;
         }
         if self.ui_state.editor_tool.is_sculpt() {
-            return self
-                .session
-                .document
-                .stack
-                .flatten_layers()
-                .iter()
-                .any(|l| l.kind.is_sculpt_base())
-                || self.session.document.selected.is_some_and(|id| {
-                    matches!(
-                        self.session.document.stack.find(id).map(|l| &l.kind),
-                        Some(
-                            terra_core::layer::LayerKind::SculptStrokes(_)
-                                | terra_core::layer::LayerKind::TerrainConstraints(_)
-                        )
-                    )
-                });
+            return self.active_sculpt_brush_available_for_selection();
         }
         if self.ui_state.editor_tool == crate::ui::EditorTool::PaintBiome {
             return self.session.document.active_biome.is_some();
@@ -85,14 +88,19 @@ impl TerraApp {
     }
 
     pub(crate) fn paint_at_cursor(&mut self) {
+        if self.ui_state.editor_tool.is_sculpt()
+            && !self.active_sculpt_brush_available_for_selection()
+        {
+            self.ui_state.status =
+                "That brush isn't supported by the selected Foundation layer.".into();
+            return;
+        }
         let Some((u, v)) = self.pick_paint_uv() else {
             return;
         };
 
         if let Some(shape_tool) = self.ui_state.editor_tool.shape_tool() {
             let Some(layer_id) = self.ensure_shape_history_target(shape_tool) else {
-                self.ui_state.status =
-                    "Could not create a Shape Layer â€” select a Region first.".into();
                 return;
             };
             self.ui_state.ensure_sculpt_defaults();
@@ -181,24 +189,13 @@ impl TerraApp {
                 | crate::ui::EditorTool::Sediment
         ) {
             use terra_core::authoring::SculptStrokeKind;
-            use terra_core::layer::BrushEditable;
             let stroke_kind = match self.ui_state.editor_tool {
                 crate::ui::EditorTool::Protect => SculptStrokeKind::Protect,
                 crate::ui::EditorTool::Hardness => SculptStrokeKind::Hardness,
                 _ => SculptStrokeKind::Sediment,
             };
-            let selected_target = self.session.document.selected.filter(|&id| {
-                self.session.document.stack.find(id).is_some_and(|layer| {
-                    layer.brush_support(stroke_kind) != terra_core::layer::EditSupport::Unsupported
-                })
-            });
-            let layer_id = if let Some(id) = selected_target {
-                id
-            } else {
-                let Some(id) = self.ensure_shape_authoring_layer() else {
-                    return;
-                };
-                id
+            let Some(layer_id) = self.ensure_shape_authoring_layer() else {
+                return;
             };
             self.ui_state.ensure_sculpt_defaults();
             self.sculpt_stroke_active = true;
@@ -684,5 +681,36 @@ impl TerraApp {
         r.upload_placement_tint(1, 1, &[0, 0, 0, 0]);
         r.set_biome_tint_strength(0.0);
         self.mask_overlay_dirty = false;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TerraApp;
+    use crate::ui::EditorTool;
+    use terra_core::layer::{FlatParams, Layer, LayerKind, LayerStack, SculptParams};
+
+    fn app_with_selected_layer(kind: LayerKind) -> TerraApp {
+        let mut app = TerraApp::default();
+        let layer = Layer::new("Selected", kind);
+        let id = layer.id();
+        app.session.document.stack = LayerStack::new();
+        app.session.document.stack.push(layer);
+        app.session.document.selected = Some(id);
+        app
+    }
+
+    #[test]
+    fn runtime_gate_applies_only_to_selected_foundation() {
+        let mut foundation =
+            app_with_selected_layer(LayerKind::SculptBase(SculptParams::filled(8, 0.0)));
+        foundation.ui_state.editor_tool = EditorTool::Raise;
+        assert!(foundation.active_sculpt_brush_available_for_selection());
+        foundation.ui_state.editor_tool = EditorTool::Terrace;
+        assert!(!foundation.active_sculpt_brush_available_for_selection());
+
+        let mut flat = app_with_selected_layer(LayerKind::Flat(FlatParams::default()));
+        flat.ui_state.editor_tool = EditorTool::Terrace;
+        assert!(flat.active_sculpt_brush_available_for_selection());
     }
 }

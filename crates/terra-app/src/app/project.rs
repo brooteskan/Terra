@@ -655,6 +655,13 @@ impl TerraApp {
                 self.ui_state.status = msg;
                 Some(id)
             }
+            ShapeTargetDecision::UnavailableOnFoundation { tool, .. } => {
+                self.ui_state.status = format!(
+                    "{} isn't supported by the selected Foundation layer",
+                    tool.label()
+                );
+                None
+            }
         }
     }
 

@@ -82,8 +82,9 @@ impl SculptStrokeKind {
 
     /// Mode byte for the legacy foundation raster (`SculptParams::stamp_circle`:
     /// 0 raise, 1 lower, 2 smooth, 3 flatten). `None` = the foundation path
-    /// cannot represent this brush; route it to a Shape (`SculptStrokes`) layer,
-    /// which implements every kind.
+    /// cannot represent this brush. Automatic authoring may use a Shape
+    /// (`SculptStrokes`) layer instead, but an explicitly selected Foundation
+    /// keeps the brush unavailable.
     pub fn foundation_mode(self) -> Option<u8> {
         match self {
             Self::Raise => Some(0),
