@@ -72,9 +72,7 @@ impl SculptParams {
 
     pub fn reset(&mut self) {
         self.ensure_buffer();
-        for s in &mut self.samples {
-            *s = self.fill_height;
-        }
+        self.samples.fill(self.fill_height);
     }
 
     /// Soft circular stamp. `mode`: 0 = raise, 1 = lower, 2 = smooth, 3 = flatten.
