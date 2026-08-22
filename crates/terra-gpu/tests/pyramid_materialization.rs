@@ -339,7 +339,7 @@ fn gpu_publication_preserves_neighbor_halos_partial_edges_and_revision_authority
     assert_eq!(rows.iter().filter(|row| row.valid != 0).count(), 3);
     assert_eq!(atlas.residency().stats().resident_tiles, 3);
     assert!(rows.iter().filter(|row| row.valid != 0).all(|row| {
-        row.level == u32::from(level) && row.revision_lo == 17 && row.revision_hi == 0
+        row.level == u32::from(level) && row.output_revision_lo == 17 && row.output_revision_hi == 0
     }));
 
     let before = atlas.residency().stats();

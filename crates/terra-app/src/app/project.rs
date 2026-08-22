@@ -1244,7 +1244,7 @@ mod tests {
             "page tile coords match key"
         );
         assert_eq!(
-            (entry.revision_hi, entry.revision_lo),
+            (entry.output_revision_hi, entry.output_revision_lo),
             ((revision >> 32) as u32, revision as u32),
             "page stamped with the current output revision"
         );
@@ -1278,7 +1278,9 @@ mod tests {
         let live = entries.iter().filter(|e| e.valid != 0).count();
         let stale = entries
             .iter()
-            .filter(|e| e.valid != 0 && (e.revision_lo, e.revision_hi) != (rev_lo, rev_hi))
+            .filter(|e| {
+                e.valid != 0 && (e.output_revision_lo, e.output_revision_hi) != (rev_lo, rev_hi)
+            })
             .count();
         assert_eq!(
             stale, 0,

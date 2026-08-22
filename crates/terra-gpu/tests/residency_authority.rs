@@ -117,7 +117,15 @@ fn gpu_atlas_has_one_cpu_residency_policy_store() {
         .iter()
         .find(|file| file.path == "crates/terra-gpu/src/tile_cache.rs")
         .expect("GpuTileAtlas source is scanned");
-    for evidence in ["residency", "insert", "write_page_entry", "page_table"] {
+    for evidence in [
+        "residency",
+        "insert",
+        "write_page_entry",
+        "page_table",
+        "virtual_page_table",
+        "configure_hierarchy",
+        "invalidate_key",
+    ] {
         assert!(
             contains_ident(&atlas.production, evidence),
             "GpuTileAtlas must couple CPU policy and page-table updates; missing `{evidence}`"

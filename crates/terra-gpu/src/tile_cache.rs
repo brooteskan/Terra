@@ -2,8 +2,8 @@ use bytemuck::{Pod, Zeroable};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use terra_core::{
-    HeightTile, TerrainContentStamp, TerrainTileKey, TileCacheError, TileCacheInsert,
-    TilePageHandle, TileResidencyCache,
+    FieldId, HeightTile, TerrainContentStamp, TerrainPyramid, TerrainTileKey, TileCacheError,
+    TileCacheInsert, TilePageHandle, TileResidencyCache,
 };
 use thiserror::Error;
 use wgpu::util::DeviceExt;
@@ -23,8 +23,16 @@ pub struct GpuPageTableEntry {
     pub width: u32,
     pub height: u32,
     pub halo: u32,
-    pub revision_lo: u32,
-    pub revision_hi: u32,
+    pub document_revision_lo: u32,
+    pub document_revision_hi: u32,
+    pub plan_revision_lo: u32,
+    pub plan_revision_hi: u32,
+    pub output_revision_lo: u32,
+    pub output_revision_hi: u32,
+    pub content_revision_lo: u32,
+    pub content_revision_hi: u32,
+    pub published_frame_lo: u32,
+    pub published_frame_hi: u32,
 }
 
 impl GpuPageTableEntry {
@@ -34,7 +42,8 @@ impl GpuPageTableEntry {
         width: u32,
         height: u32,
         halo: u32,
-        revision: u64,
+        content: TerrainContentStamp,
+        published_frame: u64,
     ) -> Self {
         let mut hasher = DefaultHasher::new();
         key.hash(&mut hasher);
@@ -50,8 +59,16 @@ impl GpuPageTableEntry {
             width,
             height,
             halo,
-            revision_lo: revision as u32,
-            revision_hi: (revision >> 32) as u32,
+            document_revision_lo: content.document_revision as u32,
+            document_revision_hi: (content.document_revision >> 32) as u32,
+            plan_revision_lo: content.plan_revision as u32,
+            plan_revision_hi: (content.plan_revision >> 32) as u32,
+            output_revision_lo: content.output_revision as u32,
+            output_revision_hi: (content.output_revision >> 32) as u32,
+            content_revision_lo: content.content_revision as u32,
+            content_revision_hi: (content.content_revision >> 32) as u32,
+            published_frame_lo: published_frame as u32,
+            published_frame_hi: (published_frame >> 32) as u32,
         }
     }
 
@@ -61,6 +78,39 @@ impl GpuPageTableEntry {
             ..Zeroable::zeroed()
         }
     }
+}
+
+/// Dense virtual-to-physical page mapping. The index is supplied by
+/// `TerrainPyramid::tile_metadata_index`; this is shader-visible residency state,
+/// not a CPU-side residency mirror.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct GpuVirtualPageEntry {
+    pub physical_slot: u32,
+    pub generation: u32,
+    pub valid: u32,
+    pub _pad: u32,
+}
+
+impl GpuVirtualPageEntry {
+    fn resident(handle: TilePageHandle) -> Self {
+        Self {
+            physical_slot: handle.slot,
+            generation: handle.generation,
+            valid: 1,
+            _pad: 0,
+        }
+    }
+}
+
+/// Immutable level addressing metadata consumed by the terrain shader.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct GpuTerrainLevelEntry {
+    pub resolution: u32,
+    pub tiles_x: u32,
+    pub tiles_z: u32,
+    pub metadata_offset: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,6 +139,8 @@ pub enum GpuTileCacheError {
     StalePyramid { content: u64, live: u64 },
     #[error("pyramid content identity is stale")]
     StalePyramidIdentity,
+    #[error("tile {0:?} is not addressable by the configured height hierarchy")]
+    UnaddressableTile(TerrainTileKey),
     #[error("pyramid tile publication failed: {0}")]
     Pyramid(#[from] GpuPyramidError),
 }
@@ -114,6 +166,11 @@ pub struct GpuTileAtlas {
     texture: wgpu::Texture,
     view: wgpu::TextureView,
     page_table: wgpu::Buffer,
+    virtual_page_table: wgpu::Buffer,
+    level_table: wgpu::Buffer,
+    hierarchy: Option<TerrainPyramid>,
+    level_count: u32,
+    virtual_page_count: u32,
     residency: TileResidencyCache,
     page_extent: u32,
     tile_size: u32,
@@ -178,6 +235,18 @@ impl GpuTileAtlas {
                 | wgpu::BufferUsages::COPY_DST
                 | wgpu::BufferUsages::COPY_SRC,
         });
+        let virtual_page_table = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("terrain-virtual-page-table"),
+            contents: bytemuck::bytes_of(&GpuVirtualPageEntry::zeroed()),
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+        });
+        let level_table = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("terrain-level-table"),
+            contents: bytemuck::bytes_of(&GpuTerrainLevelEntry::zeroed()),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
         let page_bytes = u64::from(page_extent) * u64::from(page_extent) * 4;
         let pack_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("terrain-pyramid-pack-bgl"),
@@ -238,6 +307,11 @@ impl GpuTileAtlas {
             texture,
             view,
             page_table,
+            virtual_page_table,
+            level_table,
+            hierarchy: None,
+            level_count: 0,
+            virtual_page_count: 0,
             residency: TileResidencyCache::new(page_bytes * u64::from(max_pages)),
             page_extent,
             tile_size,
@@ -249,6 +323,79 @@ impl GpuTileAtlas {
         })
     }
 
+    /// Configure the immutable virtual address space used by streamed height pages.
+    /// Reconfiguration retires all prior residency before replacing shader-visible
+    /// directory buffers, so old document mappings cannot survive a shape change.
+    pub fn configure_hierarchy(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        hierarchy: &TerrainPyramid,
+    ) {
+        self.clear(queue);
+        let mut offset = 0u32;
+        let levels: Vec<_> = hierarchy
+            .levels
+            .iter()
+            .map(|level| {
+                let metrics = hierarchy
+                    .level_metrics(level.index)
+                    .expect("descriptor level must have metrics");
+                let entry = GpuTerrainLevelEntry {
+                    resolution: level.resolution,
+                    tiles_x: metrics.tiles_x(),
+                    tiles_z: metrics.tiles_z(),
+                    metadata_offset: offset,
+                };
+                offset = offset.saturating_add(metrics.tiles_x().saturating_mul(metrics.tiles_z()));
+                entry
+            })
+            .collect();
+        let virtual_count = hierarchy.metadata_len().max(1);
+        let virtual_entries = vec![GpuVirtualPageEntry::zeroed(); virtual_count as usize];
+        self.virtual_page_table = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("terrain-virtual-page-table"),
+            contents: bytemuck::cast_slice(&virtual_entries),
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+        });
+        let level_entries = if levels.is_empty() {
+            vec![GpuTerrainLevelEntry::zeroed()]
+        } else {
+            levels
+        };
+        self.level_table = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("terrain-level-table"),
+            contents: bytemuck::cast_slice(&level_entries),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+        self.level_count = hierarchy.levels.len() as u32;
+        self.virtual_page_count = hierarchy.metadata_len();
+        self.hierarchy = Some(hierarchy.clone());
+    }
+
+    fn virtual_index(&self, key: &TerrainTileKey) -> Option<u32> {
+        (key.layer.is_none() && key.field == FieldId::Height)
+            .then(|| {
+                self.hierarchy
+                    .as_ref()?
+                    .tile_metadata_index(key.level, key.tile)
+            })
+            .flatten()
+    }
+
+    fn require_virtual_index(&self, key: &TerrainTileKey) -> Result<u32, GpuTileCacheError> {
+        self.virtual_index(key)
+            .ok_or_else(|| GpuTileCacheError::UnaddressableTile(key.clone()))
+    }
+
+    fn invalidate_key(&self, queue: &wgpu::Queue, key: &TerrainTileKey) {
+        if let Some(index) = self.virtual_index(key) {
+            self.write_virtual_entry(queue, index, GpuVirtualPageEntry::zeroed());
+        }
+    }
+
     fn allocate_page(
         &mut self,
         queue: &wgpu::Queue,
@@ -257,6 +404,9 @@ impl GpuTileAtlas {
         input_revision_hash: u64,
         content: Option<TerrainContentStamp>,
     ) -> Result<TileCacheInsert, GpuTileCacheError> {
+        if self.hierarchy.is_some() {
+            self.require_virtual_index(key)?;
+        }
         let insert = self
             .residency
             .insert_with_content(
@@ -268,12 +418,16 @@ impl GpuTileAtlas {
             )
             .map_err(GpuTileCacheError::Residency)?;
         for evicted in &insert.evicted {
+            self.invalidate_key(queue, &evicted.key);
             self.write_page_entry(
                 queue,
                 evicted.handle.slot,
                 GpuPageTableEntry::invalid(evicted.handle.generation),
             );
         }
+        // Replacing an existing virtual key keeps its physical slot but must not
+        // leave the old mapping visible while the payload is being overwritten.
+        self.invalidate_key(queue, key);
         Ok(insert)
     }
 
@@ -285,7 +439,15 @@ impl GpuTileAtlas {
         revision: u64,
         input_revision_hash: u64,
     ) -> Result<GpuTileUpload, GpuTileCacheError> {
-        self.upload_height_tile_with_content(queue, key, tile, revision, input_revision_hash, None)
+        self.upload_height_tile_with_content(
+            queue,
+            key,
+            tile,
+            revision,
+            input_revision_hash,
+            None,
+            0,
+        )
     }
 
     pub fn upload_height_tile_current(
@@ -295,6 +457,17 @@ impl GpuTileAtlas {
         tile: &HeightTile,
         content: TerrainContentStamp,
     ) -> Result<GpuTileUpload, GpuTileCacheError> {
+        self.upload_height_tile_current_at_frame(queue, key, tile, content, 0)
+    }
+
+    pub fn upload_height_tile_current_at_frame(
+        &mut self,
+        queue: &wgpu::Queue,
+        key: TerrainTileKey,
+        tile: &HeightTile,
+        content: TerrainContentStamp,
+        published_frame: u64,
+    ) -> Result<GpuTileUpload, GpuTileCacheError> {
         self.upload_height_tile_with_content(
             queue,
             key,
@@ -302,9 +475,13 @@ impl GpuTileAtlas {
             content.output_revision,
             content.content_revision,
             Some(content),
+            published_frame,
         )
     }
 
+    // Shared implementation keeps the legacy revision/hash API and the full
+    // content/frame API on one publication-ordering path.
+    #[allow(clippy::too_many_arguments)]
     fn upload_height_tile_with_content(
         &mut self,
         queue: &wgpu::Queue,
@@ -313,6 +490,7 @@ impl GpuTileAtlas {
         revision: u64,
         input_revision_hash: u64,
         content: Option<TerrainContentStamp>,
+        published_frame: u64,
     ) -> Result<GpuTileUpload, GpuTileCacheError> {
         if tile.stride() > self.page_extent || tile.stride_z() > self.page_extent {
             return Err(GpuTileCacheError::TileTooLarge {
@@ -354,9 +532,21 @@ impl GpuTileAtlas {
                 tile.interior_width,
                 tile.interior_height,
                 tile.halo,
-                revision,
+                content.unwrap_or(TerrainContentStamp {
+                    output_revision: revision,
+                    content_revision: input_revision_hash,
+                    ..TerrainContentStamp::default()
+                }),
+                published_frame,
             ),
         );
+        if let Some(virtual_index) = self.virtual_index(&key) {
+            self.write_virtual_entry(
+                queue,
+                virtual_index,
+                GpuVirtualPageEntry::resident(insert.handle),
+            );
+        }
         Ok(GpuTileUpload {
             handle: insert.handle,
             evicted: insert
@@ -386,7 +576,7 @@ impl GpuTileAtlas {
                 live: live_output_revision,
             });
         }
-        self.publish_pyramid_tile_with_identity(device, queue, pyramid, key, identity)
+        self.publish_pyramid_tile_with_identity(device, queue, pyramid, key, identity, 0)
     }
 
     pub fn publish_pyramid_tile_current(
@@ -397,11 +587,30 @@ impl GpuTileAtlas {
         key: TerrainTileKey,
         live_content: TerrainContentStamp,
     ) -> Result<GpuTileUpload, GpuTileCacheError> {
+        self.publish_pyramid_tile_current_at_frame(device, queue, pyramid, key, live_content, 0)
+    }
+
+    pub fn publish_pyramid_tile_current_at_frame(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pyramid: &GpuHeightPyramid,
+        key: TerrainTileKey,
+        live_content: TerrainContentStamp,
+        published_frame: u64,
+    ) -> Result<GpuTileUpload, GpuTileCacheError> {
         let identity = pyramid.identity();
         if identity.content_stamp() != live_content {
             return Err(GpuTileCacheError::StalePyramidIdentity);
         }
-        self.publish_pyramid_tile_with_identity(device, queue, pyramid, key, identity)
+        self.publish_pyramid_tile_with_identity(
+            device,
+            queue,
+            pyramid,
+            key,
+            identity,
+            published_frame,
+        )
     }
 
     fn publish_pyramid_tile_with_identity(
@@ -411,6 +620,7 @@ impl GpuTileAtlas {
         pyramid: &GpuHeightPyramid,
         key: TerrainTileKey,
         identity: crate::pyramid::GpuPyramidContentIdentity,
+        published_frame: u64,
     ) -> Result<GpuTileUpload, GpuTileCacheError> {
         pyramid.tile_error_index(&key)?;
         let metrics = pyramid
@@ -511,9 +721,17 @@ impl GpuTileAtlas {
                 extent.width,
                 extent.height,
                 self.halo,
-                identity.output_revision,
+                identity.content_stamp(),
+                published_frame,
             ),
         );
+        if let Some(virtual_index) = self.virtual_index(&key) {
+            self.write_virtual_entry(
+                queue,
+                virtual_index,
+                GpuVirtualPageEntry::resident(insert.handle),
+            );
+        }
         Ok(GpuTileUpload {
             handle: insert.handle,
             evicted: insert
@@ -532,6 +750,32 @@ impl GpuTileAtlas {
         self.residency.clear();
         let invalid_entries = vec![GpuPageTableEntry::zeroed(); self.max_pages as usize];
         queue.write_buffer(&self.page_table, 0, bytemuck::cast_slice(&invalid_entries));
+        if self.virtual_page_count > 0 {
+            let virtual_entries =
+                vec![GpuVirtualPageEntry::zeroed(); self.virtual_page_count as usize];
+            queue.write_buffer(
+                &self.virtual_page_table,
+                0,
+                bytemuck::cast_slice(&virtual_entries),
+            );
+        }
+    }
+
+    /// Remove one page from both the CPU policy cache and shader-visible tables.
+    pub fn unpublish(&mut self, queue: &wgpu::Queue, key: &TerrainTileKey) -> bool {
+        let Some(handle) = self.residency.peek(key).map(|entry| entry.handle) else {
+            return false;
+        };
+        if !self.residency.remove(key) {
+            return false;
+        }
+        self.invalidate_key(queue, key);
+        self.write_page_entry(
+            queue,
+            handle.slot,
+            GpuPageTableEntry::invalid(handle.generation.wrapping_add(1).max(1)),
+        );
+        true
     }
 
     pub fn lookup(&mut self, key: &TerrainTileKey) -> Option<TilePageHandle> {
@@ -571,6 +815,22 @@ impl GpuTileAtlas {
         self.page_table.clone()
     }
 
+    pub fn virtual_page_table_buffer_cloned(&self) -> wgpu::Buffer {
+        self.virtual_page_table.clone()
+    }
+
+    pub fn level_table_buffer_cloned(&self) -> wgpu::Buffer {
+        self.level_table.clone()
+    }
+
+    pub fn level_count(&self) -> u32 {
+        self.level_count
+    }
+
+    pub fn virtual_page_count(&self) -> u32 {
+        self.virtual_page_count
+    }
+
     /// Read the shader-visible page table back to the CPU. Test observability only.
     ///
     /// Blocks on a GPU readback (`map_async` + `poll(Wait)`), so it must never run
@@ -606,6 +866,44 @@ impl GpuTileAtlas {
         rx.recv()
             .expect("map callback")
             .expect("page-table readback mapping");
+        let mapped = slice.get_mapped_range();
+        let entries = bytemuck::cast_slice(&mapped).to_vec();
+        drop(mapped);
+        staging.unmap();
+        entries
+    }
+
+    #[doc(hidden)]
+    pub fn read_virtual_page_table_blocking(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> Vec<GpuVirtualPageEntry> {
+        if self.virtual_page_count == 0 {
+            return Vec::new();
+        }
+        let size =
+            std::mem::size_of::<GpuVirtualPageEntry>() as u64 * u64::from(self.virtual_page_count);
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("virtual-page-table-readback"),
+            size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("virtual-page-table-readback"),
+        });
+        encoder.copy_buffer_to_buffer(&self.virtual_page_table, 0, &staging, 0, size);
+        queue.submit(Some(encoder.finish()));
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+        device.poll(wgpu::Maintain::Wait);
+        rx.recv()
+            .expect("map callback")
+            .expect("virtual page-table mapping");
         let mapped = slice.get_mapped_range();
         let entries = bytemuck::cast_slice(&mapped).to_vec();
         drop(mapped);
@@ -706,6 +1004,11 @@ impl GpuTileAtlas {
         let offset = u64::from(slot) * std::mem::size_of::<GpuPageTableEntry>() as u64;
         queue.write_buffer(&self.page_table, offset, bytemuck::bytes_of(&entry));
     }
+
+    fn write_virtual_entry(&self, queue: &wgpu::Queue, index: u32, entry: GpuVirtualPageEntry) {
+        let offset = u64::from(index) * std::mem::size_of::<GpuVirtualPageEntry>() as u64;
+        queue.write_buffer(&self.virtual_page_table, offset, bytemuck::bytes_of(&entry));
+    }
 }
 
 #[cfg(test)]
@@ -739,12 +1042,20 @@ mod tests {
             tile.interior_width,
             tile.interior_height,
             tile.halo,
-            0x1_0000_0002,
+            TerrainContentStamp {
+                document_revision: 3,
+                plan_revision: 4,
+                output_revision: 0x1_0000_0002,
+                content_revision: 5,
+            },
+            9,
         );
         assert_eq!(entry.generation, 11);
         assert_eq!(entry.level, 5);
         assert_eq!((entry.tile_x, entry.tile_z), (1, 1));
-        assert_eq!((entry.revision_hi, entry.revision_lo), (1, 2));
+        assert_eq!((entry.output_revision_hi, entry.output_revision_lo), (1, 2));
+        assert_eq!(entry.document_revision_lo, 3);
+        assert_eq!(entry.published_frame_lo, 9);
     }
 
     #[test]
@@ -878,7 +1189,7 @@ mod tests {
         let row = after[replacement.handle.slot as usize];
         assert_eq!(row.valid, 1);
         assert_eq!(row.generation, replacement.handle.generation);
-        assert_eq!((row.revision_hi, row.revision_lo), (0, 8));
+        assert_eq!((row.output_revision_hi, row.output_revision_lo), (0, 8));
 
         atlas.clear(&gpu.queue);
         assert_eq!(atlas.residency().stats().resident_tiles, 0);
@@ -886,5 +1197,81 @@ mod tests {
             .read_page_table_blocking(&gpu.device, &gpu.queue)
             .iter()
             .all(|entry| entry.valid == 0));
+    }
+
+    #[test]
+    fn configured_hierarchy_maps_multiple_levels_and_unpublishes_child() {
+        let Some(gpu) = terra_test_gpu::headless() else {
+            return;
+        };
+        let hierarchy = TerrainPyramid::new(terra_core::PyramidConfig {
+            target_resolution: 64,
+            world_size_x: 1024.0,
+            world_size_z: 1024.0,
+            tile_size: 16,
+            halo: 1,
+        });
+        let mut atlas = GpuTileAtlas::new(&gpu.device, 16, 1, 4).unwrap();
+        atlas.configure_hierarchy(&gpu.device, &gpu.queue, &hierarchy);
+        assert_eq!(atlas.level_count(), hierarchy.levels.len() as u32);
+        assert_eq!(atlas.virtual_page_count(), hierarchy.metadata_len());
+
+        let content = TerrainContentStamp {
+            document_revision: 3,
+            plan_revision: 5,
+            output_revision: 7,
+            content_revision: 11,
+        };
+        let root_key = TerrainTileKey {
+            layer: None,
+            field: FieldId::Height,
+            level: 0,
+            tile: TileId { tx: 0, tz: 0 },
+        };
+        let child_key = TerrainTileKey {
+            layer: None,
+            field: FieldId::Height,
+            level: hierarchy.max_level(),
+            tile: TileId { tx: 1, tz: 2 },
+        };
+        let root_metrics = hierarchy.level_metrics(0).unwrap();
+        let child_metrics = hierarchy.level_metrics(hierarchy.max_level()).unwrap();
+        let root = terra_core::Heightfield::filled(root_metrics, 10.0);
+        let child = terra_core::Heightfield::filled(child_metrics, 20.0);
+        atlas
+            .upload_height_tile_current(
+                &gpu.queue,
+                root_key.clone(),
+                root.tile(root_key.tile).unwrap(),
+                content,
+            )
+            .unwrap();
+        atlas
+            .upload_height_tile_current(
+                &gpu.queue,
+                child_key.clone(),
+                child.tile(child_key.tile).unwrap(),
+                content,
+            )
+            .unwrap();
+
+        let mappings = atlas.read_virtual_page_table_blocking(&gpu.device, &gpu.queue);
+        let root_index = hierarchy.tile_metadata_index(0, root_key.tile).unwrap() as usize;
+        let child_index = hierarchy
+            .tile_metadata_index(child_key.level, child_key.tile)
+            .unwrap() as usize;
+        assert_eq!(mappings[root_index].valid, 1);
+        assert_eq!(mappings[child_index].valid, 1);
+        assert_ne!(
+            mappings[root_index].physical_slot,
+            mappings[child_index].physical_slot
+        );
+
+        assert!(atlas.unpublish(&gpu.queue, &child_key));
+        let mappings = atlas.read_virtual_page_table_blocking(&gpu.device, &gpu.queue);
+        assert_eq!(mappings[root_index].valid, 1);
+        assert_eq!(mappings[child_index].valid, 0);
+        assert!(atlas.is_current(&root_key, content));
+        assert!(!atlas.is_current(&child_key, content));
     }
 }

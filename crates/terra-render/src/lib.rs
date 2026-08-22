@@ -128,9 +128,40 @@ struct FrameUniforms {
     shadow: [f32; 4],
     /// Raster shading controls: x=ambient_strength, y=shadow_strength, z=fog_strength, w=unused
     raster: [f32; 4],
-    /// Streamed-page revision gate: x=revision_lo, y=revision_hi (u32 bits via
-    /// bitcast; the shader compares them against each page-table row), z/w unused.
-    stream2: [f32; 4],
+    /// Document and plan revision halves for complete streamed-content identity.
+    stream2: [u32; 4],
+    /// Output/content revision halves, bitcast as raw u32 values.
+    stream3: [u32; 4],
+    /// x=level_count, y=target_level, z=current_frame_lo bits, w=transition_frames.
+    stream4: [u32; 4],
+    /// x=terminal monolithic allowed, y=stream debug mode, z/w reserved.
+    stream5: [f32; 4],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TerrainTerminalFallback {
+    #[default]
+    RootRequired,
+    MonolithicMigration,
+}
+
+/// Complete shader-facing tile-stream resource set. Demand is deliberately not
+/// represented here: rendered selection comes only from these GPU tables.
+pub struct TerrainTileStreamResources {
+    pub atlas_view: wgpu::TextureView,
+    pub physical_page_table: wgpu::Buffer,
+    pub virtual_page_table: wgpu::Buffer,
+    pub level_table: wgpu::Buffer,
+    pub tile_size: u32,
+    pub halo: u32,
+    pub max_pages: u32,
+    pub level_count: u32,
+    pub target_level: u8,
+    pub target_resolution: u32,
+    pub content: terra_core::TerrainContentStamp,
+    pub transition_frames: u32,
+    pub terminal_fallback: TerrainTerminalFallback,
+    pub enable: bool,
 }
 
 /// Viewport false-color / analysis shading (mode bar).
@@ -329,20 +360,19 @@ pub struct TerrainRenderer {
     tile_atlas_texture: wgpu::Texture,
     tile_atlas_view: wgpu::TextureView,
     page_table_buf: wgpu::Buffer,
+    virtual_page_table_buf: wgpu::Buffer,
+    tile_level_table_buf: wgpu::Buffer,
     use_tile_stream: bool,
     tile_stream_tile_size: f32,
     tile_stream_halo: f32,
     tile_stream_max_pages: f32,
-    tile_stream_level: f32,
-    /// Resolution of the pyramid level the resident pages were cut at. The shader
-    /// denormalizes streamed UVs with this — *not* the monolithic `tex_size` — so a
-    /// coarse (Draft/Medium) result's 2×2/4×4 tile block spans the whole terrain
-    /// instead of a `level_res / tex_size` corner at the origin.
-    tile_stream_res: (f32, f32),
-    /// Output revision of the pages currently streamed. The shader rejects any
-    /// page-table row whose revision differs, so a stale page can never resolve
-    /// even if an invalidation site is missed (defence-in-depth for #86).
-    tile_stream_revision: u64,
+    tile_stream_level_count: u32,
+    tile_stream_target_level: u8,
+    tile_stream_target_resolution: u32,
+    tile_stream_content: terra_core::TerrainContentStamp,
+    tile_stream_transition_frames: u32,
+    tile_stream_terminal_fallback: TerrainTerminalFallback,
+    tile_stream_debug_mode: u32,
 }
 
 /// Environment lighting used for Lit viewport presentation.
@@ -887,6 +917,26 @@ impl TerrainRenderer {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 19,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 20,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -914,8 +964,13 @@ impl TerrainRenderer {
         let (albedo_array, albedo_array_view, albedo_sampler) =
             create_albedo_array(&device, &queue);
 
-        let (tile_atlas_texture, tile_atlas_view, page_table_buf) =
-            create_dummy_tile_stream(&device);
+        let (
+            tile_atlas_texture,
+            tile_atlas_view,
+            page_table_buf,
+            virtual_page_table_buf,
+            tile_level_table_buf,
+        ) = create_dummy_tile_stream(&device);
         let shadow_map = shadows::ShadowMap::new(&device, heights.display_height_view(), true);
         let staging = staging::StagingRing::new(&device, 3, 4 * 1024 * 1024);
         let gpu_timer = gpu_timing::GpuTimestampTimer::try_new(&device, &queue);
@@ -930,6 +985,8 @@ impl TerrainRenderer {
             &albedo_sampler,
             &tile_atlas_view,
             &page_table_buf,
+            &virtual_page_table_buf,
+            &tile_level_table_buf,
             &shadow_map.view,
             &shadow_map.comparison_sampler,
         );
@@ -1083,6 +1140,8 @@ impl TerrainRenderer {
                     &albedo_sampler,
                     &tile_atlas_view,
                     &page_table_buf,
+                    &virtual_page_table_buf,
+                    &tile_level_table_buf,
                     &shadow_map.view,
                     &shadow_map.comparison_sampler,
                 )
@@ -1167,13 +1226,19 @@ impl TerrainRenderer {
             tile_atlas_texture,
             tile_atlas_view,
             page_table_buf,
+            virtual_page_table_buf,
+            tile_level_table_buf,
             use_tile_stream: false,
             tile_stream_tile_size: 256.0,
             tile_stream_halo: 2.0,
             tile_stream_max_pages: 1.0,
-            tile_stream_level: 0.0,
-            tile_stream_res: (1.0, 1.0),
-            tile_stream_revision: 0,
+            tile_stream_level_count: 0,
+            tile_stream_target_level: 0,
+            tile_stream_target_resolution: 1,
+            tile_stream_content: terra_core::TerrainContentStamp::default(),
+            tile_stream_transition_frames: 8,
+            tile_stream_terminal_fallback: TerrainTerminalFallback::RootRequired,
+            tile_stream_debug_mode: 0,
         }
     }
 
@@ -1193,6 +1258,8 @@ impl TerrainRenderer {
         albedo_sampler: &wgpu::Sampler,
         tile_atlas_view: &wgpu::TextureView,
         page_table_buf: &wgpu::Buffer,
+        virtual_page_table_buf: &wgpu::Buffer,
+        tile_level_table_buf: &wgpu::Buffer,
         shadow_view: &wgpu::TextureView,
         shadow_samp: &wgpu::Sampler,
     ) -> wgpu::BindGroup {
@@ -1275,6 +1342,14 @@ impl TerrainRenderer {
                 wgpu::BindGroupEntry {
                     binding: 18,
                     resource: wgpu::BindingResource::Sampler(shadow_samp),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 19,
+                    resource: virtual_page_table_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 20,
+                    resource: tile_level_table_buf.as_entire_binding(),
                 },
             ],
         })
@@ -1799,6 +1874,8 @@ impl TerrainRenderer {
             &self.albedo_sampler,
             &self.tile_atlas_view,
             &self.page_table_buf,
+            &self.virtual_page_table_buf,
+            &self.tile_level_table_buf,
             &self.shadow_map.view,
             &self.shadow_map.comparison_sampler,
         );
@@ -1817,6 +1894,8 @@ impl TerrainRenderer {
                     &self.albedo_sampler,
                     &self.tile_atlas_view,
                     &self.page_table_buf,
+                    &self.virtual_page_table_buf,
+                    &self.tile_level_table_buf,
                     &self.shadow_map.view,
                     &self.shadow_map.comparison_sampler,
                 )
@@ -1838,38 +1917,23 @@ impl TerrainRenderer {
         self.ring_uniform_bufs.truncate(self.ring_grids.len());
     }
 
-    /// Bind a live tile atlas + page table so the terrain shader can sample
-    /// resident pages (falling back to the monolithic height texture on misses).
-    ///
-    /// `atlas_view` / `page_table` must remain valid while streaming is enabled
-    /// (typically owned by `GpuTileAtlas` in the app).
-    // Installs the tile-stream resources plus their scalar config in one call;
-    // the arguments are heterogeneous (views/buffers + sizes/level/revision/
-    // flag) and each is stored into a distinct field. Kept flat.
-    #[allow(clippy::too_many_arguments)]
-    pub fn set_tile_stream_resources(
-        &mut self,
-        atlas_view: wgpu::TextureView,
-        page_table: wgpu::Buffer,
-        tile_size: u32,
-        halo: u32,
-        max_pages: u32,
-        level: u8,
-        level_res: (u32, u32),
-        revision: u64,
-        enable: bool,
-    ) {
-        self.tile_atlas_view = atlas_view;
-        self.page_table_buf = page_table;
-        self.tile_stream_tile_size = tile_size.max(1) as f32;
-        self.tile_stream_halo = halo as f32;
-        self.tile_stream_max_pages = max_pages.max(1) as f32;
-        self.tile_stream_level = level as f32;
-        self.tile_stream_res = (level_res.0.max(1) as f32, level_res.1.max(1) as f32);
-        self.tile_stream_revision = revision;
-        // Streaming samples resident pages; the shader falls back to the monolithic
-        // height texture on page misses so presentation stays continuous.
-        self.use_tile_stream = enable;
+    /// Bind the atlas plus its dense virtual directory and immutable hierarchy.
+    /// Demand is intentionally absent: shader-visible page-table state selects data.
+    pub fn set_tile_stream_resources(&mut self, resources: TerrainTileStreamResources) {
+        self.tile_atlas_view = resources.atlas_view;
+        self.page_table_buf = resources.physical_page_table;
+        self.virtual_page_table_buf = resources.virtual_page_table;
+        self.tile_level_table_buf = resources.level_table;
+        self.tile_stream_tile_size = resources.tile_size.max(1) as f32;
+        self.tile_stream_halo = resources.halo as f32;
+        self.tile_stream_max_pages = resources.max_pages.max(1) as f32;
+        self.tile_stream_level_count = resources.level_count;
+        self.tile_stream_target_level = resources.target_level;
+        self.tile_stream_target_resolution = resources.target_resolution.max(1);
+        self.tile_stream_content = resources.content;
+        self.tile_stream_transition_frames = resources.transition_frames;
+        self.tile_stream_terminal_fallback = resources.terminal_fallback;
+        self.use_tile_stream = resources.enable;
         self.recreate_bind_group();
         self.notify_invalidation(InvalidationReason::TerrainChanged);
     }
@@ -1890,7 +1954,10 @@ impl TerrainRenderer {
     /// denormalizes streamed UVs against the page resolution rather than the
     /// monolithic `tex_size` (the corner-artifact revert check).
     pub fn tile_stream_res(&self) -> (u32, u32) {
-        (self.tile_stream_res.0 as u32, self.tile_stream_res.1 as u32)
+        (
+            self.tile_stream_target_resolution,
+            self.tile_stream_target_resolution,
+        )
     }
 
     /// The output revision the currently-streamed pages were stamped with, mirrored
@@ -1898,7 +1965,14 @@ impl TerrainRenderer {
     /// (`find_tile_page`). Tests pin this against `TerrainRuntime::output_revision`
     /// to prove the sync path stamps one authoritative revision into both places.
     pub fn tile_stream_revision(&self) -> u64 {
-        self.tile_stream_revision
+        self.tile_stream_content.output_revision
+    }
+
+    pub fn set_tile_stream_debug_mode(&mut self, mode: u32) {
+        if self.tile_stream_debug_mode != mode {
+            self.tile_stream_debug_mode = mode;
+            self.notify_invalidation(InvalidationReason::TerrainChanged);
+        }
     }
 
     pub fn set_shadows_enabled(&mut self, enable: bool) {
@@ -2261,7 +2335,7 @@ impl TerrainRenderer {
             shadow: [
                 if self.shadow_map.enabled() { 1.0 } else { 0.0 },
                 0.0015,
-                self.tile_stream_level,
+                self.tile_stream_target_level as f32,
                 1.25,
             ],
             raster: [
@@ -2270,16 +2344,35 @@ impl TerrainRenderer {
                 self.lighting.fog_strength,
                 0.0,
             ],
-            // xy: revision as raw u32 bits. The value is a small monotonic counter,
-            // so it never reaches the f32 NaN range (~2.1e9) that a load+bitcast
-            // could canonicalize; the bits survive the round trip.
-            // zw: resolution of the streamed pages' pyramid level — the shader
-            // denormalizes streamed UVs with this, not the monolithic tex_size.
             stream2: [
-                f32::from_bits(self.tile_stream_revision as u32),
-                f32::from_bits((self.tile_stream_revision >> 32) as u32),
-                self.tile_stream_res.0,
-                self.tile_stream_res.1,
+                self.tile_stream_content.document_revision as u32,
+                (self.tile_stream_content.document_revision >> 32) as u32,
+                self.tile_stream_content.plan_revision as u32,
+                (self.tile_stream_content.plan_revision >> 32) as u32,
+            ],
+            stream3: [
+                self.tile_stream_content.output_revision as u32,
+                (self.tile_stream_content.output_revision >> 32) as u32,
+                self.tile_stream_content.content_revision as u32,
+                (self.tile_stream_content.content_revision >> 32) as u32,
+            ],
+            stream4: [
+                self.tile_stream_level_count,
+                u32::from(self.tile_stream_target_level),
+                self.global_frame_index as u32,
+                self.tile_stream_transition_frames,
+            ],
+            stream5: [
+                if self.tile_stream_terminal_fallback
+                    == TerrainTerminalFallback::MonolithicMigration
+                {
+                    1.0
+                } else {
+                    0.0
+                },
+                self.tile_stream_debug_mode as f32,
+                0.0,
+                0.0,
             ],
         };
         let world_x = self.heights.world_size.0;
@@ -2727,7 +2820,13 @@ const ALBEDO_TEX_SIZE: u32 = 256;
 
 fn create_dummy_tile_stream(
     device: &wgpu::Device,
-) -> (wgpu::Texture, wgpu::TextureView, wgpu::Buffer) {
+) -> (
+    wgpu::Texture,
+    wgpu::TextureView,
+    wgpu::Buffer,
+    wgpu::Buffer,
+    wgpu::Buffer,
+) {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("dummy-tile-atlas"),
         size: wgpu::Extent3d {
@@ -2749,11 +2848,23 @@ fn create_dummy_tile_stream(
     });
     let page_table = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("dummy-page-table"),
-        size: 48,
+        size: std::mem::size_of::<terra_gpu::GpuPageTableEntry>() as u64,
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    (texture, view, page_table)
+    let virtual_page_table = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("dummy-virtual-page-table"),
+        size: std::mem::size_of::<terra_gpu::GpuVirtualPageEntry>() as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let level_table = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("dummy-terrain-level-table"),
+        size: std::mem::size_of::<terra_gpu::GpuTerrainLevelEntry>() as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    (texture, view, page_table, virtual_page_table, level_table)
 }
 
 fn create_albedo_array(
@@ -2955,42 +3066,61 @@ mod shader_tests {
         panic!("unbalanced braces in fn {name}");
     }
 
-    /// Revert check for the corner artifact: the streamed height samplers must
-    /// denormalize UVs with the streamed pages' resolution (`stream_dims`, from
-    /// `stream2.zw`) rather than the monolithic `tex_size` (`u.grid`), and the
-    /// page-miss fallback must renormalize back through the monolithic texture.
-    /// Reverting the shader math to scale streamed UVs by `u.grid` — which drops
-    /// a coarse Draft/Medium result into a `level_res/tex_size` corner — trips this.
+    /// Revert check for multilevel addressing: lookup is dense by virtual tile,
+    /// sampling uses the selected level's resolution, and no physical-page scan
+    /// can return as atlas capacity grows.
     #[test]
     fn streamed_sampling_uses_page_resolution_not_monolithic_grid() {
         let source = include_str!("shaders/terrain.wgsl");
 
-        let dims = fn_body(source, "stream_dims");
+        let lookup = fn_body(source, "lookup_tile_page");
         assert!(
-            dims.contains("stream2"),
-            "stream_dims must read the page resolution from stream2.zw"
+            lookup.contains("metadata_offset") && lookup.contains("virtual_page_table"),
+            "lookup must directly index the dense virtual page table"
+        );
+        assert!(
+            !lookup.contains("for ("),
+            "lookup must not scan physical pages"
         );
 
-        let uv = fn_body(source, "sample_height_uv");
+        let page = fn_body(source, "sample_page_bilinear");
         assert!(
-            uv.contains("stream_dims"),
-            "sample_height_uv streamed branch must denormalize with stream_dims(), not u.grid"
+            page.contains("terrain_levels") && page.contains("resolution"),
+            "page sampling must denormalize with the selected level resolution"
         );
         assert!(
-            !uv.contains("u.grid"),
-            "sample_height_uv streamed branch must not scale by the monolithic u.grid"
-        );
-
-        let bilinear = fn_body(source, "sample_height_bilinear");
-        assert!(
-            bilinear.contains("stream_dims"),
-            "sample_height_bilinear streamed branch must filter in stream_dims() space"
+            !page.contains("u.grid"),
+            "streamed page sampling must not scale by the monolithic grid"
         );
 
-        let point = fn_body(source, "sample_height_streamed_point");
+        let resolve = fn_body(source, "resolve_from_level");
         assert!(
-            point.contains("sample_height_monolithic"),
-            "the page-miss fallback must renormalize to the monolithic texture"
+            resolve.contains("level = level - 1") && resolve.contains("sample_height_monolithic"),
+            "resolution must walk resident ancestors before terminal fallback"
+        );
+    }
+
+    #[test]
+    fn streamed_debug_distinguishes_exact_ancestor_blend_and_terminal() {
+        let source = include_str!("shaders/terrain.wgsl");
+        for class in [
+            "STREAM_EXACT",
+            "STREAM_ANCESTOR",
+            "STREAM_BLEND",
+            "STREAM_TERMINAL",
+        ] {
+            assert!(
+                source.contains(class),
+                "missing stream sample class {class}"
+            );
+        }
+        let fragment = fn_body(source, "fs_main");
+        assert!(
+            fragment.contains("stream5.y")
+                && fragment.contains("STREAM_EXACT")
+                && fragment.contains("STREAM_ANCESTOR")
+                && fragment.contains("STREAM_BLEND"),
+            "debug rendering must expose the actual shader resolution class"
         );
     }
 

@@ -58,5 +58,25 @@ Publication compares the immutable pyramid's output revision with the current ru
 revision before any cache or page-table mutation. Old content cannot be relabeled as a
 current page.
 
+## Resident-ancestor presentation
+
+The atlas owns a dense virtual directory indexed by the same stable metadata order used
+for geometric errors. The shader starts at the current source level and walks toward the
+root, performing one direct lookup per level. A mapping resolves only when its physical
+slot generation, coordinates, and complete content stamp match. Lookup cost is independent
+of physical atlas capacity, and GPU page-table state—not camera demand—selects rendering.
+
+Every level covers normalized UV `[0, 1]²`. Sampling maps UV to
+`clamp(uv) * (resolution - 1)`, selects `floor(sample / tile_size)`, and filters wholly
+inside that page using its level-local halo. Partial edge pages use their clipped extent;
+world-edge halos clamp to the outermost level sample. A missing same-level neighbor causes
+a short spatial blend to the best resident ancestor, while a newly published page also
+morphs from that ancestor over a bounded frame interval. Root coverage is pinned before
+GPU-pyramid streaming is enabled.
+
+Monolithic page-miss sampling remains an explicit bounded-project/CPU migration mode and
+an emergency diagnostic path. GPU-pyramid correctness requires current resident root
+coverage, so its tests treat terminal fallback as a failure.
+
 Camera-driven selection of these tiles is described in
 [Terrain camera demand](terrain_demand.md).

@@ -22,7 +22,10 @@ pub use pyramid::{
     GpuHeightPyramid, GpuHeightPyramidMaterializer, GpuPyramidContentIdentity, GpuPyramidError,
     GpuPyramidErrorReadback, GpuPyramidPlanningMetadata,
 };
-pub use tile_cache::{GpuPageTableEntry, GpuTileAtlas, GpuTileCacheError, GpuTileUpload};
+pub use tile_cache::{
+    GpuPageTableEntry, GpuTerrainLevelEntry, GpuTileAtlas, GpuTileCacheError, GpuTileUpload,
+    GpuVirtualPageEntry,
+};
 
 use thiserror::Error;
 

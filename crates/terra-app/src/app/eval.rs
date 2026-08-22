@@ -815,6 +815,9 @@ impl TerraApp {
             output_revision: self.terrain_runtime.output_revision(),
             content_revision: self.next_cpu_tile_content_revision,
         };
+        if let (Some(atlas), Some(gpu)) = (self.tile_atlas.as_mut(), self.gpu.as_ref()) {
+            atlas.configure_hierarchy(&gpu.device, &gpu.queue, &self.terrain_runtime.pyramid);
+        }
         let requests = height
             .tiles()
             .iter()
@@ -887,6 +890,9 @@ impl TerraApp {
             Ok(pyramid) => {
                 let stamp = pyramid.identity().content_stamp();
                 let error_readback = pyramid.begin_error_readback(&gpu.device, &gpu.queue);
+                if let Some(atlas) = self.tile_atlas.as_mut() {
+                    atlas.configure_hierarchy(&gpu.device, &gpu.queue, pyramid.descriptor());
+                }
                 self.clear_terrain_demand();
                 self.gpu_pyramid_error_readback = Some(error_readback);
                 self.gpu_height_pyramid = Some(pyramid);
@@ -1089,6 +1095,10 @@ impl TerraApp {
             self.tile_atlas.as_ref().unwrap().max_pages() as usize,
         );
         let leases = self.terrain_tile_scheduler.dequeue_budgeted(budget);
+        let published_frame = self
+            .renderer
+            .as_ref()
+            .map_or(0, terra_render::TerrainRenderer::global_frame_index);
         let mut uploaded = 0;
         for lease in leases {
             if lease.request.content != live_stamp {
@@ -1119,11 +1129,12 @@ impl TerraApp {
                     self.tile_atlas
                         .as_mut()
                         .unwrap()
-                        .upload_height_tile_current(
+                        .upload_height_tile_current_at_frame(
                             &self.gpu.as_ref().unwrap().queue,
                             key.clone(),
                             tile,
                             live_stamp,
+                            published_frame,
                         )
                 }
                 terra_core::TerrainTileWorkSource::GpuPyramid => {
@@ -1138,18 +1149,22 @@ impl TerraApp {
                     self.tile_atlas
                         .as_mut()
                         .unwrap()
-                        .publish_pyramid_tile_current(
+                        .publish_pyramid_tile_current_at_frame(
                             &self.gpu.as_ref().unwrap().device,
                             &self.gpu.as_ref().unwrap().queue,
                             pyramid,
                             key.clone(),
                             live_stamp,
+                            published_frame,
                         )
                 }
             };
             match result {
                 Ok(_) => {
                     uploaded += 1;
+                    if key.level == 0 {
+                        let _ = self.tile_atlas.as_mut().unwrap().pin(&key);
+                    }
                     self.terrain_tile_scheduler.complete(lease, live_stamp);
                 }
                 Err(error) => {
@@ -1174,47 +1189,78 @@ impl TerraApp {
     }
 
     pub(crate) fn sync_tile_stream_to_renderer(&mut self) {
-        let (atlas_view, page_table, tile_size, halo, max_pages) = {
-            let Some(atlas) = self.tile_atlas.as_ref() else {
-                return;
-            };
-            (
-                atlas.create_texture_view(),
-                atlas.page_table_buffer_cloned(),
-                atlas.tile_size(),
-                atlas.halo(),
-                atlas.max_pages(),
-            )
-        };
-        // Pages just uploaded carry this revision; the shader gate rejects any
-        // page-table row that does not match it.
-        let revision = self.terrain_runtime.output_revision();
-        let Some((level, level_res)) = self.streamed_level_for_current_output() else {
-            // The result's resolution is not a pyramid level, so the resident pages
-            // (if any) cannot be sampled against a matching grid. Present the
-            // monolithic texture (normalized) instead of streaming into a corner.
+        if self.tile_atlas.is_none() {
+            return;
+        }
+        let Some(content) = self.terrain_tile_scheduler.live_content() else {
             if let Some(renderer) = self.renderer.as_mut() {
                 renderer.set_use_tile_stream(false);
             }
             return;
         };
+        let Some((level, level_res)) = self.streamed_level_for_current_output() else {
+            if let Some(renderer) = self.renderer.as_mut() {
+                renderer.set_use_tile_stream(false);
+            }
+            return;
+        };
+        let root_required = self.gpu_height_pyramid.is_some();
+        let root_current = if root_required {
+            let root_metrics = self.terrain_runtime.pyramid.level_metrics(0);
+            root_metrics.is_some_and(|metrics| {
+                let atlas = self.tile_atlas.as_ref().expect("atlas checked below");
+                (0..metrics.tiles_z()).all(|tz| {
+                    (0..metrics.tiles_x()).all(|tx| {
+                        atlas.is_current(
+                            &terra_core::TerrainTileKey {
+                                layer: None,
+                                field: terra_core::FieldId::Height,
+                                level: 0,
+                                tile: terra_core::TileId { tx, tz },
+                            },
+                            content,
+                        )
+                    })
+                })
+            })
+        } else {
+            true
+        };
+        if !root_current {
+            if let Some(renderer) = self.renderer.as_mut() {
+                renderer.set_use_tile_stream(false);
+            }
+            return;
+        }
+        let resources = {
+            let Some(atlas) = self.tile_atlas.as_ref() else {
+                return;
+            };
+            terra_render::TerrainTileStreamResources {
+                atlas_view: atlas.create_texture_view(),
+                physical_page_table: atlas.page_table_buffer_cloned(),
+                virtual_page_table: atlas.virtual_page_table_buffer_cloned(),
+                level_table: atlas.level_table_buffer_cloned(),
+                tile_size: atlas.tile_size(),
+                halo: atlas.halo(),
+                max_pages: atlas.max_pages(),
+                level_count: atlas.level_count(),
+                target_level: level,
+                target_resolution: level_res,
+                content,
+                transition_frames: 8,
+                terminal_fallback: if root_required {
+                    terra_render::TerrainTerminalFallback::RootRequired
+                } else {
+                    terra_render::TerrainTerminalFallback::MonolithicMigration
+                },
+                enable: true,
+            }
+        };
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
-        renderer.set_tile_stream_resources(
-            atlas_view,
-            page_table,
-            tile_size,
-            halo,
-            max_pages,
-            level,
-            // The shader denormalizes streamed UVs with this level's resolution, so
-            // the page block spans the whole terrain rather than a tex_size corner.
-            (level_res, level_res),
-            revision,
-            // Streamed height is primary; shader falls back to monolithic on miss.
-            true,
-        );
+        renderer.set_tile_stream_resources(resources);
     }
 
     /// GPU residency half of the output-revision boundary. `TerrainPyramid` is only
@@ -2685,7 +2731,7 @@ mod tests {
         let live_revision = app.terrain_runtime.output_revision();
         assert!(rows.iter().any(|row| {
             row.valid == 1
-                && (u64::from(row.revision_lo) | (u64::from(row.revision_hi) << 32))
+                && (u64::from(row.output_revision_lo) | (u64::from(row.output_revision_hi) << 32))
                     == live_revision
         }));
     }

@@ -22,7 +22,10 @@ Mode alone selects the backend — there is no dual progressive enable flag.
 - **Heightfield compute path tracing** — rays intersect the displaced heightfield directly in WGSL. No BLAS/TLAS; no mesh BVH for terrain.
 - **Progressive post** — consumes typed PT HDR + depth (`HdrFrame` / `GBufferViews`); no raster intermediate or optional `scene_override`.
 - **RasterLit clipmap** — dense innermost ring near height-tex density; coarse rings punch Chebyshev holes so they never overdraw fine coverage; small worlds stay on a single dense grid.
-- **Tile-stream height** — primary sample path with continuous monolithic fallback and generation-checked page-table rows.
+- **Tile-stream height** — dense GPU virtual lookup with generation/full-identity-checked
+  physical rows, finest-resident-ancestor selection, and bounded edge/temporal morphing.
+  GPU-pyramid streaming requires pinned root coverage; monolithic terminal fallback is an
+  explicit bounded-project/CPU migration policy.
 - **Adaptive quality** — dynamic internal resolution, spp/bounce/denoise under GPU budget. Fake variance-from-sample-count is **not** on the hot path until GPU variance exists.
 - **Editor refinement hysteresis** — `Interactive → Settling → Refining → Converged` driven by meaningful scene changes.
 

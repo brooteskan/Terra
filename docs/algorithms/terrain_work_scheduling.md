@@ -39,6 +39,11 @@ compares the complete live content identity before cache or page-table mutation.
 Payload commands precede the valid page-table write, and revision retirement
 disables streaming and queues a page-table clear after older GPU work.
 
+GPU-pyramid publication pins current root coverage and enables streaming only after that
+coverage is complete. Optional refinement therefore cannot evict the terminal resident
+ancestor; under insufficient capacity it waits rather than converting monolithic height
+into the correctness fallback.
+
 Snapshots report queued and in-flight counts, deduplication, reprioritization,
 cancellation, stale drops, authoritative-cache skips, submissions, completions,
 failures, budget overruns, estimated dispatched cost, and queue/completion

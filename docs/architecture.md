@@ -216,12 +216,16 @@ supersession, completion, and publication with frame, generation, and evaluation
 
 ## Terrain residency and demand planning
 
-The terrain atlas page table is the shader-visible residency authority. Each valid row
-identifies a physical atlas page by virtual level/tile coordinates, generation, extent,
-halo, and output revision. `terra-core::TileResidencyCache` is the one mutable CPU policy
+The terrain atlas page-table system is the shader-visible residency authority. A dense
+virtual directory uses `TerrainPyramid`'s stable metadata index to map level/tile
+coordinates to physical atlas slots in O(1); each physical row validates slot generation,
+virtual coordinates, extent, halo, publication frame, and the complete content identity.
+Resident-ancestor search is bounded by pyramid depth rather than atlas capacity.
+`terra-core::TileResidencyCache` is the one mutable CPU policy
 mirror: it owns the byte budget, LRU and pin policy, virtual keys, and generation-checked
 handles. `terra-gpu::GpuTileAtlas` owns that cache and translates its insertions,
-evictions, and clears directly into page-table writes. Reported residency counts are
+evictions, explicit removals, and clears directly into both GPU table layers. The dense
+directory is not a second CPU residency database. Reported residency counts are
 derived from this path and are tested against valid page-table rows.
 
 `TerrainPyramid` is the immutable addressing descriptor for a complete ceil-halving
@@ -255,10 +259,12 @@ boundary, which drops old pyramid content and clears pending uploads, the cache 
 table, and renderer streaming state. Document reset performs the same retirement while
 preserving reusable atlas resources. GPU pyramid tiles are packed directly into the atlas
 with regenerated, world-clamped halos; publication rejects a content revision that differs
-from the live revision before mutating cache state. Every valid row is stamped with that
-revision, and the shader rejects a row whose revision differs from the renderer uniform
-even if app-side invalidation were missed. Slot generations independently prevent an old
-CPU handle from resolving after reuse. See
+from the live revision before mutating cache state. Every valid row is stamped with its
+document, plan, output, and content revisions, and the shader rejects any mismatch even
+if app-side invalidation were missed. Slot generations independently prevent an old
+virtual mapping or CPU handle from resolving after reuse. Root coverage is published and
+pinned before GPU-pyramid streaming is enabled; finer pages blend spatially and temporally
+from their best current resident ancestor. See
 [GPU terrain pyramids](algorithms/terrain_pyramid.md) for sampling and error conventions.
 
 Commit `339a837` removed an earlier CPU `TerrainPyramid` residency map and viewport tile
@@ -280,7 +286,8 @@ constraints:
 The source authority test discovers persistent tile-keyed stores by shape, not by names,
 and requires any future demand planner to land with a production consumer and a
 large-world bounded-work behavior test. Shader rendering tests separately prove that a
-current page is consumed and a stale page falls back to the monolithic height texture.
+current child refines a resident root, unpublishing returns to the root, and pages from a
+stale document or output never replace current ancestors.
 
 Viewport residency is also distinct from streaming export. An export pipeline may
 materialize and persist a complete deterministic pyramid at export quality, but it must

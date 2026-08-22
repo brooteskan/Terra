@@ -49,7 +49,9 @@ Rules that must hold on every shipping build. Violations are release blockers.
 - ALWAYS replace renderer height/normal slots and evaluator working textures with the 8×8
   resident baseline on document reset; existing size checks restore the next project dimensions.
 - ALWAYS document measured GPU pass timings in profiling reports before claiming performance targets.
-- ALWAYS fall back to the monolithic height texture on tile-stream page misses.
+- ALWAYS resolve the finest current resident ancestor from GPU page-table state; require
+  pinned current root coverage for GPU-pyramid streaming and use monolithic terminal
+  fallback only for explicit bounded-project/CPU migration presentation.
 - ALWAYS abandon unsubmitted refinement work when input advances the edit generation;
   an already-submitted unit is non-cancellable and its fence remains tracked.
 - ALWAYS advance optional GPU refinement by one safe unit only after required Draft

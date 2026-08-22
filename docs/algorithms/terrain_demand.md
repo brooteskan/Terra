@@ -56,4 +56,5 @@ replacing a FIFO. It preserves age for retained demand, establishes required coa
 coverage before optional refinement, applies editor-state budgets, and rejects stale
 content identities at atlas publication. See
 [Terrain tile work scheduling](terrain_work_scheduling.md). Resident-ancestor shader
-resolution remains separate renderer fallback work.
+resolution remains separate renderer work: the plan is never passed to the renderer, and
+the dense GPU page directory alone determines which exact or ancestor page is sampled.
