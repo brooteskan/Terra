@@ -9,6 +9,7 @@ pub mod effect_filter;
 pub mod graph;
 pub mod output_identity;
 pub mod parity;
+pub mod pyramid;
 pub mod tile_cache;
 
 pub use derivatives::{cpu_slope_oracle, run_derivative_gpu, GpuDerivativeMode};
@@ -16,6 +17,9 @@ pub use graph::{
     compile_gpu_graph, expand_dirty_rect, layer_gpu_supported, GpuComputeGraph, GpuDirtyPolicy,
     GpuFallbackCode, GpuFallbackDiagnostic, GpuFallbackReason, GpuKernel, GpuLayerPlan,
     BLUR_MAX_RADIUS, EFFECT_FILTER_MAX_RADIUS, RIVER_CARVE_MAX_RADIUS,
+};
+pub use pyramid::{
+    GpuHeightPyramid, GpuHeightPyramidMaterializer, GpuPyramidContentIdentity, GpuPyramidError,
 };
 pub use tile_cache::{GpuPageTableEntry, GpuTileAtlas, GpuTileCacheError, GpuTileUpload};
 

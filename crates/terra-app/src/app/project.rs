@@ -1045,10 +1045,11 @@ mod tests {
         };
         app.last_height = Some(Heightfield::filled(metrics, 1.0));
         app.queue_final_tile_uploads();
-        let (_, old_level, old_tile) = *app
+        let old_pending = *app
             .pending_tile_uploads
             .front()
             .expect("old document upload queued");
+        let (old_level, old_tile) = (old_pending.level, old_pending.tile);
         assert_eq!(app.upload_pending_terrain_tiles(), 1);
         let old_key = TerrainTileKey {
             layer: None,
@@ -1097,10 +1098,11 @@ mod tests {
 
         app.last_height = Some(Heightfield::filled(metrics, 2.0));
         app.queue_final_tile_uploads();
-        let (_, new_level, new_tile) = *app
+        let new_pending = *app
             .pending_tile_uploads
             .front()
             .expect("new document upload queued");
+        let (new_level, new_tile) = (new_pending.level, new_pending.tile);
         assert_eq!(app.upload_pending_terrain_tiles(), 1);
         let new_key = TerrainTileKey {
             layer: None,
@@ -1149,10 +1151,11 @@ mod tests {
         };
         app.last_height = Some(Heightfield::filled(metrics, 1.0));
         app.queue_final_tile_uploads();
-        let (_, level, tile) = *app
+        let pending = *app
             .pending_tile_uploads
             .front()
             .expect("page upload queued");
+        let (level, tile) = (pending.level, pending.tile);
         assert_eq!(app.upload_pending_terrain_tiles(), 1);
         let key = TerrainTileKey {
             layer: None,
@@ -1333,10 +1336,11 @@ mod tests {
         // #34 lifecycle: worker completion re-queues tiles and re-enables streaming.
         app.last_height = Some(Heightfield::filled(metrics, 2.0));
         app.queue_final_tile_uploads();
-        let (_, new_level, new_tile) = *app
+        let new_pending = *app
             .pending_tile_uploads
             .front()
             .expect("resync upload queued");
+        let (new_level, new_tile) = (new_pending.level, new_pending.tile);
         assert_eq!(app.upload_pending_terrain_tiles(), 1);
         let new_key = TerrainTileKey {
             layer: None,

@@ -1,9 +1,13 @@
 use bytemuck::{Pod, Zeroable};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use terra_core::{HeightTile, TerrainTileKey, TileCacheError, TilePageHandle, TileResidencyCache};
+use terra_core::{
+    HeightTile, TerrainTileKey, TileCacheError, TileCacheInsert, TilePageHandle, TileResidencyCache,
+};
 use thiserror::Error;
 use wgpu::util::DeviceExt;
+
+use crate::pyramid::{GpuHeightPyramid, GpuPyramidError};
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
@@ -26,7 +30,9 @@ impl GpuPageTableEntry {
     fn resident(
         key: &TerrainTileKey,
         handle: TilePageHandle,
-        tile: &HeightTile,
+        width: u32,
+        height: u32,
+        halo: u32,
         revision: u64,
     ) -> Self {
         let mut hasher = DefaultHasher::new();
@@ -40,9 +46,9 @@ impl GpuPageTableEntry {
             level: key.level as u32,
             tile_x: key.tile.tx,
             tile_z: key.tile.tz,
-            width: tile.interior_width,
-            height: tile.interior_height,
-            halo: tile.halo,
+            width,
+            height,
+            halo,
             revision_lo: revision as u32,
             revision_hi: (revision >> 32) as u32,
         }
@@ -78,6 +84,23 @@ pub enum GpuTileCacheError {
     },
     #[error("tile residency failed: {0:?}")]
     Residency(TileCacheError),
+    #[error("pyramid content revision {content} is stale; live output revision is {live}")]
+    StalePyramid { content: u64, live: u64 },
+    #[error("pyramid tile publication failed: {0}")]
+    Pyramid(#[from] GpuPyramidError),
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct PackUniforms {
+    source_width: u32,
+    source_height: u32,
+    origin_x: u32,
+    origin_z: u32,
+    interior_width: u32,
+    interior_height: u32,
+    halo: u32,
+    page_extent: u32,
 }
 
 /// R32Float texture-array atlas plus a shader-readable page table.
@@ -94,6 +117,8 @@ pub struct GpuTileAtlas {
     halo: u32,
     max_pages: u32,
     page_bytes: u64,
+    pack_layout: wgpu::BindGroupLayout,
+    pack_pipeline: wgpu::ComputePipeline,
 }
 
 impl GpuTileAtlas {
@@ -151,6 +176,61 @@ impl GpuTileAtlas {
                 | wgpu::BufferUsages::COPY_SRC,
         });
         let page_bytes = u64::from(page_extent) * u64::from(page_extent) * 4;
+        let pack_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("terrain-pyramid-pack-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::R32Float,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        terra_core::shader_progress::record_shader_compiled();
+        let pack_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("terrain-pyramid-pack"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("shaders/terrain_pyramid_pack.wgsl").into(),
+            ),
+        });
+        let pack_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("terrain-pyramid-pack-pl"),
+            bind_group_layouts: &[&pack_layout],
+            push_constant_ranges: &[],
+        });
+        let pack_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("terrain-pyramid-pack"),
+            layout: Some(&pack_pipeline_layout),
+            module: &pack_shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
         Ok(Self {
             texture,
             view,
@@ -161,7 +241,30 @@ impl GpuTileAtlas {
             halo,
             max_pages,
             page_bytes,
+            pack_layout,
+            pack_pipeline,
         })
+    }
+
+    fn allocate_page(
+        &mut self,
+        queue: &wgpu::Queue,
+        key: &TerrainTileKey,
+        revision: u64,
+        input_revision_hash: u64,
+    ) -> Result<TileCacheInsert, GpuTileCacheError> {
+        let insert = self
+            .residency
+            .insert(key.clone(), self.page_bytes, revision, input_revision_hash)
+            .map_err(GpuTileCacheError::Residency)?;
+        for evicted in &insert.evicted {
+            self.write_page_entry(
+                queue,
+                evicted.handle.slot,
+                GpuPageTableEntry::invalid(evicted.handle.generation),
+            );
+        }
+        Ok(insert)
     }
 
     pub fn upload_height_tile(
@@ -179,18 +282,7 @@ impl GpuTileAtlas {
                 page_extent: self.page_extent,
             });
         }
-        let insert = self
-            .residency
-            .insert(key.clone(), self.page_bytes, revision, input_revision_hash)
-            .map_err(GpuTileCacheError::Residency)?;
-
-        for evicted in &insert.evicted {
-            self.write_page_entry(
-                queue,
-                evicted.handle.slot,
-                GpuPageTableEntry::invalid(evicted.handle.generation),
-            );
-        }
+        let insert = self.allocate_page(queue, &key, revision, input_revision_hash)?;
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &self.texture,
@@ -217,7 +309,139 @@ impl GpuTileAtlas {
         self.write_page_entry(
             queue,
             insert.handle.slot,
-            GpuPageTableEntry::resident(&key, insert.handle, tile, revision),
+            GpuPageTableEntry::resident(
+                &key,
+                insert.handle,
+                tile.interior_width,
+                tile.interior_height,
+                tile.halo,
+                revision,
+            ),
+        );
+        Ok(GpuTileUpload {
+            handle: insert.handle,
+            evicted: insert
+                .evicted
+                .into_iter()
+                .map(|eviction| eviction.key)
+                .collect(),
+        })
+    }
+
+    /// Publish one immutable pyramid tile directly from GPU level storage.
+    ///
+    /// Page payload work is submitted before the valid page-table row is queued,
+    /// so shader-visible residency cannot precede its texture contents.
+    pub fn publish_pyramid_tile(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pyramid: &GpuHeightPyramid,
+        key: TerrainTileKey,
+        live_output_revision: u64,
+    ) -> Result<GpuTileUpload, GpuTileCacheError> {
+        let identity = pyramid.identity();
+        if identity.output_revision != live_output_revision {
+            return Err(GpuTileCacheError::StalePyramid {
+                content: identity.output_revision,
+                live: live_output_revision,
+            });
+        }
+        pyramid.tile_error_index(&key)?;
+        let metrics = pyramid
+            .descriptor()
+            .level_metrics(key.level)
+            .ok_or_else(|| GpuPyramidError::InvalidTile { key: key.clone() })?;
+        let extent = pyramid
+            .descriptor()
+            .tile_extent(key.level, key.tile)
+            .ok_or_else(|| GpuPyramidError::InvalidTile { key: key.clone() })?;
+        if extent.width + self.halo * 2 > self.page_extent
+            || extent.height + self.halo * 2 > self.page_extent
+        {
+            return Err(GpuTileCacheError::TileTooLarge {
+                width: extent.width + self.halo * 2,
+                height: extent.height + self.halo * 2,
+                page_extent: self.page_extent,
+            });
+        }
+        let source_view = pyramid.level_view(key.level)?;
+        let insert = self.allocate_page(queue, &key, live_output_revision, identity.output.0)?;
+        // Keep this slot invalid until its new payload has been submitted. This
+        // also protects replacement of an existing virtual key in the same slot.
+        self.write_page_entry(
+            queue,
+            insert.handle.slot,
+            GpuPageTableEntry::invalid(insert.handle.generation),
+        );
+
+        let destination_view = self.texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("terrain-pyramid-atlas-slot-storage"),
+            dimension: Some(wgpu::TextureViewDimension::D2),
+            base_array_layer: insert.handle.slot,
+            array_layer_count: Some(1),
+            ..Default::default()
+        });
+        let uniforms = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("terrain-pyramid-pack-uniform"),
+            contents: bytemuck::bytes_of(&PackUniforms {
+                source_width: metrics.width,
+                source_height: metrics.height,
+                origin_x: extent.origin_x,
+                origin_z: extent.origin_z,
+                interior_width: extent.width,
+                interior_height: extent.height,
+                halo: self.halo,
+                page_extent: self.page_extent,
+            }),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("terrain-pyramid-pack-bg"),
+            layout: &self.pack_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniforms.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(source_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&destination_view),
+                },
+            ],
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("terrain-pyramid-pack-encoder"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("terrain-pyramid-pack-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pack_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(
+                self.page_extent.div_ceil(8),
+                self.page_extent.div_ceil(8),
+                1,
+            );
+        }
+        queue.submit(Some(encoder.finish()));
+        self.write_page_entry(
+            queue,
+            insert.handle.slot,
+            GpuPageTableEntry::resident(
+                &key,
+                insert.handle,
+                extent.width,
+                extent.height,
+                self.halo,
+                live_output_revision,
+            ),
         );
         Ok(GpuTileUpload {
             handle: insert.handle,
@@ -314,6 +538,75 @@ impl GpuTileAtlas {
         entries
     }
 
+    /// Read one physical atlas page for seam and publication tests only.
+    #[doc(hidden)]
+    pub fn read_page_blocking(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        slot: u32,
+    ) -> Vec<f32> {
+        assert!(slot < self.max_pages);
+        let unpadded = self.page_extent * 4;
+        let padded = unpadded.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+            * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("terrain-tile-page-readback"),
+            size: u64::from(padded) * u64::from(self.page_extent),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("terrain-tile-page-readback"),
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: 0,
+                    y: 0,
+                    z: slot,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &staging,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded),
+                    rows_per_image: Some(self.page_extent),
+                },
+            },
+            wgpu::Extent3d {
+                width: self.page_extent,
+                height: self.page_extent,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(Some(encoder.finish()));
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+        device.poll(wgpu::Maintain::Wait);
+        rx.recv()
+            .expect("map callback")
+            .expect("atlas page readback map");
+        let mapped = slice.get_mapped_range();
+        let mut result = Vec::with_capacity((self.page_extent * self.page_extent) as usize);
+        for row in 0..self.page_extent as usize {
+            let start = row * padded as usize;
+            result.extend_from_slice(bytemuck::cast_slice(
+                &mapped[start..start + unpadded as usize],
+            ));
+        }
+        drop(mapped);
+        staging.unmap();
+        result
+    }
+
     pub fn page_extent(&self) -> u32 {
         self.page_extent
     }
@@ -368,7 +661,9 @@ mod tests {
                 slot: 4,
                 generation: 11,
             },
-            &tile,
+            tile.interior_width,
+            tile.interior_height,
+            tile.halo,
             0x1_0000_0002,
         );
         assert_eq!(entry.generation, 11);

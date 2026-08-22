@@ -30,7 +30,7 @@ use terra_core::layer::LayerId;
 use terra_core::quality::PreviewQuality;
 use terra_core::tiling::UvRect;
 use terra_cpu_eval::{EvalScheduler, EvalWorker};
-use terra_gpu::GpuTileAtlas;
+use terra_gpu::{GpuHeightPyramid, GpuHeightPyramidMaterializer, GpuTileAtlas};
 use terra_gpu_eval::GpuTerrainEngine;
 use terra_gui::{GuiRenderer, GuiState, Rect, WidgetLabState};
 use terra_io::{BackgroundExporter, BackgroundProjectIo};
@@ -62,6 +62,23 @@ pub(crate) struct BootResult {
     renderer: TerrainRenderer,
     tile_atlas: Option<GpuTileAtlas>,
     gpu_engine: GpuTerrainEngine,
+    gpu_pyramid_materializer: GpuHeightPyramidMaterializer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingTilePayload {
+    CpuHeight,
+    GpuPyramid {
+        output: terra_gpu::output_identity::GpuOutputId,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingTileUpload {
+    revision: u64,
+    level: u8,
+    tile: TileId,
+    payload: PendingTilePayload,
 }
 
 /// Startup state held while the renderer's pipelines/shaders compile on a worker
@@ -306,8 +323,11 @@ pub struct TerraApp {
     last_eval_gpu_supported: bool,
     /// Progressive final-output tile atlas used by the LOD renderer migration.
     tile_atlas: Option<GpuTileAtlas>,
-    /// (output revision, pyramid level, tile) awaiting a frame-budgeted GPU upload.
-    pending_tile_uploads: VecDeque<(u64, u8, TileId)>,
+    /// Immutable GPU content pyramid for the latest accepted complete output.
+    gpu_height_pyramid: Option<GpuHeightPyramid>,
+    gpu_pyramid_materializer: Option<GpuHeightPyramidMaterializer>,
+    /// Revision/source-stamped tiles awaiting frame-budgeted atlas publication.
+    pending_tile_uploads: VecDeque<PendingTileUpload>,
     gui_renderer: Option<GuiRenderer>,
     gui_state: GuiState,
     widget_lab: WidgetLabState,
@@ -481,6 +501,8 @@ impl Default for TerraApp {
             pending_plan_invalidation: None,
             last_eval_gpu_supported: false,
             tile_atlas: None,
+            gpu_height_pyramid: None,
+            gpu_pyramid_materializer: None,
             pending_tile_uploads: VecDeque::new(),
             gui_renderer: None,
             gui_state,

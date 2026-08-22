@@ -224,15 +224,23 @@ handles. `terra-gpu::GpuTileAtlas` owns that cache and translates its insertions
 evictions, and clears directly into page-table writes. Reported residency counts are
 derived from this path and are tested against valid page-table rows.
 
-`TerrainPyramid` is only a deterministic resolution ladder. It does not own resident
-tiles, page handles, geometric-error records, or a copy of the page table. Output edits
-advance `TerrainRuntime::output_revision` through the app's single revision boundary,
-which clears pending uploads, the cache and page table, and renderer streaming state.
-Document reset performs the same retirement while preserving reusable atlas resources.
-Every uploaded row is stamped with the current output revision, and the shader rejects a
-row whose revision differs from the renderer uniform even if app-side invalidation were
-missed. Slot generations independently prevent an old CPU handle from resolving after
-reuse.
+`TerrainPyramid` is the immutable addressing descriptor for a complete ceil-halving
+resolution hierarchy. It defines level dimensions, tile extents, normalized-footprint
+parent/child coverage, and stable dense metadata indices; it owns no resident tiles,
+page handles, or copy of the page table. `terra-gpu::GpuHeightPyramid` materializes a
+completed GPU result into immutable R32Float level textures and an output-identity-stamped
+dense geometric-error buffer. Those errors describe content, not residency.
+
+Output edits advance `TerrainRuntime::output_revision` through the app's single revision
+boundary, which drops old pyramid content and clears pending uploads, the cache and page
+table, and renderer streaming state. Document reset performs the same retirement while
+preserving reusable atlas resources. GPU pyramid tiles are packed directly into the atlas
+with regenerated, world-clamped halos; publication rejects a content revision that differs
+from the live revision before mutating cache state. Every valid row is stamped with that
+revision, and the shader rejects a row whose revision differs from the renderer uniform
+even if app-side invalidation were missed. Slot generations independently prevent an old
+CPU handle from resolving after reuse. See
+[GPU terrain pyramids](algorithms/terrain_pyramid.md) for sampling and error conventions.
 
 Commit `339a837` removed an earlier CPU `TerrainPyramid` residency map and viewport tile
 plan because they duplicated GPU residency, published placeholder geometric error, had

@@ -652,6 +652,8 @@ impl ApplicationHandler<RuntimeEvent> for TerraApp {
             }
             let renderer = TerrainRenderer::new_detached(&worker_gpu, config, size);
             let gpu_engine = GpuTerrainEngine::new(&worker_gpu.device, 256);
+            let gpu_pyramid_materializer =
+                terra_gpu::GpuHeightPyramidMaterializer::new(&worker_gpu.device);
             let tile_atlas = match GpuTileAtlas::new(&worker_gpu.device, tile_size, tile_halo, 128)
             {
                 Ok(atlas) => Some(atlas),
@@ -664,6 +666,7 @@ impl ApplicationHandler<RuntimeEvent> for TerraApp {
                 renderer,
                 tile_atlas,
                 gpu_engine,
+                gpu_pyramid_materializer,
             }
         });
 
@@ -1670,6 +1673,7 @@ impl TerraApp {
             mut renderer,
             tile_atlas,
             gpu_engine,
+            gpu_pyramid_materializer,
         } = result;
         boot.pending.attach(&mut renderer);
         // Reconcile against the live window size in case it changed during init.
@@ -1679,6 +1683,7 @@ impl TerraApp {
         self.renderer = Some(renderer);
         self.tile_atlas = tile_atlas;
         self.gpu_engine = Some(gpu_engine);
+        self.gpu_pyramid_materializer = Some(gpu_pyramid_materializer);
         self.gpu = Some(boot.gpu);
         self.refresh_window_title();
         self.refresh_viewport_rect();
