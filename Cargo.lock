@@ -2600,7 +2600,7 @@ dependencies = [
 
 [[package]]
 name = "terra-app"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "directories",
  "flexi_logger",
@@ -2628,7 +2628,7 @@ dependencies = [
 
 [[package]]
 name = "terra-core"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "approx",
  "glam",
@@ -2645,7 +2645,7 @@ dependencies = [
 
 [[package]]
 name = "terra-cpu-eval"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "image",
  "log",
@@ -2660,7 +2660,7 @@ dependencies = [
 
 [[package]]
 name = "terra-gpu"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "bytemuck",
  "glam",
@@ -2675,7 +2675,7 @@ dependencies = [
 
 [[package]]
 name = "terra-gpu-eval"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "bytemuck",
  "image",
@@ -2689,7 +2689,7 @@ dependencies = [
 
 [[package]]
 name = "terra-gui"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "bytemuck",
  "fontdue",
@@ -2704,7 +2704,7 @@ dependencies = [
 
 [[package]]
 name = "terra-io"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "blake3",
  "image",
@@ -2720,14 +2720,14 @@ dependencies = [
 
 [[package]]
 name = "terra-jobs"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "rayon",
 ]
 
 [[package]]
 name = "terra-render"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "bytemuck",
  "glam",
@@ -2746,7 +2746,7 @@ dependencies = [
 
 [[package]]
 name = "terra-test-gpu"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "pollster",
  "wgpu",
