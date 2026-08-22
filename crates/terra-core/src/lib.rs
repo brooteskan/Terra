@@ -131,7 +131,7 @@ pub use sparse_paint::{
 pub use terrain::{
     EditorRefinementState, PyramidConfig, RefinementController, RefinementTimings, ResidentTile,
     TerrainCacheKey, TerrainLevel, TerrainPyramid, TerrainRuntime, TerrainTileKey, TileCacheError,
-    TileCacheInsert, TileCacheStats, TilePageHandle, TileResidencyCache,
+    TileCacheEviction, TileCacheInsert, TileCacheStats, TilePageHandle, TileResidencyCache,
 };
 pub use world_archetype::{
     alpine_world, badlands_world, blank_world_design, build_world, coastal_world, desert_world,

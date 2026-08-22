@@ -214,6 +214,51 @@ current generation atomically commits resources, graph metadata, quality, and
 presentation. Frame traces correlate job lifecycle, progress, submission depth,
 supersession, completion, and publication with frame, generation, and evaluation IDs.
 
+## Terrain residency and demand planning
+
+The terrain atlas page table is the shader-visible residency authority. Each valid row
+identifies a physical atlas page by virtual level/tile coordinates, generation, extent,
+halo, and output revision. `terra-core::TileResidencyCache` is the one mutable CPU policy
+mirror: it owns the byte budget, LRU and pin policy, virtual keys, and generation-checked
+handles. `terra-gpu::GpuTileAtlas` owns that cache and translates its insertions,
+evictions, and clears directly into page-table writes. Reported residency counts are
+derived from this path and are tested against valid page-table rows.
+
+`TerrainPyramid` is only a deterministic resolution ladder. It does not own resident
+tiles, page handles, geometric-error records, or a copy of the page table. Output edits
+advance `TerrainRuntime::output_revision` through the app's single revision boundary,
+which clears pending uploads, the cache and page table, and renderer streaming state.
+Document reset performs the same retirement while preserving reusable atlas resources.
+Every uploaded row is stamped with the current output revision, and the shader rejects a
+row whose revision differs from the renderer uniform even if app-side invalidation were
+missed. Slot generations independently prevent an old CPU handle from resolving after
+reuse.
+
+Commit `339a837` removed an earlier CPU `TerrainPyramid` residency map and viewport tile
+plan because they duplicated GPU residency, published placeholder geometric error, had
+no production consumer, and performed an O(world tiles) editor-frame probe. That cleanup
+does not prohibit the concepts involved. Screen-space-error demand, coarse-first
+refinement, viewport regions, and resident-ancestor fallback may return under these
+constraints:
+
+- planner output must change requested, uploaded, or rendered pages in production;
+- demand and fallback query the atlas/cache authority rather than creating another
+  mutable residency database;
+- selected pages and fallbacks preserve output-revision and handle-generation checks;
+- geometric error is measured or derived from real terrain data, never placeholder
+  metadata; and
+- work is bounded by visible/requested regions rather than scanning every world tile on
+  every frame.
+
+The source authority test discovers persistent tile-keyed stores by shape, not by names,
+and requires any future demand planner to land with a production consumer and a
+large-world bounded-work behavior test. Shader rendering tests separately prove that a
+current page is consumed and a stale page falls back to the monolithic height texture.
+
+Viewport residency is also distinct from streaming export. An export pipeline may
+materialize and persist a complete deterministic pyramid at export quality, but it must
+not reinterpret the viewport cache as a guaranteed complete artifact.
+
 ## Tiles & ghosts
 
 Default tile 256² with halo 2. Halos are refreshed from neighbors before stencil reads. Phase 9 tile scheduler processes dirty tiles + neighbors to avoid seams.

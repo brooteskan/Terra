@@ -8,8 +8,8 @@ mod runtime;
 mod tile;
 
 pub use cache::{
-    ResidentTile, TerrainCacheKey, TileCacheError, TileCacheInsert, TileCacheStats, TilePageHandle,
-    TileResidencyCache,
+    ResidentTile, TerrainCacheKey, TileCacheError, TileCacheEviction, TileCacheInsert,
+    TileCacheStats, TilePageHandle, TileResidencyCache,
 };
 pub use pyramid::{PyramidConfig, TerrainLevel, TerrainPyramid};
 pub use refinement::{EditorRefinementState, RefinementController, RefinementTimings};

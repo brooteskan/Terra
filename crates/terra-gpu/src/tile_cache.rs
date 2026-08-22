@@ -1,5 +1,5 @@
 use bytemuck::{Pod, Zeroable};
-use std::collections::{hash_map::DefaultHasher, HashMap};
+use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use terra_core::{HeightTile, TerrainTileKey, TileCacheError, TilePageHandle, TileResidencyCache};
 use thiserror::Error;
@@ -89,7 +89,6 @@ pub struct GpuTileAtlas {
     view: wgpu::TextureView,
     page_table: wgpu::Buffer,
     residency: TileResidencyCache,
-    handles: HashMap<TerrainTileKey, TilePageHandle>,
     page_extent: u32,
     tile_size: u32,
     halo: u32,
@@ -157,7 +156,6 @@ impl GpuTileAtlas {
             view,
             page_table,
             residency: TileResidencyCache::new(page_bytes * u64::from(max_pages)),
-            handles: HashMap::new(),
             page_extent,
             tile_size,
             halo,
@@ -187,15 +185,12 @@ impl GpuTileAtlas {
             .map_err(GpuTileCacheError::Residency)?;
 
         for evicted in &insert.evicted {
-            if let Some(handle) = self.handles.remove(evicted) {
-                self.write_page_entry(
-                    queue,
-                    handle.slot,
-                    GpuPageTableEntry::invalid(handle.generation),
-                );
-            }
+            self.write_page_entry(
+                queue,
+                evicted.handle.slot,
+                GpuPageTableEntry::invalid(evicted.handle.generation),
+            );
         }
-        self.handles.insert(key.clone(), insert.handle);
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &self.texture,
@@ -226,7 +221,11 @@ impl GpuTileAtlas {
         );
         Ok(GpuTileUpload {
             handle: insert.handle,
-            evicted: insert.evicted,
+            evicted: insert
+                .evicted
+                .into_iter()
+                .map(|eviction| eviction.key)
+                .collect(),
         })
     }
 
@@ -236,7 +235,6 @@ impl GpuTileAtlas {
     /// entirely invalid before streaming can be enabled for the next document.
     pub fn clear(&mut self, queue: &wgpu::Queue) {
         self.residency.clear();
-        self.handles.clear();
         let invalid_entries = vec![GpuPageTableEntry::zeroed(); self.max_pages as usize];
         queue.write_buffer(&self.page_table, 0, bytemuck::cast_slice(&invalid_entries));
     }
@@ -436,5 +434,87 @@ mod tests {
         let entries = atlas.read_page_table_blocking(&gpu.device, &gpu.queue);
         assert_eq!(entries[new.slot as usize].valid, 1);
         assert_eq!(entries[new.slot as usize].generation, new.generation);
+    }
+
+    #[test]
+    fn eviction_keeps_cache_and_shader_visible_page_counts_in_lockstep() {
+        let Some(gpu) = terra_test_gpu::headless() else {
+            return;
+        };
+        let mut atlas = GpuTileAtlas::new(&gpu.device, 8, 1, 2).unwrap();
+        let metrics = terra_core::heightfield::HeightfieldMetrics {
+            width: 24,
+            height: 8,
+            world_size_x: 24.0,
+            world_size_z: 8.0,
+            tile_size: 8,
+            halo: 1,
+        };
+        let layer = LayerId::new();
+        let make_key = |tx| TerrainTileKey {
+            layer: Some(layer),
+            field: FieldId::Height,
+            level: 0,
+            tile: TileId { tx, tz: 0 },
+        };
+        let first = make_key(0);
+        let second = make_key(1);
+        let third = make_key(2);
+        let first_handle = atlas
+            .upload_height_tile(
+                &gpu.queue,
+                first.clone(),
+                &HeightTile::new(first.tile, &metrics),
+                7,
+                7,
+            )
+            .unwrap()
+            .handle;
+        atlas
+            .upload_height_tile(
+                &gpu.queue,
+                second.clone(),
+                &HeightTile::new(second.tile, &metrics),
+                7,
+                7,
+            )
+            .unwrap();
+
+        let before = atlas.read_page_table_blocking(&gpu.device, &gpu.queue);
+        assert_eq!(before.iter().filter(|entry| entry.valid != 0).count(), 2);
+        assert_eq!(atlas.residency().stats().resident_tiles, 2);
+
+        let replacement = atlas
+            .upload_height_tile(
+                &gpu.queue,
+                third.clone(),
+                &HeightTile::new(third.tile, &metrics),
+                8,
+                8,
+            )
+            .unwrap();
+        assert_eq!(replacement.evicted, vec![first]);
+        assert_eq!(replacement.handle.slot, first_handle.slot);
+        assert_ne!(replacement.handle.generation, first_handle.generation);
+        assert_eq!(atlas.residency().resolve_handle(first_handle), None);
+        assert_eq!(
+            atlas.residency().resolve_handle(replacement.handle),
+            Some(&third)
+        );
+
+        let after = atlas.read_page_table_blocking(&gpu.device, &gpu.queue);
+        assert_eq!(after.iter().filter(|entry| entry.valid != 0).count(), 2);
+        assert_eq!(atlas.residency().stats().resident_tiles, 2);
+        let row = after[replacement.handle.slot as usize];
+        assert_eq!(row.valid, 1);
+        assert_eq!(row.generation, replacement.handle.generation);
+        assert_eq!((row.revision_hi, row.revision_lo), (0, 8));
+
+        atlas.clear(&gpu.queue);
+        assert_eq!(atlas.residency().stats().resident_tiles, 0);
+        assert!(atlas
+            .read_page_table_blocking(&gpu.device, &gpu.queue)
+            .iter()
+            .all(|entry| entry.valid == 0));
     }
 }

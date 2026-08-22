@@ -1254,9 +1254,9 @@ mod tests {
     /// is fed from), and `profile.tile_cache_resident` (the count the artist reads).
     /// It also forbids stale rows and pins stream-enable honesty (streaming on only
     /// with live pages at the current revision). With the write-only CPU pyramid
-    /// plan retired (#91), residency has a single authoritative source (the GPU page
-    /// table, mirrored once into the atlas residency cache), so these counts cannot
-    /// diverge by construction.
+    /// plan retired (#91) and its name blacklist replaced by behavioral authority
+    /// guards (#171), residency has one shader-visible source (the GPU page table)
+    /// and one CPU policy mirror (`TileResidencyCache`).
     fn assert_residency_sources_agree(app: &TerraApp) {
         let revision = app.terrain_runtime.output_revision();
         let rev_lo = revision as u32;

@@ -30,9 +30,15 @@ pub struct ResidentTile {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TileCacheEviction {
+    pub key: TerrainTileKey,
+    pub handle: TilePageHandle,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TileCacheInsert {
     pub handle: TilePageHandle,
-    pub evicted: Vec<TerrainTileKey>,
+    pub evicted: Vec<TileCacheEviction>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -266,12 +272,13 @@ impl TileResidencyCache {
         victims
     }
 
-    fn evict(&mut self, keys: Vec<TerrainTileKey>) -> Vec<TerrainTileKey> {
+    fn evict(&mut self, keys: Vec<TerrainTileKey>) -> Vec<TileCacheEviction> {
         keys.into_iter()
-            .filter(|key| {
-                let removed = self.remove(key);
-                self.evictions += u64::from(removed);
-                removed
+            .filter_map(|key| {
+                let handle = self.entries.get(&key)?.handle;
+                self.remove(&key);
+                self.evictions = self.evictions.saturating_add(1);
+                Some(TileCacheEviction { key, handle })
             })
             .collect()
     }
@@ -332,9 +339,13 @@ mod tests {
         let b = key(layer, 1);
         let c = key(layer, 2);
         cache.insert(a.clone(), 8, 1, 1).unwrap();
-        cache.insert(b.clone(), 8, 1, 1).unwrap();
+        let bh = cache.insert(b.clone(), 8, 1, 1).unwrap().handle;
         cache.get(&a);
-        assert_eq!(cache.insert(c, 8, 1, 1).unwrap().evicted, vec![b]);
+        assert_eq!(
+            cache.insert(c, 8, 1, 1).unwrap().evicted,
+            vec![TileCacheEviction { key: b, handle: bh }]
+        );
+        assert_eq!(cache.resolve_handle(bh), None);
     }
 
     #[test]

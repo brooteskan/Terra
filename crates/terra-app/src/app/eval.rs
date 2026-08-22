@@ -885,11 +885,11 @@ impl TerraApp {
         );
     }
 
-    /// GPU half of the output-revision boundary. CPU pyramid residency is retired
-    /// by `TerrainRuntime::advance_output_revision`; this retires the streamed side
-    /// with it: pending uploads, atlas page table + residency, and the renderer's
-    /// streaming flag. Presentation stays continuous via the shader's monolithic
-    /// page-miss fallback until `upload_pending_terrain_tiles` →
+    /// GPU residency half of the output-revision boundary. `TerrainPyramid` is only
+    /// a resolution ladder and has no resident-page records; this retires pending
+    /// uploads, the atlas page table + its `TileResidencyCache` policy mirror, and
+    /// the renderer's streaming flag. Presentation stays continuous via the
+    /// shader's monolithic page-miss fallback until `upload_pending_terrain_tiles` →
     /// `sync_tile_stream_to_renderer` re-enable streaming for the new revision.
     pub(crate) fn retire_streamed_residency(&mut self) {
         self.pending_tile_uploads.clear();

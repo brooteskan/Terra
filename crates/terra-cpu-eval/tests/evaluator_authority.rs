@@ -296,9 +296,6 @@ const RETIRED_PATHS: &[&str] = &[
     "crates/terra-core/src/domain/pipeline.rs",
     "crates/terra-core/src/terrain/executor.rs",
     "crates/terra-core/src/terrain/work.rs",
-    // B1-D7 (#91): the viewport-region types (`NormalizedRect`/`RegionSet`) existed
-    // only to feed the write-only tile plan; restoring the module fails this guard.
-    "crates/terra-core/src/terrain/region.rs",
 ];
 
 const RETIRED_SYMBOLS: &[&str] = &[
@@ -325,29 +322,6 @@ const RETIRED_B1_D5_SYMBOLS: &[&str] = &[
     "evaluate_final_height",
     "pin_baked",
     "dirty_suffix_ids",
-];
-
-/// The write-only terrain residency plan retired by B1-D7 (#91). The CPU pyramid
-/// mirrored GPU residency into `TileRecord`s and a viewport tile plan that no
-/// production reader consumed — residency is now GPU-authoritative (the atlas page
-/// table, mirrored once into `TileResidencyCache`). Banned from *production* source
-/// workspace-wide (this scan strips `cfg(test)`). This is B1-D7's revert check:
-/// restoring any of these — the pyramid residency records, the `plan_resident_tiles`
-/// screen-space-error planner, or the renderer's `update_visible_tile_plan` HUD
-/// feed — trips this list. `NormalizedRect`/`RegionSet` are guarded by their file
-/// in `RETIRED_PATHS`, not by name, so a genuinely new rect type stays possible.
-const RETIRED_B1_D7_SYMBOLS: &[&str] = &[
-    "TileRecord",
-    "publish_resident",
-    "remove_resident",
-    "clear_residency",
-    "best_resident_ancestor",
-    "level_metrics",
-    "plan_resident_tiles",
-    "projected_error_px",
-    "ViewportTilePlan",
-    "ResidentTileSelection",
-    "update_visible_tile_plan",
 ];
 
 /// Retired from the *CPU* evaluator (`terra-cpu-eval/src/lib.rs`) only — not workspace-wide.
@@ -488,17 +462,6 @@ fn retired_evaluator_generations_stay_absent() {
                     violations.push(format!(
                         "{}:{} reintroduces B1-D5 production-dead entry point `{symbol}`; it was \
                          retired as an inert eval seam (#89) and must stay out of production",
-                        file.path,
-                        line_index + 1
-                    ));
-                }
-            }
-            for symbol in RETIRED_B1_D7_SYMBOLS {
-                if tokens.contains(symbol) {
-                    violations.push(format!(
-                        "{}:{} reintroduces the B1-D7 write-only residency plan symbol `{symbol}`; \
-                         terrain residency is GPU-authoritative (atlas page table + \
-                         TileResidencyCache) and the CPU plan was retired (#91)",
                         file.path,
                         line_index + 1
                     ));

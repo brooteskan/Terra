@@ -1,6 +1,9 @@
 use super::{EditorRefinementState, PyramidConfig, RefinementController, TerrainPyramid};
 
-/// App-facing owner of final-output tile residency, revisioning, and refinement state.
+/// App-facing owner of the terrain resolution ladder, output revision, and refinement state.
+///
+/// GPU tile residency belongs to `GpuTileAtlas`; this runtime deliberately keeps
+/// no resident-page records or CPU copy of the atlas page table.
 #[derive(Debug)]
 pub struct TerrainRuntime {
     pub pyramid: TerrainPyramid,
