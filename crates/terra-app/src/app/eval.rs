@@ -54,6 +54,19 @@ fn gpu_evaluation_trace_context(
     }
 }
 
+fn terrain_tile_work_budget(
+    state: terra_core::EditorRefinementState,
+    max_pages: usize,
+) -> terra_core::TerrainTileWorkBudget {
+    let budget_us = state.terrain_budget_us();
+    let max_items = if budget_us == u64::MAX {
+        128
+    } else {
+        (budget_us / 250).clamp(1, 32) as usize
+    };
+    terra_core::TerrainTileWorkBudget::new(budget_us, max_items, max_pages.max(1))
+}
+
 impl TerraApp {
     pub(crate) fn note_refinement_activity(&mut self) {
         let now = Instant::now();
@@ -779,7 +792,7 @@ impl TerraApp {
     }
 
     pub(crate) fn queue_final_tile_uploads(&mut self) {
-        self.pending_tile_uploads.clear();
+        self.terrain_tile_scheduler.clear();
         self.gpu_height_pyramid = None;
         self.clear_terrain_demand();
         if self.tile_atlas.is_none() {
@@ -794,14 +807,40 @@ impl TerraApp {
         let Some(height) = self.last_height.as_ref() else {
             return;
         };
-        let revision = self.terrain_runtime.output_revision();
-        self.pending_tile_uploads
-            .extend(height.tiles().iter().map(|tile| super::PendingTileUpload {
-                revision,
-                level,
-                tile: tile.id,
-                payload: super::PendingTilePayload::CpuHeight,
-            }));
+        self.next_cpu_tile_content_revision =
+            self.next_cpu_tile_content_revision.wrapping_add(1).max(1);
+        let stamp = terra_core::TerrainContentStamp {
+            document_revision: self.eval_token,
+            plan_revision: self.terrain_plan_cache.structure_revision().get(),
+            output_revision: self.terrain_runtime.output_revision(),
+            content_revision: self.next_cpu_tile_content_revision,
+        };
+        let requests = height
+            .tiles()
+            .iter()
+            .map(|tile| terra_core::TerrainTileWorkRequest {
+                key: terra_core::TerrainTileWorkKey {
+                    tile: terra_core::TerrainTileKey {
+                        layer: None,
+                        field: terra_core::FieldId::Height,
+                        level,
+                        tile: tile.id,
+                    },
+                    plan_revision: stamp.plan_revision,
+                    output_revision: stamp.output_revision,
+                },
+                content: stamp,
+                source: terra_core::TerrainTileWorkSource::CpuHeight,
+                class: terra_core::TerrainDemandClass::CoarseCoverage,
+                visible: false,
+                projected_error_px: 0.0,
+                distance_m: f32::INFINITY,
+                estimated_us: 250,
+            });
+        self.terrain_tile_scheduler.reconcile(stamp, requests);
+        self.ui_state
+            .profile
+            .update_terrain_tile_work(self.terrain_tile_scheduler.stats());
     }
 
     fn materialize_gpu_pyramid(
@@ -846,33 +885,47 @@ impl TerraApp {
             );
         match materialized {
             Ok(pyramid) => {
-                let source_output = pyramid.identity().output;
+                let stamp = pyramid.identity().content_stamp();
                 let error_readback = pyramid.begin_error_readback(&gpu.device, &gpu.queue);
                 self.clear_terrain_demand();
                 self.gpu_pyramid_error_readback = Some(error_readback);
                 self.gpu_height_pyramid = Some(pyramid);
-                self.pending_tile_uploads.clear();
+                self.terrain_tile_scheduler.clear();
                 let root_metrics = self
                     .terrain_runtime
                     .pyramid
                     .level_metrics(0)
                     .expect("materialized root level");
-                let revision = self.terrain_runtime.output_revision();
                 // Bootstrap the fallback chain while the compact metadata copy is
                 // mapping. The completed demand plan replaces this queue.
+                let mut requests = Vec::new();
                 for tz in 0..root_metrics.tiles_z() {
                     for tx in 0..root_metrics.tiles_x() {
-                        self.pending_tile_uploads
-                            .push_back(super::PendingTileUpload {
-                                revision,
-                                level: 0,
-                                tile: terra_core::TileId { tx, tz },
-                                payload: super::PendingTilePayload::GpuPyramid {
-                                    output: source_output,
+                        requests.push(terra_core::TerrainTileWorkRequest {
+                            key: terra_core::TerrainTileWorkKey {
+                                tile: terra_core::TerrainTileKey {
+                                    layer: None,
+                                    field: terra_core::FieldId::Height,
+                                    level: 0,
+                                    tile: terra_core::TileId { tx, tz },
                                 },
-                            });
+                                plan_revision: stamp.plan_revision,
+                                output_revision: stamp.output_revision,
+                            },
+                            content: stamp,
+                            source: terra_core::TerrainTileWorkSource::GpuPyramid,
+                            class: terra_core::TerrainDemandClass::CoarseCoverage,
+                            visible: true,
+                            projected_error_px: f32::MAX,
+                            distance_m: 0.0,
+                            estimated_us: 250,
+                        });
                     }
                 }
+                self.terrain_tile_scheduler.reconcile(stamp, requests);
+                self.ui_state
+                    .profile
+                    .update_terrain_tile_work(self.terrain_tile_scheduler.stats());
             }
             Err(error) => {
                 log::warn!(target: "terra_app::evaluation", "GPU pyramid materialization skipped: {error}");
@@ -982,33 +1035,42 @@ impl TerraApp {
                 return false;
             }
         };
-        if self.latest_terrain_demand.as_ref() == Some(&plan) {
-            return false;
-        }
-
         let identity = pyramid.identity();
-        let revision = identity.output_revision;
-        self.pending_tile_uploads.clear();
+        let stamp = identity.content_stamp();
+        let mut requests = Vec::new();
         for demand in &plan.tiles {
             let resident_current = self
                 .tile_atlas
                 .as_ref()
-                .and_then(|atlas| atlas.residency().peek(&demand.key))
-                .is_some_and(|resident| resident.revision == revision);
+                .is_some_and(|atlas| atlas.is_current(&demand.key, stamp));
             if !resident_current {
-                self.pending_tile_uploads
-                    .push_back(super::PendingTileUpload {
-                        revision,
-                        level: demand.key.level,
-                        tile: demand.key.tile,
-                        payload: super::PendingTilePayload::GpuPyramid {
-                            output: identity.output,
-                        },
-                    });
+                requests.push(terra_core::TerrainTileWorkRequest {
+                    key: terra_core::TerrainTileWorkKey {
+                        tile: demand.key.clone(),
+                        plan_revision: stamp.plan_revision,
+                        output_revision: stamp.output_revision,
+                    },
+                    content: stamp,
+                    source: terra_core::TerrainTileWorkSource::GpuPyramid,
+                    class: demand.class,
+                    visible: true,
+                    projected_error_px: demand.projected_error_px,
+                    distance_m: demand.distance_m,
+                    estimated_us: 250,
+                });
             }
         }
+        if let Some(atlas) = self.tile_atlas.as_ref() {
+            self.terrain_tile_scheduler
+                .set_capacity(atlas.max_pages() as usize);
+        }
+        self.terrain_tile_scheduler.reconcile(stamp, requests);
+        self.ui_state
+            .profile
+            .update_terrain_tile_work(self.terrain_tile_scheduler.stats());
+        let changed = self.latest_terrain_demand.as_ref() != Some(&plan);
         self.latest_terrain_demand = Some(plan);
-        true
+        changed || !self.terrain_tile_scheduler.is_empty()
     }
 
     pub(crate) fn upload_pending_terrain_tiles(&mut self) -> usize {
@@ -1016,83 +1078,98 @@ impl TerraApp {
             || self.gpu.is_none()
             || (self.last_height.is_none() && self.gpu_height_pyramid.is_none())
         {
-            self.pending_tile_uploads.clear();
+            self.terrain_tile_scheduler.clear();
             return 0;
         }
-        let budget_us = self.terrain_runtime.refinement.state().terrain_budget_us();
-        let upload_limit = if budget_us == u64::MAX {
-            128
-        } else {
-            (budget_us / 250).clamp(1, 32) as usize
+        let Some(live_stamp) = self.terrain_tile_scheduler.live_content() else {
+            return 0;
         };
-        let live_revision = self.terrain_runtime.output_revision();
+        let budget = terrain_tile_work_budget(
+            self.terrain_runtime.refinement.state(),
+            self.tile_atlas.as_ref().unwrap().max_pages() as usize,
+        );
+        let leases = self.terrain_tile_scheduler.dequeue_budgeted(budget);
         let mut uploaded = 0;
-        while uploaded < upload_limit {
-            let Some(pending) = self.pending_tile_uploads.pop_front() else {
-                break;
-            };
-            if pending.revision != live_revision {
+        for lease in leases {
+            if lease.request.content != live_stamp {
+                self.terrain_tile_scheduler.fail(lease);
                 continue;
             }
-            let key = terra_core::TerrainTileKey {
-                layer: None,
-                field: terra_core::FieldId::Height,
-                level: pending.level,
-                tile: pending.tile,
-            };
-            let result = match pending.payload {
-                super::PendingTilePayload::CpuHeight => {
+            let key = lease.request.key.tile.clone();
+            if self
+                .tile_atlas
+                .as_ref()
+                .unwrap()
+                .is_current(&key, live_stamp)
+            {
+                self.terrain_tile_scheduler
+                    .skip_in_flight_as_resident(lease);
+                continue;
+            }
+            let result = match lease.request.source {
+                terra_core::TerrainTileWorkSource::CpuHeight => {
                     let Some(tile) = self
                         .last_height
                         .as_ref()
-                        .and_then(|height| height.tile(pending.tile))
+                        .and_then(|height| height.tile(key.tile))
                     else {
+                        self.terrain_tile_scheduler.fail(lease);
                         continue;
                     };
-                    self.tile_atlas.as_mut().unwrap().upload_height_tile(
-                        &self.gpu.as_ref().unwrap().queue,
-                        key,
-                        tile,
-                        pending.revision,
-                        pending.revision,
-                    )
+                    self.tile_atlas
+                        .as_mut()
+                        .unwrap()
+                        .upload_height_tile_current(
+                            &self.gpu.as_ref().unwrap().queue,
+                            key.clone(),
+                            tile,
+                            live_stamp,
+                        )
                 }
-                super::PendingTilePayload::GpuPyramid { output } => {
+                terra_core::TerrainTileWorkSource::GpuPyramid => {
                     let Some(pyramid) = self
                         .gpu_height_pyramid
                         .as_ref()
-                        .filter(|pyramid| pyramid.identity().output == output)
+                        .filter(|pyramid| pyramid.identity().content_stamp() == live_stamp)
                     else {
+                        self.terrain_tile_scheduler.fail(lease);
                         continue;
                     };
-                    self.tile_atlas.as_mut().unwrap().publish_pyramid_tile(
-                        &self.gpu.as_ref().unwrap().device,
-                        &self.gpu.as_ref().unwrap().queue,
-                        pyramid,
-                        key,
-                        live_revision,
-                    )
+                    self.tile_atlas
+                        .as_mut()
+                        .unwrap()
+                        .publish_pyramid_tile_current(
+                            &self.gpu.as_ref().unwrap().device,
+                            &self.gpu.as_ref().unwrap().queue,
+                            pyramid,
+                            key.clone(),
+                            live_stamp,
+                        )
                 }
             };
             match result {
                 Ok(_) => {
                     uploaded += 1;
+                    self.terrain_tile_scheduler.complete(lease, live_stamp);
                 }
                 Err(error) => {
                     log::warn!("terrain tile upload failed: {error}");
-                    self.pending_tile_uploads.clear();
-                    break;
+                    self.terrain_tile_scheduler.fail(lease);
                 }
             }
             if let Some(atlas) = self.tile_atlas.as_ref() {
-                self.ui_state
-                    .profile
-                    .update_tile_cache(atlas.residency().stats(), self.pending_tile_uploads.len());
+                self.ui_state.profile.update_tile_cache(
+                    atlas.residency().stats(),
+                    self.terrain_tile_scheduler.len(),
+                );
             }
         }
         if uploaded > 0 {
             self.sync_tile_stream_to_renderer();
         }
+        self.ui_state
+            .profile
+            .update_terrain_tile_work(self.terrain_tile_scheduler.stats());
         uploaded
     }
 
@@ -1147,7 +1224,10 @@ impl TerraApp {
     /// shader's monolithic page-miss fallback until `upload_pending_terrain_tiles` →
     /// `sync_tile_stream_to_renderer` re-enable streaming for the new revision.
     pub(crate) fn retire_streamed_residency(&mut self) {
-        self.pending_tile_uploads.clear();
+        self.terrain_tile_scheduler.clear();
+        self.ui_state
+            .profile
+            .update_terrain_tile_work(self.terrain_tile_scheduler.stats());
         self.gpu_height_pyramid = None;
         self.clear_terrain_demand();
         if let (Some(atlas), Some(gpu)) = (self.tile_atlas.as_mut(), self.gpu.as_ref()) {
@@ -2231,7 +2311,10 @@ mod tests {
     };
     use crate::ui::PanelAction;
 
-    use super::{gpu_evaluation_trace_context, uv_to_texel_rect, DeferredFullField, TerraApp};
+    use super::{
+        gpu_evaluation_trace_context, terrain_tile_work_budget, uv_to_texel_rect,
+        DeferredFullField, TerraApp,
+    };
 
     fn flat(height: f32) -> Layer {
         Layer::new("Flat", LayerKind::Flat(FlatParams { height }))
@@ -2263,6 +2346,93 @@ mod tests {
             max_v: 1.0,
         };
         assert_eq!(uv_to_texel_rect(region, 512, 256), (0, 0, 512, 256));
+    }
+
+    #[test]
+    fn tile_work_budgets_follow_every_refinement_state() {
+        use terra_core::EditorRefinementState::*;
+        assert_eq!(terrain_tile_work_budget(Interactive, 256).max_items, 8);
+        assert_eq!(terrain_tile_work_budget(Settling, 256).max_items, 20);
+        assert_eq!(terrain_tile_work_budget(Refining, 256).max_items, 32);
+        assert_eq!(terrain_tile_work_budget(Converged, 256).max_items, 4);
+        assert_eq!(terrain_tile_work_budget(Export, 256).max_items, 128);
+    }
+
+    #[test]
+    fn production_scheduler_choice_controls_first_uploaded_page() {
+        let Some(gpu) = terra_test_gpu::headless() else {
+            return;
+        };
+        let context = GpuContext {
+            device: gpu.device.clone(),
+            queue: gpu.queue.clone(),
+            surface_format: wgpu::TextureFormat::Rgba8Unorm,
+        };
+        let metrics = HeightfieldMetrics {
+            tile_size: 16,
+            halo: 1,
+            ..HeightfieldMetrics::new(32, 32, 320.0, 320.0)
+        };
+        let mut config = PyramidConfig::new(32, 320.0, 320.0);
+        config.tile_size = 16;
+        config.halo = 1;
+        let mut app = TerraApp::default();
+        app.session.document.metrics = metrics;
+        app.terrain_runtime.reconfigure(config);
+        app.last_height = Some(Heightfield::filled(metrics, 7.0));
+        app.tile_atlas = Some(GpuTileAtlas::new(&context.device, 16, 1, 8).unwrap());
+        app.gpu = Some(context);
+
+        let level = app.streamed_level_for_last_height().unwrap().0;
+        let stamp = terra_core::TerrainContentStamp {
+            document_revision: app.eval_token,
+            plan_revision: app.terrain_plan_cache.structure_revision().get(),
+            output_revision: app.terrain_runtime.output_revision(),
+            content_revision: app.eval_token,
+        };
+        let make_request = |tx, class, visible, error| terra_core::TerrainTileWorkRequest {
+            key: terra_core::TerrainTileWorkKey {
+                tile: terra_core::TerrainTileKey {
+                    layer: None,
+                    field: terra_core::FieldId::Height,
+                    level,
+                    tile: terra_core::TileId { tx, tz: 0 },
+                },
+                plan_revision: stamp.plan_revision,
+                output_revision: stamp.output_revision,
+            },
+            content: stamp,
+            source: terra_core::TerrainTileWorkSource::CpuHeight,
+            class,
+            visible,
+            projected_error_px: error,
+            distance_m: tx as f32,
+            // Converged has a 1 ms budget, so exactly one request can dispatch.
+            estimated_us: 1_000,
+        };
+        let fine = make_request(0, terra_core::TerrainDemandClass::Refinement, true, 100.0);
+        let coarse = make_request(1, terra_core::TerrainDemandClass::CoarseCoverage, true, 1.0);
+        let coarse_key = coarse.key.tile.clone();
+        let fine_key = fine.key.tile.clone();
+        app.terrain_tile_scheduler.reconcile(stamp, [fine, coarse]);
+
+        assert_eq!(app.upload_pending_terrain_tiles(), 1);
+        let atlas = app.tile_atlas.as_ref().unwrap();
+        assert!(atlas.is_current(&coarse_key, stamp));
+        assert!(!atlas.is_current(&fine_key, stamp));
+
+        // A newer CPU result in the same document/output revision receives a
+        // distinct content identity and must replace, not cache-skip, old pages.
+        app.last_height = Some(Heightfield::filled(metrics, 9.0));
+        app.queue_final_tile_uploads();
+        let newer = app.terrain_tile_scheduler.live_content().unwrap();
+        assert_ne!(newer.content_revision, stamp.content_revision);
+        assert!(app.upload_pending_terrain_tiles() > 0);
+        assert!(app
+            .tile_atlas
+            .as_ref()
+            .unwrap()
+            .is_current(&coarse_key, newer));
     }
 
     #[test]
@@ -2440,11 +2610,14 @@ mod tests {
                 .readback_bytes,
             0
         );
-        assert!(!app.pending_tile_uploads.is_empty());
-        assert!(app.pending_tile_uploads.iter().all(|pending| matches!(
-            &pending.payload,
-            super::super::PendingTilePayload::GpuPyramid { .. }
-        )));
+        assert!(!app.terrain_tile_scheduler.is_empty());
+        assert!(app
+            .terrain_tile_scheduler
+            .queued_requests()
+            .all(|pending| matches!(
+                pending.source,
+                terra_core::TerrainTileWorkSource::GpuPyramid
+            )));
 
         let residency_before = app.tile_atlas.as_ref().unwrap().residency().stats();
         app.gpu.as_ref().unwrap().device.poll(wgpu::Maintain::Wait);

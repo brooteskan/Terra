@@ -219,7 +219,7 @@ impl TerraApp {
             || self.refinement_job.is_some()
             || self.ui_state.refining
             || self.deferred_full_field.is_some()
-            || !self.pending_tile_uploads.is_empty()
+            || !self.terrain_tile_scheduler.is_empty()
             || !self.pending_ui_effects.is_empty()
             || self.pending_surface_resize.is_some()
             || self.logical_frames.has_pending();
@@ -1443,7 +1443,7 @@ impl ApplicationHandler<RuntimeEvent> for TerraApp {
                 || self.ui_state.refining
                 || self.deferred_full_field.is_some()
                 || self.gpu_pyramid_error_readback.is_some()
-                || !self.pending_tile_uploads.is_empty()
+                || !self.terrain_tile_scheduler.is_empty()
                 || export_busy
                 || jobs.any_pending;
         }
@@ -1538,7 +1538,7 @@ impl TerraApp {
         self.pending_eval = false;
         self.pending_eval_immediate = false;
         self.deferred_full_field = None;
-        self.pending_tile_uploads.clear();
+        self.terrain_tile_scheduler.clear();
         self.pending_ui_effects.clear();
         self.input.clear();
         self.pending_surface_resize = None;

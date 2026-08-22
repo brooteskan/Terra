@@ -240,6 +240,16 @@ neither queries nor mutates residency. The consumer may skip exact current pages
 querying `GpuTileAtlas`'s authoritative cache before publication. See
 [Terrain camera demand](algorithms/terrain_demand.md).
 
+`TerrainTileWorkScheduler` is the bounded consumer between demand and atlas
+publication. Its request key includes field/level/tile, compiled-plan revision, and
+output revision; its full content stamp also carries document generation and immutable
+content revision. Replanning reprioritizes retained requests without resetting age.
+Required coarse/ancestor coverage gates optional refinement, and budgeted dequeue has
+both age promotion and a one-item oversized escape. Scheduler records are demand and
+lease state only: exact-current checks always query `GpuTileAtlas`, and publication
+revalidates the full content stamp before cache or page-table mutation. See
+[Terrain tile work scheduling](algorithms/terrain_work_scheduling.md).
+
 Output edits advance `TerrainRuntime::output_revision` through the app's single revision
 boundary, which drops old pyramid content and clears pending uploads, the cache and page
 table, and renderer streaming state. Document reset performs the same retirement while

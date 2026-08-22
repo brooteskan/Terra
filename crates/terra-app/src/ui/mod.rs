@@ -1297,6 +1297,7 @@ pub struct FrameProfile {
     pub tile_cache_budget_mb: f32,
     pub tile_cache_evictions: u64,
     pub tile_uploads_pending: usize,
+    pub terrain_tile_work: terra_core::TerrainTileWorkStats,
     /// GPU terrain pass microseconds (0 if TIMESTAMP_QUERY unsupported).
     pub gpu_terrain_us: u64,
     /// Compiled terrain evaluation GPU microseconds (delayed timestamp readback).
@@ -1365,6 +1366,11 @@ impl FrameProfile {
         self.tile_cache_budget_mb = stats.budget_bytes as f32 / MIB;
         self.tile_cache_evictions = stats.evictions;
         self.tile_uploads_pending = pending_uploads;
+    }
+
+    pub fn update_terrain_tile_work(&mut self, stats: terra_core::TerrainTileWorkStats) {
+        self.tile_uploads_pending = stats.queued;
+        self.terrain_tile_work = stats;
     }
 
     // Distinct per-frame render-state inputs (scene versions, invalidation,

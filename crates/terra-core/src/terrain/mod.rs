@@ -7,6 +7,7 @@ mod pyramid;
 mod refinement;
 mod runtime;
 mod tile;
+mod work;
 
 pub use cache::{
     ResidentTile, TerrainCacheKey, TileCacheError, TileCacheEviction, TileCacheInsert,
@@ -22,3 +23,7 @@ pub use pyramid::{
 pub use refinement::{EditorRefinementState, RefinementController, RefinementTimings};
 pub use runtime::TerrainRuntime;
 pub use tile::TerrainTileKey;
+pub use work::{
+    TerrainContentStamp, TerrainTileWorkBudget, TerrainTileWorkKey, TerrainTileWorkLease,
+    TerrainTileWorkRequest, TerrainTileWorkScheduler, TerrainTileWorkSource, TerrainTileWorkStats,
+};

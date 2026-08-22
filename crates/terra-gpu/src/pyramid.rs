@@ -2,7 +2,7 @@
 
 use bytemuck::{Pod, Zeroable};
 use std::sync::mpsc::{self, TryRecvError};
-use terra_core::{TerrainPyramid, TerrainTileKey};
+use terra_core::{TerrainContentStamp, TerrainPyramid, TerrainTileKey};
 use thiserror::Error;
 use wgpu::util::DeviceExt;
 
@@ -218,6 +218,17 @@ impl GpuHeightPyramid {
             &self.error_bits,
             self.descriptor.metadata_len() as usize,
         )
+    }
+}
+
+impl GpuPyramidContentIdentity {
+    pub fn content_stamp(self) -> TerrainContentStamp {
+        TerrainContentStamp {
+            document_revision: self.generation,
+            plan_revision: self.plan_revision,
+            output_revision: self.output_revision,
+            content_revision: self.output.0,
+        }
     }
 }
 

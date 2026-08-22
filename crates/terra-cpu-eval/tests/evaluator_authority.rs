@@ -295,7 +295,9 @@ const RETIRED_PATHS: &[&str] = &[
     "crates/terra-core/src/fields/context.rs",
     "crates/terra-core/src/domain/pipeline.rs",
     "crates/terra-core/src/terrain/executor.rs",
-    "crates/terra-core/src/terrain/work.rs",
+    // #171/#178: terrain work scheduling is allowed again only as bounded demand
+    // policy. residency_authority.rs behaviorally rejects cache ownership and
+    // fictional execution seams, so the historical path blacklist is obsolete.
 ];
 
 const RETIRED_SYMBOLS: &[&str] = &[
@@ -304,7 +306,6 @@ const RETIRED_SYMBOLS: &[&str] = &[
     "TerrainPipelineExecutor",
     "TerrainPipelineStage",
     "RebuildReason",
-    "TerrainWorkScheduler",
     "TerrainWorkItem",
     "execute_vector_height_tile",
     "publish_fallback_result",

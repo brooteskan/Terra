@@ -1,4 +1,4 @@
-use super::TerrainTileKey;
+use super::{TerrainContentStamp, TerrainTileKey};
 use crate::heightfield::TileId;
 use crate::layer::LayerId;
 use std::collections::HashMap;
@@ -25,6 +25,9 @@ pub struct ResidentTile {
     pub bytes: u64,
     pub revision: u64,
     pub input_revision_hash: u64,
+    /// Full semantic identity for exact current-content queries. Legacy inserts
+    /// leave this unset and continue to use revision/hash compatibility checks.
+    pub content: Option<TerrainContentStamp>,
     pub last_used_tick: u64,
     pub pin_count: u32,
 }
@@ -133,6 +136,17 @@ impl TileResidencyCache {
         revision: u64,
         input_revision_hash: u64,
     ) -> Result<TileCacheInsert, TileCacheError> {
+        self.insert_with_content(key, bytes, revision, input_revision_hash, None)
+    }
+
+    pub fn insert_with_content(
+        &mut self,
+        key: TerrainTileKey,
+        bytes: u64,
+        revision: u64,
+        input_revision_hash: u64,
+        content: Option<TerrainContentStamp>,
+    ) -> Result<TileCacheInsert, TileCacheError> {
         if bytes > self.budget_bytes {
             return Err(TileCacheError::EntryExceedsBudget {
                 bytes,
@@ -167,6 +181,7 @@ impl TileResidencyCache {
             entry.bytes = bytes;
             entry.revision = revision;
             entry.input_revision_hash = input_revision_hash;
+            entry.content = content;
             entry.last_used_tick = self.tick;
             return Ok(TileCacheInsert {
                 handle: entry.handle,
@@ -181,12 +196,19 @@ impl TileResidencyCache {
                 bytes,
                 revision,
                 input_revision_hash,
+                content,
                 last_used_tick: self.tick,
                 pin_count: 0,
             },
         );
         self.used_bytes = self.used_bytes.saturating_add(bytes);
         Ok(TileCacheInsert { handle, evicted })
+    }
+
+    pub fn is_current(&self, key: &TerrainTileKey, content: TerrainContentStamp) -> bool {
+        self.entries
+            .get(key)
+            .is_some_and(|entry| entry.content == Some(content))
     }
 
     pub fn remove(&mut self, key: &TerrainTileKey) -> bool {

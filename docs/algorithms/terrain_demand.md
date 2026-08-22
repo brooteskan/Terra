@@ -51,6 +51,9 @@ current pages may be skipped only by querying the authoritative atlas cache. Pla
 itself never changes cache or page-table state. The existing upload path remains the sole
 publisher and repeats the live output-revision check before atlas mutation.
 
-The current FIFO adapter is intentionally narrow. Request aging, cancellation, work
-budgets, and starvation prevention belong to the revision-aware scheduler, while
-resident-ancestor shader resolution belongs to the renderer fallback work.
+The revision-aware tile scheduler incrementally reconciles changed plans instead of
+replacing a FIFO. It preserves age for retained demand, establishes required coarse
+coverage before optional refinement, applies editor-state budgets, and rejects stale
+content identities at atlas publication. See
+[Terrain tile work scheduling](terrain_work_scheduling.md). Resident-ancestor shader
+resolution remains separate renderer fallback work.

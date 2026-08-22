@@ -25,7 +25,7 @@ use crate::ui::{
     WindowsGuiState,
 };
 use terra_core::document::EditorSession;
-use terra_core::heightfield::{Heightfield, TileId};
+use terra_core::heightfield::Heightfield;
 use terra_core::layer::LayerId;
 use terra_core::quality::PreviewQuality;
 use terra_core::tiling::UvRect;
@@ -66,22 +66,6 @@ pub(crate) struct BootResult {
     tile_atlas: Option<GpuTileAtlas>,
     gpu_engine: GpuTerrainEngine,
     gpu_pyramid_materializer: GpuHeightPyramidMaterializer,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PendingTilePayload {
-    CpuHeight,
-    GpuPyramid {
-        output: terra_gpu::output_identity::GpuOutputId,
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PendingTileUpload {
-    revision: u64,
-    level: u8,
-    tile: TileId,
-    payload: PendingTilePayload,
 }
 
 /// Startup state held while the renderer's pipelines/shaders compile on a worker
@@ -335,8 +319,10 @@ pub struct TerraApp {
     gpu_pyramid_planning_metadata: Option<GpuPyramidPlanningMetadata>,
     terrain_demand_planner: terra_core::TerrainDemandPlanner,
     latest_terrain_demand: Option<terra_core::TerrainDemandPlan>,
-    /// Revision/source-stamped tiles awaiting frame-budgeted atlas publication.
-    pending_tile_uploads: VecDeque<PendingTileUpload>,
+    /// Bounded, revision-aware demand awaiting concrete CPU/GPU atlas publication.
+    terrain_tile_scheduler: terra_core::TerrainTileWorkScheduler,
+    /// Monotonic identity for accepted CPU heightfields within an output revision.
+    next_cpu_tile_content_revision: u64,
     gui_renderer: Option<GuiRenderer>,
     gui_state: GuiState,
     widget_lab: WidgetLabState,
@@ -516,7 +502,8 @@ impl Default for TerraApp {
             gpu_pyramid_planning_metadata: None,
             terrain_demand_planner: terra_core::TerrainDemandPlanner::default(),
             latest_terrain_demand: None,
-            pending_tile_uploads: VecDeque::new(),
+            terrain_tile_scheduler: terra_core::TerrainTileWorkScheduler::default(),
+            next_cpu_tile_content_revision: 0,
             gui_renderer: None,
             gui_state,
             widget_lab: WidgetLabState::default(),

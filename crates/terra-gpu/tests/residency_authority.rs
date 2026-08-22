@@ -213,6 +213,47 @@ fn demand_planner_inventory_requires_live_bounded_consumers() {
     }
 }
 
+#[test]
+fn terrain_work_scheduler_is_bounded_demand_not_residency_or_fictional_execution() {
+    let scheduler = read_workspace("crates/terra-core/src/terrain/work.rs");
+    for forbidden in [
+        "TerrainWorkKind",
+        "TerrainWorkExecutor",
+        "TilePageHandle",
+        "TileResidencyCache",
+        "GpuTileAtlas",
+    ] {
+        assert!(
+            !scheduler.contains(forbidden),
+            "terrain work policy must not own residency or fictional executors: {forbidden}"
+        );
+    }
+    for evidence in [
+        "capacity",
+        "dequeue_budgeted",
+        "duplicate_demand_is_one_work_item",
+        "aging_live_request_cannot_starve_under_repeated_new_demand",
+    ] {
+        assert!(
+            scheduler.contains(evidence),
+            "missing scheduler evidence: {evidence}"
+        );
+    }
+    let consumer = read_workspace("crates/terra-app/src/app/eval.rs");
+    for evidence in [
+        "terrain_tile_scheduler.reconcile",
+        "terrain_tile_scheduler.dequeue_budgeted",
+        "publish_pyramid_tile_current",
+        "upload_height_tile_current",
+        "production_scheduler_choice_controls_first_uploaded_page",
+    ] {
+        assert!(
+            consumer.contains(evidence),
+            "missing production evidence: {evidence}"
+        );
+    }
+}
+
 fn validate_test_evidence(planner: &ApprovedDemandPlanner, evidence: &TestEvidence, purpose: &str) {
     let source = sanitize_rust(&read_workspace(evidence.path));
     let (_, body) = find_function_item(&source, evidence.test_name).unwrap_or_else(|| {

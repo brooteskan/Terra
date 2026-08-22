@@ -2,7 +2,8 @@ use bytemuck::{Pod, Zeroable};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use terra_core::{
-    HeightTile, TerrainTileKey, TileCacheError, TileCacheInsert, TilePageHandle, TileResidencyCache,
+    HeightTile, TerrainContentStamp, TerrainTileKey, TileCacheError, TileCacheInsert,
+    TilePageHandle, TileResidencyCache,
 };
 use thiserror::Error;
 use wgpu::util::DeviceExt;
@@ -86,6 +87,8 @@ pub enum GpuTileCacheError {
     Residency(TileCacheError),
     #[error("pyramid content revision {content} is stale; live output revision is {live}")]
     StalePyramid { content: u64, live: u64 },
+    #[error("pyramid content identity is stale")]
+    StalePyramidIdentity,
     #[error("pyramid tile publication failed: {0}")]
     Pyramid(#[from] GpuPyramidError),
 }
@@ -252,10 +255,17 @@ impl GpuTileAtlas {
         key: &TerrainTileKey,
         revision: u64,
         input_revision_hash: u64,
+        content: Option<TerrainContentStamp>,
     ) -> Result<TileCacheInsert, GpuTileCacheError> {
         let insert = self
             .residency
-            .insert(key.clone(), self.page_bytes, revision, input_revision_hash)
+            .insert_with_content(
+                key.clone(),
+                self.page_bytes,
+                revision,
+                input_revision_hash,
+                content,
+            )
             .map_err(GpuTileCacheError::Residency)?;
         for evicted in &insert.evicted {
             self.write_page_entry(
@@ -275,6 +285,35 @@ impl GpuTileAtlas {
         revision: u64,
         input_revision_hash: u64,
     ) -> Result<GpuTileUpload, GpuTileCacheError> {
+        self.upload_height_tile_with_content(queue, key, tile, revision, input_revision_hash, None)
+    }
+
+    pub fn upload_height_tile_current(
+        &mut self,
+        queue: &wgpu::Queue,
+        key: TerrainTileKey,
+        tile: &HeightTile,
+        content: TerrainContentStamp,
+    ) -> Result<GpuTileUpload, GpuTileCacheError> {
+        self.upload_height_tile_with_content(
+            queue,
+            key,
+            tile,
+            content.output_revision,
+            content.content_revision,
+            Some(content),
+        )
+    }
+
+    fn upload_height_tile_with_content(
+        &mut self,
+        queue: &wgpu::Queue,
+        key: TerrainTileKey,
+        tile: &HeightTile,
+        revision: u64,
+        input_revision_hash: u64,
+        content: Option<TerrainContentStamp>,
+    ) -> Result<GpuTileUpload, GpuTileCacheError> {
         if tile.stride() > self.page_extent || tile.stride_z() > self.page_extent {
             return Err(GpuTileCacheError::TileTooLarge {
                 width: tile.stride(),
@@ -282,7 +321,7 @@ impl GpuTileAtlas {
                 page_extent: self.page_extent,
             });
         }
-        let insert = self.allocate_page(queue, &key, revision, input_revision_hash)?;
+        let insert = self.allocate_page(queue, &key, revision, input_revision_hash, content)?;
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &self.texture,
@@ -347,6 +386,32 @@ impl GpuTileAtlas {
                 live: live_output_revision,
             });
         }
+        self.publish_pyramid_tile_with_identity(device, queue, pyramid, key, identity)
+    }
+
+    pub fn publish_pyramid_tile_current(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pyramid: &GpuHeightPyramid,
+        key: TerrainTileKey,
+        live_content: TerrainContentStamp,
+    ) -> Result<GpuTileUpload, GpuTileCacheError> {
+        let identity = pyramid.identity();
+        if identity.content_stamp() != live_content {
+            return Err(GpuTileCacheError::StalePyramidIdentity);
+        }
+        self.publish_pyramid_tile_with_identity(device, queue, pyramid, key, identity)
+    }
+
+    fn publish_pyramid_tile_with_identity(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pyramid: &GpuHeightPyramid,
+        key: TerrainTileKey,
+        identity: crate::pyramid::GpuPyramidContentIdentity,
+    ) -> Result<GpuTileUpload, GpuTileCacheError> {
         pyramid.tile_error_index(&key)?;
         let metrics = pyramid
             .descriptor()
@@ -366,7 +431,13 @@ impl GpuTileAtlas {
             });
         }
         let source_view = pyramid.level_view(key.level)?;
-        let insert = self.allocate_page(queue, &key, live_output_revision, identity.output.0)?;
+        let insert = self.allocate_page(
+            queue,
+            &key,
+            identity.output_revision,
+            identity.output.0,
+            Some(identity.content_stamp()),
+        )?;
         // Keep this slot invalid until its new payload has been submitted. This
         // also protects replacement of an existing virtual key in the same slot.
         self.write_page_entry(
@@ -440,7 +511,7 @@ impl GpuTileAtlas {
                 extent.width,
                 extent.height,
                 self.halo,
-                live_output_revision,
+                identity.output_revision,
             ),
         );
         Ok(GpuTileUpload {
@@ -465,6 +536,10 @@ impl GpuTileAtlas {
 
     pub fn lookup(&mut self, key: &TerrainTileKey) -> Option<TilePageHandle> {
         self.residency.get(key).map(|entry| entry.handle)
+    }
+
+    pub fn is_current(&self, key: &TerrainTileKey, content: TerrainContentStamp) -> bool {
+        self.residency.is_current(key, content)
     }
 
     pub fn pin(&mut self, key: &TerrainTileKey) -> bool {

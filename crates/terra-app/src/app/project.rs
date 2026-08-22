@@ -403,7 +403,7 @@ impl TerraApp {
         self.ui_state.draft_displayed = false;
         self.ui_state.quality = PreviewQuality::Draft;
         self.ui_state.dirty_tile_ids.clear();
-        self.pending_tile_uploads.clear();
+        self.terrain_tile_scheduler.clear();
 
         let metrics = self.session.document.metrics;
         self.terrain_runtime
@@ -1045,11 +1045,12 @@ mod tests {
         };
         app.last_height = Some(Heightfield::filled(metrics, 1.0));
         app.queue_final_tile_uploads();
-        let old_pending = *app
-            .pending_tile_uploads
-            .front()
+        let old_pending = app
+            .terrain_tile_scheduler
+            .queued_requests()
+            .next()
             .expect("old document upload queued");
-        let (old_level, old_tile) = (old_pending.level, old_pending.tile);
+        let (old_level, old_tile) = (old_pending.key.tile.level, old_pending.key.tile.tile);
         assert_eq!(app.upload_pending_terrain_tiles(), 1);
         let old_key = TerrainTileKey {
             layer: None,
@@ -1082,7 +1083,7 @@ mod tests {
         );
         assert_eq!(atlas.residency().stats().resident_tiles, 0);
         assert_eq!(atlas.residency().resolve_handle(old_handle), None);
-        assert!(app.pending_tile_uploads.is_empty());
+        assert!(app.terrain_tile_scheduler.is_empty());
         assert!(!app
             .renderer
             .as_ref()
@@ -1098,11 +1099,12 @@ mod tests {
 
         app.last_height = Some(Heightfield::filled(metrics, 2.0));
         app.queue_final_tile_uploads();
-        let new_pending = *app
-            .pending_tile_uploads
-            .front()
+        let new_pending = app
+            .terrain_tile_scheduler
+            .queued_requests()
+            .next()
             .expect("new document upload queued");
-        let (new_level, new_tile) = (new_pending.level, new_pending.tile);
+        let (new_level, new_tile) = (new_pending.key.tile.level, new_pending.key.tile.tile);
         assert_eq!(app.upload_pending_terrain_tiles(), 1);
         let new_key = TerrainTileKey {
             layer: None,
@@ -1151,11 +1153,12 @@ mod tests {
         };
         app.last_height = Some(Heightfield::filled(metrics, 1.0));
         app.queue_final_tile_uploads();
-        let pending = *app
-            .pending_tile_uploads
-            .front()
+        let pending = app
+            .terrain_tile_scheduler
+            .queued_requests()
+            .next()
             .expect("page upload queued");
-        let (level, tile) = (pending.level, pending.tile);
+        let (level, tile) = (pending.key.tile.level, pending.key.tile.tile);
         assert_eq!(app.upload_pending_terrain_tiles(), 1);
         let key = TerrainTileKey {
             layer: None,
@@ -1185,7 +1188,7 @@ mod tests {
         let atlas = app.tile_atlas.as_ref().expect("atlas retained");
         assert_eq!(atlas.residency().stats().resident_tiles, 0);
         assert_eq!(atlas.residency().resolve_handle(old_handle), None);
-        assert!(app.pending_tile_uploads.is_empty());
+        assert!(app.terrain_tile_scheduler.is_empty());
         assert!(!app
             .renderer
             .as_ref()
@@ -1336,11 +1339,12 @@ mod tests {
         // #34 lifecycle: worker completion re-queues tiles and re-enables streaming.
         app.last_height = Some(Heightfield::filled(metrics, 2.0));
         app.queue_final_tile_uploads();
-        let new_pending = *app
-            .pending_tile_uploads
-            .front()
+        let new_pending = app
+            .terrain_tile_scheduler
+            .queued_requests()
+            .next()
             .expect("resync upload queued");
-        let (new_level, new_tile) = (new_pending.level, new_pending.tile);
+        let (new_level, new_tile) = (new_pending.key.tile.level, new_pending.key.tile.tile);
         assert_eq!(app.upload_pending_terrain_tiles(), 1);
         let new_key = TerrainTileKey {
             layer: None,
@@ -1492,7 +1496,7 @@ mod tests {
 
         app.queue_final_tile_uploads();
         assert!(
-            app.pending_tile_uploads.is_empty(),
+            app.terrain_tile_scheduler.is_empty(),
             "a non-pyramid resolution must not queue tile uploads"
         );
 

@@ -389,7 +389,7 @@ const MODULE_DEPENDENCIES: &[(&str, &[&str])] = &[
             "spatial_kernels",
         ],
     ),
-    ("terrain", &["field_data", "heightfield", "layer"]),
+    ("terrain", &["field_data", "fields", "heightfield", "layer"]),
     (
         "terrain_plan",
         &[

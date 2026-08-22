@@ -1,5 +1,6 @@
 use super::{TerrainPyramid, TerrainTileKey};
-use crate::{FieldId, TileId};
+use crate::fields::FieldId;
+use crate::heightfield::TileId;
 use glam::{Mat4, Vec3, Vec4};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};

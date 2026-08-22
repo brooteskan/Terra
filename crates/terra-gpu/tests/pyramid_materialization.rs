@@ -288,9 +288,18 @@ fn gpu_publication_preserves_neighbor_halos_partial_edges_and_revision_authority
         level,
         tile: TileId { tx, tz: 0 },
     };
+    let live_identity = pyramid.identity();
+    let left_key = make_key(0);
     let left = atlas
-        .publish_pyramid_tile(&gpu.device, &gpu.queue, &pyramid, make_key(0), 17)
+        .publish_pyramid_tile_current(
+            &gpu.device,
+            &gpu.queue,
+            &pyramid,
+            left_key.clone(),
+            live_identity.content_stamp(),
+        )
         .unwrap();
+    assert!(atlas.is_current(&left_key, live_identity.content_stamp()));
     let right = atlas
         .publish_pyramid_tile(&gpu.device, &gpu.queue, &pyramid, make_key(1), 17)
         .unwrap();
@@ -365,4 +374,21 @@ fn gpu_publication_preserves_neighbor_halos_partial_edges_and_revision_authority
             .count(),
         3
     );
+
+    let stale_identity = GpuPyramidContentIdentity {
+        plan_revision: live_identity.plan_revision + 1,
+        ..live_identity
+    };
+    let before = atlas.residency().stats().resident_tiles;
+    assert!(matches!(
+        atlas.publish_pyramid_tile_current(
+            &gpu.device,
+            &gpu.queue,
+            &pyramid,
+            make_key(0),
+            stale_identity.content_stamp(),
+        ),
+        Err(GpuTileCacheError::StalePyramidIdentity)
+    ));
+    assert_eq!(atlas.residency().stats().resident_tiles, before);
 }
