@@ -334,8 +334,10 @@ impl GpuTimestampTimer {
         let slice = buffer.slice(..u64::from(count) * 8);
         let data = slice.get_mapped_range();
         let stamps: Vec<u64> = data
-            .chunks_exact(8)
-            .map(|c| u64::from_le_bytes(c.try_into().unwrap_or([0; 8])))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|chunk| u64::from_le_bytes(*chunk))
             .collect();
         drop(data);
         buffer.unmap();
