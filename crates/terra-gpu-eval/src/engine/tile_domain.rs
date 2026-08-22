@@ -1,10 +1,40 @@
 use super::*;
 use std::sync::mpsc;
+use std::sync::Arc;
 
 use terra_core::terrain_plan::{
-    resolve_plan_domain, TerrainPlanDomainRejection, TerrainPlanDomainSlice,
+    resolve_plan_execution_strategy, FieldSlot, TerrainPlanCheckpoint, TerrainPlanDomainRejection,
+    TerrainPlanDomainSlice, TerrainPlanExecutionStrategy,
 };
-use terra_core::TerrainEvaluationDomain;
+use terra_core::{TerrainContentStamp, TerrainEvaluationDomain};
+
+pub(super) struct GpuCheckpointField {
+    pub field: FieldSlot,
+    pub texture: Arc<wgpu::Texture>,
+}
+
+/// Immutable GPU fields produced by one complete-field plan prefix.
+pub(super) struct GpuTerrainCheckpoint {
+    content: TerrainContentStamp,
+    width: u32,
+    height: u32,
+    boundary: usize,
+    quality: PreviewQuality,
+    pub fields: Vec<GpuCheckpointField>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct GpuCheckpointSeed<'a> {
+    pub checkpoint: &'a GpuTerrainCheckpoint,
+    pub origin_x: u32,
+    pub origin_z: u32,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct CompiledPlanExecutionOverride<'a> {
+    pub operations: &'a [PlanOpId],
+    pub checkpoint_seed: Option<GpuCheckpointSeed<'a>>,
+}
 
 #[derive(Debug)]
 pub enum GpuTileEvaluationError {
@@ -39,6 +69,8 @@ pub struct GpuTileProducerStats {
     pub completed: u64,
     pub cancelled: u64,
     pub evaluated_texels: u64,
+    pub checkpoint_builds: u64,
+    pub checkpoint_reuses: u64,
 }
 
 /// One isolated tile evaluation. Its texture is never visible through the
@@ -92,20 +124,13 @@ impl GpuTileEvaluationJob {
 }
 
 /// Recycles tile-sized evaluators independently of the complete-field engine.
+#[derive(Default)]
 pub struct GpuCompiledTileProducer {
     idle: Vec<GpuTerrainEngine>,
     retired: Vec<GpuTileEvaluationJob>,
     stats: GpuTileProducerStats,
-}
-
-impl Default for GpuCompiledTileProducer {
-    fn default() -> Self {
-        Self {
-            idle: Vec::new(),
-            retired: Vec::new(),
-            stats: GpuTileProducerStats::default(),
-        }
-    }
+    checkpoint_engine: Option<GpuTerrainEngine>,
+    checkpoint: Option<GpuTerrainCheckpoint>,
 }
 
 impl GpuCompiledTileProducer {
@@ -121,10 +146,18 @@ impl GpuCompiledTileProducer {
         stack: &LayerStack,
         plan: &CompiledTerrainPlan,
     ) -> Result<TerrainPlanDomainSlice, GpuTileEvaluationError> {
-        let slice = resolve_plan_domain(plan, plan.final_height())
-            .map_err(GpuTileEvaluationError::Domain)?;
-        preflight_tile_operations(stack, plan, &slice)?;
-        Ok(slice)
+        match resolve_plan_execution_strategy(plan, plan.final_height()) {
+            TerrainPlanExecutionStrategy::Local(slice) => {
+                preflight_tile_operations(stack, plan, &slice, &slice.operations)?;
+                Ok(slice)
+            }
+            TerrainPlanExecutionStrategy::Checkpointed { checkpoint, suffix } => {
+                let mut complete = checkpoint.prefix_operations.clone();
+                complete.extend(suffix.operations.iter().copied());
+                preflight_tile_operations(stack, plan, &suffix, &complete)?;
+                Ok(suffix)
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -147,6 +180,7 @@ impl GpuCompiledTileProducer {
                 requested: domain.content.plan_revision,
             });
         }
+        let strategy = resolve_plan_execution_strategy(plan, plan.final_height());
         let slice = Self::analyze(stack, plan)?;
         if slice.operation_halo != domain.operation_halo {
             return Err(GpuTileEvaluationError::HaloMismatch {
@@ -154,7 +188,28 @@ impl GpuCompiledTileProducer {
                 supplied: domain.operation_halo,
             });
         }
-        preflight_tile_operations(stack, plan, &slice)?;
+        let checkpoint_seed = match &strategy {
+            TerrainPlanExecutionStrategy::Local(_) => None,
+            TerrainPlanExecutionStrategy::Checkpointed { checkpoint, .. } => {
+                self.ensure_checkpoint(
+                    device,
+                    queue,
+                    stack,
+                    mask_assets,
+                    plan,
+                    invalidation,
+                    quality,
+                    &domain,
+                    checkpoint,
+                )?;
+                let ready = self.checkpoint.as_ref().expect("checkpoint just ensured");
+                Some(GpuCheckpointSeed {
+                    checkpoint: ready,
+                    origin_x: domain.evaluation.origin_x,
+                    origin_z: domain.evaluation.origin_z,
+                })
+            }
+        };
 
         let mut engine = if let Some(engine) = self.idle.pop() {
             self.stats.engine_reuses = self.stats.engine_reuses.saturating_add(1);
@@ -189,7 +244,7 @@ impl GpuCompiledTileProducer {
             .patched_operations
             .sort_by_key(|operation| operation.index());
         tile_invalidation.patched_operations.dedup();
-        let result = engine.evaluate_compiled_with_intent(
+        let result = engine.evaluate_compiled_with_bridge(
             device,
             queue,
             stack,
@@ -201,8 +256,13 @@ impl GpuCompiledTileProducer {
             quality,
             false,
             GpuEvaluationIntent::Complete,
+            None,
+            Some(CompiledPlanExecutionOverride {
+                operations: &slice.operations,
+                checkpoint_seed,
+            }),
         )?;
-        if !result.fully_gpu || !result.did_eval {
+        if !result.fully_gpu || (!result.did_eval && checkpoint_seed.is_none()) {
             return Err(GpuTileEvaluationError::UnsupportedOperation {
                 operation: slice
                     .operations
@@ -282,26 +342,172 @@ impl GpuCompiledTileProducer {
         }
         self.retired = waiting;
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ensure_checkpoint(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        stack: &LayerStack,
+        mask_assets: &[MaskAsset],
+        plan: &CompiledTerrainPlan,
+        invalidation: &PlanInvalidation,
+        quality: PreviewQuality,
+        domain: &TerrainEvaluationDomain,
+        descriptor: &TerrainPlanCheckpoint,
+    ) -> Result<(), GpuTileEvaluationError> {
+        let reusable = self.checkpoint.as_ref().is_some_and(|checkpoint| {
+            checkpoint.content == domain.content
+                && checkpoint.width == domain.world.level_width
+                && checkpoint.height == domain.world.level_height
+                && checkpoint.boundary == descriptor.boundary
+                && checkpoint.quality == quality
+        });
+        if reusable {
+            self.stats.checkpoint_reuses = self.stats.checkpoint_reuses.saturating_add(1);
+            return Ok(());
+        }
+
+        // Drop the old immutable publication before building a new revision.
+        // Queue submission order keeps its textures alive for already-submitted
+        // tile jobs, so cancellation can never splice two revisions together.
+        self.checkpoint = None;
+        let mut engine = self.checkpoint_engine.take().unwrap_or_else(|| {
+            GpuTerrainEngine::new(
+                device,
+                domain.world.level_width.max(domain.world.level_height),
+            )
+        });
+        engine.tile_sample_window = None;
+        engine.mark_all_dirty(stack);
+        let metrics = HeightfieldMetrics {
+            width: domain.world.level_width,
+            height: domain.world.level_height,
+            world_size_x: domain.world.world_size_x,
+            world_size_z: domain.world.world_size_z,
+            tile_size: domain
+                .world
+                .level_width
+                .max(domain.world.level_height)
+                .max(1),
+            halo: 0,
+        };
+        let revision = plan.stamp().structure_revision;
+        let result = engine.evaluate_compiled_with_bridge(
+            device,
+            queue,
+            stack,
+            mask_assets,
+            plan,
+            revision,
+            invalidation,
+            metrics,
+            quality,
+            false,
+            GpuEvaluationIntent::Complete,
+            None,
+            Some(CompiledPlanExecutionOverride {
+                operations: &descriptor.prefix_operations,
+                checkpoint_seed: None,
+            }),
+        )?;
+        if !result.fully_gpu || !result.did_eval {
+            self.checkpoint_engine = Some(engine);
+            return Err(GpuTileEvaluationError::UnsupportedOperation {
+                operation: descriptor
+                    .blockers
+                    .last()
+                    .map(|blocker| blocker.operation)
+                    .unwrap_or(PlanOpId::from_index(0)),
+                owner: descriptor.blockers.last().and_then(|blocker| blocker.owner),
+                detail: result
+                    .cpu_fallback
+                    .map(|fallback| fallback.reason.detail)
+                    .unwrap_or_else(|| "complete-field checkpoint prefix was not produced".into()),
+            });
+        }
+
+        let resources = engine
+            .plan_resources
+            .current()
+            .expect("successful compiled execution retains plan resources");
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("terrain-plan-checkpoint-snapshot"),
+        });
+        let mut fields = Vec::with_capacity(descriptor.frontier_fields.len());
+        for field in &descriptor.frontier_fields {
+            let texture = Arc::new(device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("terrain-plan-checkpoint-field"),
+                size: wgpu::Extent3d {
+                    width: metrics.width,
+                    height: metrics.height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::R32Float,
+                usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            }));
+            encoder.copy_texture_to_texture(
+                resources
+                    .texture(*field)
+                    .map_err(|error| {
+                        GpuTileEvaluationError::Engine(GpuError::Wgpu(error.to_string()))
+                    })?
+                    .as_image_copy(),
+                texture.as_image_copy(),
+                wgpu::Extent3d {
+                    width: metrics.width,
+                    height: metrics.height,
+                    depth_or_array_layers: 1,
+                },
+            );
+            fields.push(GpuCheckpointField {
+                field: *field,
+                texture,
+            });
+        }
+        queue.submit(Some(encoder.finish()));
+        self.checkpoint = Some(GpuTerrainCheckpoint {
+            content: domain.content,
+            width: metrics.width,
+            height: metrics.height,
+            boundary: descriptor.boundary,
+            quality,
+            fields,
+        });
+        self.checkpoint_engine = Some(engine);
+        self.stats.checkpoint_builds = self.stats.checkpoint_builds.saturating_add(1);
+        Ok(())
+    }
 }
 
 fn preflight_tile_operations(
     stack: &LayerStack,
     plan: &CompiledTerrainPlan,
     slice: &TerrainPlanDomainSlice,
+    complete_strategy_operations: &[PlanOpId],
 ) -> Result<(), GpuTileEvaluationError> {
     let selected: std::collections::HashSet<_> = slice.operations.iter().copied().collect();
+    let complete: std::collections::HashSet<_> =
+        complete_strategy_operations.iter().copied().collect();
     for (index, operation) in plan.operations().iter().enumerate() {
         let id = PlanOpId::from_index(index);
         if !plan.analysis().operation_is_live(id) {
             continue;
         }
-        if !selected.contains(&id) && !matches!(operation.kind, TerrainOpKind::PublishOutput { .. })
+        if !complete.contains(&id) && !matches!(operation.kind, TerrainOpKind::PublishOutput { .. })
         {
             return Err(GpuTileEvaluationError::UnsupportedOperation {
                 operation: id,
                 owner: plan.provenance().owner_of(id),
                 detail: "live named-output work is outside the requested height slice".into(),
             });
+        }
+        if !selected.contains(&id) {
+            continue;
         }
         let TerrainOpKind::RunLayerKernel { layer, .. } = operation.kind else {
             continue;

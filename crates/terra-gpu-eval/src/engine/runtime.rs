@@ -113,6 +113,7 @@ mod readback;
 mod refinement;
 #[path = "tile_domain.rs"]
 mod tile_domain;
+use tile_domain::CompiledPlanExecutionOverride;
 pub use tile_domain::{
     GpuCompiledTileProducer, GpuTileEvaluationError, GpuTileEvaluationJob, GpuTileProducerStats,
 };
@@ -473,6 +474,7 @@ impl GpuTerrainEngine {
             want_cpu,
             intent,
             bridge_prefix,
+            None,
         );
         if result
             .as_ref()

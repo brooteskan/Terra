@@ -29,8 +29,9 @@ pub use dirty::{
     PlanInvalidation,
 };
 pub use domain::{
-    resolve_plan_domain, TerrainPlanDomainRejectReason, TerrainPlanDomainRejection,
-    TerrainPlanDomainSlice,
+    resolve_plan_domain, resolve_plan_execution_strategy, TerrainPlanCheckpoint,
+    TerrainPlanDomainRejectReason, TerrainPlanDomainRejection, TerrainPlanDomainSlice,
+    TerrainPlanExecutionStrategy,
 };
 pub use ids::{
     FieldSlot, PlanOpId, PlanStructureRevision, PlanStructureSignature, TerrainPlanStamp,

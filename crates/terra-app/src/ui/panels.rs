@@ -619,6 +619,10 @@ fn profiler_panel(ui: &mut GuiContext<'_>, ui_state: &UiState) {
         );
         label(ui, &format!("Reason: {}", fallback.reason.user_message()));
     }
+    if let Some(reason) = &p.terrain_tile_fallback {
+        label(ui, "Terrain tiles: complete-field fallback");
+        label(ui, &format!("Reason: {reason}"));
+    }
     label(
         ui,
         &format!(

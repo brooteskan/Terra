@@ -1127,6 +1127,8 @@ impl TerraApp {
                     let slice =
                         terra_gpu_eval::GpuCompiledTileProducer::analyze(&preview_stack, &plan)
                             .map_err(|error| {
+                                self.ui_state.profile.terrain_tile_fallback =
+                                    Some(format!("{error:?}"));
                                 log::debug!("compiled tile deferred to pyramid: {error:?}");
                             })
                             .ok()?;
@@ -1154,12 +1156,15 @@ impl TerraApp {
                     ) {
                         Ok(engine) => Some(engine),
                         Err(error) => {
+                            self.ui_state.profile.terrain_tile_fallback =
+                                Some(format!("{error:?}"));
                             log::debug!("compiled tile deferred to pyramid: {error:?}");
                             None
                         }
                     }
                 });
                 if let Some(engine) = started_engine {
+                    self.ui_state.profile.terrain_tile_fallback = None;
                     self.compiled_tile_jobs
                         .push(super::CompiledTileWorkJob { lease, engine });
                     continue;

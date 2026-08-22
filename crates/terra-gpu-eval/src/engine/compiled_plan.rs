@@ -511,6 +511,7 @@ impl GpuTerrainEngine {
             want_cpu,
             intent,
             None,
+            None,
         )
     }
 
@@ -529,6 +530,7 @@ impl GpuTerrainEngine {
         want_cpu: bool,
         intent: GpuEvaluationIntent,
         bridge_prefix: Option<BridgePrefix<'_>>,
+        execution_override: Option<CompiledPlanExecutionOverride<'_>>,
     ) -> Result<GpuEvalResult, GpuError> {
         profiling::scope!("gpu_compiled_plan_eval");
         if !plan.matches_structure_revision(expected_revision) {
@@ -557,7 +559,8 @@ impl GpuTerrainEngine {
             resources.key() == key
                 && resources.layout().structure_signature() == plan.structure_signature()
         });
-        let cold = quality_changed
+        let cold = execution_override.is_some()
+            || quality_changed
             || !compatible_active
             || self.active_plan_revision != Some(expected_revision);
         // Cold/structural/resource executions remain transactional candidates.
@@ -587,7 +590,9 @@ impl GpuTerrainEngine {
                 "the first dirty layer has no executable operation in the compiled terrain plan",
             ));
         }
-        let mut requested: Vec<PlanOpId> = if let Some((boundary, _)) = bridge_boundary {
+        let mut requested: Vec<PlanOpId> = if let Some(override_execution) = execution_override {
+            override_execution.operations.to_vec()
+        } else if let Some((boundary, _)) = bridge_boundary {
             plan.operations()
                 .iter()
                 .enumerate()
@@ -638,12 +643,16 @@ impl GpuTerrainEngine {
         }
         self.last_eval_stats.reused_contributions = reused_plan_candidates;
         self.last_eval_stats.operations_reused = reused_plan_candidates;
-        let mut selected = staged_candidate
-            .as_ref()
-            .map(|candidate| candidate.layout())
-            .or_else(|| self.plan_resources.current().map(|active| active.layout()))
-            .expect("cold candidate or compatible active plan resources")
-            .materialization_operations(plan, &requested);
+        let mut selected = if execution_override.is_some() {
+            requested.clone()
+        } else {
+            staged_candidate
+                .as_ref()
+                .map(|candidate| candidate.layout())
+                .or_else(|| self.plan_resources.current().map(|active| active.layout()))
+                .expect("cold candidate or compatible active plan resources")
+                .materialization_operations(plan, &requested)
+        };
         if let Some((boundary, _)) = bridge_boundary {
             selected.retain(|operation| operation.index() >= boundary.index());
         }
@@ -866,6 +875,36 @@ impl GpuTerrainEngine {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("compiled-terrain-plan"),
         });
+        if let Some(seed) = execution_override.and_then(|execution| execution.checkpoint_seed) {
+            for field in &seed.checkpoint.fields {
+                let destination = candidate
+                    .texture(field.field)
+                    .map_err(|error| GpuError::Wgpu(error.to_string()))?;
+                encoder.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: field.texture.as_ref(),
+                        mip_level: 0,
+                        origin: wgpu::Origin3d {
+                            x: seed.origin_x,
+                            y: seed.origin_z,
+                            z: 0,
+                        },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: destination,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d {
+                        width: metrics.width,
+                        height: metrics.height,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
+        }
         let evaluation_timing_slot = self
             .evaluation_timer
             .as_mut()
@@ -1162,7 +1201,10 @@ impl GpuTerrainEngine {
                 deferred_layers: flat_layers.len().saturating_sub(from_index),
             }
         });
-        let presentation_field = if deferred_at.is_some() || planned_fallback.is_some() {
+        let presentation_field = if execution_override.is_some()
+            || deferred_at.is_some()
+            || planned_fallback.is_some()
+        {
             last_height.unwrap_or(plan.final_height())
         } else {
             plan.final_height()

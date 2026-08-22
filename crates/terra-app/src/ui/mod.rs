@@ -1266,6 +1266,8 @@ pub struct FrameProfile {
     pub path: &'static str,
     /// First layer and stable reason code at an intentional GPU-to-CPU boundary.
     pub gpu_fallback: Option<terra_gpu::GpuFallbackDiagnostic>,
+    /// Explicit complete-field fallback used when a compiled tile/checkpoint is unsupported.
+    pub terrain_tile_fallback: Option<String>,
     /// Interaction/generation observability required by #148.
     pub first_visible_preview_us: u64,
     pub settled_authoritative_us: u64,
