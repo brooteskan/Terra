@@ -734,8 +734,10 @@ mod tests {
         write_height_raw_streamed(&hf, &path).unwrap();
         let bytes = std::fs::read(path).unwrap();
         let values: Vec<f32> = bytes
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
             .collect();
         assert_eq!(values, vec![0.25, 1.25, 2.25, 3.25, 4.25, 5.25]);
         let _ = std::fs::remove_dir_all(&dir);
