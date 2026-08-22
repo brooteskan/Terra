@@ -225,9 +225,7 @@ impl TerrainDocument {
             ops: Vec::new(),
             paint: Some({
                 let mut p = PaintBuffer::new(256, 256);
-                for s in &mut p.samples {
-                    *s = 1.0;
-                }
+                p.samples.fill(1.0);
                 p
             }),
             display_color: crate::mask::default_mask_display_color(),
