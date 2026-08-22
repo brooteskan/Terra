@@ -54,4 +54,7 @@ console-only diagnostics.
 
 ## Export
 
-Export packaging (height PNG/meta, raw, masks, splats, normals, and related outputs) is wired through `terra-io` but is **not ready for production**. Treat the Export panel as experimental scaffolding.
+Start Export writes a deterministic, content-addressed multiresolution R32F height package
+through the same compiled GPU tile producer used by viewport streaming. The v1 package includes
+measured geometric errors and seam metadata; materials, vegetation, and engine adapters are not
+yet part of this streaming slice. Unsupported compiled operations fail explicitly.

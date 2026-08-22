@@ -2,6 +2,7 @@
 
 mod actions;
 mod eval;
+mod export;
 mod frame_trace;
 mod helpers;
 mod input;
@@ -265,6 +266,7 @@ pub struct TerraApp {
     last_height: Option<Heightfield>,
     project_path: Option<PathBuf>,
     exporter: BackgroundExporter,
+    height_pyramid_export: export::HeightPyramidExportController,
     project_io: BackgroundProjectIo,
     /// Zero-sized registry adapter for the tool-thumbnail decode pool.
     tool_thumbs: crate::ui::ToolThumbPump,
@@ -475,6 +477,7 @@ impl Default for TerraApp {
             last_height: None,
             project_path: None,
             exporter: BackgroundExporter::new(),
+            height_pyramid_export: export::HeightPyramidExportController::default(),
             project_io: BackgroundProjectIo::new(),
             tool_thumbs: crate::ui::ToolThumbPump,
             jobs: Arc::new(jobs),

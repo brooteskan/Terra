@@ -452,12 +452,13 @@ fn export_panel(
     ui.separator();
 
     label(ui, "Outputs (per Start Export)");
-    label(ui, "- height.png (16-bit) + height.r32");
-    label(ui, "- splat.png (RGBA material weights)");
-    label(ui, "- color.png (baked albedo tint)");
-    label(ui, "- normal.png (from height derivatives)");
-    label(ui, "- mask_*.png aux fields");
-    label(ui, "Meta JSON carries world size for DCC handoff.");
+    label(ui, "- deterministic multiresolution R32F height tiles");
+    label(ui, "- measured geometric errors + seam metadata");
+    label(ui, "- content-addressed manifest and payloads");
+    label(
+        ui,
+        "Materials and engine adapters follow the height package.",
+    );
     ui.separator();
 
     label(

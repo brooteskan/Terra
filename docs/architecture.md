@@ -304,6 +304,12 @@ Viewport residency is also distinct from streaming export. An export pipeline ma
 materialize and persist a complete deterministic pyramid at export quality, but it must
 not reinterpret the viewport cache as a guaranteed complete artifact.
 
+The production height-pyramid exporter supplies a deterministic complete demand set to
+the same revision-aware scheduler and compiled GPU tile producer used by the viewport.
+It persists fixed pages with the shared halo convention into immutable,
+content-addressed generations and publishes only after complete validation. See
+[Deterministic height-pyramid export](algorithms/terrain_streaming_export.md).
+
 ## Tiles & ghosts
 
 Default tile 256² with halo 2. Halos are refreshed from neighbors before stencil reads. Phase 9 tile scheduler processes dirty tiles + neighbors to avoid seams.

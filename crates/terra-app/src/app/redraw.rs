@@ -698,15 +698,21 @@ impl TerraApp {
                     self.request_rebuild();
                 }
                 if ui_out.request_cancel_build {
-                    self.eval_token = self.eval_token.wrapping_add(1);
-                    self.eval_worker.set_token(self.eval_token);
-                    self.supersede_gpu_refinement();
-                    self.pending_eval = false;
-                    self.pending_eval_immediate = false;
-                    self.ui_state.refining = false;
-                    self.ui_state.build_progress = None;
-                    self.ui_state.refining_layer_name = None;
-                    self.ui_state.status = "Build cancelled".into();
+                    if self.height_pyramid_export.is_busy() {
+                        self.height_pyramid_export.cancel();
+                        self.ui_state.status = "Cancelling export".into();
+                        self.request_app_frame(FrameRequestReason::UiActions);
+                    } else {
+                        self.eval_token = self.eval_token.wrapping_add(1);
+                        self.eval_worker.set_token(self.eval_token);
+                        self.supersede_gpu_refinement();
+                        self.pending_eval = false;
+                        self.pending_eval_immediate = false;
+                        self.ui_state.refining = false;
+                        self.ui_state.build_progress = None;
+                        self.ui_state.refining_layer_name = None;
+                        self.ui_state.status = "Build cancelled".into();
+                    }
                 }
                 if ui_out.request_retry_evaluation {
                     self.worker_mark_all_dirty = true;

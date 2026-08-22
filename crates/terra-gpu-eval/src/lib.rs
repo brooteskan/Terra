@@ -7,8 +7,9 @@ mod evaluation_timing;
 #[cfg(feature = "gpu-parity")]
 pub use engine::GpuSimulationStateReadback;
 pub use engine::{
-    GpuCompiledTileProducer, GpuEvalResult, GpuEvalStats, GpuEvaluationIntent, GpuPreviewFreshness,
-    GpuRefinementJob, GpuRefinementPhase, GpuRefinementProgress, GpuRefinementStep,
-    GpuTerrainEngine, GpuTileEvaluationError, GpuTileEvaluationJob, GpuTileProducerStats,
+    GpuCompiledTileProducer, GpuEvalResult, GpuEvalStats, GpuEvaluationIntent, GpuPackedHeightTile,
+    GpuPackedTileReadback, GpuPreviewFreshness, GpuRefinementJob, GpuRefinementPhase,
+    GpuRefinementProgress, GpuRefinementStep, GpuTerrainEngine, GpuTileEvaluationError,
+    GpuTileEvaluationJob, GpuTileProducerStats,
 };
 pub use evaluation_timing::{GpuEvaluationTiming, GpuEvaluationTraceContext};

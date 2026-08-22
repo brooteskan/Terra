@@ -83,6 +83,30 @@ pub struct GpuTileEvaluationJob {
     complete: bool,
 }
 
+/// CPU-owned packed height page produced asynchronously from one completed tile
+/// evaluation. The layout matches the atlas page contract: fixed square extent,
+/// interior at `(halo, halo)`, clamped world-edge halo, deterministic zero fill.
+#[derive(Debug)]
+pub struct GpuPackedHeightTile {
+    pub key: terra_core::TerrainTileKey,
+    pub content: TerrainContentStamp,
+    pub page_extent: u32,
+    pub interior_width: u32,
+    pub interior_height: u32,
+    pub halo: u32,
+    pub samples: Vec<f32>,
+}
+
+/// Non-blocking mapped transfer which retains its evaluator until the producer
+/// observes completion and recycles it.
+pub struct GpuPackedTileReadback {
+    evaluation: Option<GpuTileEvaluationJob>,
+    buffer: wgpu::Buffer,
+    padded_bytes_per_row: u32,
+    page_extent: u32,
+    receiver: Option<mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
+}
+
 impl GpuTileEvaluationJob {
     pub fn domain(&self) -> &TerrainEvaluationDomain {
         &self.domain
@@ -102,6 +126,75 @@ impl GpuTileEvaluationJob {
                 .as_ref()
                 .expect("job owns engine")
                 .output_texture_view()
+        })
+    }
+
+    /// Copy this completed tile evaluator into an asynchronously mapped buffer.
+    /// Packing is finalized when [`GpuCompiledTileProducer::poll_packed_readback`]
+    /// observes the map callback.
+    pub fn begin_packed_readback(
+        self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        page_extent: u32,
+    ) -> Result<GpuPackedTileReadback, GpuError> {
+        if !self.complete {
+            return Err(GpuError::Wgpu(
+                "packed tile readback requested before evaluation completion".into(),
+            ));
+        }
+        let width = self.domain.evaluation.width;
+        let height = self.domain.evaluation.height;
+        let unpadded = width * 4;
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded_bytes_per_row = unpadded.div_ceil(align) * align;
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gpu-packed-terrain-tile-readback"),
+            size: u64::from(padded_bytes_per_row) * u64::from(height),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("gpu-packed-terrain-tile-readback-copy"),
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: self
+                    .engine
+                    .as_ref()
+                    .expect("job owns engine")
+                    .output_texture(),
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_bytes_per_row),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(Some(encoder.finish()));
+        let (sender, receiver) = mpsc::channel();
+        buffer
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let _ = sender.send(result);
+            });
+        Ok(GpuPackedTileReadback {
+            evaluation: Some(self),
+            buffer,
+            padded_bytes_per_row,
+            page_extent,
+            receiver: Some(receiver),
         })
     }
 
@@ -322,6 +415,110 @@ impl GpuCompiledTileProducer {
             self.recycle(job);
         } else {
             self.retired.push(job);
+        }
+    }
+
+    /// Poll a mapped tile transfer and finalize the atlas-compatible page on the
+    /// CPU. The mapping is compact and export-only; viewport publication remains
+    /// GPU-to-GPU through `GpuTileAtlas`.
+    pub fn poll_packed_readback(
+        &mut self,
+        device: &wgpu::Device,
+        readback: &mut GpuPackedTileReadback,
+    ) -> Result<Option<GpuPackedHeightTile>, GpuError> {
+        let Some(receiver) = readback.receiver.as_ref() else {
+            return Ok(None);
+        };
+        let _ = device.poll(wgpu::Maintain::Poll);
+        match receiver.try_recv() {
+            Err(mpsc::TryRecvError::Empty) => Ok(None),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                readback.receiver = None;
+                if let Some(job) = readback.evaluation.take() {
+                    self.recycle(job);
+                }
+                Err(GpuError::Wgpu(
+                    "packed tile readback callback disconnected".into(),
+                ))
+            }
+            Ok(Err(error)) => {
+                readback.receiver = None;
+                if let Some(job) = readback.evaluation.take() {
+                    self.recycle(job);
+                }
+                Err(GpuError::Wgpu(error.to_string()))
+            }
+            Ok(Ok(())) => {
+                readback.receiver = None;
+                let job = readback
+                    .evaluation
+                    .take()
+                    .expect("mapped readback retains evaluation");
+                let domain = job.domain.clone();
+                let mapped = readback.buffer.slice(..).get_mapped_range();
+                let row_floats = (readback.padded_bytes_per_row / 4) as usize;
+                let mapped_floats: &[f32] = bytemuck::cast_slice(&mapped);
+                let mut local = Vec::with_capacity(
+                    domain.evaluation.width as usize * domain.evaluation.height as usize,
+                );
+                for z in 0..domain.evaluation.height as usize {
+                    let start = z * row_floats;
+                    local.extend_from_slice(
+                        &mapped_floats[start..start + domain.evaluation.width as usize],
+                    );
+                }
+                drop(mapped);
+                readback.buffer.unmap();
+                let minimum_extent =
+                    domain.interior.width.max(domain.interior.height) + domain.publication_halo * 2;
+                if readback.page_extent < minimum_extent {
+                    self.recycle(job);
+                    return Err(GpuError::Wgpu(format!(
+                        "packed page extent {} is smaller than required {}",
+                        readback.page_extent, minimum_extent
+                    )));
+                }
+                let mut samples =
+                    vec![0.0; readback.page_extent as usize * readback.page_extent as usize];
+                let valid_width = domain.interior.width + domain.publication_halo * 2;
+                let valid_height = domain.interior.height + domain.publication_halo * 2;
+                for pz in 0..valid_height {
+                    for px in 0..valid_width {
+                        let global_x = (i64::from(domain.interior.origin_x) + i64::from(px)
+                            - i64::from(domain.publication_halo))
+                        .clamp(0, i64::from(domain.world.level_width) - 1)
+                            as u32;
+                        let global_z = (i64::from(domain.interior.origin_z) + i64::from(pz)
+                            - i64::from(domain.publication_halo))
+                        .clamp(0, i64::from(domain.world.level_height) - 1)
+                            as u32;
+                        let local_x = global_x - domain.evaluation.origin_x;
+                        let local_z = global_z - domain.evaluation.origin_z;
+                        samples[(pz * readback.page_extent + px) as usize] =
+                            local[(local_z * domain.evaluation.width + local_x) as usize];
+                    }
+                }
+                let result = GpuPackedHeightTile {
+                    key: domain.key.clone(),
+                    content: domain.content,
+                    page_extent: readback.page_extent,
+                    interior_width: domain.interior.width,
+                    interior_height: domain.interior.height,
+                    halo: domain.publication_halo,
+                    samples,
+                };
+                self.recycle(job);
+                Ok(Some(result))
+            }
+        }
+    }
+
+    pub fn cancel_packed_readback(&mut self, mut readback: GpuPackedTileReadback) {
+        self.stats.cancelled = self.stats.cancelled.saturating_add(1);
+        if let Some(job) = readback.evaluation.take() {
+            // The copy precedes all later submissions on the same queue, so the
+            // evaluator can be reused without changing the bytes being copied.
+            self.recycle(job);
         }
     }
 

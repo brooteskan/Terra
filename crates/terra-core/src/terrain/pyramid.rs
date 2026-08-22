@@ -1,4 +1,7 @@
+use crate::fields::FieldId;
 use crate::heightfield::{HeightfieldMetrics, TileId, DEFAULT_HALO, DEFAULT_TILE_SIZE};
+
+use super::TerrainTileKey;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PyramidConfig {
@@ -149,6 +152,41 @@ impl TerrainPyramid {
             .sum()
     }
 
+    /// Every final-height tile in stable package order: levels coarse to fine,
+    /// then tile rows and columns. The iterator is complete by construction and
+    /// its position agrees with [`Self::tile_metadata_index`].
+    pub fn height_tiles(&self) -> impl Iterator<Item = TerrainTileKey> + '_ {
+        self.levels.iter().flat_map(|level| {
+            let metrics = self
+                .level_metrics(level.index)
+                .expect("pyramid owns valid level metadata");
+            (0..metrics.tiles_z()).flat_map(move |tz| {
+                (0..metrics.tiles_x()).map(move |tx| TerrainTileKey {
+                    layer: None,
+                    field: FieldId::Height,
+                    level: level.index,
+                    tile: TileId { tx, tz },
+                })
+            })
+        })
+    }
+
+    /// Stable final-height traversal for one level.
+    pub fn height_tiles_at_level(
+        &self,
+        level: u8,
+    ) -> Option<impl Iterator<Item = TerrainTileKey> + '_> {
+        let metrics = self.level_metrics(level)?;
+        Some((0..metrics.tiles_z()).flat_map(move |tz| {
+            (0..metrics.tiles_x()).map(move |tx| TerrainTileKey {
+                layer: None,
+                field: FieldId::Height,
+                level,
+                tile: TileId { tx, tz },
+            })
+        }))
+    }
+
     /// Parent tiles whose normalized sample footprint intersects `tile`.
     ///
     /// A non-power-of-two edge can overlap more than one parent page, so this
@@ -267,6 +305,14 @@ mod tests {
             }
         }
         assert_eq!(indices, (0..pyramid.metadata_len()).collect::<Vec<_>>());
+        let keys = pyramid.height_tiles().collect::<Vec<_>>();
+        assert_eq!(keys.len(), pyramid.metadata_len() as usize);
+        for (index, key) in keys.iter().enumerate() {
+            assert_eq!(
+                pyramid.tile_metadata_index(key.level, key.tile),
+                Some(index as u32)
+            );
+        }
     }
 
     #[test]

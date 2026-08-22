@@ -982,10 +982,33 @@ impl ApplicationHandler<RuntimeEvent> for TerraApp {
         let jobs = Arc::clone(&self.jobs).tick(self);
         self.drain_project_io();
         let camera_flying = self.apply_camera_fly();
-        let mut export_busy = !self.exporter.job.done;
+        if let Some(gpu) = self.gpu.as_ref() {
+            self.height_pyramid_export.pump(&gpu.device, &gpu.queue);
+        }
+        let mut export_busy = self.height_pyramid_export.is_busy() || !self.exporter.job.done;
         if export_busy {
-            self.ui_state.export_progress = Some(self.exporter.job.progress);
-            self.ui_state.status = format!("Export {:.0}%", self.exporter.job.progress * 100.0);
+            let progress = if self.height_pyramid_export.is_busy() {
+                self.height_pyramid_export.progress()
+            } else {
+                self.exporter.job.progress
+            };
+            self.ui_state.export_progress = Some(progress);
+            self.ui_state.status = format!("Export {:.0}%", progress * 100.0);
+        } else if let Some(result) = self.height_pyramid_export.take_result() {
+            self.ui_state.export_progress = None;
+            self.terrain_runtime
+                .refinement
+                .finish_export(self.runtime_started.elapsed().as_millis() as u64);
+            match result {
+                Ok(package) => {
+                    self.ui_state.status = format!("Exported {}", package.manifest_path.display());
+                }
+                Err(error) => {
+                    log::error!("height-pyramid export failed: {error}");
+                    self.ui_state.status = format!("Export failed: {error}");
+                }
+            }
+            export_busy = true;
         } else if let Some(result) = self.exporter.job.result.take() {
             self.ui_state.export_progress = None;
             self.terrain_runtime

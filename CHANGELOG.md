@@ -4,6 +4,11 @@ All notable changes to Terra will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- Deterministic streaming height-pyramid export now drives complete coarse-to-fine coverage
+  through the shared compiled GPU tile producer and writes content-addressed R32F pages,
+  measured geometric errors, validated seam metadata, and an exact-or-ancestor test reader.
+
 ### Fixed
 - Progressive Draft-to-Full evaluation now resamples carried auxiliary mask fields to the active grid, preventing boundary panics in masked CPU filters such as Crater.
 - Evaluation panics are reported as recoverable layer failures, unexpected worker disconnects restart the worker, and the editor keeps the last-good terrain visible with a persistent Retry status.

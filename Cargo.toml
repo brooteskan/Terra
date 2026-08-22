@@ -40,6 +40,7 @@ image = { version = "0.25", default-features = false, features = ["png", "tiff"]
 thiserror = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 bytemuck = { version = "1", features = ["derive"] }
+blake3 = "1"
 pollster = "0.4"
 log = "0.4"
 flexi_logger = { version = "0.31", default-features = false }

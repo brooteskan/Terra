@@ -2,6 +2,7 @@
 
 mod export;
 mod geotiff;
+mod height_pyramid;
 mod import;
 
 pub use export::{
@@ -9,6 +10,11 @@ pub use export::{
     TileManifestEntry,
 };
 pub use geotiff::{read_geotiff_heights, GeoTiffInfo};
+pub use height_pyramid::{
+    HeightPyramidEncoding, HeightPyramidLevelManifest, HeightPyramidManifest, HeightPyramidPackage,
+    HeightPyramidPackageBuilder, HeightPyramidPackageResult, HeightPyramidTileManifest,
+    HeightPyramidWorld,
+};
 pub use import::{import_heightmap_png, import_heightmap_raw};
 
 use std::path::PathBuf;

@@ -15,6 +15,7 @@ pub use api::{
 };
 pub use runtime::GpuTerrainEngine;
 pub use runtime::{
-    GpuCompiledTileProducer, GpuTileEvaluationError, GpuTileEvaluationJob, GpuTileProducerStats,
+    GpuCompiledTileProducer, GpuPackedHeightTile, GpuPackedTileReadback, GpuTileEvaluationError,
+    GpuTileEvaluationJob, GpuTileProducerStats,
 };
 pub use stats::{GpuEvalStats, GpuPlanOperationDisposition, GpuPlanOperationTrace};

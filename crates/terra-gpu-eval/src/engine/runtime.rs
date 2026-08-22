@@ -115,7 +115,8 @@ mod refinement;
 mod tile_domain;
 use tile_domain::CompiledPlanExecutionOverride;
 pub use tile_domain::{
-    GpuCompiledTileProducer, GpuTileEvaluationError, GpuTileEvaluationJob, GpuTileProducerStats,
+    GpuCompiledTileProducer, GpuPackedHeightTile, GpuPackedTileReadback, GpuTileEvaluationError,
+    GpuTileEvaluationJob, GpuTileProducerStats,
 };
 #[path = "resources.rs"]
 mod resources;

@@ -560,6 +560,10 @@ impl TerraApp {
     }
 
     pub(crate) fn start_export(&mut self) {
+        if self.gpu.is_none() {
+            self.ui_state.status = "Export requires an initialized GPU".into();
+            return;
+        }
         let path = if let Some(existing) = self.ui_state.export_path.clone() {
             std::path::PathBuf::from(existing)
         } else {
@@ -569,7 +573,7 @@ impl TerraApp {
             self.ui_state.export_path = Some(path.display().to_string());
             path
         };
-        if !self.exporter.job.done {
+        if self.height_pyramid_export.is_busy() || !self.exporter.job.done {
             self.ui_state.status = "Export already running".into();
             return;
         }
@@ -578,7 +582,17 @@ impl TerraApp {
         self.terrain_runtime.refinement.begin_export();
         self.ui_state.export_progress = Some(0.0);
         self.ui_state.status = format!("Exporting to {}", path.display());
-        self.exporter.start(self.session.document.clone(), path);
+        let generation = self.eval_token.wrapping_add(1).max(1);
+        if let Err(error) =
+            self.height_pyramid_export
+                .start(self.session.document.clone(), path, generation)
+        {
+            self.ui_state.export_progress = None;
+            self.ui_state.status = format!("Export failed: {error}");
+            self.terrain_runtime
+                .refinement
+                .finish_export(self.runtime_started.elapsed().as_millis() as u64);
+        }
     }
 
     /// Ensure a Shape history layer for the active sculpt tool.

@@ -4,6 +4,7 @@
 mod cache;
 mod demand;
 mod domain;
+mod geometric_error;
 mod pyramid;
 mod refinement;
 mod runtime;
@@ -21,6 +22,7 @@ pub use demand::{
 pub use domain::{
     TerrainDomainError, TerrainEvaluationDomain, TerrainSampleExtent, TerrainWorldTransform,
 };
+pub use geometric_error::measure_tile_geometric_error;
 pub use pyramid::{
     PyramidConfig, TerrainLevel, TerrainPyramid, TerrainTileExtent, TerrainTileRange,
 };

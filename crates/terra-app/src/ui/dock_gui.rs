@@ -68,7 +68,14 @@ pub fn draw_bottom_dock(
 
     // Right: processing / failure / idle status + action (layout first for truncation).
     let (status_text, show_progress, progress, show_retry) =
-        if let Some(failure) = ui_state.evaluation_failure.as_ref() {
+        if let Some(progress) = ui_state.export_progress {
+            (
+                format!("Exporting height pyramid {:.0}%", progress * 100.0),
+                true,
+                progress.clamp(0.0, 1.0),
+                false,
+            )
+        } else if let Some(failure) = ui_state.evaluation_failure.as_ref() {
             let layer = failure.layer_name.as_deref().unwrap_or("Terrain");
             let recovery = if failure.worker_restarted {
                 "worker restarted; last good preview shown"
