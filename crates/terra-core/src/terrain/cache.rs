@@ -121,6 +121,41 @@ impl TileResidencyCache {
         self.entries.get(key)
     }
 
+    /// Mark a resident page as recently demanded without exposing its payload.
+    pub fn touch(&mut self, key: &TerrainTileKey) -> bool {
+        self.tick = self.tick.wrapping_add(1);
+        self.entries.get_mut(key).is_some_and(|entry| {
+            entry.last_used_tick = self.tick;
+            true
+        })
+    }
+
+    /// Replace the current demand-scoped protection set.
+    ///
+    /// Infinite coarse coverage moves with the camera, so protection is a
+    /// boolean property of the latest demand rather than an accumulating pin
+    /// count. Explicit legacy pins may still use [`Self::pin`] / [`Self::unpin`].
+    pub fn set_demand_protection<'a>(
+        &mut self,
+        protected: impl IntoIterator<Item = &'a TerrainTileKey>,
+    ) {
+        for entry in self.entries.values_mut() {
+            entry.pin_count = 0;
+        }
+        for key in protected {
+            if let Some(entry) = self.entries.get_mut(key) {
+                entry.pin_count = 1;
+            }
+        }
+    }
+
+    /// Authoritative resident inventory used by `GpuTileAtlas` to rebuild its
+    /// transient shader-visible sparse directory. No caller may retain a second
+    /// tile-keyed residency store from this iterator.
+    pub fn residents(&self) -> impl Iterator<Item = (&TerrainTileKey, &ResidentTile)> {
+        self.entries.iter()
+    }
+
     pub fn resolve_handle(&self, handle: TilePageHandle) -> Option<&TerrainTileKey> {
         let slot = self.slots.get(handle.slot as usize)?;
         (slot.generation == handle.generation)
@@ -434,6 +469,28 @@ mod tests {
             cache.insert(key(layer, 1), 8, 1, 1),
             Err(TileCacheError::AllCandidatesPinned { .. })
         ));
+    }
+
+    #[test]
+    fn demand_protection_moves_without_accumulating_pin_counts() {
+        let layer = LayerId::new();
+        let mut cache = TileResidencyCache::new(20);
+        let a = key(layer, 0);
+        let b = key(layer, 1);
+        let c = key(layer, 2);
+        cache.insert(a.clone(), 10, 1, 1).unwrap();
+        cache.insert(b.clone(), 10, 1, 1).unwrap();
+
+        cache.set_demand_protection([&a]);
+        assert_eq!(cache.peek(&a).unwrap().pin_count, 1);
+        cache.set_demand_protection([&b]);
+        assert_eq!(cache.peek(&a).unwrap().pin_count, 0);
+        assert_eq!(cache.peek(&b).unwrap().pin_count, 1);
+
+        let inserted = cache.insert(c, 10, 1, 1).unwrap();
+        assert_eq!(inserted.evicted.len(), 1);
+        assert_eq!(inserted.evicted[0].key, a);
+        assert!(cache.peek(&b).is_some());
     }
 
     #[test]

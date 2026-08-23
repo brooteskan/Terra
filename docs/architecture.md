@@ -219,16 +219,19 @@ supersession, completion, and publication with frame, generation, and evaluation
 
 ## Terrain residency and demand planning
 
-The terrain atlas page-table system is the shader-visible residency authority. A dense
-virtual directory uses `TerrainPyramid`'s stable metadata index to map level/tile
-coordinates to physical atlas slots in O(1); each physical row validates slot generation,
-virtual coordinates, extent, halo, publication frame, and the complete content identity.
-Resident-ancestor search is bounded by pyramid depth rather than atlas capacity.
+The terrain atlas page-table system is the shader-visible residency authority. Bounded
+worlds use a dense virtual directory and `TerrainPyramid`'s stable metadata index to map
+level/tile coordinates to physical atlas slots in O(1). Infinite worlds use a
+fixed-capacity open-addressed directory containing the full signed 64-bit X/Z address.
+Each physical row validates slot generation, virtual coordinates, extent, halo,
+publication frame, and the complete content identity. Resident-ancestor search is
+bounded by topology depth rather than atlas capacity.
 `terra-core::TileResidencyCache` is the one mutable CPU policy
 mirror: it owns the byte budget, LRU and pin policy, virtual keys, and generation-checked
 handles. `terra-gpu::GpuTileAtlas` owns that cache and translates its insertions,
-evictions, explicit removals, and clears directly into both GPU table layers. The dense
-directory is not a second CPU residency database. Reported residency counts are
+evictions, explicit removals, and clears directly into both GPU table layers. Dense and
+sparse directories are shader-visible projections, not second CPU residency databases.
+The sparse directory is rebuilt transiently from the cache on mutation. Reported counts are
 derived from this path and are tested against valid page-table rows.
 
 `terra-world` owns the fixed-origin `f64` CPU coordinate system, signed `i64` tile
@@ -300,9 +303,12 @@ coordinates and performs backend preflight before allocation; its packed result
 removes operation guards without finite-world edge clamping. OpenSimplex and
 Worley use the CPU realization until matching GPU contracts exist.
 
-Infinite demand keys feed that same tile-domain contract, but are deliberately not
-submitted to the bounded atlas's dense virtual directory. Sparse page addressing,
-allocation, eviction, and publication are owned by the following residency slice.
+Infinite demand keys feed that same tile-domain contract and are reconciled into a
+capacity-bounded scheduler. Current residents are touched, obsolete queued and in-flight
+work is cancelled, and coarse/ancestor protection moves with demand. GPU-compatible
+plans publish tile-domain results directly; other admitted graphs publish packed CPU
+results. Both paths allocate only after live content validation and update the sparse
+directory from the authoritative cache. Renderer lookup remains camera-relative work.
 
 Output edits advance `TerrainRuntime::output_revision` through the app's single revision
 boundary, which drops old pyramid content and clears pending uploads, the cache and page

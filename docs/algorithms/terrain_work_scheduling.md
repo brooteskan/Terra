@@ -34,10 +34,12 @@ This escape plus age promotion prevents stationary-view starvation.
 ## Publication and statistics
 
 The production work sources are CPU height-tile upload, immutable GPU-pyramid
-publication, and compiled tile-domain GPU evaluation. The compiled source stages
+publication, compiled tile-domain GPU evaluation, and CPU Infinite tile evaluation.
+The compiled source stages
 tile-sized plan resources and becomes publishable only after its complete suffix
 finishes and the scheduler lease remains current. Unsupported or global plans
-defer explicitly to the immutable pyramid. Atlas publication
+defer explicitly to the immutable pyramid for bounded worlds; admitted Infinite graphs
+without a GPU realization use the CPU Infinite evaluator instead. Atlas publication
 compares the complete live content identity before cache or page-table mutation.
 Payload commands precede the valid page-table write, and revision retirement
 disables streaming and queues a page-table clear after older GPU work.
@@ -47,10 +49,16 @@ coverage is complete. Optional refinement therefore cannot evict the terminal re
 ancestor; under insufficient capacity it waits rather than converting monolithic height
 into the correctness fallback.
 
+Infinite reconciliation replaces absent queued and in-flight work, preserves the age of
+retained work, and defers required leases that cannot yet allocate without losing their
+queue position. Demand-scoped coarse/ancestor protection is recomputed each plan rather
+than accumulated as pin counts. CPU results are packed only for the duration of their
+synchronous atlas upload; the scheduler and atlas retain no CPU tile payload mirror.
+
 Snapshots report queued and in-flight counts, deduplication, reprioritization,
 cancellation, stale drops, authoritative-cache skips, submissions, completions,
 failures, budget overruns, estimated dispatched cost, and queue/completion
-latency totals and maxima.
+latency totals and maxima, including deferred leases.
 
 See [Compiled tile-domain GPU evaluation](compiled_tile_evaluation.md) for the
 domain, reach, and atomic-publication contract.

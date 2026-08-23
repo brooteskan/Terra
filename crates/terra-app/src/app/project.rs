@@ -500,6 +500,55 @@ impl TerraApp {
             }
         };
 
+        if let Some(gpu) = self.gpu.as_ref() {
+            let device_limit = gpu.device.limits().max_texture_array_layers.max(1);
+            let (tile_size, halo, max_pages, infinite_topology) = match project_world {
+                terra_core::document::ProjectWorld::BoundedHeightfield(_) => {
+                    let pyramid = self
+                        .terrain_runtime
+                        .bounded_pyramid()
+                        .expect("bounded runtime configured above");
+                    (
+                        pyramid.config.tile_size,
+                        pyramid.config.halo,
+                        128u32.min(device_limit),
+                        None,
+                    )
+                }
+                terra_core::document::ProjectWorld::InfiniteProceduralWorld(settings) => (
+                    settings.tile_size_samples,
+                    settings.publication_halo_samples,
+                    u32::try_from(super::eval::infinite_gpu_page_capacity(settings))
+                        .unwrap_or(u32::MAX)
+                        .min(device_limit)
+                        .max(1),
+                    settings.topology().ok(),
+                ),
+            };
+            let replace = self.tile_atlas.as_ref().is_none_or(|atlas| {
+                atlas.tile_size() != tile_size
+                    || atlas.halo() != halo
+                    || (infinite_topology.is_some() && atlas.max_pages() != max_pages)
+            });
+            if replace {
+                self.tile_atlas =
+                    match terra_gpu::GpuTileAtlas::new(&gpu.device, tile_size, halo, max_pages) {
+                        Ok(atlas) => Some(atlas),
+                        Err(error) => {
+                            self.ui_state.status = format!("GPU tile atlas disabled: {error}");
+                            None
+                        }
+                    };
+            }
+            if let Some(atlas) = self.tile_atlas.as_mut() {
+                if let Some(topology) = infinite_topology {
+                    atlas.configure_infinite(&gpu.device, &gpu.queue, topology);
+                } else if let Some(pyramid) = self.terrain_runtime.bounded_pyramid() {
+                    atlas.configure_hierarchy(&gpu.device, &gpu.queue, pyramid);
+                }
+            }
+        }
+
         if let Some(engine) = self.gpu_engine.as_mut() {
             if let Some(gpu) = self.gpu.as_ref() {
                 engine.reset_project_state(&gpu.device, &gpu.queue);

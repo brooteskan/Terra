@@ -24,6 +24,7 @@ pub struct TerrainTileWorkKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerrainTileWorkSource {
     CpuHeight,
+    CpuInfinitePlan,
     GpuPyramid,
     GpuCompiledPlan,
 }
@@ -88,6 +89,7 @@ pub struct TerrainTileWorkStats {
     pub submitted: u64,
     pub completed: u64,
     pub failed: u64,
+    pub deferred: u64,
     pub budget_overruns: u64,
     pub estimated_us_dispatched: u64,
     pub queue_latency_us_total: u64,
@@ -206,6 +208,13 @@ impl TerrainTileWorkScheduler {
             .stats
             .cancelled
             .saturating_add(before.saturating_sub(self.queued.len()) as u64);
+        let before_in_flight = self.in_flight.len();
+        self.in_flight
+            .retain(|_, entry| demanded.contains(&entry.request.key));
+        self.stats.cancelled = self
+            .stats
+            .cancelled
+            .saturating_add(before_in_flight.saturating_sub(self.in_flight.len()) as u64);
         self.trim_to_capacity();
         self.refresh_counts();
     }
@@ -232,6 +241,7 @@ impl TerrainTileWorkScheduler {
         let required_pending = self
             .queued
             .values()
+            .chain(self.in_flight.values())
             .any(|entry| entry.request.is_required_coverage());
         let mut candidates: Vec<_> = self
             .queued
@@ -308,6 +318,20 @@ impl TerrainTileWorkScheduler {
     pub fn fail(&mut self, lease: TerrainTileWorkLease) {
         if self.in_flight.remove(&lease.id).is_some() {
             self.stats.failed = self.stats.failed.saturating_add(1);
+        }
+        self.refresh_counts();
+    }
+
+    /// Return temporarily blocked live work to the queue without losing its
+    /// first-seen age. This is used when current fallback protection leaves no
+    /// safe atlas victim yet.
+    pub fn defer(&mut self, lease: TerrainTileWorkLease) {
+        let Some(entry) = self.in_flight.remove(&lease.id) else {
+            return;
+        };
+        if self.live_content == Some(entry.request.content) {
+            self.queued.insert(entry.request.key.clone(), entry);
+            self.stats.deferred = self.stats.deferred.saturating_add(1);
         }
         self.refresh_counts();
     }
@@ -580,5 +604,82 @@ mod tests {
             selected_old,
             "the retained request must eventually be forced"
         );
+    }
+
+    #[test]
+    fn demand_replacement_cancels_absent_in_flight_work() {
+        let mut scheduler = TerrainTileWorkScheduler::new(8);
+        let old = request(2, 1, TerrainDemandClass::Refinement, true, 3.0, 10);
+        scheduler.reconcile(stamp(11), [old]);
+        let lease = scheduler
+            .dequeue_budgeted(TerrainTileWorkBudget::new(10, 1, 8))
+            .pop()
+            .unwrap();
+        let replacement = request(2, 2, TerrainDemandClass::Refinement, true, 3.0, 10);
+        scheduler.reconcile(stamp(11), [replacement]);
+        assert!(!scheduler.lease_is_live(lease.id, stamp(11)));
+        assert!(!scheduler.complete(lease, stamp(11)));
+    }
+
+    #[test]
+    fn repeated_long_distance_replacement_never_accumulates_work_history() {
+        let mut scheduler = TerrainTileWorkScheduler::new(4);
+        for position in 0..1_000 {
+            let demanded = (0..4).map(|offset| {
+                request(
+                    2,
+                    position * 8 + offset,
+                    TerrainDemandClass::Refinement,
+                    true,
+                    3.0,
+                    10,
+                )
+            });
+            scheduler.reconcile(stamp(11), demanded);
+            assert_eq!(scheduler.len(), 4);
+            let _ = scheduler.dequeue_budgeted(TerrainTileWorkBudget::new(10, 1, 4));
+            let stats = scheduler.stats();
+            assert_eq!(stats.queued + stats.in_flight, 4);
+        }
+        assert!(scheduler.stats().cancelled > 900);
+    }
+
+    #[test]
+    fn required_in_flight_work_gates_optional_refinement() {
+        let mut scheduler = TerrainTileWorkScheduler::new(8);
+        let required = request(0, 1, TerrainDemandClass::CoarseCoverage, true, 1.0, 10);
+        let fine = request(2, 2, TerrainDemandClass::Refinement, true, 30.0, 10);
+        scheduler.reconcile(stamp(11), [required, fine]);
+        let coarse = scheduler
+            .dequeue_budgeted(TerrainTileWorkBudget::new(10, 1, 8))
+            .pop()
+            .unwrap();
+        assert_eq!(coarse.request.class, TerrainDemandClass::CoarseCoverage);
+        assert!(scheduler
+            .dequeue_budgeted(TerrainTileWorkBudget::new(10, 1, 8))
+            .is_empty());
+        assert!(scheduler.complete(coarse, stamp(11)));
+        assert_eq!(
+            scheduler.dequeue_budgeted(TerrainTileWorkBudget::new(10, 1, 8))[0]
+                .request
+                .class,
+            TerrainDemandClass::Refinement
+        );
+    }
+
+    #[test]
+    fn deferred_work_preserves_queue_membership() {
+        let mut scheduler = TerrainTileWorkScheduler::new(8);
+        scheduler.reconcile(
+            stamp(11),
+            [request(2, 1, TerrainDemandClass::Refinement, true, 3.0, 10)],
+        );
+        let lease = scheduler
+            .dequeue_budgeted(TerrainTileWorkBudget::new(10, 1, 8))
+            .pop()
+            .unwrap();
+        scheduler.defer(lease);
+        assert_eq!(scheduler.len(), 1);
+        assert_eq!(scheduler.stats().deferred, 1);
     }
 }

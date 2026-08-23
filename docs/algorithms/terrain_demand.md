@@ -77,9 +77,11 @@ coverage before optional refinement, applies editor-state budgets, and rejects s
 content identities at atlas publication. See
 [Terrain tile work scheduling](terrain_work_scheduling.md). Resident-ancestor shader
 resolution remains separate renderer work: the plan is never passed to the renderer, and
-the dense GPU page directory alone determines which exact or ancestor page is sampled.
+the GPU page directory alone determines which exact or ancestor page is sampled.
 
 Infinite plans already produce canonical signed `TerrainTileKey` values accepted by
-`TerrainEvaluationDomain::for_infinite_tile`. Sparse GPU directory publication and
-eviction remain the residency slice; the bounded dense atlas is never given an Infinite
-address.
+`TerrainEvaluationDomain::for_infinite_tile`. The app reconciles those keys into bounded
+work, touches demanded residents, and moves coarse/ancestor protection with the current
+plan. A fixed-capacity open-addressed GPU directory stores full signed coordinates; it is
+rebuilt from the authoritative residency cache on publication and eviction, so travelled
+addresses do not accumulate in a second CPU map.

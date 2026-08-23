@@ -42,7 +42,9 @@ struct PageTableEntry {
     valid: u32,
     level: u32,
     tile_x: u32,
+    tile_x_hi: u32,
     tile_z: u32,
+    tile_z_hi: u32,
     width: u32,
     height: u32,
     halo: u32,
@@ -62,7 +64,11 @@ struct VirtualPageEntry {
     physical_slot: u32,
     generation: u32,
     valid: u32,
-    pad: u32,
+    lod: u32,
+    tile_x: u32,
+    tile_x_hi: u32,
+    tile_z: u32,
+    tile_z_hi: u32,
 };
 
 struct TerrainLevelEntry {
