@@ -1,9 +1,9 @@
 name: CPU terrain contract
 
 on:
-  pull_request:
   push:
-    branches: [master, wozzits-codex, "release/**"]
+    tags:
+      - "brooteskan-v*"
 
 jobs:
   determinism-tiling-and-halos:

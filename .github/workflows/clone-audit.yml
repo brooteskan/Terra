@@ -1,9 +1,9 @@
 name: Production clone ratchet
 
 on:
-  pull_request:
   push:
-    branches: [master, wozzits, wozzits-codex, "release/**"]
+    tags:
+      - "brooteskan-v*"
 
 permissions:
   contents: read
