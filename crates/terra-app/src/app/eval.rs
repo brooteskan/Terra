@@ -1148,8 +1148,8 @@ impl TerraApp {
         let aspect = width as f32 / height.max(1) as f32;
         let (min_height, max_height) = renderer.heights.height_range;
         let view = terra_core::TerrainDemandView {
-            eye: renderer.camera.eye(),
-            view_proj: renderer.camera.view_proj(aspect),
+            eye: renderer.camera.eye().as_vec3(),
+            view_proj: renderer.camera_view_proj(aspect),
             fov_y: renderer.camera.fov_y,
             near: renderer.camera.near,
             viewport_width_px: width,
@@ -1245,20 +1245,14 @@ impl TerraApp {
         let aspect = width as f32 / height.max(1) as f32;
         let eye = renderer.camera.eye();
         let target = renderer.camera.target;
-        let eye_world = match terra_world::WorldPosition::try_new(
-            f64::from(eye.x),
-            f64::from(eye.z),
-        ) {
+        let eye_world = match terra_world::WorldPosition::try_new(eye.x, eye.z) {
             Ok(position) => position,
             Err(error) => {
                 log::warn!(target: "terra_app::evaluation", "Infinite demand eye rejected: {error}");
                 return false;
             }
         };
-        let coverage_center_world = match terra_world::WorldPosition::try_new(
-            f64::from(target.x),
-            f64::from(target.z),
-        ) {
+        let coverage_center_world = match terra_world::WorldPosition::try_new(target.x, target.z) {
             Ok(position) => position,
             Err(error) => {
                 log::warn!(target: "terra_app::evaluation", "Infinite demand centre rejected: {error}");
@@ -1269,7 +1263,7 @@ impl TerraApp {
         let view = terra_core::InfiniteTerrainDemandView {
             eye_world,
             coverage_center_world,
-            eye_height: eye.y,
+            eye_height: eye.y as f32,
             relative_view_proj: renderer.camera.relative_view_proj(aspect),
             fov_y: renderer.camera.fov_y,
             near: renderer.camera.near,
@@ -1777,6 +1771,63 @@ impl TerraApp {
     }
 
     pub(crate) fn sync_tile_stream_to_renderer(&mut self) {
+        if let Some(topology) = self.terrain_runtime.infinite_topology().copied() {
+            let Some(content) = self.terrain_tile_scheduler.live_content() else {
+                if let Some(renderer) = self.renderer.as_mut() {
+                    renderer.set_use_tile_stream(false);
+                }
+                return;
+            };
+            let Some(plan) = self.latest_terrain_demand.as_ref() else {
+                if let Some(renderer) = self.renderer.as_mut() {
+                    renderer.set_use_tile_stream(false);
+                }
+                return;
+            };
+            let Some(atlas) = self.tile_atlas.as_ref().filter(|atlas| atlas.is_infinite()) else {
+                if let Some(renderer) = self.renderer.as_mut() {
+                    renderer.set_use_tile_stream(false);
+                }
+                return;
+            };
+            let mut coarse_count = 0usize;
+            let coarse_ready = plan
+                .tiles
+                .iter()
+                .filter(|tile| tile.class == terra_core::TerrainDemandClass::CoarseCoverage)
+                .all(|tile| {
+                    coarse_count += 1;
+                    atlas.is_current(&tile.key, content)
+                });
+            if coarse_count == 0 || !coarse_ready {
+                if let Some(renderer) = self.renderer.as_mut() {
+                    renderer.set_use_tile_stream(false);
+                }
+                return;
+            }
+            let resources = terra_render::TerrainTileStreamResources {
+                atlas_view: atlas.create_texture_view(),
+                physical_page_table: atlas.page_table_buffer_cloned(),
+                virtual_page_table: atlas.virtual_page_table_buffer_cloned(),
+                level_table: atlas.level_table_buffer_cloned(),
+                tile_size: atlas.tile_size(),
+                halo: atlas.halo(),
+                max_pages: atlas.max_pages(),
+                level_count: atlas.level_count(),
+                target_level: 0,
+                target_resolution: atlas.tile_size().saturating_add(1),
+                content,
+                transition_frames: 8,
+                terminal_fallback: terra_render::TerrainTerminalFallback::RootRequired,
+                virtual_page_count: atlas.virtual_page_count(),
+                infinite_topology: Some(topology.config()),
+                enable: true,
+            };
+            if let Some(renderer) = self.renderer.as_mut() {
+                renderer.set_tile_stream_resources(resources);
+            }
+            return;
+        }
         let Some(runtime_pyramid) = self.terrain_runtime.bounded_pyramid().cloned() else {
             if let Some(renderer) = self.renderer.as_mut() {
                 renderer.set_use_tile_stream(false);
@@ -1865,6 +1916,8 @@ impl TerraApp {
                 } else {
                     terra_render::TerrainTerminalFallback::MonolithicMigration
                 },
+                virtual_page_count: atlas.virtual_page_count(),
+                infinite_topology: None,
                 enable: true,
             }
         };
@@ -2983,7 +3036,10 @@ mod tests {
     use terra_core::PyramidConfig;
     use terra_gpu::GpuTileAtlas;
     use terra_gpu_eval::{GpuEvaluationIntent, GpuTerrainEngine};
-    use terra_render::{GpuContext, HeightPresentGeom, TerrainRenderer, TerrainTraversalMode};
+    use terra_render::{
+        GpuContext, HeightPresentGeom, InfinitePresentationConfig, TerrainRenderer,
+        TerrainTraversalMode,
+    };
 
     use crate::app::frame_trace::{EvaluationTraceId, FrameTraceEventKind};
     use crate::app::logical_frame::{
@@ -3039,6 +3095,10 @@ mod tests {
             None,
             TerrainTraversalMode::Infinite,
         );
+        renderer.configure_infinite_presentation(InfinitePresentationConfig {
+            topology: topology.config(),
+            horizon_m: settings.horizon_m,
+        });
         renderer.frame_camera_to_infinite(0.0, 0.0, settings.preview_radius_m as f32);
         app.renderer = Some(renderer);
         app.gpu = Some(context);
@@ -3089,6 +3149,35 @@ mod tests {
             )
             .expect("planned signed key must satisfy the #185 tile-domain contract");
         }
+
+        let live_content = app.terrain_tile_scheduler.live_content().unwrap();
+        let coarse_keys: Vec<_> = demand
+            .tiles
+            .iter()
+            .filter(|tile| tile.class == terra_core::TerrainDemandClass::CoarseCoverage)
+            .map(|tile| tile.key.clone())
+            .collect();
+        let page_extent = settings.tile_size_samples + settings.publication_halo_samples * 2;
+        let samples = vec![12.0; (page_extent * page_extent) as usize];
+        for key in coarse_keys {
+            app.tile_atlas
+                .as_mut()
+                .unwrap()
+                .upload_packed_height_tile_current_at_frame(
+                    &gpu.queue,
+                    key,
+                    &samples,
+                    page_extent,
+                    page_extent,
+                    settings.publication_halo_samples,
+                    live_content,
+                    live_content,
+                    0,
+                )
+                .unwrap();
+        }
+        app.sync_tile_stream_to_renderer();
+        assert!(app.renderer.as_ref().unwrap().tile_stream_enabled());
 
         app.session.document.stack.push(Layer::new(
             "CPU Infinite noise",
@@ -3467,7 +3556,7 @@ mod tests {
             .for_each(|error| *error = 10.0);
         {
             let camera = &mut app.renderer.as_mut().unwrap().camera;
-            camera.target = glam::Vec3::new(320.0, 19.0, 320.0);
+            camera.target = glam::Vec3::new(320.0, 19.0, 320.0).into();
             camera.distance = 10_000.0;
             camera.yaw = 0.7;
             camera.pitch = 0.7;

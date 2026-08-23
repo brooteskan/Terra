@@ -1417,12 +1417,16 @@ impl ApplicationHandler<RuntimeEvent> for TerraApp {
                         self.session.document.level_steps.high_detail,
                         terra_core::analyze::HighDetailMode::Camera
                     ) {
-                        if let Some(r) = self.renderer.as_ref() {
-                            let u = (r.camera.target.x / r.heights.world_size.0.max(1e-3))
-                                .clamp(0.05, 0.95);
-                            let v = (r.camera.target.z / r.heights.world_size.1.max(1e-3))
-                                .clamp(0.05, 0.95);
-                            let half = 0.18;
+                        if let Some(r) = self.renderer.as_ref().filter(|renderer| {
+                            renderer.traversal_mode() == terra_render::TerrainTraversalMode::Bounded
+                        }) {
+                            let u = (r.camera.target.x
+                                / f64::from(r.heights.world_size.0.max(1e-3)))
+                            .clamp(0.05, 0.95) as f32;
+                            let v = (r.camera.target.z
+                                / f64::from(r.heights.world_size.1.max(1e-3)))
+                            .clamp(0.05, 0.95) as f32;
+                            let half = 0.18f32;
                             self.session.document.level_steps.hd_zone = [
                                 (u - half).max(0.0),
                                 (v - half).max(0.0),

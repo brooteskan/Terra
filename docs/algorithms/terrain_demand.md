@@ -85,3 +85,9 @@ work, touches demanded residents, and moves coarse/ancestor protection with the 
 plan. A fixed-capacity open-addressed GPU directory stores full signed coordinates; it is
 rebuilt from the authoritative residency cache on publication and eviction, so travelled
 addresses do not accumulate in a second CPU map.
+
+The application enables Infinite shader sampling after every current `CoarseCoverage`
+request is resident; optional refinements may remain queued or in flight. The renderer
+derives the same finite horizon geometrically from camera and topology settings rather
+than receiving the demand set, and the page directory remains the sole presentation
+authority.

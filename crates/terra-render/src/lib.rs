@@ -111,6 +111,13 @@ pub enum TerrainTraversalMode {
     Infinite,
 }
 
+/// Fixed-origin spatial inputs required to derive a transient Infinite render frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct InfinitePresentationConfig {
+    pub topology: terra_core::InfiniteTopologyConfig,
+    pub horizon_m: f64,
+}
+
 impl TerrainTraversalMode {
     fn constrain_camera(self, camera: &mut OrbitCamera, world_size: (f32, f32)) {
         if self == Self::Bounded {
@@ -153,6 +160,12 @@ struct FrameUniforms {
     stream4: [u32; 4],
     /// x=terminal monolithic allowed, y=stream debug mode, z/w reserved.
     stream5: [f32; 4],
+    /// x=Infinite sparse addressing, y=sparse directory capacity, z=max LOD.
+    stream6: [u32; 4],
+    /// Signed finest-tile render anchor: x low/high, z low/high.
+    stream7: [u32; 4],
+    /// x=finest spacing metres, y=finest tile span metres.
+    stream8: [f32; 4],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -178,6 +191,8 @@ pub struct TerrainTileStreamResources {
     pub content: terra_core::TerrainContentStamp,
     pub transition_frames: u32,
     pub terminal_fallback: TerrainTerminalFallback,
+    pub virtual_page_count: u32,
+    pub infinite_topology: Option<terra_core::InfiniteTopologyConfig>,
     pub enable: bool,
 }
 
@@ -318,6 +333,7 @@ pub struct TerrainRenderer {
     pub heights: HeightGpu,
     pub camera: OrbitCamera,
     traversal_mode: TerrainTraversalMode,
+    infinite_presentation: Option<InfinitePresentationConfig>,
     pub size: winit::dpi::PhysicalSize<u32>,
     /// Last CPU→GPU height upload microseconds.
     pub last_upload_us: u64,
@@ -391,6 +407,8 @@ pub struct TerrainRenderer {
     tile_stream_transition_frames: u32,
     tile_stream_terminal_fallback: TerrainTerminalFallback,
     tile_stream_debug_mode: u32,
+    tile_stream_virtual_page_count: u32,
+    tile_stream_infinite_topology: Option<terra_core::InfiniteTopologyConfig>,
 }
 
 /// Environment lighting used for Lit viewport presentation.
@@ -1255,6 +1273,7 @@ impl TerrainRenderer {
             heights,
             camera,
             traversal_mode: TerrainTraversalMode::Bounded,
+            infinite_presentation: None,
             size,
             ocean_pipeline,
             last_upload_us: 0,
@@ -1302,6 +1321,8 @@ impl TerrainRenderer {
             tile_stream_transition_frames: 8,
             tile_stream_terminal_fallback: TerrainTerminalFallback::RootRequired,
             tile_stream_debug_mode: 0,
+            tile_stream_virtual_page_count: 0,
+            tile_stream_infinite_topology: None,
         }
     }
 
@@ -1540,7 +1561,11 @@ impl TerrainRenderer {
 
     /// Active presentation backend for the current mode.
     pub fn presentation_backend(&self) -> PresentationBackendId {
-        PresentationBackendId::from_mode(self.quality.config.mode)
+        if self.traversal_mode == TerrainTraversalMode::Infinite {
+            PresentationBackendId::RasterLit
+        } else {
+            PresentationBackendId::from_mode(self.quality.config.mode)
+        }
     }
 
     /// Upload heightfield to GPU textures (no mesh rebuild). Swaps display buffer when done.
@@ -1894,10 +1919,10 @@ impl TerrainRenderer {
     pub fn frame_camera_to_terrain(&mut self) {
         let (min_h, max_h) = self.heights.height_range;
         let extent = self.heights.world_size.0.max(self.heights.world_size.1);
-        self.camera.target = glam::Vec3::new(
-            self.heights.world_size.0 * 0.5,
-            (min_h + max_h) * 0.5,
-            self.heights.world_size.1 * 0.5,
+        self.camera.target = glam::DVec3::new(
+            f64::from(self.heights.world_size.0) * 0.5,
+            f64::from((min_h + max_h) * 0.5),
+            f64::from(self.heights.world_size.1) * 0.5,
         );
         self.camera.distance = extent * 1.1;
         self.camera_framed = true;
@@ -1908,12 +1933,12 @@ impl TerrainRenderer {
     /// slice; this keeps current traversal centred on the correct signed axes.
     pub fn frame_camera_to_infinite(
         &mut self,
-        origin_x: f32,
-        origin_z: f32,
+        origin_x: f64,
+        origin_z: f64,
         preview_radius_m: f32,
     ) {
         let (min_h, max_h) = self.heights.height_range;
-        self.camera.target = glam::Vec3::new(origin_x, (min_h + max_h) * 0.5, origin_z);
+        self.camera.target = glam::DVec3::new(origin_x, f64::from((min_h + max_h) * 0.5), origin_z);
         self.camera.distance = preview_radius_m.max(10.0) * 1.1;
         self.camera_framed = true;
     }
@@ -1924,8 +1949,8 @@ impl TerrainRenderer {
 
     /// Move the orbit target to a normalized location in the terrain footprint.
     pub fn focus_camera_uv(&mut self, u: f32, v: f32) {
-        self.camera.target.x = u.clamp(0.0, 1.0) * self.heights.world_size.0;
-        self.camera.target.z = v.clamp(0.0, 1.0) * self.heights.world_size.1;
+        self.camera.target.x = f64::from(u.clamp(0.0, 1.0) * self.heights.world_size.0);
+        self.camera.target.z = f64::from(v.clamp(0.0, 1.0) * self.heights.world_size.1);
         self.constrain_camera();
     }
 
@@ -2015,6 +2040,8 @@ impl TerrainRenderer {
         self.tile_stream_content = resources.content;
         self.tile_stream_transition_frames = resources.transition_frames;
         self.tile_stream_terminal_fallback = resources.terminal_fallback;
+        self.tile_stream_virtual_page_count = resources.virtual_page_count;
+        self.tile_stream_infinite_topology = resources.infinite_topology;
         self.use_tile_stream = resources.enable;
         self.recreate_bind_group();
         self.notify_invalidation(InvalidationReason::TerrainChanged);
@@ -2111,7 +2138,10 @@ impl TerrainRenderer {
         traversal_mode: TerrainTraversalMode,
     ) {
         self.traversal_mode = traversal_mode;
+        self.infinite_presentation = None;
         self.use_tile_stream = false;
+        self.tile_stream_virtual_page_count = 0;
+        self.tile_stream_infinite_topology = None;
         self.presentation_baseline = None;
         self.last_presentation_record = None;
         self.heights
@@ -2155,6 +2185,47 @@ impl TerrainRenderer {
         self.traversal_mode
     }
 
+    pub fn configure_infinite_presentation(&mut self, config: InfinitePresentationConfig) {
+        self.traversal_mode = TerrainTraversalMode::Infinite;
+        self.infinite_presentation = Some(config);
+        let next = ClipmapConfig::for_infinite(config.topology, config.horizon_m);
+        self.clipmap = next;
+        self.world_grid = self.clipmap.fallback.clone();
+        if self.grid.resolution != self.world_grid.grid_size {
+            self.grid = TerrainGrid::new(&self.device, self.world_grid.grid_size);
+        }
+        self.ring_grids = self
+            .clipmap
+            .rings
+            .iter()
+            .map(|ring| TerrainGrid::new(&self.device, ring.grid_size))
+            .collect();
+        self.ensure_ring_uniform_bufs();
+        self.recreate_bind_group();
+        self.request_camera_reframe();
+    }
+
+    /// Camera-relative frame origin snapped to the finest Infinite tile lattice.
+    pub fn render_origin_xz(&self) -> glam::DVec2 {
+        let Some(config) = self.infinite_presentation else {
+            return glam::DVec2::ZERO;
+        };
+        let origin = config.topology.origin;
+        let span = config.topology.finest_spacing_m * f64::from(config.topology.tile_size);
+        if !span.is_finite() || span <= 0.0 {
+            return glam::DVec2::new(origin.x_m(), origin.z_m());
+        }
+        glam::DVec2::new(
+            origin.x_m() + ((self.camera.target.x - origin.x_m()) / span).floor() * span,
+            origin.z_m() + ((self.camera.target.z - origin.z_m()) / span).floor() * span,
+        )
+    }
+
+    pub fn camera_view_proj(&self, aspect: f32) -> glam::Mat4 {
+        self.camera
+            .view_proj_relative_to(aspect, self.render_origin_xz())
+    }
+
     /// Apply the active topology's camera constraint. Infinite traversal keeps
     /// the rig unchanged, including across negative fixed-origin coordinates.
     pub fn constrain_camera(&mut self) {
@@ -2196,7 +2267,7 @@ impl TerrainRenderer {
 
     /// Deprecated: prefer [`Self::set_renderer_mode`]. Only applies when mode is ProgressivePt.
     pub fn set_progressive_enabled(&mut self, enabled: bool) {
-        let backend = PresentationBackendId::from_mode(self.quality.config.mode);
+        let backend = self.presentation_backend();
         if matches!(backend, PresentationBackendId::ProgressivePt) {
             self.progressive.set_enabled(enabled);
         } else {
@@ -2294,8 +2365,9 @@ impl TerrainRenderer {
         // 0 keeps the depth pass off, matching the historical "no shadows" look.
         self.shadow_map
             .set_enabled(self.lighting.shadow_strength > 1e-4);
-        let shadows_for_schedule =
-            self.shadow_map.enabled() && matches!(backend, PresentationBackendId::RasterLit);
+        let shadows_for_schedule = self.traversal_mode == TerrainTraversalMode::Bounded
+            && self.shadow_map.enabled()
+            && matches!(backend, PresentationBackendId::RasterLit);
         // Converged progressive frames (spp 0) present the last HDR without a new
         // dispatch; the schedule records that so its plan matches what runs.
         let pt_dispatch = self.quality.spp_this_frame > 0;
@@ -2319,7 +2391,8 @@ impl TerrainRenderer {
         }
 
         self.constrain_camera();
-        let view_proj = self.camera.view_proj(aspect);
+        let render_origin = self.render_origin_xz();
+        let view_proj = self.camera_view_proj(aspect);
         let (min_h, max_h) = self.heights.height_range;
         let (tw, th) = self.heights.tex_size;
         self.last_grid_resolution = self.grid.resolution;
@@ -2368,7 +2441,32 @@ impl TerrainRenderer {
             self.heights.world_size,
             self.heights.height_range,
         );
-        let eye = self.camera.eye();
+        let absolute_eye = self.camera.eye();
+        let eye = glam::Vec3::new(
+            (absolute_eye.x - render_origin.x) as f32,
+            absolute_eye.y as f32,
+            (absolute_eye.z - render_origin.y) as f32,
+        );
+        let (stream6, stream7, stream8) = if let Some(topology) = self.tile_stream_infinite_topology
+        {
+            let tile_span = topology.finest_spacing_m * f64::from(topology.tile_size);
+            let anchor_x = ((render_origin.x - topology.origin.x_m()) / tile_span).floor() as i64;
+            let anchor_z = ((render_origin.y - topology.origin.z_m()) / tile_span).floor() as i64;
+            let x = anchor_x as u64;
+            let z = anchor_z as u64;
+            (
+                [
+                    1,
+                    self.tile_stream_virtual_page_count,
+                    u32::from(topology.max_lod.get()),
+                    0,
+                ],
+                [x as u32, (x >> 32) as u32, z as u32, (z >> 32) as u32],
+                [topology.finest_spacing_m as f32, tile_span as f32, 0.0, 0.0],
+            )
+        } else {
+            ([0; 4], [0; 4], [0.0; 4])
+        };
         let base_uniforms = FrameUniforms {
             view_proj: view_proj.to_cols_array_2d(),
             light_dir: self.lighting.light_dir,
@@ -2448,6 +2546,9 @@ impl TerrainRenderer {
                 0.0,
                 0.0,
             ],
+            stream6,
+            stream7,
+            stream8,
         };
         let world_x = self.heights.world_size.0;
         let world_z = self.heights.world_size.1;
@@ -2511,7 +2612,12 @@ impl TerrainRenderer {
                     let mask = self.adaptive.prepare_all_active_mask();
                     self.path_tracer.upload_sample_mask(&self.queue, &mask);
 
-                    let view_mat = glam::Mat4::look_at_rh(eye, self.camera.target, glam::Vec3::Y);
+                    let target = glam::Vec3::new(
+                        (self.camera.target.x - render_origin.x) as f32,
+                        self.camera.target.y as f32,
+                        (self.camera.target.z - render_origin.y) as f32,
+                    );
+                    let view_mat = glam::Mat4::look_at_rh(eye, target, glam::Vec3::Y);
                     let view_inv = view_mat.inverse();
                     let dx = world_x / tw.max(1) as f32;
                     let dz = world_z / th.max(1) as f32;
@@ -2571,8 +2677,8 @@ impl TerrainRenderer {
                 if present.use_single_grid {
                     let mut uniforms = base_uniforms;
                     uniforms.clipmap = [
-                        0.0,
-                        0.0,
+                        (present.fallback_origin_x - render_origin.x) as f32,
+                        (present.fallback_origin_z - render_origin.y) as f32,
                         present.fallback_spacing,
                         self.grid.resolution as f32,
                     ];
@@ -2583,8 +2689,8 @@ impl TerrainRenderer {
                     if present.draw_fallback {
                         let mut uniforms = base_uniforms;
                         uniforms.clipmap = [
-                            0.0,
-                            0.0,
+                            (present.fallback_origin_x - render_origin.x) as f32,
+                            (present.fallback_origin_z - render_origin.y) as f32,
                             present.fallback_spacing,
                             self.grid.resolution as f32,
                         ];
@@ -2601,8 +2707,8 @@ impl TerrainRenderer {
                         };
                         let mut uniforms = base_uniforms;
                         uniforms.clipmap = [
-                            draw.origin_x,
-                            draw.origin_z,
+                            (draw.origin_x - render_origin.x) as f32,
+                            (draw.origin_z - render_origin.y) as f32,
                             draw.spacing,
                             draw.grid_size as f32,
                         ];
@@ -2688,8 +2794,12 @@ impl TerrainRenderer {
                     // Hole-free uniforms for terrain-scene composition.
                     {
                         let mut uniforms = base_uniforms;
-                        uniforms.clipmap =
-                            [0.0, 0.0, fallback_spacing, self.grid.resolution as f32];
+                        uniforms.clipmap = [
+                            (present.fallback_origin_x - render_origin.x) as f32,
+                            (present.fallback_origin_z - render_origin.y) as f32,
+                            fallback_spacing,
+                            self.grid.resolution as f32,
+                        ];
                         uniforms.viz[3] = 0.0;
                         self.queue.write_buffer(
                             &self.uniform_buf,
@@ -2721,7 +2831,9 @@ impl TerrainRenderer {
                             timestamp_writes: None,
                             occlusion_query_set: None,
                         });
-                        if self.ocean_level.is_some() {
+                        if self.traversal_mode == TerrainTraversalMode::Bounded
+                            && self.ocean_level.is_some()
+                        {
                             pass.set_pipeline(&self.ocean_pipeline);
                             pass.set_bind_group(0, &self.bind_group, &[]);
                             pass.set_vertex_buffer(0, self.grid.vertex_buf.slice(..));
@@ -2741,8 +2853,10 @@ impl TerrainRenderer {
                             );
                             pass.draw_indexed(0..self.grid.edge_index_count, 0, 0..1);
                         }
-                        self.vegetation.draw(&mut pass);
-                        self.overhang.draw(&mut pass);
+                        if self.traversal_mode == TerrainTraversalMode::Bounded {
+                            self.vegetation.draw(&mut pass);
+                            self.overhang.draw(&mut pass);
+                        }
                     }
                 }
             }
@@ -3120,6 +3234,22 @@ mod shader_tests {
         assert!(
             resolve.contains("level = level - 1") && resolve.contains("sample_height_monolithic"),
             "resolution must walk resident ancestors before terminal fallback"
+        );
+    }
+
+    #[test]
+    fn infinite_streaming_uses_signed_sparse_lookup_and_never_monolithic_fallback() {
+        let source = include_str!("shaders/terrain.wgsl");
+        let lookup = fn_body(source, "lookup_tile_page_sparse");
+        assert!(lookup.contains("sparse_hash") && lookup.contains("mapping.tile_x_hi"));
+        assert!(lookup.contains("mapping.tile_z_hi") && lookup.contains("probe < capacity"));
+        let address = fn_body(source, "infinite_address");
+        assert!(address.contains("signed64_add_i32") && address.contains("signed64_shift_right"));
+        let resolve = fn_body(source, "resolve_height_infinite_from");
+        assert!(resolve.contains("lookup_tile_page_sparse"));
+        assert!(
+            !resolve.contains("sample_height_monolithic"),
+            "Infinite page misses must not expose the finite monolithic heightfield"
         );
     }
 

@@ -45,6 +45,12 @@ impl EditorOverlays {
         color: [f32; 4],
     ) {
         self.sync_height(gpu, renderer);
+        if renderer.traversal_mode() == terra_render::TerrainTraversalMode::Infinite {
+            // Sparse authored editing is a later slice. Do not run the bounded
+            // monolithic picker in an incorrect coordinate frame.
+            self.brush.hide(&gpu.queue);
+            return;
+        }
         let (width, height) = renderer.size();
         let aspect = width as f32 / height.max(1) as f32;
         self.brush.request_surface_pick(
@@ -67,6 +73,9 @@ impl EditorOverlays {
         cursor: (f32, f32),
         screen: (f32, f32),
     ) -> Option<SurfacePick> {
+        if renderer.traversal_mode() == terra_render::TerrainTraversalMode::Infinite {
+            return None;
+        }
         let (width, height) = renderer.size();
         let aspect = width as f32 / height.max(1) as f32;
         self.brush
@@ -81,16 +90,18 @@ impl EditorOverlays {
     ) {
         self.sync_height(gpu, renderer);
         let (width, height) = renderer.size();
-        let view_proj = renderer
-            .camera
-            .view_proj(width as f32 / height.max(1) as f32);
+        let view_proj = renderer.camera_view_proj(width as f32 / height.max(1) as f32);
         self.brush.upload_view_proj(&gpu.queue, view_proj);
         self.guides.upload_view_proj(&gpu.queue, view_proj);
+        let render_origin = renderer.render_origin_xz();
         self.guides.sync_geometry(
             &gpu.queue,
             renderer.heights.world_size,
             renderer.heights.height_range,
-            (renderer.camera.target.x, renderer.camera.target.z),
+            (
+                (renderer.camera.target.x - render_origin.x) as f32,
+                (renderer.camera.target.z - render_origin.y) as f32,
+            ),
         );
 
         let mut encoder = gpu

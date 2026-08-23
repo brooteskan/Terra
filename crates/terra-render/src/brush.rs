@@ -476,7 +476,14 @@ pub fn pick_terrain_uv(
     screen: (f32, f32),
     world_size: (f32, f32),
 ) -> Option<(f32, f32)> {
-    pick_at_plane(camera, aspect, cursor, screen, world_size, camera.target.y)
+    pick_at_plane(
+        camera,
+        aspect,
+        cursor,
+        screen,
+        world_size,
+        camera.target.y as f32,
+    )
 }
 
 /// Raycast onto a CPU heightfield using a bounded surface traversal and bisection.
@@ -633,7 +640,7 @@ mod tests {
         let metrics = HeightfieldMetrics::new(256, 256, 4096.0, 4096.0);
         let heights = Heightfield::filled(metrics, 700.0);
         let camera = OrbitCamera {
-            target: Vec3::new(2048.0, 700.0, 2048.0),
+            target: Vec3::new(2048.0, 700.0, 2048.0).into(),
             distance: 4800.0,
             yaw: 0.7,
             pitch: 0.6,
@@ -660,7 +667,7 @@ mod tests {
         let metrics = HeightfieldMetrics::new(256, 256, 4096.0, 4096.0);
         let heights = Heightfield::filled(metrics, 800.0);
         let camera = OrbitCamera {
-            target: Vec3::new(-800.0, 0.0, 2048.0),
+            target: Vec3::new(-800.0, 0.0, 2048.0).into(),
             distance: 4000.0,
             yaw: 0.0,
             pitch: 0.4,
@@ -676,7 +683,7 @@ mod tests {
                 cursor,
                 screen,
                 (4096.0, 4096.0),
-                camera.target.y,
+                camera.target.y as f32,
             ),
             None,
             "the old target-plane seed rejects this visible edge hit"

@@ -715,9 +715,9 @@ impl ViewportRenderSettings {
 /// Persisted orbit-camera state for a numbered navigation bookmark.
 #[derive(Debug, Clone, Copy)]
 pub struct CameraBookmark {
-    pub x: f32,
-    pub y: f32,
-    pub z: f32,
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
     pub yaw: f32,
     pub pitch: f32,
     pub distance: f32,

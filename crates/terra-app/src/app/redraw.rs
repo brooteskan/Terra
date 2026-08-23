@@ -409,10 +409,18 @@ impl TerraApp {
                 renderer.quality().config.mode,
                 progressive_samples,
             );
-            self.ui_state.camera_xz = (
-                (renderer.camera.target.x / renderer.heights.world_size.0.max(1.0)).clamp(0.0, 1.0),
-                (renderer.camera.target.z / renderer.heights.world_size.1.max(1.0)).clamp(0.0, 1.0),
-            );
+            self.ui_state.camera_xz = if renderer.traversal_mode()
+                == terra_render::TerrainTraversalMode::Infinite
+            {
+                (0.5, 0.5)
+            } else {
+                (
+                    (renderer.camera.target.x / f64::from(renderer.heights.world_size.0.max(1.0)))
+                        .clamp(0.0, 1.0) as f32,
+                    (renderer.camera.target.z / f64::from(renderer.heights.world_size.1.max(1.0)))
+                        .clamp(0.0, 1.0) as f32,
+                )
+            };
             self.ui_state.camera_yaw = renderer.camera.yaw;
             self.ui_state.camera_pitch = renderer.camera.pitch;
             let view = frame

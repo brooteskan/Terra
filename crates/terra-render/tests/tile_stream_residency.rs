@@ -2,13 +2,14 @@
 //! page is visible, and its output-revision stamp rejects stale pages (#171).
 
 use terra_core::{
-    Heightfield, HeightfieldMetrics, PyramidConfig, TerrainContentStamp, TerrainPyramid,
-    TerrainTileKey, TileId,
+    Heightfield, HeightfieldMetrics, InfiniteTopology, InfiniteTopologyConfig, Lod, PyramidConfig,
+    TerrainContentStamp, TerrainPyramid, TerrainTileKey, TileAddress, TileCoord, TileId,
+    WorldPosition,
 };
 use terra_gpu::GpuTileAtlas;
 use terra_render::{
-    GpuContext, TerrainRenderer, TerrainTerminalFallback, TerrainTileStreamResources,
-    ViewportRendererMode,
+    GpuContext, InfinitePresentationConfig, TerrainRenderer, TerrainTerminalFallback,
+    TerrainTileStreamResources, TerrainTraversalMode, ViewportRendererMode,
 };
 
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
@@ -53,6 +54,8 @@ fn stream_resources(
         content,
         transition_frames: 0,
         terminal_fallback,
+        virtual_page_count: atlas.virtual_page_count(),
+        infinite_topology: None,
         enable: true,
     }
 }
@@ -112,6 +115,8 @@ fn stale_page_revision_falls_back_to_monolithic_height() {
         content,
         transition_frames: 0,
         terminal_fallback: TerrainTerminalFallback::MonolithicMigration,
+        virtual_page_count: atlas.virtual_page_count(),
+        infinite_topology: None,
         enable: true,
     };
     current.set_tile_stream_resources(resources(content));
@@ -234,5 +239,132 @@ fn resident_child_refines_and_unpublish_returns_to_current_root() {
         differing_pixels(&coarse, &stale),
         0,
         "a child from another document revision must never replace the current root"
+    );
+}
+
+#[test]
+fn infinite_sparse_page_renders_at_large_signed_coordinates() {
+    let Some(gpu) = terra_test_gpu::headless() else {
+        return;
+    };
+    let ctx = GpuContext::new(gpu.device.clone(), gpu.queue.clone(), FORMAT);
+    let topology = InfiniteTopology::try_new(InfiniteTopologyConfig {
+        origin: WorldPosition::ORIGIN,
+        tile_size: 8,
+        finest_spacing_m: 1.0,
+        max_lod: Lod::try_new(4).unwrap(),
+    })
+    .unwrap();
+    let content = TerrainContentStamp {
+        document_revision: 101,
+        plan_revision: 103,
+        output_revision: 107,
+        content_revision: 109,
+    };
+    let key = TerrainTileKey::height(TileAddress::new(
+        Lod::try_new(4).unwrap(),
+        TileCoord {
+            x: 39_062,
+            z: -39_063,
+        },
+    ));
+    let mut atlas = GpuTileAtlas::new(&gpu.device, 8, 1, 8).unwrap();
+    atlas.configure_infinite(&gpu.device, &gpu.queue, topology);
+    atlas
+        .upload_packed_height_tile_current_at_frame(
+            &gpu.queue,
+            key,
+            &vec![45.0; 100],
+            10,
+            10,
+            1,
+            content,
+            content,
+            0,
+        )
+        .unwrap();
+
+    let mut renderer = TerrainRenderer::new_headless(&ctx, W, H);
+    renderer.set_renderer_mode(ViewportRendererMode::Raster);
+    renderer.reset_project_state((64.0, 64.0), None, TerrainTraversalMode::Infinite);
+    renderer.configure_infinite_presentation(InfinitePresentationConfig {
+        topology: topology.config(),
+        horizon_m: 32.0,
+    });
+    renderer.frame_camera_to_infinite(5_000_000.0, -5_000_000.0, 24.0);
+    renderer.camera.target.y = 45.0;
+
+    let before_target = gpu.target(W, H, FORMAT);
+    renderer.render_to_view(&before_target.view, W, H);
+    let before = gpu.read_rgba8(&before_target);
+
+    renderer.set_tile_stream_resources(TerrainTileStreamResources {
+        atlas_view: atlas.create_texture_view(),
+        physical_page_table: atlas.page_table_buffer_cloned(),
+        virtual_page_table: atlas.virtual_page_table_buffer_cloned(),
+        level_table: atlas.level_table_buffer_cloned(),
+        tile_size: atlas.tile_size(),
+        halo: atlas.halo(),
+        max_pages: atlas.max_pages(),
+        level_count: atlas.level_count(),
+        target_level: 0,
+        target_resolution: 9,
+        content,
+        transition_frames: 0,
+        terminal_fallback: TerrainTerminalFallback::RootRequired,
+        virtual_page_count: atlas.virtual_page_count(),
+        infinite_topology: Some(topology.config()),
+        enable: true,
+    });
+    renderer.set_tile_stream_debug_mode(1);
+    let after_target = gpu.target(W, H, FORMAT);
+    renderer.render_to_view(&after_target.view, W, H);
+    let after = gpu.read_rgba8(&after_target);
+    assert!(
+        differing_pixels(&before, &after) > 0,
+        "a resident signed sparse page must affect camera-relative presentation"
+    );
+
+    let fine_keys: Vec<_> = [624_999, 625_000]
+        .into_iter()
+        .flat_map(|x| {
+            [-625_001, -625_000].into_iter().map(move |z| {
+                TerrainTileKey::height(TileAddress::new(Lod::FINEST, TileCoord { x, z }))
+            })
+        })
+        .collect();
+    for fine_key in &fine_keys {
+        atlas
+            .upload_packed_height_tile_current_at_frame(
+                &gpu.queue,
+                fine_key.clone(),
+                &vec![20.0; 100],
+                10,
+                10,
+                1,
+                content,
+                content,
+                1,
+            )
+            .unwrap();
+    }
+    let refined_target = gpu.target(W, H, FORMAT);
+    renderer.render_to_view(&refined_target.view, W, H);
+    let refined = gpu.read_rgba8(&refined_target);
+    assert!(
+        differing_pixels(&after, &refined) > 0,
+        "a resident fine page must refine its coarse Infinite ancestor"
+    );
+
+    for fine_key in &fine_keys {
+        assert!(atlas.unpublish(&gpu.queue, fine_key));
+    }
+    let restored_target = gpu.target(W, H, FORMAT);
+    renderer.render_to_view(&restored_target.view, W, H);
+    let restored = gpu.read_rgba8(&restored_target);
+    assert_eq!(
+        differing_pixels(&after, &restored),
+        0,
+        "evicting Infinite detail must restore the same resident coarse ancestor"
     );
 }

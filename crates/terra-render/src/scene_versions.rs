@@ -4,7 +4,7 @@
 //! terrain caches can stay valid when only lighting or camera moved.
 
 use crate::camera::OrbitCamera;
-use glam::Vec3;
+use glam::DVec3;
 
 /// Monotonic generation counters for selective invalidation.
 #[derive(Debug, Clone, Copy, Default)]
@@ -132,8 +132,8 @@ impl Default for CameraChangeThresholds {
 
 #[derive(Debug, Clone, Copy)]
 pub struct CameraSnapshot {
-    pub eye: Vec3,
-    pub target: Vec3,
+    pub eye: DVec3,
+    pub target: DVec3,
     pub yaw: f32,
     pub pitch: f32,
     pub fov_y: f32,
@@ -167,7 +167,7 @@ impl CameraSnapshot {
         let eye_delta = (self.eye - prev.eye).length();
         let target_delta = (self.target - prev.target).length();
         let translation = eye_delta.max(target_delta);
-        if translation >= thresholds.cut_translation_m {
+        if translation >= f64::from(thresholds.cut_translation_m) {
             return Some(InvalidationReason::CameraCut);
         }
         let rot = (self.yaw - prev.yaw)
@@ -184,7 +184,7 @@ impl CameraSnapshot {
         {
             return Some(InvalidationReason::ProjectionChanged);
         }
-        if translation > thresholds.translation_m || rot > thresholds.rotation_rad {
+        if translation > f64::from(thresholds.translation_m) || rot > thresholds.rotation_rad {
             return Some(InvalidationReason::CameraMoved);
         }
         None

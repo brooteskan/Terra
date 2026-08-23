@@ -1,8 +1,10 @@
-use glam::{Mat4, Vec3};
+use glam::{DVec2, DVec3, Mat4, Vec3};
 
 #[derive(Debug, Clone)]
 pub struct OrbitCamera {
-    pub target: Vec3,
+    /// Authoritative fixed-origin camera target. X/Z stay double precision until
+    /// a frame-local render origin has been subtracted.
+    pub target: DVec3,
     pub distance: f32,
     pub yaw: f32,
     pub pitch: f32,
@@ -14,7 +16,7 @@ pub struct OrbitCamera {
 impl Default for OrbitCamera {
     fn default() -> Self {
         Self {
-            target: Vec3::ZERO,
+            target: DVec3::ZERO,
             distance: 1500.0,
             yaw: 0.7,
             pitch: 0.6,
@@ -32,8 +34,8 @@ impl OrbitCamera {
         Vec3::new(self.yaw.cos() * cp, self.pitch.sin(), self.yaw.sin() * cp)
     }
 
-    pub fn eye(&self) -> Vec3 {
-        self.target + self.offset_dir() * self.distance
+    pub fn eye(&self) -> DVec3 {
+        self.target + self.offset_dir().as_dvec3() * f64::from(self.distance)
     }
 
     /// Look direction from eye toward target.
@@ -52,7 +54,23 @@ impl OrbitCamera {
     }
 
     pub fn view_proj(&self, aspect: f32) -> Mat4 {
-        let view = Mat4::look_at_rh(self.eye(), self.target, Vec3::Y);
+        self.view_proj_relative_to(aspect, DVec2::ZERO)
+    }
+
+    /// View-projection after translating fixed-origin X/Z into a local frame.
+    pub fn view_proj_relative_to(&self, aspect: f32, origin_xz: DVec2) -> Mat4 {
+        let eye = self.eye();
+        let local_eye = Vec3::new(
+            (eye.x - origin_xz.x) as f32,
+            eye.y as f32,
+            (eye.z - origin_xz.y) as f32,
+        );
+        let local_target = Vec3::new(
+            (self.target.x - origin_xz.x) as f32,
+            self.target.y as f32,
+            (self.target.z - origin_xz.y) as f32,
+        );
+        let view = Mat4::look_at_rh(local_eye, local_target, Vec3::Y);
         let proj = Mat4::perspective_rh(self.fov_y, aspect.max(0.01), self.near, self.far);
         proj * view
     }
@@ -77,7 +95,7 @@ impl OrbitCamera {
         let eye = self.eye();
         self.yaw += dx * 0.005;
         self.pitch = (self.pitch + dy * 0.005).clamp(-1.45, 1.45);
-        self.target = eye - self.offset_dir() * self.distance;
+        self.target = eye - self.offset_dir().as_dvec3() * f64::from(self.distance);
     }
 
     pub fn zoom(&mut self, delta: f32) {
@@ -93,7 +111,7 @@ impl OrbitCamera {
         let scale = self.distance * 0.00125;
         // Drag right → world moves right under the camera (invert screen X).
         // Drag up → pan along camera up.
-        self.target += right * (-dx * scale) + up * (dy * scale);
+        self.target += (right * (-dx * scale) + up * (dy * scale)).as_dvec3();
     }
 
     /// Fly the camera rig: `forward`/`right`/`up` are typically -1..1 from WASD/QE.
@@ -113,7 +131,7 @@ impl OrbitCamera {
         if boost {
             speed *= 3.0;
         }
-        self.target += dir * speed * dt;
+        self.target += (dir * speed * dt).as_dvec3();
     }
 
     /// Keep the camera rig over the heightfield with margin for FPS look/fly.
@@ -122,21 +140,21 @@ impl OrbitCamera {
     /// distant eye puts the target outside the world, then yanking it back teleports the eye.
     /// Instead, clamp the eye with padding and translate target by the same delta (rigid rig).
     pub fn clamp_to_world(&mut self, world_size: (f32, f32)) {
-        let max_x = world_size.0.max(1.0);
-        let max_z = world_size.1.max(1.0);
-        let pad = (max_x.max(max_z) * 0.75).max(self.distance);
+        let max_x = f64::from(world_size.0.max(1.0));
+        let max_z = f64::from(world_size.1.max(1.0));
+        let pad = (max_x.max(max_z) * 0.75).max(f64::from(self.distance));
         let eye = self.eye();
         let clamped_x = eye.x.clamp(-pad, max_x + pad);
         let clamped_z = eye.z.clamp(-pad, max_z + pad);
         let dx = clamped_x - eye.x;
         let dz = clamped_z - eye.z;
-        if dx.abs() > 1e-6 || dz.abs() > 1e-6 {
+        if dx.abs() > 1e-9 || dz.abs() > 1e-9 {
             self.target.x += dx;
             self.target.z += dz;
         }
     }
 
-    pub fn reset(&mut self, target: Vec3, distance: f32) {
+    pub fn reset(&mut self, target: DVec3, distance: f32) {
         self.target = target;
         self.distance = distance;
         self.yaw = 0.7;
@@ -151,7 +169,7 @@ mod tests {
     #[test]
     fn look_keeps_eye_fixed() {
         let mut cam = OrbitCamera {
-            target: Vec3::new(100.0, 0.0, 200.0),
+            target: Vec3::new(100.0, 0.0, 200.0).into(),
             distance: 500.0,
             yaw: 0.4,
             pitch: 0.5,
@@ -169,7 +187,7 @@ mod tests {
     #[test]
     fn fly_forward_moves_toward_look() {
         let mut cam = OrbitCamera {
-            target: Vec3::new(0.0, 0.0, 0.0),
+            target: Vec3::new(0.0, 0.0, 0.0).into(),
             distance: 100.0,
             yaw: 0.0,
             pitch: 0.0,
@@ -187,7 +205,7 @@ mod tests {
     #[test]
     fn fly_forward_dives_when_looking_down() {
         let mut cam = OrbitCamera {
-            target: Vec3::new(500.0, 100.0, 500.0),
+            target: Vec3::new(500.0, 100.0, 500.0).into(),
             distance: 800.0,
             yaw: 0.4,
             pitch: 0.9, // steep look-down
@@ -211,16 +229,16 @@ mod tests {
 
     #[test]
     fn look_then_clamp_keeps_eye_stable_near_world_edge() {
-        let world = (4096.0, 4096.0);
+        let world = (4096.0f32, 4096.0f32);
         let mut cam = OrbitCamera {
-            target: Vec3::new(2048.0, 100.0, 2048.0),
+            target: Vec3::new(2048.0, 100.0, 2048.0).into(),
             distance: 4500.0,
             yaw: 0.7,
             pitch: 0.6,
             ..OrbitCamera::default()
         };
         // Overview framing puts the eye outside the footprint.
-        assert!(cam.eye().x > world.0 || cam.eye().z > world.1);
+        assert!(cam.eye().x > f64::from(world.0) || cam.eye().z > f64::from(world.1));
         let eye_before = cam.eye();
         cam.look(80.0, -40.0);
         cam.clamp_to_world(world);
@@ -234,7 +252,7 @@ mod tests {
     #[test]
     fn fly_qe_changes_altitude() {
         let mut cam = OrbitCamera {
-            target: Vec3::new(100.0, 50.0, 200.0),
+            target: Vec3::new(100.0, 50.0, 200.0).into(),
             distance: 400.0,
             yaw: 1.0,
             pitch: 0.7,
@@ -246,5 +264,29 @@ mod tests {
         let y1 = cam.target.y;
         cam.fly(0.0, 0.0, -1.0, 1.0, false); // Q
         assert!(cam.target.y < y1, "Q should lower altitude");
+    }
+
+    #[test]
+    fn translated_large_coordinate_frames_produce_the_same_local_matrix() {
+        let mut a = OrbitCamera {
+            target: DVec3::new(5_000_000.25, 75.0, -5_000_000.5),
+            distance: 900.0,
+            yaw: 0.35,
+            pitch: 0.65,
+            ..OrbitCamera::default()
+        };
+        let origin_a = DVec2::new(5_000_000.0, -5_000_256.0);
+        let matrix_a = a.view_proj_relative_to(16.0 / 9.0, origin_a);
+        a.target.x += 256.0;
+        a.target.z -= 512.0;
+        let matrix_b = a.view_proj_relative_to(16.0 / 9.0, origin_a + DVec2::new(256.0, -512.0));
+        for (left, right) in matrix_a
+            .to_cols_array()
+            .into_iter()
+            .zip(matrix_b.to_cols_array())
+        {
+            assert!((left - right).abs() < 1.0e-6);
+        }
+        assert_eq!(a.target.x - 5_000_256.0, 0.25);
     }
 }

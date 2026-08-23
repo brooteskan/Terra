@@ -64,17 +64,17 @@ impl ClipmapRingLevel {
     /// Snap ring origin so vertices stay aligned across levels (Losasso & Hoppe).
     pub fn snap_origin(
         &self,
-        camera_x: f32,
-        camera_z: f32,
+        camera_x: f64,
+        camera_z: f64,
         bounds: ClipmapTraversalBounds,
-    ) -> (f32, f32) {
-        let half = self.coverage() * 0.5;
-        let snap = self.spacing.max(1e-6);
+    ) -> (f64, f64) {
+        let half = f64::from(self.coverage()) * 0.5;
+        let snap = f64::from(self.spacing.max(1e-6));
         let mut ox = ((camera_x - half) / snap).floor() * snap;
         let mut oz = ((camera_z - half) / snap).floor() * snap;
         if let ClipmapTraversalBounds::Bounded { world_x, world_z } = bounds {
-            let max_x = (world_x - self.coverage()).max(0.0);
-            let max_z = (world_z - self.coverage()).max(0.0);
+            let max_x = f64::from((world_x - self.coverage()).max(0.0));
+            let max_z = f64::from((world_z - self.coverage()).max(0.0));
             ox = ox.clamp(0.0, max_x);
             oz = oz.clamp(0.0, max_z);
         }
@@ -138,13 +138,44 @@ impl ClipmapConfig {
         }
     }
 
+    /// Build dyadic rings directly from an Infinite topology. The fallback grid
+    /// uses the configured coarsest sample lattice and only spans the active
+    /// camera horizon; it never represents a complete world.
+    pub fn for_infinite(topology: terra_core::InfiniteTopologyConfig, horizon_m: f64) -> Self {
+        let finest = topology.finest_spacing_m.max(1.0e-6) as f32;
+        let horizon = horizon_m.max(f64::from(finest));
+        let ring_grid_size = WorldGridConfig::for_world(129).grid_size;
+        let mut rings = Vec::new();
+        for lod in 0..=topology.max_lod.get() {
+            let spacing = finest * 2.0f32.powi(i32::from(lod));
+            rings.push(ClipmapRingLevel {
+                grid_size: ring_grid_size,
+                spacing,
+            });
+            if f64::from(spacing) * f64::from(ring_grid_size - 1) * 0.5 >= horizon {
+                break;
+            }
+        }
+        let coarsest_spacing = finest * 2.0f32.powi(i32::from(topology.max_lod.get()));
+        let required_cells = ((horizon * 2.0) / f64::from(coarsest_spacing))
+            .ceil()
+            .clamp(1.0, f64::from(u32::MAX - 1)) as u32;
+        let max_grid = crate::grid::TerrainGrid::max_resolution_for_device_limits();
+        let fallback = WorldGridConfig::for_world(required_cells.saturating_add(1).min(max_grid));
+        Self {
+            rings,
+            fallback,
+            skirt_depth: 0.0,
+        }
+    }
+
     /// Recompute snapped origins for every ring from the camera-centre XZ.
     pub fn ring_origins(
         &self,
-        camera_x: f32,
-        camera_z: f32,
+        camera_x: f64,
+        camera_z: f64,
         bounds: ClipmapTraversalBounds,
-    ) -> Vec<(f32, f32)> {
+    ) -> Vec<(f64, f64)> {
         self.rings
             .iter()
             .map(|ring| ring.snap_origin(camera_x, camera_z, bounds))
@@ -156,8 +187,8 @@ impl ClipmapConfig {
 #[derive(Debug, Clone, Copy)]
 pub struct ClipmapRingDraw {
     pub ring_index: usize,
-    pub origin_x: f32,
-    pub origin_z: f32,
+    pub origin_x: f64,
+    pub origin_z: f64,
     pub spacing: f32,
     pub grid_size: u32,
     /// Discard fragments whose Chebyshev distance from ring centre is below this
@@ -176,6 +207,8 @@ pub struct ClipmapPresentPlan {
     pub draw_fallback: bool,
     pub fallback_spacing: f32,
     pub fallback_grid_size: u32,
+    pub fallback_origin_x: f64,
+    pub fallback_origin_z: f64,
     pub fallback_exclude_half_extent: f32,
     /// Coarse → fine rings (fine wins depth; coarse holes prevent overdraw).
     pub rings: Vec<ClipmapRingDraw>,
@@ -183,8 +216,8 @@ pub struct ClipmapPresentPlan {
 
 #[derive(Debug, Clone, Copy)]
 pub struct ClipmapPresentInput {
-    pub camera_x: f32,
-    pub camera_z: f32,
+    pub camera_x: f64,
+    pub camera_z: f64,
     pub world_x: f32,
     pub world_z: f32,
     pub height_tex_w: u32,
@@ -204,9 +237,10 @@ impl ClipmapPresentPlan {
 
         // Prefer a single dense grid when it is at least as fine as the heightfield,
         // or when the world is small enough that rings buy nothing.
-        let use_single_grid = single_spacing <= tex_spacing * 1.25
-            || clipmap.rings.is_empty()
-            || extent <= dense_cells * tex_spacing * 1.1;
+        let use_single_grid = input.traversal_bounds != ClipmapTraversalBounds::Infinite
+            && (single_spacing <= tex_spacing * 1.25
+                || clipmap.rings.is_empty()
+                || extent <= dense_cells * tex_spacing * 1.1);
 
         if use_single_grid {
             return Self {
@@ -214,6 +248,8 @@ impl ClipmapPresentPlan {
                 draw_fallback: false,
                 fallback_spacing,
                 fallback_grid_size: clipmap.fallback.grid_size,
+                fallback_origin_x: 0.0,
+                fallback_origin_z: 0.0,
                 fallback_exclude_half_extent: 0.0,
                 rings: Vec::new(),
             };
@@ -246,12 +282,27 @@ impl ClipmapPresentPlan {
             .last()
             .map(|r| r.coverage() * 0.5)
             .unwrap_or(0.0);
+        let fallback_extent = f64::from(fallback_spacing)
+            * f64::from(clipmap.fallback.grid_size.saturating_sub(1).max(1));
+        let fallback_snap = f64::from(fallback_spacing.max(1.0e-6));
+        let (fallback_origin_x, fallback_origin_z) = if input.traversal_bounds
+            == ClipmapTraversalBounds::Infinite
+        {
+            (
+                ((input.camera_x - fallback_extent * 0.5) / fallback_snap).floor() * fallback_snap,
+                ((input.camera_z - fallback_extent * 0.5) / fallback_snap).floor() * fallback_snap,
+            )
+        } else {
+            (0.0, 0.0)
+        };
 
         Self {
             use_single_grid: false,
             draw_fallback: true,
             fallback_spacing,
             fallback_grid_size: clipmap.fallback.grid_size,
+            fallback_origin_x,
+            fallback_origin_z,
             fallback_exclude_half_extent: outer_half,
             rings: draws,
         }
@@ -395,8 +446,24 @@ mod tests {
         };
         let origins = cfg.ring_origins(-17.25, 9.5, ClipmapTraversalBounds::Infinite);
         for (ring, (x, z)) in cfg.rings.iter().zip(origins) {
-            assert_eq!(x.rem_euclid(ring.spacing), 0.0);
-            assert_eq!(z.rem_euclid(ring.spacing), 0.0);
+            assert_eq!(x.rem_euclid(f64::from(ring.spacing)), 0.0);
+            assert_eq!(z.rem_euclid(f64::from(ring.spacing)), 0.0);
         }
+    }
+
+    #[test]
+    fn infinite_config_uses_topology_spacing_and_horizon_fallback() {
+        let topology = terra_core::InfiniteTopologyConfig {
+            origin: terra_core::WorldPosition::ORIGIN,
+            tile_size: 256,
+            finest_spacing_m: 1.0,
+            max_lod: terra_core::Lod::try_new(12).unwrap(),
+        };
+        let cfg = ClipmapConfig::for_infinite(topology, 16_384.0);
+        assert_eq!(cfg.rings.first().unwrap().spacing, 1.0);
+        assert_eq!(cfg.rings.last().unwrap().spacing, 256.0);
+        assert!(cfg.rings.last().unwrap().coverage() * 0.5 >= 16_384.0);
+        assert_eq!(cfg.fallback.grid_size, 9);
+        assert_eq!(cfg.fallback.spacing_for_extent(32_768.0), 4096.0);
     }
 }

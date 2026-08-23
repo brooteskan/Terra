@@ -32,6 +32,12 @@ struct FrameUniforms {
     stream4: vec4<u32>,
     // x=terminal monolithic allowed, y=debug mode
     stream5: vec4<f32>,
+    // x=Infinite sparse addressing, y=directory capacity, z=max LOD
+    stream6: vec4<u32>,
+    // Signed finest-tile render anchor: x low/high, z low/high
+    stream7: vec4<u32>,
+    // x=finest spacing metres, y=finest tile span metres
+    stream8: vec4<f32>,
 };
 
 /// Physical page-table row (must match `GpuPageTableEntry`).
@@ -138,7 +144,12 @@ fn vs_main(v: VsIn) -> VsOut {
     );
     let huv = clamp(huv_raw, vec2<f32>(0.0), vec2<f32>(1.0));
 
-    let surface_h = sample_height_bilinear(huv);
+    var surface_h = 0.0;
+    if (u.stream6.x != 0u) {
+        surface_h = resolve_height_infinite(vec2<f32>(wx, wz)).height;
+    } else {
+        surface_h = sample_height_bilinear(huv);
+    }
     // grid.w = slab base height (below terrain min).
     let base_y = u.grid.w;
     let h = select(surface_h, base_y, v.use_base > 0.5);
@@ -147,7 +158,7 @@ fn vs_main(v: VsIn) -> VsOut {
     o.position = u.view_proj * vec4<f32>(world_pos, 1.0);
     o.world_pos = world_pos;
     o.face = v.face;
-    o.terrain_uv = huv_raw;
+    o.terrain_uv = select(huv_raw, vec2<f32>(0.5), u.stream6.x != 0u);
 
     if (v.face > 1.5) {
         o.normal = vec3<f32>(0.0, -1.0, 0.0);
@@ -164,10 +175,19 @@ fn vs_main(v: VsIn) -> VsOut {
             o.normal = vec3<f32>(0.0, 0.0, 1.0);
         }
     } else {
-        let ntex = textureDimensions(normal_tex);
-        let nx = i32(clamp(huv.x * f32(ntex.x - 1u), 0.0, f32(ntex.x - 1u)));
-        let ny = i32(clamp(huv.y * f32(ntex.y - 1u), 0.0, f32(ntex.y - 1u)));
-        o.normal = textureLoad(normal_tex, vec2<i32>(nx, ny), 0).xyz;
+        if (u.stream6.x != 0u) {
+            let d = max(u.stream8.x, 0.01);
+            let hx0 = resolve_height_infinite(vec2<f32>(wx - d, wz)).height;
+            let hx1 = resolve_height_infinite(vec2<f32>(wx + d, wz)).height;
+            let hz0 = resolve_height_infinite(vec2<f32>(wx, wz - d)).height;
+            let hz1 = resolve_height_infinite(vec2<f32>(wx, wz + d)).height;
+            o.normal = normalize(vec3<f32>(hx0 - hx1, 2.0 * d, hz0 - hz1));
+        } else {
+            let ntex = textureDimensions(normal_tex);
+            let nx = i32(clamp(huv.x * f32(ntex.x - 1u), 0.0, f32(ntex.x - 1u)));
+            let ny = i32(clamp(huv.y * f32(ntex.y - 1u), 0.0, f32(ntex.y - 1u)));
+            o.normal = textureLoad(normal_tex, vec2<i32>(nx, ny), 0).xyz;
+        }
     }
     return o;
 }
@@ -232,6 +252,90 @@ fn page_identity_current(e: PageTableEntry) -> bool {
         && e.content_revision_hi == u.stream3.w;
 }
 
+struct Signed64Words {
+    lo: u32,
+    hi: u32,
+};
+
+fn signed64_add_i32(value: Signed64Words, delta: i32) -> Signed64Words {
+    let delta_lo = bitcast<u32>(delta);
+    let delta_hi = select(0u, 0xffffffffu, delta < 0);
+    let lo = value.lo + delta_lo;
+    let carry = select(0u, 1u, lo < value.lo);
+    return Signed64Words(lo, value.hi + delta_hi + carry);
+}
+
+fn signed64_shift_right(value: Signed64Words, shift: u32) -> Signed64Words {
+    if (shift == 0u) { return value; }
+    let sign_word = select(0u, 0xffffffffu, bitcast<i32>(value.hi) < 0);
+    if (shift < 32u) {
+        return Signed64Words(
+            (value.lo >> shift) | (value.hi << (32u - shift)),
+            bitcast<u32>(bitcast<i32>(value.hi) >> shift),
+        );
+    }
+    if (shift < 64u) {
+        return Signed64Words(
+            bitcast<u32>(bitcast<i32>(value.hi) >> (shift - 32u)),
+            sign_word,
+        );
+    }
+    return Signed64Words(sign_word, sign_word);
+}
+
+fn sparse_hash(lod: u32, x: Signed64Words, z: Signed64Words) -> u32 {
+    var hash = 2166136261u;
+    hash = (hash ^ lod) * 16777619u;
+    hash = (hash ^ x.lo) * 16777619u;
+    hash = (hash ^ x.hi) * 16777619u;
+    hash = (hash ^ z.lo) * 16777619u;
+    hash = (hash ^ z.hi) * 16777619u;
+    return hash;
+}
+
+fn infinite_address(local_xz: vec2<f32>, lod: u32) -> vec4<u32> {
+    let tile_span = max(u.stream8.y, 1.0e-6);
+    let delta_x = i32(floor(local_xz.x / tile_span));
+    let delta_z = i32(floor(local_xz.y / tile_span));
+    let fine_x = signed64_add_i32(Signed64Words(u.stream7.x, u.stream7.y), delta_x);
+    let fine_z = signed64_add_i32(Signed64Words(u.stream7.z, u.stream7.w), delta_z);
+    let tile_x = signed64_shift_right(fine_x, lod);
+    let tile_z = signed64_shift_right(fine_z, lod);
+    return vec4<u32>(tile_x.lo, tile_x.hi, tile_z.lo, tile_z.hi);
+}
+
+fn lookup_tile_page_sparse(lod: u32, address: vec4<u32>) -> i32 {
+    let capacity = u.stream6.y;
+    if (capacity == 0u) { return -1; }
+    let mask = capacity - 1u;
+    var index = sparse_hash(
+        lod,
+        Signed64Words(address.x, address.y),
+        Signed64Words(address.z, address.w),
+    ) & mask;
+    for (var probe = 0u; probe < capacity; probe = probe + 1u) {
+        let mapping = virtual_page_table[index];
+        if (mapping.valid == 0u) { return -1; }
+        if (mapping.lod == lod
+            && mapping.tile_x == address.x && mapping.tile_x_hi == address.y
+            && mapping.tile_z == address.z && mapping.tile_z_hi == address.w) {
+            let max_pages = u32(max(u.stream.w, 1.0));
+            if (mapping.physical_slot >= max_pages) { return -1; }
+            let e = page_table[mapping.physical_slot];
+            if (e.valid != 0u && e.generation == mapping.generation
+                && e.level == lod
+                && e.tile_x == address.x && e.tile_x_hi == address.y
+                && e.tile_z == address.z && e.tile_z_hi == address.w
+                && page_identity_current(e)) {
+                return i32(mapping.physical_slot);
+            }
+            return -1;
+        }
+        index = (index + 1u) & mask;
+    }
+    return -1;
+}
+
 fn lookup_tile_page(level: u32, tile_x: u32, tile_z: u32) -> i32 {
     let level_count = u.stream4.x;
     if (level >= level_count) { return -1; }
@@ -270,6 +374,111 @@ fn sample_page_bilinear(page: u32, uv: vec2<f32>) -> f32 {
     let h01 = textureLoad(tile_atlas, vec2<i32>(p0.x, p1.y), i32(page), 0).r;
     let h11 = textureLoad(tile_atlas, p1, i32(page), 0).r;
     return mix(mix(h00, h10, f.x), mix(h01, h11, f.x), f.y);
+}
+
+fn infinite_tile_origin_local(local_xz: vec2<f32>, lod: u32) -> vec2<f32> {
+    let fine_span = max(u.stream8.y, 1.0e-6);
+    let level_scale = exp2(f32(lod));
+    var mask = 0u;
+    if (lod > 0u && lod < 32u) {
+        mask = (1u << lod) - 1u;
+    }
+    let anchor_phase = vec2<f32>(
+        f32(u.stream7.x & mask),
+        f32(u.stream7.z & mask),
+    );
+    let fine_position = local_xz / fine_span;
+    let group = floor((anchor_phase + fine_position) / level_scale) * level_scale
+        - anchor_phase;
+    return group * fine_span;
+}
+
+fn sample_page_infinite(page: u32, local_xz: vec2<f32>, lod: u32) -> f32 {
+    let e = page_table[page];
+    let spacing = max(u.stream8.x, 1.0e-6) * exp2(f32(lod));
+    let tile_origin = infinite_tile_origin_local(local_xz, lod);
+    let p = (local_xz - tile_origin) / spacing + vec2<f32>(f32(e.halo));
+    let limit = vec2<i32>(
+        i32(e.width + e.halo * 2u - 1u),
+        i32(e.height + e.halo * 2u - 1u),
+    );
+    let p0 = clamp(vec2<i32>(floor(p)), vec2<i32>(0), limit);
+    let p1 = min(p0 + vec2<i32>(1), limit);
+    let f = fract(p);
+    let h00 = textureLoad(tile_atlas, p0, i32(page), 0).r;
+    let h10 = textureLoad(tile_atlas, vec2<i32>(p1.x, p0.y), i32(page), 0).r;
+    let h01 = textureLoad(tile_atlas, vec2<i32>(p0.x, p1.y), i32(page), 0).r;
+    let h11 = textureLoad(tile_atlas, p1, i32(page), 0).r;
+    return mix(mix(h00, h10, f.x), mix(h01, h11, f.x), f.y);
+}
+
+fn resolve_height_infinite_from(local_xz: vec2<f32>, start_lod: u32) -> ResolvedHeightSample {
+    let max_lod = u.stream6.z;
+    for (var lod = start_lod; lod <= max_lod; lod = lod + 1u) {
+        let address = infinite_address(local_xz, lod);
+        let page = lookup_tile_page_sparse(lod, address);
+        if (page >= 0) {
+            return ResolvedHeightSample(
+                sample_page_infinite(u32(page), local_xz, lod),
+                select(STREAM_ANCESTOR, STREAM_EXACT, lod == 0u),
+                lod,
+            );
+        }
+    }
+    return ResolvedHeightSample(u.world.z, STREAM_TERMINAL, max_lod);
+}
+
+fn infinite_page_edge_weight(page: u32, local_xz: vec2<f32>, lod: u32) -> f32 {
+    let e = page_table[page];
+    let spacing = max(u.stream8.x, 1.0e-6) * exp2(f32(lod));
+    let level_span = max(u.stream8.y, 1.0e-6) * exp2(f32(lod));
+    let tile_origin = infinite_tile_origin_local(local_xz, lod);
+    let local = (local_xz - tile_origin) / spacing;
+    let band = 4.0;
+    var weight = 1.0;
+    if (local.x < band
+        && lookup_tile_page_sparse(lod, infinite_address(local_xz - vec2<f32>(level_span, 0.0), lod)) < 0) {
+        weight = min(weight, smoothstep(0.0, band, local.x));
+    }
+    if (f32(e.width - 1u) - local.x < band
+        && lookup_tile_page_sparse(lod, infinite_address(local_xz + vec2<f32>(level_span, 0.0), lod)) < 0) {
+        weight = min(weight, smoothstep(0.0, band, f32(e.width - 1u) - local.x));
+    }
+    if (local.y < band
+        && lookup_tile_page_sparse(lod, infinite_address(local_xz - vec2<f32>(0.0, level_span), lod)) < 0) {
+        weight = min(weight, smoothstep(0.0, band, local.y));
+    }
+    if (f32(e.height - 1u) - local.y < band
+        && lookup_tile_page_sparse(lod, infinite_address(local_xz + vec2<f32>(0.0, level_span), lod)) < 0) {
+        weight = min(weight, smoothstep(0.0, band, f32(e.height - 1u) - local.y));
+    }
+    return weight;
+}
+
+fn resolve_height_infinite(local_xz: vec2<f32>) -> ResolvedHeightSample {
+    let selected = resolve_height_infinite_from(local_xz, 0u);
+    if (selected.sample_class == STREAM_TERMINAL || selected.level >= u.stream6.z) {
+        return selected;
+    }
+    let address = infinite_address(local_xz, selected.level);
+    let page = lookup_tile_page_sparse(selected.level, address);
+    if (page < 0) { return selected; }
+    let e = page_table[u32(page)];
+    let transition_frames = f32(max(u.stream4.w, 1u));
+    let time_weight = select(
+        smoothstep(0.0, 1.0, f32(u.stream4.z - e.published_frame_lo) / transition_frames),
+        1.0,
+        u.stream4.w == 0u,
+    );
+    let weight = min(time_weight, infinite_page_edge_weight(u32(page), local_xz, selected.level));
+    if (weight >= 0.999) { return selected; }
+    let ancestor = resolve_height_infinite_from(local_xz, selected.level + 1u);
+    if (ancestor.sample_class == STREAM_TERMINAL) { return selected; }
+    return ResolvedHeightSample(
+        mix(ancestor.height, selected.height, weight),
+        STREAM_BLEND,
+        selected.level,
+    );
 }
 
 fn resolve_from_level(uv: vec2<f32>, start_level: i32) -> ResolvedHeightSample {
@@ -608,7 +817,12 @@ fn fs_main(i: VsOut) -> @location(0) vec4<f32> {
         }
     }
     if (u.stream.x > 0.5 && u.stream5.y > 0.5 && i.face < 0.5) {
-        let resolved = resolve_height_streamed(clamp(i.terrain_uv, vec2<f32>(0.0), vec2<f32>(1.0)));
+        var resolved: ResolvedHeightSample;
+        if (u.stream6.x != 0u) {
+            resolved = resolve_height_infinite(i.world_pos.xz);
+        } else {
+            resolved = resolve_height_streamed(clamp(i.terrain_uv, vec2<f32>(0.0), vec2<f32>(1.0)));
+        }
         if (resolved.sample_class == STREAM_EXACT) {
             return vec4<f32>(0.10, 0.85, 0.25, 1.0);
         }
@@ -624,6 +838,27 @@ fn fs_main(i: VsOut) -> @location(0) vec4<f32> {
             vec4<f32>(0.75, 0.2, 0.95, 1.0),
             u.stream5.x > 0.5,
         );
+    }
+    if (u.stream6.x != 0u) {
+        let resolved = resolve_height_infinite(i.world_pos.xz);
+        if (resolved.sample_class == STREAM_TERMINAL) {
+            discard;
+        }
+        var n = normalize(i.normal);
+        if (dot(n, n) < 1.0e-6) {
+            n = vec3<f32>(0.0, 1.0, 0.0);
+        }
+        let light = normalize(-u.light_dir.xyz);
+        let ndl = max(dot(n, light), 0.0);
+        let span = max(u.world.w - u.world.z, 1.0e-3);
+        let h = clamp((i.world_pos.y - u.world.z) / span, 0.0, 1.0);
+        let low = vec3<f32>(0.29, 0.30, 0.23);
+        let high = vec3<f32>(0.50, 0.49, 0.45);
+        var color = mix(low, high, h) * (0.34 + 0.66 * ndl);
+        let distance_m = length(i.world_pos - u.eye.xyz);
+        let fog_amount = clamp(1.0 - exp(-distance_m * max(u.fog.x, 1.0e-6)), 0.0, u.fog.z);
+        color = mix(color, vec3<f32>(0.48, 0.55, 0.64), fog_amount * u.raster.z);
+        return vec4<f32>(aces_tonemap(color * max(u.eye.w, 0.1)), 1.0);
     }
     // Slab sides / underside — World Creator–style light cliff faces.
     if (i.face > 0.5) {

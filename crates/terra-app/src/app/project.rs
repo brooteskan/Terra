@@ -491,11 +491,13 @@ impl TerraApp {
                 (
                     (local_span, local_span),
                     terra_render::TerrainTraversalMode::Infinite,
-                    Some((
-                        settings.origin.x_m() as f32,
-                        settings.origin.z_m() as f32,
-                        settings.preview_radius_m as f32,
-                    )),
+                    settings.topology().ok().map(|topology| {
+                        (
+                            topology.config(),
+                            settings.horizon_m,
+                            settings.preview_radius_m as f32,
+                        )
+                    }),
                 )
             }
         };
@@ -556,8 +558,18 @@ impl TerraApp {
         }
         if let Some(renderer) = self.renderer.as_mut() {
             renderer.reset_project_state(world_size, ocean_level, traversal_mode);
-            if let Some((origin_x, origin_z, preview_radius)) = infinite_frame {
-                renderer.frame_camera_to_infinite(origin_x, origin_z, preview_radius);
+            if let Some((topology, horizon_m, preview_radius)) = infinite_frame {
+                renderer.configure_infinite_presentation(
+                    terra_render::InfinitePresentationConfig {
+                        topology,
+                        horizon_m,
+                    },
+                );
+                renderer.frame_camera_to_infinite(
+                    topology.origin.x_m(),
+                    topology.origin.z_m(),
+                    preview_radius,
+                );
             }
         }
         // Preserve the GPU allocation, but make all previous-document pages

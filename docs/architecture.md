@@ -308,7 +308,12 @@ capacity-bounded scheduler. Current residents are touched, obsolete queued and i
 work is cancelled, and coarse/ancestor protection moves with demand. GPU-compatible
 plans publish tile-domain results directly; other admitted graphs publish packed CPU
 results. Both paths allocate only after live content validation and update the sparse
-directory from the authoritative cache. Renderer lookup remains camera-relative work.
+directory from the authoritative cache. Renderer lookup is camera-relative: the camera
+remains fixed-origin `f64`, a transient origin is snapped to the current finest tile, and
+clipmap geometry narrows to `f32` only after subtracting that origin. The shader rebuilds
+full signed tile addresses from the render anchor, probes the sparse directory, and walks
+resident ancestors without consulting the finite monolithic heightfield. Rebase state is
+presentation-only and never participates in content identity or residency invalidation.
 
 Output edits advance `TerrainRuntime::output_revision` through the app's single revision
 boundary, which drops old pyramid content and clears pending uploads, the cache and page
