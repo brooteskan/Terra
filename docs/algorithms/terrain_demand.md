@@ -1,9 +1,9 @@
 # Terrain camera demand
 
 Viewport demand is a deterministic, residency-free description of which immutable
-height-pyramid tiles would improve the current camera view. `TerrainDemandPlanner` owns
-only its previous refinement decisions for hysteresis. It does not contain atlas slots,
-page handles, publication state, or a copy of `TileResidencyCache`.
+terrain tiles would improve the current camera view. `TerrainDemandPlanner` owns only
+its previous refinement decisions for hysteresis. It does not contain atlas slots, page
+handles, publication state, or a copy of `TileResidencyCache`.
 
 ## Inputs and error projection
 
@@ -43,6 +43,26 @@ non-power-of-two levels where one child footprint can intersect multiple parent 
 The final output is unique and ordered coarse-to-fine, guaranteeing that the current
 consumer and the later work scheduler can establish coverage before optional detail.
 
+## Infinite sparse topology
+
+Infinite planning is a separate traversal over shared projection, culling, ordering, and
+budget primitives. It never invents a root tile or enumerates a complete level. A finite
+half-open tile window at the configured coarsest LOD is derived directly from the camera
+centre and horizon. That entire window is emitted as `CoarseCoverage` before refinement;
+a plan is rejected if mandatory coverage cannot fit the tile and node limits.
+
+Visible refinement is restricted to the preview radius. Signed children use the
+`terra-world` Euclidean power-of-two hierarchy, and a refinement is admitted only when
+its complete chain through the active coarsest window fits atomically. Planning AABBs
+remain `f64` in fixed-origin X/Z until they are translated relative to the eye for
+clip-space tests. Replanning replaces the previous Infinite hysteresis set, so travel
+does not accumulate addresses or work.
+
+Infinite geometric error is indexed by LOD rather than by a global tile array. The
+initial model uses a conservative configured or certified height/error envelope; future
+generated tiles may provide sparse certified envelopes without making visited area a
+planner data structure.
+
 ## Production consumption
 
 `terra-app` converts the current renderer camera into planner input after compact error
@@ -58,3 +78,8 @@ content identities at atlas publication. See
 [Terrain tile work scheduling](terrain_work_scheduling.md). Resident-ancestor shader
 resolution remains separate renderer work: the plan is never passed to the renderer, and
 the dense GPU page directory alone determines which exact or ancestor page is sampled.
+
+Infinite plans already produce canonical signed `TerrainTileKey` values accepted by
+`TerrainEvaluationDomain::for_infinite_tile`. Sparse GPU directory publication and
+eviction remain the residency slice; the bounded dense atlas is never given an Infinite
+address.

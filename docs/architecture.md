@@ -255,6 +255,14 @@ neither queries nor mutates residency. The consumer may skip exact current pages
 querying `GpuTileAtlas`'s authoritative cache before publication. See
 [Terrain camera demand](algorithms/terrain_demand.md).
 
+For Infinite projects the planner instead derives a finite signed window at the
+configured coarsest LOD from camera centre and horizon. Mandatory coarse coverage is
+inserted before visible SSE refinement, each refinement is closed over its Euclidean
+ancestor chain, and node/tile budgets cap every plan. Fixed-origin bounds are translated
+relative to the eye before `f32` frustum projection. Error policy is O(LOD), with room
+for certified sparse tile envelopes; there is no dense global metadata array. Replanning
+replaces hysteresis state rather than accumulating travelled addresses.
+
 `TerrainTileWorkScheduler` is the bounded consumer between demand and atlas
 publication. Its request key includes field/level/tile, compiled-plan revision, and
 output revision; its full content stamp also carries document generation and immutable
@@ -291,6 +299,10 @@ the world address into an unsigned level rectangle. The GPU uses split-origin
 coordinates and performs backend preflight before allocation; its packed result
 removes operation guards without finite-world edge clamping. OpenSimplex and
 Worley use the CPU realization until matching GPU contracts exist.
+
+Infinite demand keys feed that same tile-domain contract, but are deliberately not
+submitted to the bounded atlas's dense virtual directory. Sparse page addressing,
+allocation, eviction, and publication are owned by the following residency slice.
 
 Output edits advance `TerrainRuntime::output_revision` through the app's single revision
 boundary, which drops old pyramid content and clears pending uploads, the cache and page

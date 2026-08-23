@@ -16,7 +16,8 @@ pub use cache::{
     TileCacheStats, TilePageHandle, TileResidencyCache,
 };
 pub use demand::{
-    conservative_geometric_errors, TerrainDemandClass, TerrainDemandConfig, TerrainDemandError,
+    conservative_geometric_errors, InfiniteTerrainDemandConfig, InfiniteTerrainDemandView,
+    InfiniteTerrainErrorModel, TerrainDemandClass, TerrainDemandConfig, TerrainDemandError,
     TerrainDemandPlan, TerrainDemandPlanner, TerrainDemandView, TerrainTileDemand,
 };
 pub use domain::{

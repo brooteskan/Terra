@@ -4,6 +4,7 @@ use crate::heightfield::TileId;
 use glam::{Mat4, Vec3, Vec4};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use terra_world::{InfiniteTopology, Lod, TileAddress, WorldError, WorldPosition, WorldRect};
 use thiserror::Error;
 
 /// Camera-driven terrain demand policy. Tile and node limits bound both the
@@ -42,6 +43,80 @@ pub struct TerrainDemandView {
     pub max_height: f32,
 }
 
+/// Camera state for an unbounded topology. X/Z positions remain authoritative
+/// `f64` world coordinates; `relative_view_proj` observes positions translated
+/// so the eye is at the origin before they are narrowed for clip-space tests.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct InfiniteTerrainDemandView {
+    pub eye_world: WorldPosition,
+    pub coverage_center_world: WorldPosition,
+    pub eye_height: f32,
+    pub relative_view_proj: Mat4,
+    pub fov_y: f32,
+    pub near: f32,
+    pub viewport_width_px: u32,
+    pub viewport_height_px: u32,
+    pub min_height: f32,
+    pub max_height: f32,
+}
+
+/// Persistent-world radii used to derive a finite sparse planning window.
+/// Work limits remain in [`TerrainDemandConfig`] and are intentionally transient.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct InfiniteTerrainDemandConfig {
+    pub preview_radius_m: f64,
+    pub horizon_m: f64,
+}
+
+/// Conservative world-space approximation error indexed only by LOD. This is
+/// O(topology depth), never O(visited area), and can later be tightened by a
+/// certified sparse metadata source without changing planner traversal.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InfiniteTerrainErrorModel {
+    errors_by_lod: Vec<f32>,
+}
+
+impl InfiniteTerrainErrorModel {
+    pub fn try_new(
+        topology: &InfiniteTopology,
+        errors_by_lod: Vec<f32>,
+    ) -> Result<Self, TerrainDemandError> {
+        let required = usize::from(topology.config().max_lod.get()) + 1;
+        if errors_by_lod.len() < required
+            || errors_by_lod
+                .iter()
+                .take(required)
+                .any(|error| !error.is_finite() || *error < 0.0)
+        {
+            return Err(TerrainDemandError::InvalidInfiniteErrorModel);
+        }
+        Ok(Self {
+            errors_by_lod: errors_by_lod[..required].to_vec(),
+        })
+    }
+
+    /// Safe initial model when generated sparse tiles have no certified local
+    /// envelope yet. The configured height span bounds any parent approximation.
+    pub fn from_height_span(
+        topology: &InfiniteTopology,
+        min_height: f32,
+        max_height: f32,
+    ) -> Result<Self, TerrainDemandError> {
+        if !min_height.is_finite() || !max_height.is_finite() {
+            return Err(TerrainDemandError::InvalidInfiniteErrorModel);
+        }
+        let span = (max_height - min_height).abs().max(1.0e-3);
+        Self::try_new(
+            topology,
+            vec![span; usize::from(topology.config().max_lod.get()) + 1],
+        )
+    }
+
+    fn error(&self, address: TileAddress) -> f32 {
+        self.errors_by_lod[usize::from(address.lod.get())]
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TerrainDemandClass {
     CoarseCoverage,
@@ -76,6 +151,26 @@ pub enum TerrainDemandError {
     InvalidConfig,
     #[error("invalid demand view")]
     InvalidView,
+    #[error("invalid Infinite demand configuration")]
+    InvalidInfiniteConfig,
+    #[error("invalid Infinite geometric-error model")]
+    InvalidInfiniteErrorModel,
+    #[error(
+        "mandatory Infinite coarse coverage requires {required} tiles and nodes; limits are {tile_limit} tiles and {node_limit} nodes"
+    )]
+    InsufficientCoverageBudget {
+        required: usize,
+        tile_limit: usize,
+        node_limit: usize,
+    },
+    #[error("Infinite demand spatial calculation failed: {0}")]
+    Spatial(WorldError),
+}
+
+impl From<WorldError> for TerrainDemandError {
+    fn from(value: WorldError) -> Self {
+        Self::Spatial(value)
+    }
 }
 
 /// Convert local child-versus-parent errors into a conservative top-down error
@@ -157,16 +252,25 @@ struct NodeCandidate {
     distance_m: f32,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct InfiniteNodeCandidate {
+    address: TileAddress,
+    projected_error_px: f32,
+    distance_m: f32,
+}
+
 /// Stateful only for threshold hysteresis. The retained keys describe the last
 /// refinement decision and are not a mirror of current or intended residency.
 #[derive(Debug, Default, Clone)]
 pub struct TerrainDemandPlanner {
     previously_refined: BTreeSet<NodeKey>,
+    previously_refined_infinite: BTreeSet<TileAddress>,
 }
 
 impl TerrainDemandPlanner {
     pub fn reset(&mut self) {
         self.previously_refined.clear();
+        self.previously_refined_infinite.clear();
     }
 
     pub fn plan(
@@ -317,6 +421,183 @@ impl TerrainDemandPlanner {
             tile_budget_exhausted,
         })
     }
+
+    /// Plan one finite camera-centred window over the signed sparse hierarchy.
+    /// Mandatory horizon coverage is established before any visible refinement,
+    /// and every admitted refinement is closed over its Euclidean parent chain.
+    pub fn plan_infinite(
+        &mut self,
+        topology: &InfiniteTopology,
+        errors: &InfiniteTerrainErrorModel,
+        view: InfiniteTerrainDemandView,
+        config: TerrainDemandConfig,
+        infinite: InfiniteTerrainDemandConfig,
+    ) -> Result<TerrainDemandPlan, TerrainDemandError> {
+        validate_infinite_inputs(topology, errors, view, config, infinite)?;
+
+        let coverage_rect = centered_world_rect(view.coverage_center_world, infinite.horizon_m)?;
+        let coverage_range =
+            topology.addresses_intersecting(coverage_rect, topology.config().max_lod)?;
+        let coverage_count = coverage_range.checked_len()?;
+        if coverage_count > config.max_demand_tiles || coverage_count > config.max_visited_nodes {
+            return Err(TerrainDemandError::InsufficientCoverageBudget {
+                required: coverage_count,
+                tile_limit: config.max_demand_tiles,
+                node_limit: config.max_visited_nodes,
+            });
+        }
+
+        let mut demands = BTreeMap::<TileAddress, TerrainTileDemand>::new();
+        let mut refined = BTreeSet::new();
+        let mut queued = BTreeSet::new();
+        let mut frontier = VecDeque::new();
+        let mut visited_nodes = 0usize;
+        let mut culled_nodes = 0usize;
+        let mut node_budget_exhausted = false;
+        let mut tile_budget_exhausted = false;
+
+        let mut coverage = coverage_range.iter().collect::<Vec<_>>();
+        coverage.sort_by(|a, b| compare_infinite_addresses_by_distance(topology, view, *a, *b));
+        for address in &coverage {
+            visited_nodes += 1;
+            let candidate = infinite_candidate(topology, errors, view, *address)?;
+            demands.insert(
+                *address,
+                TerrainTileDemand {
+                    key: TerrainTileKey::height(*address),
+                    class: TerrainDemandClass::CoarseCoverage,
+                    projected_error_px: candidate.projected_error_px,
+                    distance_m: candidate.distance_m,
+                },
+            );
+        }
+
+        let mut first_children = Vec::new();
+        for address in coverage {
+            if address.lod == Lod::FINEST {
+                continue;
+            }
+            for child in topology.children(address)? {
+                if queued.insert(child)
+                    && tile_intersects_radius(
+                        topology,
+                        child,
+                        view.coverage_center_world,
+                        infinite.preview_radius_m,
+                    )?
+                {
+                    first_children.push(infinite_candidate(topology, errors, view, child)?);
+                }
+            }
+        }
+        first_children.sort_by(compare_infinite_candidates);
+        frontier.extend(first_children);
+
+        while let Some(candidate) = frontier.pop_front() {
+            if visited_nodes >= config.max_visited_nodes {
+                node_budget_exhausted = true;
+                break;
+            }
+            visited_nodes += 1;
+            let address = candidate.address;
+            let bounds = infinite_tile_relative_bounds(topology, address, view)?;
+            if aabb_outside_clip(bounds, view.relative_view_proj) {
+                culled_nodes += 1;
+                continue;
+            }
+
+            let selected = if self.previously_refined_infinite.contains(&address) {
+                candidate.projected_error_px >= config.coarsen_error_px
+            } else {
+                candidate.projected_error_px > config.target_error_px
+            };
+            if !selected {
+                continue;
+            }
+
+            let ancestors = infinite_parent_chain(topology, address)?;
+            let missing = ancestors
+                .iter()
+                .copied()
+                .filter(|ancestor| !demands.contains_key(ancestor))
+                .collect::<Vec<_>>();
+            let needed = 1usize.saturating_add(missing.len());
+            if demands.len().saturating_add(needed) > config.max_demand_tiles {
+                tile_budget_exhausted = true;
+                continue;
+            }
+
+            for ancestor in missing {
+                let ancestor_candidate = infinite_candidate(topology, errors, view, ancestor)?;
+                demands.insert(
+                    ancestor,
+                    TerrainTileDemand {
+                        key: TerrainTileKey::height(ancestor),
+                        class: if ancestor.lod == topology.config().max_lod {
+                            TerrainDemandClass::CoarseCoverage
+                        } else {
+                            TerrainDemandClass::FallbackAncestor
+                        },
+                        projected_error_px: ancestor_candidate.projected_error_px,
+                        distance_m: ancestor_candidate.distance_m,
+                    },
+                );
+            }
+            for ancestor in &ancestors {
+                if ancestor.lod != topology.config().max_lod {
+                    if let Some(demand) = demands.get_mut(ancestor) {
+                        demand.class = TerrainDemandClass::FallbackAncestor;
+                    }
+                }
+            }
+            refined.insert(address);
+            demands.entry(address).or_insert_with(|| TerrainTileDemand {
+                key: TerrainTileKey::height(address),
+                class: TerrainDemandClass::Refinement,
+                projected_error_px: candidate.projected_error_px,
+                distance_m: candidate.distance_m,
+            });
+
+            if address.lod != Lod::FINEST {
+                let mut children = Vec::new();
+                for child in topology.children(address)? {
+                    if queued.insert(child)
+                        && tile_intersects_radius(
+                            topology,
+                            child,
+                            view.coverage_center_world,
+                            infinite.preview_radius_m,
+                        )?
+                    {
+                        children.push(infinite_candidate(topology, errors, view, child)?);
+                    }
+                }
+                children.sort_by(compare_infinite_candidates);
+                frontier.extend(children);
+            }
+        }
+
+        self.previously_refined_infinite = refined;
+        let mut tiles = demands.into_values().collect::<Vec<_>>();
+        tiles.sort_by(|a, b| {
+            b.key
+                .address
+                .lod
+                .cmp(&a.key.address.lod)
+                .then_with(|| a.class.cmp(&b.class))
+                .then_with(|| b.projected_error_px.total_cmp(&a.projected_error_px))
+                .then_with(|| a.distance_m.total_cmp(&b.distance_m))
+                .then_with(|| a.key.address.coord.z.cmp(&b.key.address.coord.z))
+                .then_with(|| a.key.address.coord.x.cmp(&b.key.address.coord.x))
+        });
+        Ok(TerrainDemandPlan {
+            tiles,
+            visited_nodes,
+            culled_nodes,
+            node_budget_exhausted,
+            tile_budget_exhausted,
+        })
+    }
 }
 
 fn validate_inputs(
@@ -357,6 +638,175 @@ fn validate_inputs(
         return Err(TerrainDemandError::InvalidView);
     }
     Ok(())
+}
+
+fn validate_infinite_inputs(
+    topology: &InfiniteTopology,
+    errors: &InfiniteTerrainErrorModel,
+    view: InfiniteTerrainDemandView,
+    config: TerrainDemandConfig,
+    infinite: InfiniteTerrainDemandConfig,
+) -> Result<(), TerrainDemandError> {
+    if !config.target_error_px.is_finite()
+        || !config.coarsen_error_px.is_finite()
+        || config.target_error_px <= 0.0
+        || config.coarsen_error_px < 0.0
+        || config.coarsen_error_px >= config.target_error_px
+        || config.max_demand_tiles == 0
+        || config.max_visited_nodes == 0
+    {
+        return Err(TerrainDemandError::InvalidConfig);
+    }
+    if !view.relative_view_proj.is_finite()
+        || !view.eye_height.is_finite()
+        || !view.fov_y.is_finite()
+        || !view.near.is_finite()
+        || !view.min_height.is_finite()
+        || !view.max_height.is_finite()
+        || view.fov_y <= 0.0
+        || view.fov_y >= std::f32::consts::PI
+        || view.near <= 0.0
+        || view.viewport_width_px == 0
+        || view.viewport_height_px == 0
+    {
+        return Err(TerrainDemandError::InvalidView);
+    }
+    if !infinite.preview_radius_m.is_finite()
+        || !infinite.horizon_m.is_finite()
+        || infinite.preview_radius_m <= 0.0
+        || infinite.horizon_m < infinite.preview_radius_m
+    {
+        return Err(TerrainDemandError::InvalidInfiniteConfig);
+    }
+    let required = usize::from(topology.config().max_lod.get()) + 1;
+    if errors.errors_by_lod.len() < required {
+        return Err(TerrainDemandError::InvalidInfiniteErrorModel);
+    }
+    Ok(())
+}
+
+fn centered_world_rect(
+    center: WorldPosition,
+    radius_m: f64,
+) -> Result<WorldRect, TerrainDemandError> {
+    let min = WorldPosition::try_new(center.x_m() - radius_m, center.z_m() - radius_m)?;
+    let max = WorldPosition::try_new(center.x_m() + radius_m, center.z_m() + radius_m)?;
+    Ok(WorldRect::try_new(min, max)?)
+}
+
+fn tile_intersects_radius(
+    topology: &InfiniteTopology,
+    address: TileAddress,
+    center: WorldPosition,
+    radius_m: f64,
+) -> Result<bool, TerrainDemandError> {
+    let rect = topology.tile_extent(address)?.world;
+    let nearest_x = center.x_m().clamp(rect.min().x_m(), rect.max().x_m());
+    let nearest_z = center.z_m().clamp(rect.min().z_m(), rect.max().z_m());
+    let dx = nearest_x - center.x_m();
+    let dz = nearest_z - center.z_m();
+    Ok(dx.mul_add(dx, dz * dz) <= radius_m * radius_m)
+}
+
+fn infinite_tile_relative_bounds(
+    topology: &InfiniteTopology,
+    address: TileAddress,
+    view: InfiniteTerrainDemandView,
+) -> Result<(Vec3, Vec3), TerrainDemandError> {
+    let rect = topology.tile_extent(address)?.world;
+    let min_y = view.min_height.min(view.max_height) - view.eye_height;
+    let max_y = view
+        .min_height
+        .max(view.max_height)
+        .max(view.min_height.min(view.max_height) + 1.0e-3)
+        - view.eye_height;
+    let min = Vec3::new(
+        relative_f64_to_f32(rect.min().x_m() - view.eye_world.x_m())?,
+        min_y,
+        relative_f64_to_f32(rect.min().z_m() - view.eye_world.z_m())?,
+    );
+    let max = Vec3::new(
+        relative_f64_to_f32(rect.max().x_m() - view.eye_world.x_m())?,
+        max_y,
+        relative_f64_to_f32(rect.max().z_m() - view.eye_world.z_m())?,
+    );
+    Ok((min, max))
+}
+
+fn relative_f64_to_f32(value: f64) -> Result<f32, TerrainDemandError> {
+    if !value.is_finite() || value.abs() > f64::from(f32::MAX) {
+        return Err(TerrainDemandError::Spatial(WorldError::ArithmeticOverflow));
+    }
+    Ok(value as f32)
+}
+
+fn infinite_candidate(
+    topology: &InfiniteTopology,
+    errors: &InfiniteTerrainErrorModel,
+    view: InfiniteTerrainDemandView,
+    address: TileAddress,
+) -> Result<InfiniteNodeCandidate, TerrainDemandError> {
+    let bounds = infinite_tile_relative_bounds(topology, address, view)?;
+    let distance_m = distance_to_aabb(Vec3::ZERO, bounds);
+    Ok(InfiniteNodeCandidate {
+        address,
+        projected_error_px: errors.error(address) * infinite_pixel_projection_scale(view)
+            / distance_m.max(view.near),
+        distance_m,
+    })
+}
+
+fn infinite_pixel_projection_scale(view: InfiniteTerrainDemandView) -> f32 {
+    view.viewport_height_px as f32 / (2.0 * (view.fov_y * 0.5).tan())
+}
+
+fn compare_infinite_candidates(a: &InfiniteNodeCandidate, b: &InfiniteNodeCandidate) -> Ordering {
+    b.projected_error_px
+        .total_cmp(&a.projected_error_px)
+        .then_with(|| a.distance_m.total_cmp(&b.distance_m))
+        .then_with(|| a.address.cmp(&b.address))
+}
+
+fn compare_infinite_addresses_by_distance(
+    topology: &InfiniteTopology,
+    view: InfiniteTerrainDemandView,
+    a: TileAddress,
+    b: TileAddress,
+) -> Ordering {
+    let distance = |address| {
+        let rect = topology
+            .tile_extent(address)
+            .expect("validated Infinite coverage address")
+            .world;
+        let nearest_x = view
+            .coverage_center_world
+            .x_m()
+            .clamp(rect.min().x_m(), rect.max().x_m());
+        let nearest_z = view
+            .coverage_center_world
+            .z_m()
+            .clamp(rect.min().z_m(), rect.max().z_m());
+        let dx = nearest_x - view.coverage_center_world.x_m();
+        let dz = nearest_z - view.coverage_center_world.z_m();
+        dx.mul_add(dx, dz * dz)
+    };
+    distance(a)
+        .total_cmp(&distance(b))
+        .then_with(|| a.coord.z.cmp(&b.coord.z))
+        .then_with(|| a.coord.x.cmp(&b.coord.x))
+}
+
+fn infinite_parent_chain(
+    topology: &InfiniteTopology,
+    address: TileAddress,
+) -> Result<Vec<TileAddress>, TerrainDemandError> {
+    let mut parents = Vec::new();
+    let mut child = address;
+    while child.lod < topology.config().max_lod {
+        child = topology.parent(child)?;
+        parents.push(child);
+    }
+    Ok(parents)
 }
 
 fn terrain_key(pyramid: &TerrainPyramid, key: NodeKey) -> TerrainTileKey {
@@ -503,6 +953,7 @@ fn aabb_outside_clip(bounds: (Vec3, Vec3), view_proj: Mat4) -> bool {
 mod tests {
     use super::*;
     use crate::PyramidConfig;
+    use terra_world::{InfiniteTopologyConfig, TileCoord};
 
     fn view(eye: Vec3, target: Vec3, viewport_height_px: u32, fov_y: f32) -> TerrainDemandView {
         let aspect = 16.0 / 9.0;
@@ -541,6 +992,47 @@ mod tests {
             .filter_map(|demand| pyramid.topology().level_index(demand.key.address))
             .max()
             .unwrap_or(0)
+    }
+
+    fn infinite_topology() -> InfiniteTopology {
+        InfiniteTopology::try_new(InfiniteTopologyConfig {
+            origin: WorldPosition::ORIGIN,
+            tile_size: 16,
+            finest_spacing_m: 1.0,
+            max_lod: Lod::try_new(3).unwrap(),
+        })
+        .unwrap()
+    }
+
+    fn infinite_view(center_x: f64, center_z: f64) -> InfiniteTerrainDemandView {
+        let eye_world = WorldPosition::try_new(center_x, center_z + 96.0).unwrap();
+        let center_world = WorldPosition::try_new(center_x, center_z).unwrap();
+        let eye_height = 96.0;
+        let target_from_eye = Vec3::new(0.0, -eye_height, -96.0);
+        let projection = Mat4::perspective_rh(1.0, 16.0 / 9.0, 1.0, 10_000.0);
+        InfiniteTerrainDemandView {
+            eye_world,
+            coverage_center_world: center_world,
+            eye_height,
+            relative_view_proj: projection * Mat4::look_at_rh(Vec3::ZERO, target_from_eye, Vec3::Y),
+            fov_y: 1.0,
+            near: 1.0,
+            viewport_width_px: 1920,
+            viewport_height_px: 1080,
+            min_height: -64.0,
+            max_height: 256.0,
+        }
+    }
+
+    fn infinite_config() -> InfiniteTerrainDemandConfig {
+        InfiniteTerrainDemandConfig {
+            preview_radius_m: 96.0,
+            horizon_m: 160.0,
+        }
+    }
+
+    fn infinite_errors(topology: &InfiniteTopology) -> InfiniteTerrainErrorModel {
+        InfiniteTerrainErrorModel::try_new(topology, vec![500.0; 4]).unwrap()
     }
 
     #[test]
@@ -740,5 +1232,197 @@ mod tests {
             )
             .unwrap();
         assert_eq!(deepest(&pyramid, &plan), finest);
+    }
+
+    #[test]
+    fn infinite_planning_crosses_zero_and_closes_every_refinement_over_parents() {
+        let topology = infinite_topology();
+        let errors = infinite_errors(&topology);
+        let mut planner = TerrainDemandPlanner::default();
+        let plan = planner
+            .plan_infinite(
+                &topology,
+                &errors,
+                infinite_view(0.0, 0.0),
+                TerrainDemandConfig::default(),
+                infinite_config(),
+            )
+            .unwrap();
+
+        assert!(plan
+            .tiles
+            .iter()
+            .any(|demand| demand.key.address.coord.x < 0));
+        assert!(plan
+            .tiles
+            .iter()
+            .any(|demand| demand.key.address.coord.x >= 0));
+        assert!(plan
+            .tiles
+            .iter()
+            .any(|demand| demand.key.address.coord.z < 0));
+        assert!(plan
+            .tiles
+            .iter()
+            .any(|demand| demand.key.address.coord.z >= 0));
+
+        let addresses = plan
+            .tiles
+            .iter()
+            .map(|demand| demand.key.address)
+            .collect::<BTreeSet<_>>();
+        for refinement in plan
+            .tiles
+            .iter()
+            .filter(|demand| demand.class == TerrainDemandClass::Refinement)
+        {
+            let mut address = refinement.key.address;
+            while address.lod < topology.config().max_lod {
+                address = topology.parent(address).unwrap();
+                assert!(addresses.contains(&address), "missing parent {address:?}");
+            }
+        }
+        assert!(plan
+            .tiles
+            .windows(2)
+            .all(|pair| { pair[0].key.address.lod >= pair[1].key.address.lod }));
+    }
+
+    #[test]
+    fn infinite_planning_work_is_independent_of_distance_from_fixed_origin() {
+        let topology = infinite_topology();
+        let errors = infinite_errors(&topology);
+        let mut near_planner = TerrainDemandPlanner::default();
+        let near = near_planner
+            .plan_infinite(
+                &topology,
+                &errors,
+                infinite_view(0.0, 0.0),
+                TerrainDemandConfig::default(),
+                infinite_config(),
+            )
+            .unwrap();
+        let mut far_planner = TerrainDemandPlanner::default();
+        let far = far_planner
+            .plan_infinite(
+                &topology,
+                &errors,
+                infinite_view(10_000_000.0, -10_000_000.0),
+                TerrainDemandConfig::default(),
+                infinite_config(),
+            )
+            .unwrap();
+
+        assert_eq!(near.visited_nodes, far.visited_nodes);
+        assert_eq!(near.tiles.len(), far.tiles.len());
+    }
+
+    #[test]
+    fn infinite_planning_respects_budgets_after_mandatory_coverage() {
+        let topology = infinite_topology();
+        let errors = infinite_errors(&topology);
+        let config = TerrainDemandConfig {
+            max_demand_tiles: 24,
+            max_visited_nodes: 28,
+            ..TerrainDemandConfig::default()
+        };
+        let mut planner = TerrainDemandPlanner::default();
+        let plan = planner
+            .plan_infinite(
+                &topology,
+                &errors,
+                infinite_view(0.0, 0.0),
+                config,
+                InfiniteTerrainDemandConfig {
+                    preview_radius_m: 64.0,
+                    horizon_m: 96.0,
+                },
+            )
+            .unwrap();
+        assert!(plan.tiles.len() <= config.max_demand_tiles);
+        assert!(plan.visited_nodes <= config.max_visited_nodes);
+        assert!(plan
+            .tiles
+            .iter()
+            .take_while(|demand| demand.key.address.lod == topology.config().max_lod)
+            .all(|demand| demand.class == TerrainDemandClass::CoarseCoverage));
+    }
+
+    #[test]
+    fn infinite_planning_rejects_a_budget_that_cannot_cover_the_horizon() {
+        let topology = infinite_topology();
+        let errors = infinite_errors(&topology);
+        let mut planner = TerrainDemandPlanner::default();
+        let error = planner
+            .plan_infinite(
+                &topology,
+                &errors,
+                infinite_view(0.0, 0.0),
+                TerrainDemandConfig {
+                    max_demand_tiles: 1,
+                    max_visited_nodes: 1,
+                    ..TerrainDemandConfig::default()
+                },
+                infinite_config(),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            TerrainDemandError::InsufficientCoverageBudget { .. }
+        ));
+    }
+
+    #[test]
+    fn infinite_replanning_drops_irrelevant_demand_and_hysteresis_state() {
+        let topology = infinite_topology();
+        let errors = infinite_errors(&topology);
+        let mut planner = TerrainDemandPlanner::default();
+        let first = planner
+            .plan_infinite(
+                &topology,
+                &errors,
+                infinite_view(-256.0, -256.0),
+                TerrainDemandConfig::default(),
+                infinite_config(),
+            )
+            .unwrap();
+        let second = planner
+            .plan_infinite(
+                &topology,
+                &errors,
+                infinite_view(1_000_000.0, 1_000_000.0),
+                TerrainDemandConfig::default(),
+                infinite_config(),
+            )
+            .unwrap();
+        let second_addresses = second
+            .tiles
+            .iter()
+            .map(|demand| demand.key.address)
+            .collect::<BTreeSet<_>>();
+        assert!(first
+            .tiles
+            .iter()
+            .all(|demand| !second_addresses.contains(&demand.key.address)));
+        assert!(planner.previously_refined_infinite.len() <= second.visited_nodes);
+    }
+
+    #[test]
+    fn infinite_signed_quadrants_produce_expected_finest_coordinates() {
+        let topology = infinite_topology();
+        for (x, z) in [(-32.0, -32.0), (-32.0, 32.0), (32.0, -32.0), (32.0, 32.0)] {
+            let address = topology
+                .address_at_world(WorldPosition::try_new(x, z).unwrap(), Lod::FINEST)
+                .unwrap();
+            assert_eq!(address.coord.x.signum(), (x as i64).signum());
+            assert_eq!(address.coord.z.signum(), (z as i64).signum());
+        }
+        assert_eq!(
+            topology
+                .address_at_world(WorldPosition::try_new(-0.001, -0.001).unwrap(), Lod::FINEST,)
+                .unwrap()
+                .coord,
+            TileCoord { x: -1, z: -1 }
+        );
     }
 }

@@ -125,6 +125,18 @@ impl TileAddressRange {
             next: Some(self.min.coord),
         }
     }
+
+    /// Number of addresses in this finite range, with no enumeration and no
+    /// signed-coordinate overflow. Callers use this to reject an oversized
+    /// camera window before beginning bounded planning work.
+    pub fn checked_len(self) -> Result<usize, WorldError> {
+        let width = i128::from(self.max.coord.x) - i128::from(self.min.coord.x) + 1;
+        let height = i128::from(self.max.coord.z) - i128::from(self.min.coord.z) + 1;
+        let count = width
+            .checked_mul(height)
+            .ok_or(WorldError::ArithmeticOverflow)?;
+        usize::try_from(count).map_err(|_| WorldError::ArithmeticOverflow)
+    }
 }
 
 pub struct TileAddressRangeIter {

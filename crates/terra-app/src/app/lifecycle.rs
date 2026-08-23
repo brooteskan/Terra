@@ -525,7 +525,7 @@ impl TerraApp {
                         } else {
                             renderer.camera.look(dx * speed, dy * speed);
                         }
-                        renderer.camera.clamp_to_world(renderer.heights.world_size);
+                        renderer.constrain_camera();
                     }
                     MouseButton::Right | MouseButton::Middle => {
                         let speed = self.ui_state.camera_speed.max(0.05);
@@ -535,7 +535,7 @@ impl TerraApp {
                             self.right_drag_distance += dx.abs() + dy.abs();
                         }
                         renderer.camera.pan(dx, dy);
-                        renderer.camera.clamp_to_world(renderer.heights.world_size);
+                        renderer.constrain_camera();
                     }
                     _ => {}
                 }
@@ -1763,7 +1763,7 @@ impl TerraApp {
             let speed = self.ui_state.camera_speed.max(0.05);
             r.camera
                 .fly(forward, right, up, dt * speed, self.modifiers_shift);
-            r.camera.clamp_to_world(r.heights.world_size);
+            r.constrain_camera();
         }
         true
     }

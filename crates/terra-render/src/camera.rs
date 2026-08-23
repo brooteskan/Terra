@@ -57,6 +57,15 @@ impl OrbitCamera {
         proj * view
     }
 
+    /// View-projection for geometry already translated so the eye is at the
+    /// origin. Sparse planning uses this to preserve signed `f64` world X/Z
+    /// until the final camera-relative narrowing step.
+    pub fn relative_view_proj(&self, aspect: f32) -> Mat4 {
+        let view = Mat4::look_at_rh(Vec3::ZERO, self.forward(), Vec3::Y);
+        let proj = Mat4::perspective_rh(self.fov_y, aspect.max(0.01), self.near, self.far);
+        proj * view
+    }
+
     /// Orbit around the look-at target (classic turntable).
     pub fn orbit(&mut self, dx: f32, dy: f32) {
         self.yaw += dx * 0.005;

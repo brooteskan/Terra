@@ -102,6 +102,36 @@ mod tests {
     }
 
     #[test]
+    fn signed_address_range_counts_without_enumerating_or_overflowing() {
+        let lod = Lod::FINEST;
+        let range = TileAddressRange::try_new(
+            TileAddress::new(lod, TileCoord { x: -3, z: -2 }),
+            TileAddress::new(lod, TileCoord { x: 4, z: 5 }),
+        )
+        .unwrap();
+        assert_eq!(range.checked_len().unwrap(), 64);
+
+        let enormous = TileAddressRange::try_new(
+            TileAddress::new(
+                lod,
+                TileCoord {
+                    x: i64::MIN,
+                    z: i64::MIN,
+                },
+            ),
+            TileAddress::new(
+                lod,
+                TileCoord {
+                    x: i64::MAX,
+                    z: i64::MAX,
+                },
+            ),
+        )
+        .unwrap();
+        assert_eq!(enormous.checked_len(), Err(WorldError::ArithmeticOverflow));
+    }
+
+    #[test]
     fn infinite_world_conversion_uses_floor_for_negative_positions() {
         let topology = InfiniteTopology::try_new(InfiniteTopologyConfig {
             origin: WorldPosition::ORIGIN,

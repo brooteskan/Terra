@@ -5,7 +5,7 @@
 
 use glam::Mat4;
 
-use crate::clipmap::{ClipmapConfig, ClipmapPresentPlan};
+use crate::clipmap::{ClipmapConfig, ClipmapPresentInput, ClipmapPresentPlan};
 
 /// Inputs for one RasterLit present pass.
 #[derive(Clone, Copy)]
@@ -22,20 +22,7 @@ pub struct RasterLitDrawParams<'a> {
 /// Plan clipmap / single-grid present for the current camera and height density.
 pub fn plan_raster_present(
     clipmap: &ClipmapConfig,
-    camera_x: f32,
-    camera_z: f32,
-    world_x: f32,
-    world_z: f32,
-    height_tex_w: u32,
-    height_tex_h: u32,
+    input: ClipmapPresentInput,
 ) -> ClipmapPresentPlan {
-    ClipmapPresentPlan::build(
-        clipmap,
-        camera_x,
-        camera_z,
-        world_x,
-        world_z,
-        height_tex_w,
-        height_tex_h,
-    )
+    ClipmapPresentPlan::build(clipmap, input)
 }

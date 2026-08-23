@@ -3,6 +3,13 @@
 //! Mesh vertex count is fixed per ring; the terrain vertex shader samples the
 //! full-resolution height texture regardless of grid spacing.
 
+/// Whether camera-centred geometry is constrained to a finite heightfield.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ClipmapTraversalBounds {
+    Bounded { world_x: f32, world_z: f32 },
+    Infinite,
+}
+
 /// Single world-covering displacement grid (coarsest / full fallback).
 #[derive(Debug, Clone)]
 pub struct WorldGridConfig {
@@ -59,17 +66,18 @@ impl ClipmapRingLevel {
         &self,
         camera_x: f32,
         camera_z: f32,
-        world_x: f32,
-        world_z: f32,
+        bounds: ClipmapTraversalBounds,
     ) -> (f32, f32) {
         let half = self.coverage() * 0.5;
         let snap = self.spacing.max(1e-6);
         let mut ox = ((camera_x - half) / snap).floor() * snap;
         let mut oz = ((camera_z - half) / snap).floor() * snap;
-        let max_x = (world_x - self.coverage()).max(0.0);
-        let max_z = (world_z - self.coverage()).max(0.0);
-        ox = ox.clamp(0.0, max_x);
-        oz = oz.clamp(0.0, max_z);
+        if let ClipmapTraversalBounds::Bounded { world_x, world_z } = bounds {
+            let max_x = (world_x - self.coverage()).max(0.0);
+            let max_z = (world_z - self.coverage()).max(0.0);
+            ox = ox.clamp(0.0, max_x);
+            oz = oz.clamp(0.0, max_z);
+        }
         (ox, oz)
     }
 }
@@ -135,12 +143,11 @@ impl ClipmapConfig {
         &self,
         camera_x: f32,
         camera_z: f32,
-        world_x: f32,
-        world_z: f32,
+        bounds: ClipmapTraversalBounds,
     ) -> Vec<(f32, f32)> {
         self.rings
             .iter()
-            .map(|ring| ring.snap_origin(camera_x, camera_z, world_x, world_z))
+            .map(|ring| ring.snap_origin(camera_x, camera_z, bounds))
             .collect()
     }
 }
@@ -174,18 +181,21 @@ pub struct ClipmapPresentPlan {
     pub rings: Vec<ClipmapRingDraw>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ClipmapPresentInput {
+    pub camera_x: f32,
+    pub camera_z: f32,
+    pub world_x: f32,
+    pub world_z: f32,
+    pub height_tex_w: u32,
+    pub height_tex_h: u32,
+    pub traversal_bounds: ClipmapTraversalBounds,
+}
+
 impl ClipmapPresentPlan {
-    pub fn build(
-        clipmap: &ClipmapConfig,
-        camera_x: f32,
-        camera_z: f32,
-        world_x: f32,
-        world_z: f32,
-        height_tex_w: u32,
-        height_tex_h: u32,
-    ) -> Self {
-        let extent = world_x.max(world_z).max(1.0);
-        let tex = height_tex_w.max(height_tex_h).max(9);
+    pub fn build(clipmap: &ClipmapConfig, input: ClipmapPresentInput) -> Self {
+        let extent = input.world_x.max(input.world_z).max(1.0);
+        let tex = input.height_tex_w.max(input.height_tex_h).max(9);
         let tex_spacing = extent / tex.saturating_sub(1).max(1) as f32;
         let fallback_spacing = clipmap.fallback.spacing_for_extent(extent);
         let max_dense = crate::grid::TerrainGrid::max_resolution_for_device_limits();
@@ -209,7 +219,7 @@ impl ClipmapPresentPlan {
             };
         }
 
-        let origins = clipmap.ring_origins(camera_x, camera_z, world_x, world_z);
+        let origins = clipmap.ring_origins(input.camera_x, input.camera_z, input.traversal_bounds);
         // rings[] is fine → coarse; draw order is coarse → fine.
         let mut draws = Vec::with_capacity(clipmap.rings.len());
         for (rev_i, ring) in clipmap.rings.iter().enumerate().rev() {
@@ -284,7 +294,21 @@ mod tests {
     #[test]
     fn small_world_uses_single_grid_plan() {
         let cfg = ClipmapConfig::for_world_with_height(512.0, 513, 513);
-        let plan = ClipmapPresentPlan::build(&cfg, 256.0, 256.0, 512.0, 512.0, 513, 513);
+        let plan = ClipmapPresentPlan::build(
+            &cfg,
+            ClipmapPresentInput {
+                camera_x: 256.0,
+                camera_z: 256.0,
+                world_x: 512.0,
+                world_z: 512.0,
+                height_tex_w: 513,
+                height_tex_h: 513,
+                traversal_bounds: ClipmapTraversalBounds::Bounded {
+                    world_x: 512.0,
+                    world_z: 512.0,
+                },
+            },
+        );
         assert!(plan.use_single_grid);
         assert!(plan.rings.is_empty());
     }
@@ -293,7 +317,21 @@ mod tests {
     fn large_world_plans_coarse_to_fine_rings() {
         // Exceed device-dense single-grid coverage so rings are required.
         let cfg = ClipmapConfig::for_world_with_height(65536.0, 513, 8193);
-        let plan = ClipmapPresentPlan::build(&cfg, 32000.0, 32000.0, 65536.0, 65536.0, 8193, 8193);
+        let plan = ClipmapPresentPlan::build(
+            &cfg,
+            ClipmapPresentInput {
+                camera_x: 32000.0,
+                camera_z: 32000.0,
+                world_x: 65536.0,
+                world_z: 65536.0,
+                height_tex_w: 8193,
+                height_tex_h: 8193,
+                traversal_bounds: ClipmapTraversalBounds::Bounded {
+                    world_x: 65536.0,
+                    world_z: 65536.0,
+                },
+            },
+        );
         assert!(!plan.use_single_grid);
         assert!(plan.draw_fallback);
         assert_eq!(plan.rings.len(), cfg.rings.len());
@@ -310,8 +348,55 @@ mod tests {
             grid_size: 65,
             spacing: 8.0,
         };
-        let (ox, oz) = ring.snap_origin(100.3, 200.7, 4096.0, 4096.0);
+        let (ox, oz) = ring.snap_origin(
+            100.3,
+            200.7,
+            ClipmapTraversalBounds::Bounded {
+                world_x: 4096.0,
+                world_z: 4096.0,
+            },
+        );
         assert!((ox % 8.0).abs() < 1e-4);
         assert!((oz % 8.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn infinite_ring_origin_is_unclamped_across_zero() {
+        let ring = ClipmapRingLevel {
+            grid_size: 65,
+            spacing: 8.0,
+        };
+        let (ox, oz) = ring.snap_origin(-3.0, 5.0, ClipmapTraversalBounds::Infinite);
+        assert!(ox < 0.0);
+        assert!(oz < 0.0);
+        assert_eq!(ox.rem_euclid(8.0), 0.0);
+        assert_eq!(oz.rem_euclid(8.0), 0.0);
+    }
+
+    #[test]
+    fn infinite_ring_origins_stay_on_each_dyadic_lattice() {
+        let cfg = ClipmapConfig {
+            rings: vec![
+                ClipmapRingLevel {
+                    grid_size: 129,
+                    spacing: 2.0,
+                },
+                ClipmapRingLevel {
+                    grid_size: 129,
+                    spacing: 4.0,
+                },
+                ClipmapRingLevel {
+                    grid_size: 65,
+                    spacing: 8.0,
+                },
+            ],
+            fallback: WorldGridConfig::for_world(65),
+            skirt_depth: 0.0,
+        };
+        let origins = cfg.ring_origins(-17.25, 9.5, ClipmapTraversalBounds::Infinite);
+        for (ring, (x, z)) in cfg.rings.iter().zip(origins) {
+            assert_eq!(x.rem_euclid(ring.spacing), 0.0);
+            assert_eq!(z.rem_euclid(ring.spacing), 0.0);
+        }
     }
 }

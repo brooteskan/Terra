@@ -460,7 +460,7 @@ impl TerraApp {
         self.ui_state.dirty_tile_ids.clear();
         self.clear_terrain_tile_work();
 
-        let world_size = match project_world {
+        let (world_size, traversal_mode, infinite_frame) = match project_world {
             terra_core::document::ProjectWorld::BoundedHeightfield(settings) => {
                 self.terrain_runtime
                     .reconfigure(terra_core::PyramidConfig::new(
@@ -468,7 +468,11 @@ impl TerraApp {
                         settings.metrics.world_size_x,
                         settings.metrics.world_size_z,
                     ));
-                (settings.metrics.world_size_x, settings.metrics.world_size_z)
+                (
+                    (settings.metrics.world_size_x, settings.metrics.world_size_z),
+                    terra_render::TerrainTraversalMode::Bounded,
+                    None,
+                )
             }
             terra_core::document::ProjectWorld::InfiniteProceduralWorld(settings) => {
                 match settings.topology() {
@@ -484,7 +488,15 @@ impl TerraApp {
                     }
                 }
                 let local_span = (settings.horizon_m * 2.0).clamp(1.0, f64::from(f32::MAX)) as f32;
-                (local_span, local_span)
+                (
+                    (local_span, local_span),
+                    terra_render::TerrainTraversalMode::Infinite,
+                    Some((
+                        settings.origin.x_m() as f32,
+                        settings.origin.z_m() as f32,
+                        settings.preview_radius_m as f32,
+                    )),
+                )
             }
         };
 
@@ -494,7 +506,10 @@ impl TerraApp {
             }
         }
         if let Some(renderer) = self.renderer.as_mut() {
-            renderer.reset_project_state(world_size, ocean_level);
+            renderer.reset_project_state(world_size, ocean_level, traversal_mode);
+            if let Some((origin_x, origin_z, preview_radius)) = infinite_frame {
+                renderer.frame_camera_to_infinite(origin_x, origin_z, preview_radius);
+            }
         }
         // Preserve the GPU allocation, but make all previous-document pages
         // unreachable and stop streaming until the new document re-syncs.
@@ -846,7 +861,7 @@ impl TerraApp {
             renderer.camera.yaw = bookmark.yaw;
             renderer.camera.pitch = bookmark.pitch;
             renderer.camera.distance = bookmark.distance;
-            renderer.camera.clamp_to_world(renderer.heights.world_size);
+            renderer.constrain_camera();
             self.ui_state.status = format!("Recalled camera bookmark {}", index + 1);
         }
     }

@@ -67,6 +67,18 @@ fn terrain_tile_work_budget(
     terra_core::TerrainTileWorkBudget::new(budget_us, max_items, max_pages.max(1))
 }
 
+fn infinite_gpu_page_capacity(
+    settings: &terra_core::document::InfiniteProceduralWorldSettings,
+) -> usize {
+    let page_extent = u64::from(settings.tile_size_samples)
+        .saturating_add(u64::from(settings.publication_halo_samples).saturating_mul(2));
+    let page_bytes = page_extent.saturating_mul(page_extent).saturating_mul(4);
+    let budget_bytes = u64::from(settings.gpu_residency_budget_mib).saturating_mul(1024 * 1024);
+    usize::try_from(budget_bytes / page_bytes.max(1))
+        .unwrap_or(usize::MAX)
+        .max(1)
+}
+
 impl TerraApp {
     /// Compile and validate the current graph for direct Infinite sparse-tile
     /// execution. This is the single admission gate shared by rebuild requests
@@ -1058,6 +1070,9 @@ impl TerraApp {
     /// Poll the one-shot geometric-error metadata transfer and, once ready,
     /// refresh the camera-visible demand consumed by the current upload adapter.
     pub(crate) fn refresh_terrain_demand(&mut self) -> bool {
+        if self.session.document.infinite_settings().is_some() {
+            return self.refresh_infinite_terrain_demand();
+        }
         let metadata_result = match (self.gpu.as_ref(), self.gpu_pyramid_error_readback.as_mut()) {
             (Some(gpu), Some(readback)) => Some(readback.poll(&gpu.device)),
             _ => None,
@@ -1186,6 +1201,99 @@ impl TerraApp {
         let changed = self.latest_terrain_demand.as_ref() != Some(&plan);
         self.latest_terrain_demand = Some(plan);
         changed || !self.terrain_tile_scheduler.is_empty()
+    }
+
+    fn refresh_infinite_terrain_demand(&mut self) -> bool {
+        if self
+            .ui_state
+            .infinite_spatial_status
+            .is_some_and(|status| status.reason.is_some())
+        {
+            return false;
+        }
+        let Some(settings) = self.session.document.infinite_settings().cloned() else {
+            return false;
+        };
+        let Some(topology) = self.terrain_runtime.infinite_topology().copied() else {
+            return false;
+        };
+        let Some(renderer) = self.renderer.as_ref() else {
+            return false;
+        };
+        let (width, height) = renderer.size();
+        let aspect = width as f32 / height.max(1) as f32;
+        let eye = renderer.camera.eye();
+        let target = renderer.camera.target;
+        let eye_world = match terra_world::WorldPosition::try_new(
+            f64::from(eye.x),
+            f64::from(eye.z),
+        ) {
+            Ok(position) => position,
+            Err(error) => {
+                log::warn!(target: "terra_app::evaluation", "Infinite demand eye rejected: {error}");
+                return false;
+            }
+        };
+        let coverage_center_world = match terra_world::WorldPosition::try_new(
+            f64::from(target.x),
+            f64::from(target.z),
+        ) {
+            Ok(position) => position,
+            Err(error) => {
+                log::warn!(target: "terra_app::evaluation", "Infinite demand centre rejected: {error}");
+                return false;
+            }
+        };
+        let (min_height, max_height) = renderer.heights.height_range;
+        let view = terra_core::InfiniteTerrainDemandView {
+            eye_world,
+            coverage_center_world,
+            eye_height: eye.y,
+            relative_view_proj: renderer.camera.relative_view_proj(aspect),
+            fov_y: renderer.camera.fov_y,
+            near: renderer.camera.near,
+            viewport_width_px: width,
+            viewport_height_px: height,
+            min_height,
+            max_height,
+        };
+        let max_tiles = infinite_gpu_page_capacity(&settings);
+        let config = terra_core::TerrainDemandConfig {
+            max_demand_tiles: max_tiles,
+            max_visited_nodes: max_tiles.saturating_mul(32).max(64),
+            ..terra_core::TerrainDemandConfig::default()
+        };
+        let error_model = match terra_core::InfiniteTerrainErrorModel::from_height_span(
+            &topology, min_height, max_height,
+        ) {
+            Ok(model) => model,
+            Err(error) => {
+                log::warn!(target: "terra_app::evaluation", "Infinite demand error model rejected: {error}");
+                return false;
+            }
+        };
+        let plan = match self.terrain_demand_planner.plan_infinite(
+            &topology,
+            &error_model,
+            view,
+            config,
+            terra_core::InfiniteTerrainDemandConfig {
+                preview_radius_m: settings.preview_radius_m,
+                horizon_m: settings.horizon_m,
+            },
+        ) {
+            Ok(plan) => plan,
+            Err(error) => {
+                log::warn!(target: "terra_app::evaluation", "Infinite terrain demand planning skipped: {error}");
+                return false;
+            }
+        };
+
+        // #187 consumes this exact bounded signed-key plan when sparse atlas
+        // publication lands. Do not feed it to the current dense bounded table.
+        let changed = self.latest_terrain_demand.as_ref() != Some(&plan);
+        self.latest_terrain_demand = Some(plan);
+        changed
     }
 
     pub(crate) fn upload_pending_terrain_tiles(&mut self) -> usize {
@@ -2665,7 +2773,7 @@ mod tests {
     use terra_core::PyramidConfig;
     use terra_gpu::GpuTileAtlas;
     use terra_gpu_eval::{GpuEvaluationIntent, GpuTerrainEngine};
-    use terra_render::{GpuContext, HeightPresentGeom, TerrainRenderer};
+    use terra_render::{GpuContext, HeightPresentGeom, TerrainRenderer, TerrainTraversalMode};
 
     use crate::app::frame_trace::{EvaluationTraceId, FrameTraceEventKind};
     use crate::app::logical_frame::{
@@ -2690,6 +2798,71 @@ mod tests {
         let status = app.ui_state.infinite_spatial_status.unwrap();
         assert_eq!(status.operation_halo, Some(0));
         assert!(status.reason.is_none());
+    }
+
+    #[test]
+    fn infinite_app_planning_produces_signed_bounded_demand_and_tile_domains() {
+        let Some(gpu) = terra_test_gpu::headless() else {
+            return;
+        };
+        let context = GpuContext::new(
+            gpu.device.clone(),
+            gpu.queue.clone(),
+            wgpu::TextureFormat::Rgba8Unorm,
+        );
+        let settings = terra_core::document::InfiniteProceduralWorldSettings::default();
+        let topology = settings.topology().unwrap();
+        let mut app = TerraApp::default();
+        app.session.document =
+            terra_core::document::TerrainDocument::new_infinite(settings.clone()).unwrap();
+        app.terrain_runtime
+            .try_reconfigure(terra_core::TerrainRuntimeConfig::Infinite(
+                topology.config(),
+            ))
+            .unwrap();
+        let mut renderer = TerrainRenderer::new_headless(&context, 128, 128);
+        renderer.reset_project_state(
+            (
+                settings.horizon_m as f32 * 2.0,
+                settings.horizon_m as f32 * 2.0,
+            ),
+            None,
+            TerrainTraversalMode::Infinite,
+        );
+        renderer.frame_camera_to_infinite(0.0, 0.0, settings.preview_radius_m as f32);
+        app.renderer = Some(renderer);
+        assert!(app.refresh_infinite_spatial_status());
+        assert!(app.refresh_terrain_demand());
+
+        let demand = app
+            .latest_terrain_demand
+            .as_ref()
+            .expect("Infinite demand plan");
+        assert!(!demand.tiles.is_empty());
+        assert!(demand.tiles.len() <= super::infinite_gpu_page_capacity(&settings));
+        assert!(demand
+            .tiles
+            .iter()
+            .any(|tile| tile.key.address.coord.x < 0 || tile.key.address.coord.z < 0));
+        assert!(app.terrain_tile_scheduler.is_empty());
+
+        let content = terra_core::TerrainContentStamp {
+            document_revision: 1,
+            plan_revision: 2,
+            output_revision: app.terrain_runtime.output_revision(),
+            content_revision: 3,
+        };
+        for tile in &demand.tiles {
+            terra_core::TerrainEvaluationDomain::for_infinite_tile(
+                &topology,
+                tile.key.clone(),
+                settings.seed,
+                settings.publication_halo_samples,
+                0,
+                content,
+            )
+            .expect("planned signed key must satisfy the #185 tile-domain contract");
+        }
     }
 
     #[test]

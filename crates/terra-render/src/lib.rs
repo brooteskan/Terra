@@ -60,7 +60,8 @@ pub use backends::{
 pub use brush::{pick_terrain_uv, pick_terrain_uv_on_surface, BrushOverlay, SurfacePick};
 pub use camera::OrbitCamera;
 pub use clipmap::{
-    ClipmapConfig, ClipmapPresentPlan, ClipmapRingDraw, ClipmapRingLevel, WorldGridConfig,
+    ClipmapConfig, ClipmapPresentInput, ClipmapPresentPlan, ClipmapRingDraw, ClipmapRingLevel,
+    ClipmapTraversalBounds, WorldGridConfig,
 };
 pub use frame_graph::{FrameGraph, FrameSchedule, PassKind};
 pub use gpu_timing::{GpuPresentationTraceContext, GpuTimings};
@@ -100,6 +101,22 @@ pub enum RenderError {
     Surface(#[from] wgpu::SurfaceError),
     #[error("{0}")]
     Msg(String),
+}
+
+/// Camera and clipmap traversal policy selected by the active project topology.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TerrainTraversalMode {
+    #[default]
+    Bounded,
+    Infinite,
+}
+
+impl TerrainTraversalMode {
+    fn constrain_camera(self, camera: &mut OrbitCamera, world_size: (f32, f32)) {
+        if self == Self::Bounded {
+            camera.clamp_to_world(world_size);
+        }
+    }
 }
 
 #[repr(C)]
@@ -300,6 +317,7 @@ pub struct TerrainRenderer {
     pub world_grid: WorldGridConfig,
     pub heights: HeightGpu,
     pub camera: OrbitCamera,
+    traversal_mode: TerrainTraversalMode,
     pub size: winit::dpi::PhysicalSize<u32>,
     /// Last CPU→GPU height upload microseconds.
     pub last_upload_us: u64,
@@ -1236,6 +1254,7 @@ impl TerrainRenderer {
             world_grid,
             heights,
             camera,
+            traversal_mode: TerrainTraversalMode::Bounded,
             size,
             ocean_pipeline,
             last_upload_us: 0,
@@ -1884,6 +1903,21 @@ impl TerrainRenderer {
         self.camera_framed = true;
     }
 
+    /// Frame a local Infinite-world preview around the fixed project origin.
+    /// Large-coordinate camera-relative presentation is completed by the next
+    /// slice; this keeps current traversal centred on the correct signed axes.
+    pub fn frame_camera_to_infinite(
+        &mut self,
+        origin_x: f32,
+        origin_z: f32,
+        preview_radius_m: f32,
+    ) {
+        let (min_h, max_h) = self.heights.height_range;
+        self.camera.target = glam::Vec3::new(origin_x, (min_h + max_h) * 0.5, origin_z);
+        self.camera.distance = preview_radius_m.max(10.0) * 1.1;
+        self.camera_framed = true;
+    }
+
     pub fn request_camera_reframe(&mut self) {
         self.camera_framed = false;
     }
@@ -1892,7 +1926,7 @@ impl TerrainRenderer {
     pub fn focus_camera_uv(&mut self, u: f32, v: f32) {
         self.camera.target.x = u.clamp(0.0, 1.0) * self.heights.world_size.0;
         self.camera.target.z = v.clamp(0.0, 1.0) * self.heights.world_size.1;
-        self.camera.clamp_to_world(self.heights.world_size);
+        self.constrain_camera();
     }
 
     /// Switch to a near-vertical overview while retaining the current target.
@@ -2070,7 +2104,13 @@ impl TerrainRenderer {
     }
 
     /// Clear viewport GPU state that belongs to the previous document.
-    pub fn reset_project_state(&mut self, world_size: (f32, f32), ocean_level: Option<f32>) {
+    pub fn reset_project_state(
+        &mut self,
+        world_size: (f32, f32),
+        ocean_level: Option<f32>,
+        traversal_mode: TerrainTraversalMode,
+    ) {
+        self.traversal_mode = traversal_mode;
         self.use_tile_stream = false;
         self.presentation_baseline = None;
         self.last_presentation_record = None;
@@ -2109,6 +2149,27 @@ impl TerrainRenderer {
             self.grid = TerrainGrid::new(&self.device, self.world_grid.grid_size);
         }
         self.recreate_bind_group();
+    }
+
+    pub const fn traversal_mode(&self) -> TerrainTraversalMode {
+        self.traversal_mode
+    }
+
+    /// Apply the active topology's camera constraint. Infinite traversal keeps
+    /// the rig unchanged, including across negative fixed-origin coordinates.
+    pub fn constrain_camera(&mut self) {
+        self.traversal_mode
+            .constrain_camera(&mut self.camera, self.heights.world_size);
+    }
+
+    fn clipmap_traversal_bounds(&self) -> ClipmapTraversalBounds {
+        match self.traversal_mode {
+            TerrainTraversalMode::Bounded => ClipmapTraversalBounds::Bounded {
+                world_x: self.heights.world_size.0,
+                world_z: self.heights.world_size.1,
+            },
+            TerrainTraversalMode::Infinite => ClipmapTraversalBounds::Infinite,
+        }
     }
 
     /// Push viewport chrome display aids (wireframe / grid / bounds / contours / shading).
@@ -2257,10 +2318,10 @@ impl TerrainRenderer {
             self.progressive.set_enabled(false);
         }
 
+        self.constrain_camera();
         let view_proj = self.camera.view_proj(aspect);
         let (min_h, max_h) = self.heights.height_range;
         let (tw, th) = self.heights.tex_size;
-        self.camera.clamp_to_world(self.heights.world_size);
         self.last_grid_resolution = self.grid.resolution;
 
         let lighting_signature = [
@@ -2494,12 +2555,15 @@ impl TerrainRenderer {
             PresentationBackendId::RasterLit => {
                 let present = backends::raster_lit::plan_raster_present(
                     &self.clipmap,
-                    self.camera.target.x,
-                    self.camera.target.z,
-                    world_x,
-                    world_z,
-                    tw,
-                    th,
+                    ClipmapPresentInput {
+                        camera_x: self.camera.target.x,
+                        camera_z: self.camera.target.z,
+                        world_x,
+                        world_z,
+                        height_tex_w: tw,
+                        height_tex_h: th,
+                        traversal_bounds: self.clipmap_traversal_bounds(),
+                    },
                 );
 
                 // Upload all per-draw uniforms before the pass (queue writes are
@@ -3132,6 +3196,19 @@ mod render_error_tests {
             err,
             RenderError::Surface(wgpu::SurfaceError::Lost)
         ));
+    }
+
+    #[test]
+    fn infinite_traversal_does_not_clamp_the_camera_rig() {
+        let mut camera = OrbitCamera::default();
+        camera.target.x = -1_000_000.0;
+        camera.target.z = 1_000_000.0;
+        let before = camera.target;
+        TerrainTraversalMode::Infinite.constrain_camera(&mut camera, (4096.0, 4096.0));
+        assert_eq!(camera.target, before);
+
+        TerrainTraversalMode::Bounded.constrain_camera(&mut camera, (4096.0, 4096.0));
+        assert_ne!(camera.target, before);
     }
 }
 

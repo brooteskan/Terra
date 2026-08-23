@@ -135,6 +135,7 @@ pub use sparse_paint::{
 };
 pub use terrain::{
     conservative_geometric_errors, measure_tile_geometric_error, EditorRefinementState,
+    InfiniteTerrainDemandConfig, InfiniteTerrainDemandView, InfiniteTerrainErrorModel,
     PyramidConfig, RefinementController, RefinementTimings, ResidentTile, TerrainCacheKey,
     TerrainContentStamp, TerrainDemandClass, TerrainDemandConfig, TerrainDemandError,
     TerrainDemandPlan, TerrainDemandPlanner, TerrainDemandView, TerrainDomainError,
