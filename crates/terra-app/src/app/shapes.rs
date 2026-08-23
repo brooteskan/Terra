@@ -100,7 +100,15 @@ impl TerraApp {
             self.placement_tint_dirty = false;
             return;
         }
-        let res = doc.preview_resolution.clamp(64, 512);
+        let Some(res) = doc
+            .bounded_settings()
+            .map(|settings| settings.preview_resolution.clamp(64, 512))
+        else {
+            r.upload_placement_tint(1, 1, &[0, 0, 0, 0]);
+            r.set_biome_tint_strength(0.0);
+            self.placement_tint_dirty = false;
+            return;
+        };
         let isolate = if layer.isolate_active {
             doc.active_biome
         } else {
@@ -238,12 +246,17 @@ impl TerraApp {
             let Some((_, cursor_y)) = self.last_cursor else {
                 return;
             };
-            let world_span = self
+            let Some(metrics) = self
                 .session
                 .document
-                .metrics
-                .world_size_x
-                .max(self.session.document.metrics.world_size_z);
+                .bounded_settings()
+                .map(|settings| settings.metrics)
+            else {
+                self.ui_state.status =
+                    "Shape editing is unavailable for Infinite projects in this slice.".into();
+                return;
+            };
+            let world_span = metrics.world_size_x.max(metrics.world_size_z);
             let meters_per_pixel = (world_span / 2048.0).clamp(0.1, 5.0);
             let height =
                 drag.start_height - (cursor_y - drag.start_cursor.1) as f32 * meters_per_pixel;
@@ -303,7 +316,16 @@ impl TerraApp {
                 self.ui_state.status = "Measure: click end point".into();
             }
             Some((u0, v0)) => {
-                let m = &self.session.document.metrics;
+                let Some(m) = self
+                    .session
+                    .document
+                    .bounded_settings()
+                    .map(|settings| settings.metrics)
+                else {
+                    self.ui_state.status =
+                        "Measuring authored terrain is unavailable for Infinite projects.".into();
+                    return;
+                };
                 let dx = (u - u0) * m.world_size_x;
                 let dz = (v - v0) * m.world_size_z;
                 let mut dy = 0.0;

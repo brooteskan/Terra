@@ -53,9 +53,11 @@ fn flat_doc_normalizes_into_wc_tree() {
     let mut doc = TerrainDocument {
         version: DOCUMENT_VERSION,
         name: "Flat".into(),
-        metrics: HeightfieldMetrics::preview_default(),
-        preview_resolution: 64,
-        export_resolution: 64,
+        world: ProjectWorld::BoundedHeightfield(BoundedHeightfieldSettings {
+            metrics: HeightfieldMetrics::preview_default(),
+            preview_resolution: 64,
+            export_resolution: 64,
+        }),
         stack,
         masks: Vec::new(),
         selected: None,
@@ -149,6 +151,87 @@ fn default_roundtrip() {
     assert_eq!(back.version, DOCUMENT_VERSION);
     assert!(back.stack.first_biome().is_some());
     assert_eq!(back.stack.layer_ids(), before_ids);
+}
+
+#[test]
+fn legacy_world_fields_migrate_to_bounded_heightfield() {
+    let doc = TerrainDocument::new_default();
+    let bounded = doc.bounded_settings().unwrap().clone();
+    let mut value = serde_json::to_value(&doc).unwrap();
+    let object = value.as_object_mut().unwrap();
+    object.remove("world");
+    object.insert(
+        "metrics".into(),
+        serde_json::to_value(bounded.metrics).unwrap(),
+    );
+    object.insert(
+        "preview_resolution".into(),
+        serde_json::json!(bounded.preview_resolution),
+    );
+    object.insert(
+        "export_resolution".into(),
+        serde_json::json!(bounded.export_resolution),
+    );
+
+    let loaded = TerrainDocument::from_json(&serde_json::to_string(&value).unwrap()).unwrap();
+
+    assert_eq!(loaded.world_kind(), ProjectWorldKind::BoundedHeightfield);
+    assert_eq!(loaded.bounded_settings(), Some(&bounded));
+}
+
+#[test]
+fn infinite_world_round_trips_all_authoritative_settings() {
+    let settings = InfiniteProceduralWorldSettings {
+        seed: 0xfeed_beef,
+        origin: WorldPosition::try_new(-12_345.5, 98_765.25).unwrap(),
+        finest_spacing_m: 0.25,
+        tile_size_samples: 128,
+        publication_halo_samples: 4,
+        max_lod: Lod::try_new(9).unwrap(),
+        preview_radius_m: 2_000.0,
+        horizon_m: 32_000.0,
+        cpu_residency_budget_mib: 384,
+        gpu_residency_budget_mib: 96,
+    };
+    let doc = TerrainDocument::new_infinite(settings.clone()).unwrap();
+
+    let json = doc.to_json().unwrap();
+    let loaded = TerrainDocument::from_json(&json).unwrap();
+
+    assert_eq!(loaded.version, DOCUMENT_VERSION);
+    assert_eq!(loaded.infinite_settings(), Some(&settings));
+    assert!(json.contains("\"type\":\"infinite_procedural_world\""));
+    assert!(!json.contains("\"samples\""));
+    assert!(loaded
+        .stack
+        .flatten_layers()
+        .into_iter()
+        .all(|layer| !layer.kind.is_sculpt_base()));
+}
+
+#[test]
+fn infinite_world_validation_rejects_invalid_sparse_configuration() {
+    let mut settings = InfiniteProceduralWorldSettings::default();
+    settings.finest_spacing_m = 0.0;
+    assert!(settings.validate().unwrap_err().contains("spacing"));
+
+    let mut settings = InfiniteProceduralWorldSettings::default();
+    settings.tile_size_samples = 100;
+    assert!(settings.validate().unwrap_err().contains("power of two"));
+
+    settings = InfiniteProceduralWorldSettings::default();
+    settings.horizon_m = settings.preview_radius_m - 1.0;
+    assert!(settings
+        .validate()
+        .unwrap_err()
+        .contains("at least the preview radius"));
+
+    settings = InfiniteProceduralWorldSettings::default();
+    settings.gpu_residency_budget_mib = 0;
+    assert!(settings
+        .validate()
+        .unwrap_err()
+        .contains("must be positive"));
 }
 
 fn assert_surface_kind_roundtrips(kind: LayerKind) {

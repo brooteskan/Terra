@@ -265,12 +265,20 @@ pub(crate) fn try_apply(
         } => {
             use terra_core::layer::{BrushDab, BrushEditable, EditSupport};
 
+            let Some(metrics) = app
+                .session
+                .document
+                .bounded_settings()
+                .map(|settings| settings.metrics)
+            else {
+                app.ui_state.status =
+                    "Sculpt painting is unavailable for Infinite projects in this slice.".into();
+                return Ok(());
+            };
+
             let falloff = app.ui_state.sculpt_falloff_exponent();
             let continuing = app.last_paint_uv.is_some();
-            let world_radius = radius
-                * 0.5
-                * (app.session.document.metrics.world_size_x
-                    + app.session.document.metrics.world_size_z);
+            let world_radius = radius * 0.5 * (metrics.world_size_x + metrics.world_size_z);
             if let Some(target) = app.session.document.stack.find_mut(layer) {
                 let support = target.brush_support(stroke_kind);
                 if support == EditSupport::Unsupported {

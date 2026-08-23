@@ -260,9 +260,12 @@ fn scaffold_doc(
     if matches!(template, WorldTemplate::Blank) {
         doc.name = "Untitled World".into();
     }
-    doc.metrics = HeightfieldMetrics::new(preview_res, preview_res, world_size_m, world_size_m);
-    doc.preview_resolution = preview_res;
-    doc.export_resolution = (world_size_m / mps).round().clamp(1024.0, 8192.0) as u32;
+    let bounded = doc
+        .bounded_settings_mut()
+        .expect("world archetypes are bounded heightfields");
+    bounded.metrics = HeightfieldMetrics::new(preview_res, preview_res, world_size_m, world_size_m);
+    bounded.preview_resolution = preview_res;
+    bounded.export_resolution = (world_size_m / mps).round().clamp(1024.0, 8192.0) as u32;
     doc.blueprint = template.blueprint(world_size_m);
     doc.presets_used.push(template.id().into());
     doc
@@ -481,14 +484,17 @@ fn finish_biomes(doc: &mut TerrainDocument, biomes: BiomeLibrary, mps: f32, hd_o
 // —— Macro stages ————————————————————————————————————————————————————
 
 fn prepare_blank_surface(doc: &mut TerrainDocument) {
+    let preview_resolution = doc
+        .bounded_settings()
+        .expect("blank world archetype is bounded")
+        .preview_resolution;
     if let Some(base) = doc
         .stack
         .flatten_layers_mut()
         .into_iter()
         .find(|l| l.kind.is_sculpt_base())
     {
-        base.kind =
-            LayerKind::SculptBase(SculptParams::filled(doc.preview_resolution.min(512), 8.0));
+        base.kind = LayerKind::SculptBase(SculptParams::filled(preview_resolution.min(512), 8.0));
     }
 }
 

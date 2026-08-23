@@ -291,6 +291,62 @@ impl TerraApp {
         }
     }
 
+    pub(crate) fn new_infinite_project(
+        &mut self,
+        settings: terra_core::document::InfiniteProceduralWorldSettings,
+    ) {
+        if let Err(error) = settings.validate() {
+            self.ui_state.status = format!("Invalid Infinite project settings: {error}");
+            self.request_app_frame(FrameRequestReason::UiActions);
+            return;
+        }
+
+        let projects_root = default_terra_projects_dir();
+        if let Err(error) = std::fs::create_dir_all(&projects_root) {
+            self.ui_state.status = format!("Could not create projects folder: {error}");
+            self.request_app_frame(FrameRequestReason::UiActions);
+            return;
+        }
+        let Some(picked) = rfd::FileDialog::new()
+            .add_filter("Terra Project", &["json"])
+            .set_directory(&projects_root)
+            .set_file_name("infinite_world.json")
+            .save_file()
+        else {
+            return;
+        };
+        let name = project_name_from_path(&picked);
+        let path = match prepare_project_path(&projects_root, &name) {
+            Ok(path) => path,
+            Err(error) => {
+                self.ui_state.status = format!("Could not create project folder: {error}");
+                self.request_app_frame(FrameRequestReason::UiActions);
+                return;
+            }
+        };
+        let mut doc = match terra_core::document::TerrainDocument::new_infinite(settings) {
+            Ok(doc) => doc,
+            Err(error) => {
+                self.ui_state.status = format!("Could not create Infinite project: {error}");
+                return;
+            }
+        };
+        doc.name = name;
+        doc.presets_used.push("Infinite Procedural World".into());
+        match save_project(&doc, &path) {
+            Ok(()) => {
+                self.show_new_template_picker = false;
+                self.enter_editor(doc, Some(path.clone()), false);
+                self.remember_recent(&path);
+                self.ui_state.status = format!("Created {}", path.display());
+            }
+            Err(error) => {
+                self.ui_state.status = format!("Could not create project: {error}");
+                self.request_app_frame(FrameRequestReason::UiActions);
+            }
+        }
+    }
+
     pub(crate) fn open_project_dialog(&mut self) {
         let projects_root = default_terra_projects_dir();
         let mut dialog = rfd::FileDialog::new().add_filter("Terra Project", &["json"]);
@@ -331,10 +387,9 @@ impl TerraApp {
         self.pending_eval_immediate = false;
 
         // Fresh session (undo stacks, outdated sims, rebuild feedback) — same as a cold open.
-        let world_size = (document.metrics.world_size_x, document.metrics.world_size_z);
+        let project_world = document.world.clone();
         let ocean = Some(document.blueprint.sea_level).filter(|v| v.is_finite());
-        let mut session = EditorSession::new();
-        session.document = document;
+        let mut session = EditorSession::with_document(document);
         session.history = CommandHistory::default();
         session.dirty_eval = true;
         self.session = session;
@@ -344,7 +399,7 @@ impl TerraApp {
         self.screen = AppScreen::Editor;
         self.pending_project_action = None;
 
-        self.reset_runtime_for_document(world_size, ocean);
+        self.reset_runtime_for_document(&project_world, ocean);
         self.apply_document_lighting();
 
         // Editor chrome starts minimized on create/open.
@@ -366,7 +421,7 @@ impl TerraApp {
     /// Shared by new-project, open-project, and close-project paths.
     pub(crate) fn reset_runtime_for_document(
         &mut self,
-        world_size: (f32, f32),
+        project_world: &terra_core::document::ProjectWorld,
         ocean_level: Option<f32>,
     ) {
         self.supersede_gpu_refinement();
@@ -405,13 +460,33 @@ impl TerraApp {
         self.ui_state.dirty_tile_ids.clear();
         self.clear_terrain_tile_work();
 
-        let metrics = self.session.document.metrics;
-        self.terrain_runtime
-            .reconfigure(terra_core::PyramidConfig::new(
-                self.session.document.preview_resolution.max(256),
-                metrics.world_size_x,
-                metrics.world_size_z,
-            ));
+        let world_size = match project_world {
+            terra_core::document::ProjectWorld::BoundedHeightfield(settings) => {
+                self.terrain_runtime
+                    .reconfigure(terra_core::PyramidConfig::new(
+                        settings.preview_resolution.max(256),
+                        settings.metrics.world_size_x,
+                        settings.metrics.world_size_z,
+                    ));
+                (settings.metrics.world_size_x, settings.metrics.world_size_z)
+            }
+            terra_core::document::ProjectWorld::InfiniteProceduralWorld(settings) => {
+                match settings.topology() {
+                    Ok(topology) => {
+                        if let Err(error) = self.terrain_runtime.try_reconfigure(
+                            terra_core::TerrainRuntimeConfig::Infinite(topology.config()),
+                        ) {
+                            self.ui_state.status = format!("Invalid Infinite topology: {error}");
+                        }
+                    }
+                    Err(error) => {
+                        self.ui_state.status = format!("Invalid Infinite topology: {error}");
+                    }
+                }
+                let local_span = (settings.horizon_m * 2.0).clamp(1.0, f64::from(f32::MAX)) as f32;
+                (local_span, local_span)
+            }
+        };
 
         if let Some(engine) = self.gpu_engine.as_mut() {
             if let Some(gpu) = self.gpu.as_ref() {
@@ -439,7 +514,8 @@ impl TerraApp {
         self.session.history = CommandHistory::default();
         self.project_path = None;
         self.document_dirty = false;
-        self.reset_runtime_for_document((1000.0, 1000.0), None);
+        let project_world = self.session.document.world.clone();
+        self.reset_runtime_for_document(&project_world, None);
         self.pending_project_action = None;
         self.screen = AppScreen::Home;
         self.ui_state.status = String::new();
@@ -1051,7 +1127,7 @@ mod tests {
         let mut app = TerraApp::default();
         app.renderer = Some(TerrainRenderer::new_headless(&context, 64, 64));
         app.gpu = Some(context);
-        let config = app.terrain_runtime.pyramid.config;
+        let config = app.terrain_runtime.bounded_pyramid().unwrap().config;
         app.tile_atlas = Some(
             GpuTileAtlas::new(&gpu.device, config.tile_size, config.halo, 4).expect("test atlas"),
         );
@@ -1089,7 +1165,8 @@ mod tests {
             (atlas.tile_size(), atlas.halo(), atlas.max_pages())
         };
 
-        app.reset_runtime_for_document((1000.0, 1000.0), None);
+        let world = app.session.document.world.clone();
+        app.reset_runtime_for_document(&world, None);
 
         let atlas = app.tile_atlas.as_ref().expect("reset must retain atlas");
         assert_eq!(
@@ -1148,7 +1225,7 @@ mod tests {
         let mut app = TerraApp::default();
         app.renderer = Some(TerrainRenderer::new_headless(&context, 64, 64));
         app.gpu = Some(context);
-        let config = app.terrain_runtime.pyramid.config;
+        let config = app.terrain_runtime.bounded_pyramid().unwrap().config;
         app.tile_atlas = Some(
             GpuTileAtlas::new(&gpu.device, config.tile_size, config.halo, 4).expect("test atlas"),
         );
@@ -1242,7 +1319,8 @@ mod tests {
         let entry = live[0];
         let (level, tile) = app
             .terrain_runtime
-            .pyramid
+            .bounded_pyramid()
+            .unwrap()
             .level_and_tile(key.address)
             .expect("resident key belongs to bounded pyramid");
         assert_eq!(entry.level as u8, level, "page level matches key");

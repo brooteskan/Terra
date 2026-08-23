@@ -434,9 +434,13 @@ impl Default for TerraApp {
         ui_state.layout = prefs.layout;
         ui_state.apply_preferred_workspace_from_prefs();
         let session = EditorSession::new();
-        let metrics = session.document.metrics;
+        let bounded = session
+            .document
+            .bounded_settings()
+            .expect("default editor session is bounded");
+        let metrics = bounded.metrics;
         let terrain_runtime = terra_core::TerrainRuntime::new(terra_core::PyramidConfig::new(
-            session.document.preview_resolution,
+            bounded.preview_resolution,
             metrics.world_size_x,
             metrics.world_size_z,
         ));

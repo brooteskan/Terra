@@ -847,6 +847,9 @@ fn peek_world_size_label(path: &Path) -> Option<String> {
     let mut buf = vec![0u8; 8192];
     let n = file.read(&mut buf).ok()?;
     let head = String::from_utf8_lossy(&buf[..n]);
+    if head.contains("\"type\":\"infinite_procedural_world\"") {
+        return Some("Infinite Procedural World".into());
+    }
     let wx = find_json_f32(&head, "\"world_size_x\"")?;
     let wz = find_json_f32(&head, "\"world_size_z\"").unwrap_or(wx);
     let km_x = (wx / 1000.0).round().max(1.0) as i32;
@@ -888,17 +891,21 @@ fn truncate_middle(s: &str, max_chars: usize) -> String {
 #[derive(Debug, Clone, PartialEq)]
 pub enum NewProjectTemplateChoice {
     Cancel,
-    Create {
+    CreateBounded {
         template_id: String,
         /// World Creator–style Resolution: world extent in metres (samples derived).
         world_size_m: f32,
         sea_level: f32,
+    },
+    CreateInfinite {
+        settings: terra_core::document::InfiniteProceduralWorldSettings,
     },
 }
 
 /// World settings edited in the New Project modal.
 #[derive(Debug, Clone)]
 pub struct NewWorldSettings {
+    pub world_kind: terra_core::document::ProjectWorldKind,
     /// World Creator–style Resolution — physical extent in metres.
     pub world_size_m: f32,
     pub sea_level: f32,
@@ -906,17 +913,64 @@ pub struct NewWorldSettings {
     pub units_kilometers: bool,
     /// UI-only: horizontal scroll for World Design cards.
     pub design_scroll_x: f32,
+    pub infinite_seed: u64,
+    pub infinite_origin_x_m: f64,
+    pub infinite_origin_z_m: f64,
+    pub infinite_finest_spacing_m: f64,
+    pub infinite_tile_size_samples: u32,
+    pub infinite_max_lod: u8,
+    pub infinite_preview_radius_m: f64,
+    pub infinite_horizon_m: f64,
+    pub infinite_cpu_budget_mib: u32,
+    pub infinite_gpu_budget_mib: u32,
 }
 
 impl Default for NewWorldSettings {
     fn default() -> Self {
         Self {
+            world_kind: terra_core::document::ProjectWorldKind::BoundedHeightfield,
             world_size_m: 4096.0,
             sea_level: 0.0,
             units_kilometers: false,
             design_scroll_x: 0.0,
+            infinite_seed: 1,
+            infinite_origin_x_m: 0.0,
+            infinite_origin_z_m: 0.0,
+            infinite_finest_spacing_m: 1.0,
+            infinite_tile_size_samples: 256,
+            infinite_max_lod: 12,
+            infinite_preview_radius_m: 4_096.0,
+            infinite_horizon_m: 16_384.0,
+            infinite_cpu_budget_mib: 256,
+            infinite_gpu_budget_mib: 32,
         }
     }
+}
+
+fn infinite_settings_from_ui(
+    settings: &NewWorldSettings,
+) -> Result<terra_core::document::InfiniteProceduralWorldSettings, String> {
+    let origin = terra_world::WorldPosition::try_new(
+        settings.infinite_origin_x_m,
+        settings.infinite_origin_z_m,
+    )
+    .map_err(|error| error.to_string())?;
+    let max_lod =
+        terra_world::Lod::try_new(settings.infinite_max_lod).map_err(|error| error.to_string())?;
+    let result = terra_core::document::InfiniteProceduralWorldSettings {
+        seed: settings.infinite_seed,
+        origin,
+        finest_spacing_m: settings.infinite_finest_spacing_m,
+        tile_size_samples: settings.infinite_tile_size_samples,
+        publication_halo_samples: terra_core::heightfield::DEFAULT_HALO,
+        max_lod,
+        preview_radius_m: settings.infinite_preview_radius_m,
+        horizon_m: settings.infinite_horizon_m,
+        cpu_residency_budget_mib: settings.infinite_cpu_budget_mib,
+        gpu_residency_budget_mib: settings.infinite_gpu_budget_mib,
+    };
+    result.validate()?;
+    Ok(result)
 }
 
 /// Modal template picker for New Project with World Design settings.
@@ -979,36 +1033,78 @@ pub fn draw_new_project_templates(
         apply_template_defaults(selected_id, settings);
     }
 
-    // â€”â€” WORLD DESIGN â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”
     ui.label_at(
         content_x,
-        y,
-        "WORLD DESIGN",
+        y + 4.0,
+        "WORLD TYPE",
         style::TEXT_MUTED,
         FONT_SCALE * 0.78,
     );
-    y += 20.0;
-
-    let design = world_design_templates();
-    let design_card_w = 280.0;
-    let design_card_h = 220.0;
-    let design_gap = style::SPACE_3;
-    let design_strip = Rect::from_pos_size(content_x, y, content_w, design_card_h);
-    let mut design_scroll = settings.design_scroll_x;
-    draw_template_strip(
+    let type_x = content_x + 112.0;
+    let type_w = content_w - 112.0;
+    let bounded_r = Rect::from_pos_size(type_x, y, type_w * 0.48, 30.0);
+    let infinite_r = Rect::from_pos_size(type_x + type_w * 0.5, y, type_w * 0.5, 30.0);
+    if segmented_button(
         ui,
-        Id::new("nw_design_strip"),
-        design_strip,
-        &design,
-        selected_id,
-        settings,
-        &mut design_scroll,
-        design_card_w,
-        design_card_h,
-        design_gap,
-    );
-    settings.design_scroll_x = design_scroll;
-    y += design_card_h + style::SPACE_5;
+        Id::new("nw_type_bounded"),
+        bounded_r,
+        "Bounded Heightfield",
+        settings.world_kind == terra_core::document::ProjectWorldKind::BoundedHeightfield,
+    ) {
+        settings.world_kind = terra_core::document::ProjectWorldKind::BoundedHeightfield;
+    }
+    if segmented_button(
+        ui,
+        Id::new("nw_type_infinite"),
+        infinite_r,
+        "Infinite Procedural World",
+        settings.world_kind == terra_core::document::ProjectWorldKind::InfiniteProceduralWorld,
+    ) {
+        settings.world_kind = terra_core::document::ProjectWorldKind::InfiniteProceduralWorld;
+    }
+    y += 44.0;
+
+    // â€”â€” WORLD DESIGN â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”
+    if settings.world_kind == terra_core::document::ProjectWorldKind::BoundedHeightfield {
+        ui.label_at(
+            content_x,
+            y,
+            "WORLD DESIGN",
+            style::TEXT_MUTED,
+            FONT_SCALE * 0.78,
+        );
+        y += 20.0;
+
+        let design = world_design_templates();
+        let design_card_w = 280.0;
+        let design_card_h = 220.0;
+        let design_gap = style::SPACE_3;
+        let design_strip = Rect::from_pos_size(content_x, y, content_w, design_card_h);
+        let mut design_scroll = settings.design_scroll_x;
+        draw_template_strip(
+            ui,
+            Id::new("nw_design_strip"),
+            design_strip,
+            &design,
+            selected_id,
+            settings,
+            &mut design_scroll,
+            design_card_w,
+            design_card_h,
+            design_gap,
+        );
+        settings.design_scroll_x = design_scroll;
+        y += design_card_h + style::SPACE_5;
+    } else {
+        ui.label_at(
+            content_x,
+            y,
+            "Deterministic sparse terrain generated from absolute world coordinates.",
+            style::TEXT_DIM,
+            FONT_SCALE * 0.92,
+        );
+        y += 30.0;
+    }
 
     // â€”â€” WORLD SETTINGS â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”
     ui.label_at(
@@ -1022,37 +1118,39 @@ pub fn draw_new_project_templates(
     let units_w = 188.0;
     let units_h = 28.0;
     let units_r = Rect::from_pos_size(panel.max_x - inset - units_w, y, units_w, units_h);
-    ui.panel_rounded(units_r, style::INPUT_BG, style::RADIUS_SM);
-    let half = units_w * 0.5;
-    let m_r = Rect::from_pos_size(
-        units_r.min_x + 2.0,
-        units_r.min_y + 2.0,
-        half - 3.0,
-        units_h - 4.0,
-    );
-    let k_r = Rect::from_pos_size(
-        units_r.min_x + half + 1.0,
-        units_r.min_y + 2.0,
-        half - 3.0,
-        units_h - 4.0,
-    );
-    if segmented_button(
-        ui,
-        Id::new("nw_units_m"),
-        m_r,
-        "Meters",
-        !settings.units_kilometers,
-    ) {
-        settings.units_kilometers = false;
-    }
-    if segmented_button(
-        ui,
-        Id::new("nw_units_km"),
-        k_r,
-        "Kilometers",
-        settings.units_kilometers,
-    ) {
-        settings.units_kilometers = true;
+    if settings.world_kind == terra_core::document::ProjectWorldKind::BoundedHeightfield {
+        ui.panel_rounded(units_r, style::INPUT_BG, style::RADIUS_SM);
+        let half = units_w * 0.5;
+        let m_r = Rect::from_pos_size(
+            units_r.min_x + 2.0,
+            units_r.min_y + 2.0,
+            half - 3.0,
+            units_h - 4.0,
+        );
+        let k_r = Rect::from_pos_size(
+            units_r.min_x + half + 1.0,
+            units_r.min_y + 2.0,
+            half - 3.0,
+            units_h - 4.0,
+        );
+        if segmented_button(
+            ui,
+            Id::new("nw_units_m"),
+            m_r,
+            "Meters",
+            !settings.units_kilometers,
+        ) {
+            settings.units_kilometers = false;
+        }
+        if segmented_button(
+            ui,
+            Id::new("nw_units_km"),
+            k_r,
+            "Kilometers",
+            settings.units_kilometers,
+        ) {
+            settings.units_kilometers = true;
+        }
     }
     y += units_h + style::SPACE_3;
 
@@ -1063,58 +1161,180 @@ pub fn draw_new_project_templates(
     let settings_x = content_x;
     let settings_w = content_w;
 
-    let km = settings.units_kilometers;
-    let mut size_display = if km {
-        settings.world_size_m / 1000.0
-    } else {
-        settings.world_size_m
-    };
-    let (size_min, size_max) = if km {
-        (1.024, 100.0)
-    } else {
-        (1024.0, 100_000.0)
-    };
-    if draw_setting_row(
-        ui,
-        Id::new("nw_size"),
-        Rect::from_pos_size(settings_x, y, settings_w, row_h),
-        Icon::Maximize2,
-        "Resolution",
-        &mut size_display,
-        size_min,
-        size_max,
-        !km,
-    ) {
-        settings.world_size_m = if km {
-            (size_display * 1000.0).clamp(1024.0, 100_000.0)
+    if settings.world_kind == terra_core::document::ProjectWorldKind::BoundedHeightfield {
+        let km = settings.units_kilometers;
+        let mut size_display = if km {
+            settings.world_size_m / 1000.0
         } else {
-            size_display.clamp(1024.0, 100_000.0)
+            settings.world_size_m
         };
-    }
-    y += row_h + row_gap;
+        let (size_min, size_max) = if km {
+            (1.024, 100.0)
+        } else {
+            (1024.0, 100_000.0)
+        };
+        if draw_setting_row(
+            ui,
+            Id::new("nw_size"),
+            Rect::from_pos_size(settings_x, y, settings_w, row_h),
+            Icon::Maximize2,
+            "Resolution",
+            &mut size_display,
+            size_min,
+            size_max,
+            !km,
+        ) {
+            settings.world_size_m = if km {
+                (size_display * 1000.0).clamp(1024.0, 100_000.0)
+            } else {
+                size_display.clamp(1024.0, 100_000.0)
+            };
+        }
+        y += row_h + row_gap;
 
-    let mut sea_display = if km {
-        settings.sea_level / 1000.0
-    } else {
-        settings.sea_level
-    };
-    let (sea_min, sea_max) = if km { (-0.05, 0.05) } else { (-50.0, 50.0) };
-    if draw_setting_row(
-        ui,
-        Id::new("nw_sea"),
-        Rect::from_pos_size(settings_x, y, settings_w, row_h),
-        Icon::Waves,
-        "Sea level",
-        &mut sea_display,
-        sea_min,
-        sea_max,
-        false,
-    ) {
-        settings.sea_level = if km {
-            (sea_display * 1000.0).clamp(-50.0, 50.0)
+        let mut sea_display = if km {
+            settings.sea_level / 1000.0
         } else {
-            sea_display.clamp(-50.0, 50.0)
+            settings.sea_level
         };
+        let (sea_min, sea_max) = if km { (-0.05, 0.05) } else { (-50.0, 50.0) };
+        if draw_setting_row(
+            ui,
+            Id::new("nw_sea"),
+            Rect::from_pos_size(settings_x, y, settings_w, row_h),
+            Icon::Waves,
+            "Sea level",
+            &mut sea_display,
+            sea_min,
+            sea_max,
+            false,
+        ) {
+            settings.sea_level = if km {
+                (sea_display * 1000.0).clamp(-50.0, 50.0)
+            } else {
+                sea_display.clamp(-50.0, 50.0)
+            };
+        }
+    } else {
+        macro_rules! infinite_row {
+            ($id:literal, $icon:expr, $label:literal, $value:expr, $min:expr, $max:expr, $integer:expr, $assign:expr) => {{
+                let mut display = $value as f32;
+                if draw_setting_row(
+                    ui,
+                    Id::new($id),
+                    Rect::from_pos_size(settings_x, y, settings_w, row_h),
+                    $icon,
+                    $label,
+                    &mut display,
+                    $min,
+                    $max,
+                    $integer,
+                ) {
+                    $assign(display);
+                }
+                y += row_h + row_gap;
+            }};
+        }
+        infinite_row!(
+            "nw_seed",
+            Icon::Sparkles,
+            "Seed",
+            settings.infinite_seed,
+            0.0,
+            16_000_000.0,
+            true,
+            |v: f32| settings.infinite_seed = v as u64
+        );
+        infinite_row!(
+            "nw_origin_x",
+            Icon::Move,
+            "Origin X (m)",
+            settings.infinite_origin_x_m,
+            -10_000_000.0,
+            10_000_000.0,
+            false,
+            |v: f32| settings.infinite_origin_x_m = f64::from(v)
+        );
+        infinite_row!(
+            "nw_origin_z",
+            Icon::Move,
+            "Origin Z (m)",
+            settings.infinite_origin_z_m,
+            -10_000_000.0,
+            10_000_000.0,
+            false,
+            |v: f32| settings.infinite_origin_z_m = f64::from(v)
+        );
+        infinite_row!(
+            "nw_spacing",
+            Icon::Grid3x3,
+            "Finest m/sample",
+            settings.infinite_finest_spacing_m,
+            0.1,
+            64.0,
+            false,
+            |v: f32| settings.infinite_finest_spacing_m = f64::from(v)
+        );
+        infinite_row!(
+            "nw_tile_size",
+            Icon::Package,
+            "Tile size (samples)",
+            settings.infinite_tile_size_samples,
+            32.0,
+            1024.0,
+            true,
+            |v: f32| settings.infinite_tile_size_samples = v as u32
+        );
+        infinite_row!(
+            "nw_max_lod",
+            Icon::Layers,
+            "Maximum LOD",
+            settings.infinite_max_lod,
+            0.0,
+            24.0,
+            true,
+            |v: f32| settings.infinite_max_lod = v as u8
+        );
+        infinite_row!(
+            "nw_preview_radius",
+            Icon::Camera,
+            "Preview radius (m)",
+            settings.infinite_preview_radius_m,
+            256.0,
+            100_000.0,
+            true,
+            |v: f32| settings.infinite_preview_radius_m = f64::from(v)
+        );
+        infinite_row!(
+            "nw_horizon",
+            Icon::Maximize2,
+            "Horizon (m)",
+            settings.infinite_horizon_m,
+            512.0,
+            1_000_000.0,
+            true,
+            |v: f32| settings.infinite_horizon_m = f64::from(v)
+        );
+        infinite_row!(
+            "nw_cpu_budget",
+            Icon::Activity,
+            "CPU residency (MiB)",
+            settings.infinite_cpu_budget_mib,
+            1.0,
+            4096.0,
+            true,
+            |v: f32| settings.infinite_cpu_budget_mib = v as u32
+        );
+        infinite_row!(
+            "nw_gpu_budget",
+            Icon::Gauge,
+            "GPU residency (MiB)",
+            settings.infinite_gpu_budget_mib,
+            1.0,
+            4096.0,
+            true,
+            |v: f32| settings.infinite_gpu_budget_mib = v as u32
+        );
     }
     let _ = (y, row_h, row_gap);
     let _ = settings_bottom;
@@ -1135,19 +1355,35 @@ pub fn draw_new_project_templates(
     if chip_button(ui, Id::new("new_tmpl_cancel"), "Cancel", cancel_r, false) {
         choice = Some(NewProjectTemplateChoice::Cancel);
     }
+    let infinite_settings = infinite_settings_from_ui(settings);
+    let can_create = match settings.world_kind {
+        terra_core::document::ProjectWorldKind::BoundedHeightfield => !selected_id.is_empty(),
+        terra_core::document::ProjectWorldKind::InfiniteProceduralWorld => {
+            infinite_settings.is_ok()
+        }
+    };
     if chip_icon_button(
         ui,
         Id::new("new_tmpl_create"),
         Icon::Sparkles,
         "Create World",
         create_r,
-        true,
-    ) && !selected_id.is_empty()
+        can_create,
+    ) && can_create
     {
-        choice = Some(NewProjectTemplateChoice::Create {
-            template_id: selected_id.clone(),
-            world_size_m: settings.world_size_m,
-            sea_level: settings.sea_level,
+        choice = Some(match settings.world_kind {
+            terra_core::document::ProjectWorldKind::BoundedHeightfield => {
+                NewProjectTemplateChoice::CreateBounded {
+                    template_id: selected_id.clone(),
+                    world_size_m: settings.world_size_m,
+                    sea_level: settings.sea_level,
+                }
+            }
+            terra_core::document::ProjectWorldKind::InfiniteProceduralWorld => {
+                NewProjectTemplateChoice::CreateInfinite {
+                    settings: infinite_settings.expect("validated above"),
+                }
+            }
         });
     }
     if ui.input.escape_pressed && !had_text_focus {

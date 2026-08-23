@@ -374,7 +374,7 @@ fn genuinely_future_version_is_rejected_clearly() {
 }
 
 #[test]
-fn rectangular_sculpt_sources_round_trip_in_version_3() {
+fn rectangular_sculpt_sources_round_trip_in_current_version() {
     let mut document = TerrainDocument::default();
     let base = document
         .stack
@@ -389,7 +389,7 @@ fn rectangular_sculpt_sources_round_trip_in_version_3() {
 
     let json = document.to_json().expect("rectangular source saves");
     let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-    assert_eq!(value["version"], 3);
+    assert_eq!(value["version"], DOCUMENT_VERSION);
     assert!(json.contains("\"width\":128"));
     assert!(json.contains("\"height\":256"));
 

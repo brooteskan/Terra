@@ -138,11 +138,12 @@ pub use terrain::{
     PyramidConfig, RefinementController, RefinementTimings, ResidentTile, TerrainCacheKey,
     TerrainContentStamp, TerrainDemandClass, TerrainDemandConfig, TerrainDemandError,
     TerrainDemandPlan, TerrainDemandPlanner, TerrainDemandView, TerrainDomainError,
-    TerrainEvaluationDomain, TerrainLevel, TerrainPyramid, TerrainRuntime, TerrainSampleExtent,
-    TerrainTileDemand, TerrainTileExtent, TerrainTileKey, TerrainTileRange, TerrainTileWorkBudget,
-    TerrainTileWorkKey, TerrainTileWorkLease, TerrainTileWorkRequest, TerrainTileWorkScheduler,
-    TerrainTileWorkSource, TerrainTileWorkStats, TerrainWorldTransform, TileCacheError,
-    TileCacheEviction, TileCacheInsert, TileCacheStats, TilePageHandle, TileResidencyCache,
+    TerrainEvaluationDomain, TerrainLevel, TerrainPyramid, TerrainRuntime, TerrainRuntimeConfig,
+    TerrainRuntimeTopology, TerrainSampleExtent, TerrainTileDemand, TerrainTileExtent,
+    TerrainTileKey, TerrainTileRange, TerrainTileWorkBudget, TerrainTileWorkKey,
+    TerrainTileWorkLease, TerrainTileWorkRequest, TerrainTileWorkScheduler, TerrainTileWorkSource,
+    TerrainTileWorkStats, TerrainWorldTransform, TileCacheError, TileCacheEviction,
+    TileCacheInsert, TileCacheStats, TilePageHandle, TileResidencyCache,
 };
 pub use world_archetype::{
     alpine_world, badlands_world, blank_world_design, build_world, coastal_world, desert_world,

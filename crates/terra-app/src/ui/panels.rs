@@ -413,6 +413,17 @@ fn export_panel(
     ui_state: &mut UiState,
     out: &mut FrameUiOutput,
 ) {
+    let Some(bounded) = doc.bounded_settings() else {
+        label(
+            ui,
+            "Complete-world export is unavailable for Infinite Procedural World projects.",
+        );
+        label(
+            ui,
+            "Finite-region export is tracked separately from this project-model slice.",
+        );
+        return;
+    };
     label(ui, "What you'll get");
     label(ui, "- height.png / height.r32 - heightmap");
     label(ui, "- height_meta.json - size / world extents");
@@ -424,12 +435,12 @@ fn export_panel(
     ui.separator();
 
     label(ui, "Resolution");
-    let mut export_res = doc.export_resolution as i32;
+    let mut export_res = bounded.export_resolution as i32;
     let mut update = TerrainSettingsUpdate::default();
     if slider_i32(ui, "Export res", &mut export_res, 512, 8192) {
         update.export_resolution = Some(export_res as u32);
     }
-    let mut preview_res = doc.preview_resolution as i32;
+    let mut preview_res = bounded.preview_resolution as i32;
     if slider_i32(ui, "Preview res", &mut preview_res, 256, 8192) {
         update.preview_resolution = Some(preview_res as u32);
     }

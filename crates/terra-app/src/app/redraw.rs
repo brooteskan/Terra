@@ -645,11 +645,14 @@ impl TerraApp {
             if let Some(choice) = template_choice {
                 match choice {
                     NewProjectTemplateChoice::Cancel => self.show_new_template_picker = false,
-                    NewProjectTemplateChoice::Create {
+                    NewProjectTemplateChoice::CreateBounded {
                         template_id,
                         world_size_m,
                         sea_level,
                     } => self.new_project_with_template(&template_id, world_size_m, sea_level),
+                    NewProjectTemplateChoice::CreateInfinite { settings } => {
+                        self.new_infinite_project(settings)
+                    }
                 }
             }
 

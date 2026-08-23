@@ -1,4 +1,4 @@
-﻿//! Serializable project document.
+//! Serializable project document.
 
 mod session;
 
@@ -16,6 +16,7 @@ use crate::layer::{
 use crate::mask::{MaskAsset, MaskId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use terra_world::{InfiniteTopology, InfiniteTopologyConfig, Lod, WorldPosition};
 
 /// Highest persisted document version ever emitted. This value is monotonic and
 /// must never be decremented. Readers accept supported older versions and reject
@@ -23,7 +24,183 @@ use std::collections::HashMap;
 /// authored identity and semantics. Persisted enum tags are additive (renames
 /// require aliases or migration), and every new persisted field requires a Serde
 /// default or an explicit migration. Writers always stamp this current version.
-pub const DOCUMENT_VERSION: u32 = 3;
+pub const DOCUMENT_VERSION: u32 = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectWorldKind {
+    BoundedHeightfield,
+    InfiniteProceduralWorld,
+}
+
+impl ProjectWorldKind {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::BoundedHeightfield => "Bounded Heightfield",
+            Self::InfiniteProceduralWorld => "Infinite Procedural World",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BoundedHeightfieldSettings {
+    pub metrics: HeightfieldMetrics,
+    pub preview_resolution: u32,
+    pub export_resolution: u32,
+}
+
+impl Default for BoundedHeightfieldSettings {
+    fn default() -> Self {
+        let metrics = HeightfieldMetrics::preview_default();
+        Self {
+            metrics,
+            preview_resolution: metrics.width,
+            export_resolution: 2048,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InfiniteProceduralWorldSettings {
+    pub seed: u64,
+    pub origin: WorldPosition,
+    pub finest_spacing_m: f64,
+    pub tile_size_samples: u32,
+    pub publication_halo_samples: u32,
+    pub max_lod: Lod,
+    pub preview_radius_m: f64,
+    pub horizon_m: f64,
+    pub cpu_residency_budget_mib: u32,
+    pub gpu_residency_budget_mib: u32,
+}
+
+impl Default for InfiniteProceduralWorldSettings {
+    fn default() -> Self {
+        Self {
+            seed: 1,
+            origin: WorldPosition::ORIGIN,
+            finest_spacing_m: 1.0,
+            tile_size_samples: crate::heightfield::DEFAULT_TILE_SIZE,
+            publication_halo_samples: crate::heightfield::DEFAULT_HALO,
+            max_lod: Lod::try_new(12).expect("default Infinite LOD is valid"),
+            preview_radius_m: 4_096.0,
+            horizon_m: 16_384.0,
+            cpu_residency_budget_mib: 256,
+            gpu_residency_budget_mib: 32,
+        }
+    }
+}
+
+impl InfiniteProceduralWorldSettings {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.tile_size_samples < 32
+            || self.tile_size_samples > 1024
+            || !self.tile_size_samples.is_power_of_two()
+        {
+            return Err(format!(
+                "tile size must be a power of two from 32 through 1024, got {}",
+                self.tile_size_samples
+            ));
+        }
+        if self.publication_halo_samples > crate::heightfield::MAX_HALO
+            || self.publication_halo_samples >= self.tile_size_samples / 2
+        {
+            return Err(format!(
+                "publication halo must be smaller than half the tile and at most {}, got {}",
+                crate::heightfield::MAX_HALO,
+                self.publication_halo_samples
+            ));
+        }
+        if !self.preview_radius_m.is_finite() || self.preview_radius_m <= 0.0 {
+            return Err("preview radius must be finite and positive".into());
+        }
+        if !self.horizon_m.is_finite() || self.horizon_m < self.preview_radius_m {
+            return Err("horizon must be finite and at least the preview radius".into());
+        }
+        if self.cpu_residency_budget_mib == 0 || self.gpu_residency_budget_mib == 0 {
+            return Err("CPU and GPU residency budgets must be positive".into());
+        }
+        let topology = self.topology().map_err(|error| error.to_string())?;
+        let _ = topology
+            .spacing(self.max_lod)
+            .map_err(|error| error.to_string())?;
+
+        let page_extent = u64::from(self.tile_size_samples)
+            .checked_add(u64::from(self.publication_halo_samples).saturating_mul(2))
+            .ok_or_else(|| "tile page extent overflow".to_string())?;
+        let page_bytes = page_extent
+            .checked_mul(page_extent)
+            .and_then(|samples| samples.checked_mul(4))
+            .ok_or_else(|| "tile page byte size overflow".to_string())?;
+        let gpu_bytes = u64::from(self.gpu_residency_budget_mib) * 1024 * 1024;
+        let cpu_bytes = u64::from(self.cpu_residency_budget_mib) * 1024 * 1024;
+        if gpu_bytes < page_bytes || cpu_bytes < page_bytes {
+            return Err("CPU and GPU residency budgets must each hold at least one tile".into());
+        }
+        Ok(())
+    }
+
+    pub fn topology(&self) -> Result<InfiniteTopology, terra_world::WorldError> {
+        InfiniteTopology::try_new(InfiniteTopologyConfig {
+            origin: self.origin,
+            tile_size: self.tile_size_samples,
+            finest_spacing_m: self.finest_spacing_m,
+            max_lod: self.max_lod,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "settings", rename_all = "snake_case")]
+pub enum ProjectWorld {
+    BoundedHeightfield(BoundedHeightfieldSettings),
+    InfiniteProceduralWorld(InfiniteProceduralWorldSettings),
+}
+
+impl Default for ProjectWorld {
+    fn default() -> Self {
+        Self::BoundedHeightfield(BoundedHeightfieldSettings::default())
+    }
+}
+
+impl ProjectWorld {
+    pub const fn kind(&self) -> ProjectWorldKind {
+        match self {
+            Self::BoundedHeightfield(_) => ProjectWorldKind::BoundedHeightfield,
+            Self::InfiniteProceduralWorld(_) => ProjectWorldKind::InfiniteProceduralWorld,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::BoundedHeightfield(settings) => settings
+                .metrics
+                .validate()
+                .map_err(|error| format!("invalid heightfield metrics: {error}")),
+            Self::InfiniteProceduralWorld(settings) => settings.validate(),
+        }
+    }
+
+    pub const fn bounded(&self) -> Option<&BoundedHeightfieldSettings> {
+        match self {
+            Self::BoundedHeightfield(settings) => Some(settings),
+            Self::InfiniteProceduralWorld(_) => None,
+        }
+    }
+
+    pub fn bounded_mut(&mut self) -> Option<&mut BoundedHeightfieldSettings> {
+        match self {
+            Self::BoundedHeightfield(settings) => Some(settings),
+            Self::InfiniteProceduralWorld(_) => None,
+        }
+    }
+
+    pub const fn infinite(&self) -> Option<&InfiniteProceduralWorldSettings> {
+        match self {
+            Self::InfiniteProceduralWorld(settings) => Some(settings),
+            Self::BoundedHeightfield(_) => None,
+        }
+    }
+}
 
 /// Presentation lighting for the 3D viewport, saved with the project so a custom
 /// look is restored on load. Angles are degrees; strengths are renderer multipliers.
@@ -63,9 +240,7 @@ impl Default for ViewportLighting {
 pub struct TerrainDocument {
     pub version: u32,
     pub name: String,
-    pub metrics: HeightfieldMetrics,
-    pub preview_resolution: u32,
-    pub export_resolution: u32,
+    pub world: ProjectWorld,
     pub stack: LayerStack,
     pub masks: Vec<MaskAsset>,
     pub selected: Option<LayerId>,
@@ -127,7 +302,8 @@ fn ensure_all_biome_sections(nodes: &mut [StackNode]) {
 
 impl TerrainDocument {
     pub fn new_default() -> Self {
-        let metrics = HeightfieldMetrics::preview_default();
+        let bounded = BoundedHeightfieldSettings::default();
+        let metrics = bounded.metrics;
         let mut stack = LayerStack::new();
         // Sculptable foundation — selected by default for raise/lower.
         let base = Layer::new(
@@ -177,9 +353,7 @@ impl TerrainDocument {
         Self {
             version: DOCUMENT_VERSION,
             name: "Untitled".into(),
-            metrics,
-            preview_resolution: metrics.width,
-            export_resolution: 2048,
+            world: ProjectWorld::BoundedHeightfield(bounded),
             stack,
             masks: Vec::new(),
             selected: Some(base_id),
@@ -197,6 +371,55 @@ impl TerrainDocument {
             simulation_scenarios: crate::simulation_scenario::SimulationScenarioLibrary::default(),
             viewport_lighting: ViewportLighting::default(),
         }
+    }
+
+    pub fn new_infinite(settings: InfiniteProceduralWorldSettings) -> Result<Self, String> {
+        settings.validate()?;
+        let mut doc = Self::new_default();
+        doc.world = ProjectWorld::InfiniteProceduralWorld(settings.clone());
+        doc.stack
+            .nodes
+            .retain(|node| !matches!(node, StackNode::Layer(layer) if layer.kind.is_sculpt_base()));
+        if let Some(shape) = doc.stack.find_category_mut(StackCategory::Shape) {
+            shape.children.clear();
+        }
+        let procedural = Layer::new(
+            "Procedural Terrain",
+            LayerKind::NoiseValue(NoiseParams {
+                seed: settings.seed,
+                frequency: 0.0015,
+                amplitude: 80.0,
+                octaves: 4,
+                lacunarity: 2.0,
+                persistence: 0.5,
+                ..NoiseParams::default()
+            }),
+        );
+        let id = procedural.id();
+        doc.stack.push_into_category(procedural);
+        doc.selected = Some(id);
+        doc.blueprint.metres_per_sample = settings.finest_spacing_m as f32;
+        doc.sparse_paint = crate::sparse_paint::SparsePaintStore::new(
+            settings.finest_spacing_m as f32,
+            settings.tile_size_samples,
+        );
+        Ok(doc)
+    }
+
+    pub const fn world_kind(&self) -> ProjectWorldKind {
+        self.world.kind()
+    }
+
+    pub const fn bounded_settings(&self) -> Option<&BoundedHeightfieldSettings> {
+        self.world.bounded()
+    }
+
+    pub fn bounded_settings_mut(&mut self) -> Option<&mut BoundedHeightfieldSettings> {
+        self.world.bounded_mut()
+    }
+
+    pub const fn infinite_settings(&self) -> Option<&InfiniteProceduralWorldSettings> {
+        self.world.infinite()
     }
 
     /// Demonstration stack: Base + Alpine biome under Surface.
@@ -412,16 +635,40 @@ impl TerrainDocument {
     }
 
     pub fn from_json(s: &str) -> Result<Self, serde_json::Error> {
-        let mut doc: Self = serde_json::from_str(s)?;
+        let mut value: serde_json::Value = serde_json::from_str(s)?;
+        if value.get("world").is_none() {
+            let object = value
+                .as_object_mut()
+                .ok_or_else(|| serde::de::Error::custom("project document must be an object"))?;
+            let metrics = object
+                .remove("metrics")
+                .ok_or_else(|| serde::de::Error::custom("legacy project is missing metrics"))?;
+            let preview_resolution = object.remove("preview_resolution").ok_or_else(|| {
+                serde::de::Error::custom("legacy project is missing preview_resolution")
+            })?;
+            let export_resolution = object.remove("export_resolution").ok_or_else(|| {
+                serde::de::Error::custom("legacy project is missing export_resolution")
+            })?;
+            object.insert(
+                "world".into(),
+                serde_json::json!({
+                    "type": "bounded_heightfield",
+                    "settings": {
+                        "metrics": metrics,
+                        "preview_resolution": preview_resolution,
+                        "export_resolution": export_resolution
+                    }
+                }),
+            );
+        }
+        let mut doc: Self = serde_json::from_value(value)?;
         if doc.version > DOCUMENT_VERSION {
             return Err(serde::de::Error::custom(format!(
                 "unsupported document version {} (latest supported {})",
                 doc.version, DOCUMENT_VERSION
             )));
         }
-        doc.metrics.validate().map_err(|error| {
-            serde::de::Error::custom(format!("invalid heightfield metrics: {error}"))
-        })?;
+        doc.world.validate().map_err(serde::de::Error::custom)?;
         doc.normalize_wc_tree();
         Ok(doc)
     }
@@ -536,14 +783,17 @@ impl TerrainDocument {
 
     /// Bake one biome's placement paint into a MaskAsset bound on that biome group.
     pub fn sync_biome_paint_to_mask(&mut self, biome_id: LayerId) {
+        let Some(bounded) = self.bounded_settings() else {
+            return;
+        };
+        let world_x = bounded.metrics.world_size_x;
+        let world_z = bounded.metrics.world_size_z;
+        let res = bounded.preview_resolution.clamp(64, 1024);
         let placement_id = self.ensure_placement_layer();
-        let world_x = self.metrics.world_size_x;
-        let world_z = self.metrics.world_size_z;
         let key = crate::sparse_paint::SparsePaintChannelKey {
             placement_id,
             biome_id,
         };
-        let res = self.preview_resolution.clamp(64, 1024);
         let paint = if self.sparse_paint.has_channel(key) {
             let samples = self.sparse_paint.bake_uv(key, res, res, world_x, world_z);
             crate::mask::PaintBuffer {

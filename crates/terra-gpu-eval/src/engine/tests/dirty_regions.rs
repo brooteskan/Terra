@@ -1069,8 +1069,17 @@ fn untitled6_tree_warm_brushes_stay_bounded() {
         (true, SculptStrokeKind::Pinch),
     ] {
         let (mut document, ids) = untitled6_document(res, Untitled6Variant::ProductionTopology);
-        document.metrics.tile_size = 16;
-        document.metrics.halo = 2;
+        {
+            let bounded = document
+                .bounded_settings_mut()
+                .expect("Untitled6 fixture is bounded");
+            bounded.metrics.tile_size = 16;
+            bounded.metrics.halo = 2;
+        }
+        let metrics = document
+            .bounded_settings()
+            .expect("Untitled6 fixture is bounded")
+            .metrics;
         let target = if target_strokes {
             ids.semantic_sculpt
         } else {
@@ -1094,7 +1103,7 @@ fn untitled6_tree_warm_brushes_stay_bounded() {
                 cache.current_plan().unwrap(),
                 cache.structure_revision(),
                 &cold,
-                document.metrics,
+                metrics,
                 PreviewQuality::Draft,
                 false,
                 GpuEvaluationIntent::Complete,
@@ -1138,7 +1147,7 @@ fn untitled6_tree_warm_brushes_stay_bounded() {
                 cache.current_plan().unwrap(),
                 cache.structure_revision(),
                 &invalidation,
-                document.metrics,
+                metrics,
                 PreviewQuality::Draft,
                 false,
                 GpuEvaluationIntent::InteractiveLocal,
@@ -1180,7 +1189,7 @@ fn untitled6_tree_warm_brushes_stay_bounded() {
                     cache.current_plan().unwrap(),
                     cache.structure_revision(),
                     &PlanInvalidation::default(),
-                    document.metrics,
+                    metrics,
                     quality,
                     false,
                     GpuEvaluationIntent::Complete,
@@ -1197,7 +1206,7 @@ fn untitled6_tree_warm_brushes_stay_bounded() {
         let settled = engine
             .readback_current(&gpu.device, &gpu.queue)
             .expect("settled preview");
-        let oracle = cpu_oracle(&document.stack, document.metrics);
+        let oracle = cpu_oracle(&document.stack, metrics);
         terra_gpu::parity::assert_field_parity(
             &format!("Untitled6 target_strokes={target_strokes} brush={brush:?}"),
             &settled,

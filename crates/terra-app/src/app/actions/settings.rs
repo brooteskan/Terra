@@ -36,19 +36,21 @@ fn apply_update(
     let mut changed = false;
     let mut preview_changed = false;
 
-    if let Some(value) = update.export_resolution {
-        assign_if_changed(
-            &mut document.export_resolution,
-            value.clamp(512, 8192),
-            &mut changed,
-        );
-    }
-    if let Some(value) = update.preview_resolution {
-        let value = value.clamp(256, 8192);
-        if document.preview_resolution != value {
-            document.preview_resolution = value;
-            changed = true;
-            preview_changed = true;
+    if let Some(bounded) = document.bounded_settings_mut() {
+        if let Some(value) = update.export_resolution {
+            assign_if_changed(
+                &mut bounded.export_resolution,
+                value.clamp(512, 8192),
+                &mut changed,
+            );
+        }
+        if let Some(value) = update.preview_resolution {
+            let value = value.clamp(256, 8192);
+            if bounded.preview_resolution != value {
+                bounded.preview_resolution = value;
+                changed = true;
+                preview_changed = true;
+            }
         }
     }
     if let Some(value) = finite_clamped(update.precision, 0.25, 4.0) {
@@ -146,7 +148,14 @@ mod tests {
             },
         )]);
 
-        assert_eq!(app.session.document.export_resolution, 4096);
+        assert_eq!(
+            app.session
+                .document
+                .bounded_settings()
+                .unwrap()
+                .export_resolution,
+            4096
+        );
         assert!(app.document_dirty);
         assert_eq!(app.eval_token, token_before);
         assert_eq!(app.terrain_runtime.output_revision(), runtime_before);
@@ -158,8 +167,11 @@ mod tests {
     #[test]
     fn normalized_no_op_and_non_finite_values_do_nothing() {
         let mut app = TerraApp::default();
-        app.session.document.export_resolution = 512;
-        app.session.document.preview_resolution = 256;
+        {
+            let bounded = app.session.document.bounded_settings_mut().unwrap();
+            bounded.export_resolution = 512;
+            bounded.preview_resolution = 256;
+        }
         app.worker_mark_all_dirty = false;
         let cached_layer = seed_clean_evaluator_cache(&mut app);
         let token_before = app.eval_token;
@@ -198,11 +210,25 @@ mod tests {
             },
         )]);
 
-        assert_eq!(app.session.document.preview_resolution, 8192);
+        assert_eq!(
+            app.session
+                .document
+                .bounded_settings()
+                .unwrap()
+                .preview_resolution,
+            8192
+        );
         assert!(app.document_dirty);
         assert_eq!(app.eval_token, token_before.wrapping_add(1));
         assert_eq!(app.terrain_runtime.output_revision(), runtime_before + 1);
-        assert_eq!(app.terrain_runtime.pyramid.config.target_resolution, 8192);
+        assert_eq!(
+            app.terrain_runtime
+                .bounded_pyramid()
+                .unwrap()
+                .config
+                .target_resolution,
+            8192
+        );
         assert!(app.pending_eval);
         assert!(app.worker_mark_all_dirty);
         assert!(app.scheduler.evaluator.cache.is_dirty(cached_layer));

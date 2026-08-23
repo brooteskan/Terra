@@ -95,7 +95,7 @@ fn tropical_island_evaluates_with_biome_content() {
         }
     }
 
-    let metrics = doc.metrics;
+    let metrics = doc.bounded_settings().unwrap().metrics;
     let mut ctx = EvalContext::new(metrics);
     ctx.quality = PreviewQuality::Draft;
     ctx.mask_assets = doc.masks.clone();

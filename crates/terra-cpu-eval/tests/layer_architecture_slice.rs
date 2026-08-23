@@ -38,7 +38,7 @@ fn default_stack_uses_wc_categories() {
 fn alpine_vertical_slice_evaluates() {
     let mut doc = TerrainDocument::new_default();
     let metrics = HeightfieldMetrics::new(64, 64, 256.0, 256.0);
-    doc.metrics = metrics;
+    doc.bounded_settings_mut().unwrap().metrics = metrics;
     if let Some(shape) = doc.stack.find_category_mut(StackCategory::Shape) {
         shape.children.clear();
     }
@@ -105,7 +105,7 @@ fn alpine_vertical_slice_evaluates() {
 fn isolated_group_mask_limits_result() {
     let metrics = HeightfieldMetrics::new(32, 32, 128.0, 128.0);
     let mut doc = TerrainDocument::new_default();
-    doc.metrics = metrics;
+    doc.bounded_settings_mut().unwrap().metrics = metrics;
     doc.stack.nodes.clear();
     doc.stack.push(Layer::new(
         "Base",
@@ -158,7 +158,7 @@ fn isolated_group_mask_limits_result() {
 fn pass_through_vs_isolated_input_modes() {
     let metrics = HeightfieldMetrics::new(16, 16, 64.0, 64.0);
     let mut doc = TerrainDocument::new_default();
-    doc.metrics = metrics;
+    doc.bounded_settings_mut().unwrap().metrics = metrics;
     doc.stack.nodes.clear();
     doc.stack.push(Layer::new(
         "Base",

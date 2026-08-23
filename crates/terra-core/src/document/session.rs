@@ -52,8 +52,12 @@ impl Default for EditorSession {
 
 impl EditorSession {
     pub fn new() -> Self {
+        Self::with_document(TerrainDocument::new_default())
+    }
+
+    pub fn with_document(document: TerrainDocument) -> Self {
         Self {
-            document: TerrainDocument::new_default(),
+            document,
             history: CommandHistory::new(256),
             outdated_sim_layers: Vec::new(),
             rebuild_feedback: RebuildFeedbackState::default(),
@@ -64,13 +68,6 @@ impl EditorSession {
             scenario_redo: Vec::new(),
             mask_paint_undo: Vec::new(),
             paint_undo: Vec::new(),
-        }
-    }
-
-    pub fn with_document(document: TerrainDocument) -> Self {
-        Self {
-            document,
-            ..Self::new()
         }
     }
 

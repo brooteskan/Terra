@@ -85,8 +85,11 @@ pub fn untitled6_document(
     let metrics = HeightfieldMetrics::new(resolution, resolution, 4096.0, 4096.0);
     let mut document = TerrainDocument::new_default();
     document.name = "Untitled6 regression".into();
-    document.metrics = metrics;
-    document.preview_resolution = resolution;
+    let bounded = document
+        .bounded_settings_mut()
+        .expect("test fixture is bounded");
+    bounded.metrics = metrics;
+    bounded.preview_resolution = resolution;
     document.stack = stack;
     document.masks.clear();
     document.selected = Some(base_id);

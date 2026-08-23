@@ -1,5 +1,14 @@
 use super::*;
 
+fn document_metrics(
+    document: &terra_core::document::TerrainDocument,
+) -> terra_core::HeightfieldMetrics {
+    document
+        .bounded_settings()
+        .expect("GPU refinement fixtures are bounded")
+        .metrics
+}
+
 /// #154: optional refinement is split into fenced units, keeps its plan
 /// resources private until publication, and produces the same field as the
 /// existing complete evaluator.
@@ -31,7 +40,7 @@ fn resumable_refinement_is_depth_one_transactional_and_matches_complete_eval() {
             plan,
             revision,
             &invalidation,
-            document.metrics,
+            document_metrics(&document),
             PreviewQuality::Medium,
             false,
             GpuEvaluationIntent::Complete,
@@ -51,7 +60,7 @@ fn resumable_refinement_is_depth_one_transactional_and_matches_complete_eval() {
             plan,
             revision,
             &invalidation,
-            document.metrics,
+            document_metrics(&document),
             PreviewQuality::Medium,
         )
         .expect("begin resumable Medium evaluation");
@@ -132,7 +141,7 @@ fn resumable_refinement_is_depth_one_transactional_and_matches_complete_eval() {
             plan,
             revision,
             &invalidation,
-            document.metrics,
+            document_metrics(&document),
             PreviewQuality::Full,
         )
         .expect("begin stale Full generation");
@@ -155,7 +164,7 @@ fn resumable_refinement_is_depth_one_transactional_and_matches_complete_eval() {
             plan,
             revision,
             &invalidation,
-            document.metrics,
+            document_metrics(&document),
             PreviewQuality::Medium,
         )
         .expect("begin replacement generation");
@@ -197,7 +206,7 @@ fn untitled6_release_timing_probe_2048_4096() {
                 cache.current_plan().unwrap(),
                 cache.structure_revision(),
                 &cold_invalidation,
-                document.metrics,
+                document_metrics(&document),
                 PreviewQuality::Draft,
                 false,
                 GpuEvaluationIntent::Complete,
@@ -245,7 +254,7 @@ fn untitled6_release_timing_probe_2048_4096() {
                 cache.current_plan().unwrap(),
                 cache.structure_revision(),
                 &invalidation,
-                document.metrics,
+                document_metrics(&document),
                 PreviewQuality::Draft,
                 false,
                 GpuEvaluationIntent::InteractiveLocal,
@@ -270,7 +279,7 @@ fn untitled6_release_timing_probe_2048_4096() {
                     cache.current_plan().unwrap(),
                     cache.structure_revision(),
                     &PlanInvalidation::default(),
-                    document.metrics,
+                    document_metrics(&document),
                     PreviewQuality::Draft,
                     false,
                     GpuEvaluationIntent::Complete,
@@ -316,7 +325,7 @@ fn untitled6_release_timing_probe_2048_4096() {
                     cache.current_plan().unwrap(),
                     cache.structure_revision(),
                     &transition_invalidation,
-                    document.metrics,
+                    document_metrics(&document),
                     PreviewQuality::Full,
                     false,
                     GpuEvaluationIntent::Complete,
@@ -371,7 +380,7 @@ fn untitled6_release_timing_probe_2048_4096() {
                     cache.current_plan().unwrap(),
                     cache.structure_revision(),
                     &full_invalidation,
-                    document.metrics,
+                    document_metrics(&document),
                     PreviewQuality::Full,
                     false,
                     GpuEvaluationIntent::Complete,

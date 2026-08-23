@@ -1640,11 +1640,23 @@ pub fn draw_editor_gui(
     }
     out.actions
         .extend(draw_inspector_gui(ui, doc, ui_state, inspector));
+    let viewport_world_size = doc.bounded_settings().map_or_else(
+        || {
+            doc.infinite_settings()
+                .map_or(1.0, |settings| (settings.horizon_m * 2.0) as f32)
+        },
+        |bounded| {
+            bounded
+                .metrics
+                .world_size_x
+                .max(bounded.metrics.world_size_z)
+        },
+    );
     out.actions.extend(draw_viewport_overlays(
         ui,
         ui_state,
         doc,
-        doc.metrics.world_size_x.max(doc.metrics.world_size_z),
+        viewport_world_size,
     ));
     draw_bottom_dock(ui, doc, ui_state, dock, &mut out);
     draw_windows(ui, doc, ui_state, windows, &mut out);

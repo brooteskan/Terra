@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 terra-core = { workspace = true }
+terra-world = { workspace = true }
 terra-cpu-eval = { workspace = true }
 terra-jobs = { workspace = true }
 terra-gpu = { workspace = true }

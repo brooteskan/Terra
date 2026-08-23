@@ -131,6 +131,18 @@ impl TerraApp {
     /// submitted to the existing eval worker, leaving last-good content on screen until
     /// the worker publishes its result.
     pub(crate) fn request_rebuild_immediate(&mut self) {
+        let Some(preview_resolution) = self
+            .session
+            .document
+            .bounded_settings()
+            .map(|settings| settings.preview_resolution)
+        else {
+            self.pending_eval = false;
+            self.pending_eval_immediate = false;
+            self.ui_state.status =
+                "Infinite sparse evaluation is introduced by the next implementation slice.".into();
+            return;
+        };
         // Cancel any in-flight CPU job so a late Full result cannot pop the viewport.
         self.eval_token = self.eval_token.wrapping_add(1);
         self.scheduler.current_token = self.eval_token;
@@ -155,11 +167,7 @@ impl TerraApp {
         // Match the resolution already on screen (renderer tex or last_height).
         if let Some(r) = self.renderer.as_ref() {
             let w = r.heights.tex_size.0.max(1);
-            let preview = self
-                .session
-                .document
-                .preview_resolution
-                .min(INTERACTIVE_PREVIEW_CAP);
+            let preview = preview_resolution.min(INTERACTIVE_PREVIEW_CAP);
             let medium = PreviewQuality::Medium.resolution(preview, preview);
             self.scheduler.quality = if w >= preview {
                 PreviewQuality::Full
@@ -195,6 +203,9 @@ impl TerraApp {
     /// Create an isolated GPU job for optional Medium/Full work. Required
     /// interactive evaluation continues to use `run_eval_step_with_intent`.
     pub(crate) fn begin_gpu_refinement(&mut self, quality: PreviewQuality) -> bool {
+        let Some(bounded) = self.session.document.bounded_settings().cloned() else {
+            return false;
+        };
         if self.refinement_job.is_some()
             || !matches!(quality, PreviewQuality::Medium | PreviewQuality::Full)
         {
@@ -213,13 +224,9 @@ impl TerraApp {
         };
         let invalidation = self.pending_plan_invalidation.clone().unwrap_or_default();
         let revision = self.terrain_plan_cache.structure_revision();
-        let preview = self
-            .session
-            .document
-            .preview_resolution
-            .min(INTERACTIVE_PREVIEW_CAP);
-        let resolution = quality.resolution(preview, self.session.document.export_resolution);
-        let Ok(metrics) = self.session.document.metrics.at_resolution(resolution) else {
+        let preview = bounded.preview_resolution.min(INTERACTIVE_PREVIEW_CAP);
+        let resolution = quality.resolution(preview, bounded.export_resolution);
+        let Ok(metrics) = bounded.metrics.at_resolution(resolution) else {
             return false;
         };
 
@@ -229,12 +236,10 @@ impl TerraApp {
         if let (Some(engine), Some(renderer)) = (self.gpu_engine.as_ref(), self.renderer.as_mut()) {
             let (width, height) = renderer.heights.tex_size;
             if width > 0 && height > 0 {
-                let current_metrics = self
-                    .session
-                    .document
+                let current_metrics = bounded
                     .metrics
                     .at_resolution(width)
-                    .unwrap_or(self.session.document.metrics);
+                    .unwrap_or(bounded.metrics);
                 renderer.present_gpu_height_region(
                     engine.output_texture(),
                     terra_render::HeightPresentGeom {
@@ -321,6 +326,15 @@ impl TerraApp {
     /// Advance at most one safe unit. The engine itself enforces a depth-one
     /// refinement queue; this method supplies generation and publication gates.
     pub(crate) fn advance_gpu_refinement(&mut self) -> bool {
+        let Some(base_metrics) = self
+            .session
+            .document
+            .bounded_settings()
+            .map(|settings| settings.metrics)
+        else {
+            self.refinement_job = None;
+            return false;
+        };
         let Some(mut job) = self.refinement_job.take() else {
             return false;
         };
@@ -472,12 +486,9 @@ impl TerraApp {
             );
         }
         if let (Some(engine), Some(renderer)) = (self.gpu_engine.as_ref(), self.renderer.as_mut()) {
-            let result_metrics = self
-                .session
-                .document
-                .metrics
+            let result_metrics = base_metrics
                 .at_resolution(result.width)
-                .unwrap_or(self.session.document.metrics);
+                .unwrap_or(base_metrics);
             let dx = result_metrics.dx();
             let dz = result_metrics.dz();
             let geom = terra_render::HeightPresentGeom {
@@ -585,6 +596,11 @@ impl TerraApp {
 
     /// Offload CPU stack eval to the worker — never block the UI thread.
     pub(crate) fn enqueue_async_eval(&mut self, quality: PreviewQuality) {
+        let Some(bounded) = self.session.document.bounded_settings().cloned() else {
+            self.worker_refine_pending = false;
+            self.ui_state.refining = false;
+            return;
+        };
         let preview_stack = self.session.document.preview_eval_stack();
         self.ui_state.refining_layer_name = self
             .session
@@ -615,14 +631,10 @@ impl TerraApp {
             quality,
             stack: preview_stack,
             masks: self.session.document.masks.clone(),
-            base_metrics: self.session.document.metrics,
+            base_metrics: bounded.metrics,
             level_steps: self.session.document.level_steps.clone(),
-            preview_res: self
-                .session
-                .document
-                .preview_resolution
-                .min(INTERACTIVE_PREVIEW_CAP),
-            export_res: self.session.document.export_resolution,
+            preview_res: bounded.preview_resolution.min(INTERACTIVE_PREVIEW_CAP),
+            export_res: bounded.export_resolution,
             aux: self.scheduler.last_aux.clone(),
             strata: self.scheduler.last_strata.clone(),
             mask_reference: self.scheduler.last_good.clone(),
@@ -676,6 +688,9 @@ impl TerraApp {
     /// Full tile grid. A cold cache or first stroke fails the gate and runs today's
     /// Draft→Medium→Full ladder unchanged.
     fn straight_to_full_quality(&mut self, requested: PreviewQuality) -> PreviewQuality {
+        let Some(bounded) = self.session.document.bounded_settings().cloned() else {
+            return requested;
+        };
         if matches!(requested, PreviewQuality::Full | PreviewQuality::Export) {
             return requested;
         }
@@ -685,16 +700,12 @@ impl TerraApp {
         let Some(region) = self.worker_dirty_region else {
             return requested;
         };
-        let full_res = self
-            .session
-            .document
-            .preview_resolution
-            .min(INTERACTIVE_PREVIEW_CAP);
+        let full_res = bounded.preview_resolution.min(INTERACTIVE_PREVIEW_CAP);
         // Only worthwhile once the cache holds Full-res checkpoints to reuse.
         if self.worker_cache_res != Some(full_res) {
             return requested;
         }
-        let Ok(full_metrics) = self.session.document.metrics.at_resolution(full_res) else {
+        let Ok(full_metrics) = bounded.metrics.at_resolution(full_res) else {
             return requested;
         };
         let budget = (full_metrics.tile_count() / 4).max(1);
@@ -772,7 +783,7 @@ impl TerraApp {
     pub(crate) fn streamed_level_for_last_height(&self) -> Option<(u8, u32)> {
         let width = self.last_height.as_ref()?.metrics.width;
         self.terrain_runtime
-            .pyramid
+            .bounded_pyramid()?
             .levels()
             .iter()
             .find(|level| level.resolution == width)
@@ -798,6 +809,9 @@ impl TerraApp {
         if self.tile_atlas.is_none() {
             return;
         }
+        let Some(pyramid) = self.terrain_runtime.bounded_pyramid().cloned() else {
+            return;
+        };
         let Some((level, _res)) = self.streamed_level_for_last_height() else {
             // No pyramid level matches this result's resolution: don't stamp pages
             // at a fabricated level. Streaming stays off and the monolithic path
@@ -816,7 +830,7 @@ impl TerraApp {
             content_revision: self.next_cpu_tile_content_revision,
         };
         if let (Some(atlas), Some(gpu)) = (self.tile_atlas.as_mut(), self.gpu.as_ref()) {
-            atlas.configure_hierarchy(&gpu.device, &gpu.queue, &self.terrain_runtime.pyramid);
+            atlas.configure_hierarchy(&gpu.device, &gpu.queue, &pyramid);
         }
         let requests = height
             .tiles()
@@ -824,8 +838,7 @@ impl TerraApp {
             .map(|tile| terra_core::TerrainTileWorkRequest {
                 key: terra_core::TerrainTileWorkKey {
                     tile: terra_core::TerrainTileKey::height(
-                        self.terrain_runtime
-                            .pyramid
+                        pyramid
                             .address(level, tile.id)
                             .expect("height tile belongs to streamed bounded level"),
                     ),
@@ -852,6 +865,9 @@ impl TerraApp {
         width: u32,
         height: u32,
     ) {
+        let Some(runtime_pyramid) = self.terrain_runtime.bounded_pyramid().cloned() else {
+            return;
+        };
         if !output.is_current_complete_final()
             || output.intent != GpuEvaluationIntent::Complete
             || output.generation != self.eval_token
@@ -876,7 +892,7 @@ impl TerraApp {
             .materialize(
                 &gpu.device,
                 &gpu.queue,
-                &self.terrain_runtime.pyramid,
+                &runtime_pyramid,
                 engine.output_texture(),
                 (width, height),
                 GpuPyramidContentIdentity {
@@ -899,7 +915,8 @@ impl TerraApp {
                 self.clear_terrain_tile_work();
                 let root_metrics = self
                     .terrain_runtime
-                    .pyramid
+                    .bounded_pyramid()
+                    .expect("GPU pyramid materialization is bounded")
                     .level_metrics(0)
                     .expect("materialized root level");
                 // Bootstrap the fallback chain while the compact metadata copy is
@@ -911,7 +928,8 @@ impl TerraApp {
                             key: terra_core::TerrainTileWorkKey {
                                 tile: terra_core::TerrainTileKey::height(
                                     self.terrain_runtime
-                                        .pyramid
+                                        .bounded_pyramid()
+                                        .expect("GPU pyramid materialization is bounded")
                                         .address(0, terra_core::TileId { tx, tz })
                                         .expect("root tile belongs to bounded pyramid"),
                                 ),
@@ -1090,6 +1108,10 @@ impl TerraApp {
         let Some(live_stamp) = self.terrain_tile_scheduler.live_content() else {
             return 0;
         };
+        let Some(runtime_pyramid) = self.terrain_runtime.bounded_pyramid().cloned() else {
+            self.clear_terrain_tile_work();
+            return 0;
+        };
         let budget = terrain_tile_work_budget(
             self.terrain_runtime.refinement.state(),
             self.tile_atlas.as_ref().unwrap().max_pages() as usize,
@@ -1133,7 +1155,7 @@ impl TerraApp {
                             })
                             .ok()?;
                     let domain = terra_core::TerrainEvaluationDomain::for_tile(
-                        &self.terrain_runtime.pyramid,
+                        &runtime_pyramid,
                         key.clone(),
                         self.tile_atlas.as_ref().unwrap().halo(),
                         slice.operation_halo,
@@ -1193,13 +1215,7 @@ impl TerraApp {
                 match result {
                     Ok(_) => {
                         uploaded += 1;
-                        if self
-                            .terrain_runtime
-                            .pyramid
-                            .topology()
-                            .level_index(key.address)
-                            == Some(0)
-                        {
+                        if runtime_pyramid.topology().level_index(key.address) == Some(0) {
                             let _ = self.tile_atlas.as_mut().unwrap().pin(&key);
                         }
                         self.terrain_tile_scheduler.complete(lease, live_stamp);
@@ -1214,8 +1230,7 @@ impl TerraApp {
             let result = match lease.request.source {
                 terra_core::TerrainTileWorkSource::CpuHeight => {
                     let Some(tile) = self.last_height.as_ref().and_then(|height| {
-                        self.terrain_runtime
-                            .pyramid
+                        runtime_pyramid
                             .level_and_tile(key.address)
                             .and_then(|(_, tile)| height.tile(tile))
                     }) else {
@@ -1259,13 +1274,7 @@ impl TerraApp {
             match result {
                 Ok(_) => {
                     uploaded += 1;
-                    if self
-                        .terrain_runtime
-                        .pyramid
-                        .topology()
-                        .level_index(key.address)
-                        == Some(0)
-                    {
+                    if runtime_pyramid.topology().level_index(key.address) == Some(0) {
                         let _ = self.tile_atlas.as_mut().unwrap().pin(&key);
                     }
                     self.terrain_tile_scheduler.complete(lease, live_stamp);
@@ -1333,9 +1342,8 @@ impl TerraApp {
                     uploaded += 1;
                     if self
                         .terrain_runtime
-                        .pyramid
-                        .topology()
-                        .level_index(key.address)
+                        .bounded_pyramid()
+                        .and_then(|pyramid| pyramid.topology().level_index(key.address))
                         == Some(0)
                     {
                         let _ = self.tile_atlas.as_mut().unwrap().pin(&key);
@@ -1360,6 +1368,12 @@ impl TerraApp {
     }
 
     pub(crate) fn sync_tile_stream_to_renderer(&mut self) {
+        let Some(runtime_pyramid) = self.terrain_runtime.bounded_pyramid().cloned() else {
+            if let Some(renderer) = self.renderer.as_mut() {
+                renderer.set_use_tile_stream(false);
+            }
+            return;
+        };
         if self.tile_atlas.is_none() {
             return;
         }
@@ -1395,15 +1409,14 @@ impl TerraApp {
             return;
         }
         let root_current = if root_required {
-            let root_metrics = self.terrain_runtime.pyramid.level_metrics(0);
+            let root_metrics = runtime_pyramid.level_metrics(0);
             root_metrics.is_some_and(|metrics| {
                 let atlas = self.tile_atlas.as_ref().expect("atlas checked below");
                 (0..metrics.tiles_z()).all(|tz| {
                     (0..metrics.tiles_x()).all(|tx| {
                         atlas.is_current(
                             &terra_core::TerrainTileKey::height(
-                                self.terrain_runtime
-                                    .pyramid
+                                runtime_pyramid
                                     .address(0, terra_core::TileId { tx, tz })
                                     .expect("root tile belongs to bounded pyramid"),
                             ),
@@ -1598,13 +1611,31 @@ impl TerraApp {
         self.pending_plan_edits
             .push(terra_core::terrain_plan::TerrainEditClass::Structure);
         self.scheduler.evaluator.mark_all_dirty(&preview);
-        let metrics = self.session.document.metrics;
-        self.terrain_runtime
-            .reconfigure(terra_core::PyramidConfig::new(
-                self.session.document.preview_resolution,
-                metrics.world_size_x,
-                metrics.world_size_z,
-            ));
+        match &self.session.document.world {
+            terra_core::document::ProjectWorld::BoundedHeightfield(settings) => {
+                self.terrain_runtime
+                    .reconfigure(terra_core::PyramidConfig::new(
+                        settings.preview_resolution,
+                        settings.metrics.world_size_x,
+                        settings.metrics.world_size_z,
+                    ));
+            }
+            terra_core::document::ProjectWorld::InfiniteProceduralWorld(settings) => {
+                let config = match settings.topology() {
+                    Ok(topology) => topology.config(),
+                    Err(error) => {
+                        self.ui_state.status = format!("Invalid Infinite topology: {error}");
+                        return;
+                    }
+                };
+                if let Err(error) = self
+                    .terrain_runtime
+                    .try_reconfigure(terra_core::TerrainRuntimeConfig::Infinite(config))
+                {
+                    self.ui_state.status = format!("Invalid Infinite topology: {error}");
+                }
+            }
+        }
         // reconfigure() advances the output revision; retire the streamed side too.
         self.retire_streamed_residency();
         self.worker_mark_all_dirty = true;
@@ -1727,6 +1758,15 @@ impl TerraApp {
     }
 
     pub(crate) fn run_eval_step_with_intent(&mut self, intent: GpuEvaluationIntent) {
+        let Some(bounded) = self.session.document.bounded_settings().cloned() else {
+            self.pending_eval = false;
+            self.pending_eval_immediate = false;
+            self.ui_state.refining = false;
+            self.ui_state.status =
+                "Infinite project is ready; sparse terrain evaluation is not part of this slice."
+                    .into();
+            return;
+        };
         profiling::scope!("eval_step");
         let t0 = Instant::now();
         let trace_id = self.frame_trace.next_evaluation_id();
@@ -1743,12 +1783,8 @@ impl TerraApp {
         );
         self.ui_state.profile.first_visible_preview_us = 0;
         self.ui_state.profile.settled_authoritative_us = 0;
-        let preview = self
-            .session
-            .document
-            .preview_resolution
-            .min(INTERACTIVE_PREVIEW_CAP);
-        let export = self.session.document.export_resolution;
+        let preview = bounded.preview_resolution.min(INTERACTIVE_PREVIEW_CAP);
+        let export = bounded.export_resolution;
         if self.force_draft {
             let full_resolution = PreviewQuality::Full.resolution(preview, export);
             let selected_is_bounded_sculpt = self
@@ -1780,7 +1816,7 @@ impl TerraApp {
             };
             self.force_draft = false;
         }
-        let base = self.session.document.metrics;
+        let base = bounded.metrics;
         let quality = self.scheduler.quality;
         self.frame_trace.record(
             Instant::now(),
@@ -2612,7 +2648,7 @@ mod tests {
         config.tile_size = 16;
         config.halo = 1;
         let mut app = TerraApp::default();
-        app.session.document.metrics = metrics;
+        app.session.document.bounded_settings_mut().unwrap().metrics = metrics;
         app.terrain_runtime.reconfigure(config);
         app.last_height = Some(Heightfield::filled(metrics, 7.0));
         app.tile_atlas = Some(GpuTileAtlas::new(&context.device, 16, 1, 8).unwrap());
@@ -2629,7 +2665,8 @@ mod tests {
             key: terra_core::TerrainTileWorkKey {
                 tile: terra_core::TerrainTileKey::height(
                     app.terrain_runtime
-                        .pyramid
+                        .bounded_pyramid()
+                        .unwrap()
                         .address(level, terra_core::TileId { tx, tz: 0 })
                         .unwrap(),
                 ),
@@ -2705,9 +2742,11 @@ mod tests {
         stack.push(flat(12.0));
 
         let mut app = TerraApp::default();
-        app.session.document.metrics =
-            HeightfieldMetrics::new(resolution, resolution, 640.0, 640.0);
-        app.session.document.preview_resolution = resolution;
+        {
+            let bounded = app.session.document.bounded_settings_mut().unwrap();
+            bounded.metrics = HeightfieldMetrics::new(resolution, resolution, 640.0, 640.0);
+            bounded.preview_resolution = resolution;
+        }
         app.session.document.stack = stack;
         app.renderer = Some(TerrainRenderer::new_headless(
             &context, resolution, resolution,
@@ -2797,9 +2836,11 @@ mod tests {
         let mut stack = LayerStack::new();
         stack.push(flat(19.0));
         let mut app = TerraApp::default();
-        app.session.document.metrics =
-            HeightfieldMetrics::new(resolution, resolution, 640.0, 640.0);
-        app.session.document.preview_resolution = resolution;
+        {
+            let bounded = app.session.document.bounded_settings_mut().unwrap();
+            bounded.metrics = HeightfieldMetrics::new(resolution, resolution, 640.0, 640.0);
+            bounded.preview_resolution = resolution;
+        }
         app.session.document.stack = stack;
         app.scheduler.quality = PreviewQuality::Full;
         app.terrain_runtime.reconfigure(config);
@@ -2862,12 +2903,14 @@ mod tests {
         assert!(demand.tiles.len() <= app.tile_atlas.as_ref().unwrap().max_pages() as usize);
         assert!(demand.tiles.windows(2).all(|pair| {
             app.terrain_runtime
-                .pyramid
+                .bounded_pyramid()
+                .unwrap()
                 .topology()
                 .level_index(pair[0].key.address)
                 <= app
                     .terrain_runtime
-                    .pyramid
+                    .bounded_pyramid()
+                    .unwrap()
                     .topology()
                     .level_index(pair[1].key.address)
         }));
@@ -2898,7 +2941,8 @@ mod tests {
             .iter()
             .filter_map(|demand| {
                 app.terrain_runtime
-                    .pyramid
+                    .bounded_pyramid()
+                    .unwrap()
                     .topology()
                     .level_index(demand.key.address)
             })
@@ -2914,7 +2958,8 @@ mod tests {
             .iter()
             .filter_map(|demand| {
                 app.terrain_runtime
-                    .pyramid
+                    .bounded_pyramid()
+                    .unwrap()
                     .topology()
                     .level_index(demand.key.address)
             })
@@ -3166,9 +3211,11 @@ mod tests {
         stack.push(shape);
 
         let mut app = TerraApp::default();
-        app.session.document.metrics =
-            HeightfieldMetrics::new(resolution, resolution, 1280.0, 1280.0);
-        app.session.document.preview_resolution = resolution;
+        {
+            let bounded = app.session.document.bounded_settings_mut().unwrap();
+            bounded.metrics = HeightfieldMetrics::new(resolution, resolution, 1280.0, 1280.0);
+            bounded.preview_resolution = resolution;
+        }
         app.session.document.stack = stack;
         app.session.document.selected = Some(shape_id);
         app.scheduler.quality = PreviewQuality::Full;
@@ -3452,6 +3499,8 @@ mod tests {
         let full_res = app
             .session
             .document
+            .bounded_settings()
+            .unwrap()
             .preview_resolution
             .min(super::INTERACTIVE_PREVIEW_CAP);
 
@@ -3492,6 +3541,8 @@ mod tests {
         let full_res = app
             .session
             .document
+            .bounded_settings()
+            .unwrap()
             .preview_resolution
             .min(super::INTERACTIVE_PREVIEW_CAP);
         app.worker_cache_res = Some(full_res);

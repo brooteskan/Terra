@@ -9,7 +9,11 @@ use crate::{EvalContext, StackEvaluator};
 
 /// Evaluate a document to a heightfield and collect morphometrics.
 pub fn measure_document(doc: &TerrainDocument) -> Result<(Heightfield, TerrainStatistics), String> {
-    let mut ctx = EvalContext::new(doc.metrics);
+    let metrics = doc
+        .bounded_settings()
+        .expect("realism benchmarks require a bounded heightfield")
+        .metrics;
+    let mut ctx = EvalContext::new(metrics);
     ctx.quality = PreviewQuality::Draft;
     let mut eval = StackEvaluator::new();
     let hf = eval

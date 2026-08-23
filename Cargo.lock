@@ -2621,6 +2621,7 @@ dependencies = [
  "terra-jobs",
  "terra-render",
  "terra-test-gpu",
+ "terra-world",
  "thiserror 2.0.19",
  "wgpu",
  "winit",

@@ -181,7 +181,12 @@ fn evaluate_document_for_export(
     doc: &TerrainDocument,
     cancel: CancelToken,
 ) -> Result<(Heightfield, EvalContext), terra_cpu_eval::EvalError> {
-    let metrics = doc.metrics.at_resolution(doc.export_resolution)?;
+    let bounded = doc.bounded_settings().ok_or_else(|| {
+        terra_cpu_eval::EvalError::Io(
+            "complete-world export is unavailable for Infinite Procedural World projects".into(),
+        )
+    })?;
+    let metrics = bounded.metrics.at_resolution(bounded.export_resolution)?;
     let mut evaluator = StackEvaluator::new();
     // Export runs a full rebuild from scratch and never reloads its own baked
     // checkpoints; spilling export-resolution bakes into the shared cache dir (and
@@ -421,7 +426,7 @@ mod worker_tests {
 
     fn flat_doc() -> TerrainDocument {
         let mut doc = TerrainDocument::new_default();
-        doc.export_resolution = 32;
+        doc.bounded_settings_mut().unwrap().export_resolution = 32;
         doc.stack = LayerStack::new();
         doc.stack.push(Layer::new(
             "Export Height",
@@ -461,7 +466,7 @@ mod worker_tests {
         // A zero export resolution would derive a zero-dimension, zero-tile
         // metrics and panic in tile arithmetic. It must surface as a typed error.
         let mut doc = flat_doc();
-        doc.export_resolution = 0;
+        doc.bounded_settings_mut().unwrap().export_resolution = 0;
         let result = evaluate_document_for_export(&doc, CancelToken::never());
         assert!(
             matches!(result, Err(terra_cpu_eval::EvalError::InvalidMetrics(_))),
@@ -567,6 +572,43 @@ mod worker_tests {
             "load should complete"
         );
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn infinite_project_save_close_and_reopen_preserves_identity_without_tiles() {
+        use terra_core::document::InfiniteProceduralWorldSettings;
+        use terra_core::{Lod, WorldPosition};
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "terra-infinite-{}-{unique}.terra",
+            std::process::id()
+        ));
+        let settings = InfiniteProceduralWorldSettings {
+            seed: 42,
+            origin: WorldPosition::try_new(-5_000.0, 8_000.0).unwrap(),
+            finest_spacing_m: 0.5,
+            tile_size_samples: 128,
+            publication_halo_samples: 4,
+            max_lod: Lod::try_new(11).unwrap(),
+            preview_radius_m: 8_000.0,
+            horizon_m: 64_000.0,
+            cpu_residency_budget_mib: 512,
+            gpu_residency_budget_mib: 128,
+        };
+        let document = TerrainDocument::new_infinite(settings.clone()).unwrap();
+
+        save_project(&document, &path).unwrap();
+        drop(document);
+        let loaded = load_project(&path).unwrap();
+
+        assert_eq!(loaded.infinite_settings(), Some(&settings));
+        let persisted = std::fs::read_to_string(&path).unwrap();
+        assert!(!persisted.contains("\"samples\""));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -733,7 +775,7 @@ mod worker_tests {
     #[test]
     fn export_eval_failure_crosses_worker_typed() {
         let mut doc = flat_doc();
-        doc.export_resolution = 0;
+        doc.bounded_settings_mut().unwrap().export_resolution = 0;
 
         let mut exporter = BackgroundExporter::new();
         exporter.start(doc, std::env::temp_dir());

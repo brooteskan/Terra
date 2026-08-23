@@ -397,15 +397,25 @@ pub fn draw_menu_bar(
 }
 
 fn world_size_label(doc: &TerrainDocument) -> String {
+    let Some(bounded) = doc.bounded_settings() else {
+        let settings = doc
+            .infinite_settings()
+            .expect("project world is bounded or infinite");
+        let horizon_km = settings.horizon_m / 1000.0;
+        return format!(
+            "Infinite | {:.2} m/sample | {:.0} km horizon",
+            settings.finest_spacing_m, horizon_km
+        );
+    };
     // ASCII `x` only — the baked UI font is printable ASCII (× → "?").
-    let wx = doc.metrics.world_size_x.max(0.0);
-    let wz = doc.metrics.world_size_z.max(0.0);
+    let wx = bounded.metrics.world_size_x.max(0.0);
+    let wz = bounded.metrics.world_size_z.max(0.0);
     if wx >= 1000.0 || wz >= 1000.0 {
         format!("{:.0}x{:.0} km", wx / 1000.0, wz / 1000.0)
     } else if wx > 0.0 && wz > 0.0 {
         format!("{:.0}x{:.0} m", wx, wz)
     } else {
-        let res = doc.preview_resolution.max(1);
+        let res = bounded.preview_resolution.max(1);
         format!("{res}x{res}")
     }
 }

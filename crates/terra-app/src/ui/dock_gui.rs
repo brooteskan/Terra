@@ -55,8 +55,13 @@ pub fn draw_bottom_dock(
     };
     let res = if ui_state.profile.tex_w > 0 {
         format!("{}x{}", ui_state.profile.tex_w, ui_state.profile.tex_h)
+    } else if let Some(bounded) = doc.bounded_settings() {
+        format!(
+            "{}x{}",
+            bounded.preview_resolution, bounded.preview_resolution
+        )
     } else {
-        format!("{}x{}", doc.preview_resolution, doc.preview_resolution)
+        "Sparse tiles pending".into()
     };
     let quality = quality_name(ui_state.quality);
     let backend = if ui_state.profile.path.is_empty() {

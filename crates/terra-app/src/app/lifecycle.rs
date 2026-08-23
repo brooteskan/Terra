@@ -642,7 +642,11 @@ impl ApplicationHandler<RuntimeEvent> for TerraApp {
         // build against a cloned GpuContext and hand the finished objects back.
         let config = pending.config().clone();
         let size = pending.size();
-        let tile_config = self.terrain_runtime.pyramid.config;
+        let tile_config = self
+            .terrain_runtime
+            .bounded_pyramid()
+            .expect("application boot starts with a bounded project runtime")
+            .config;
         let (tile_size, tile_halo) = (tile_config.tile_size, tile_config.halo);
         let worker_gpu = gpu.clone();
         let inject_boot_fault = startup::injected_fault("boot-worker");

@@ -41,8 +41,12 @@ fn main() {
         .expect("usage: sculpt_eval_probe <project.json>");
     let mut doc = terra_io::load_project(std::path::Path::new(&path)).expect("load project");
 
-    let preview_res = doc.preview_resolution.min(8192);
-    let metrics = doc
+    let bounded = doc
+        .bounded_settings()
+        .cloned()
+        .expect("sculpt probe requires a bounded heightfield");
+    let preview_res = bounded.preview_resolution.min(8192);
+    let metrics = bounded
         .metrics
         .at_resolution(preview_res)
         .expect("metrics at preview res");
@@ -90,7 +94,8 @@ fn main() {
 
     // --- Now paint one pinch stroke and time the scoped incremental. ---
     let (u, v, radius_uv) = (0.5f32, 0.5f32, 0.03f32);
-    let world_radius = radius_uv * 0.5 * (doc.metrics.world_size_x + doc.metrics.world_size_z);
+    let world_radius =
+        radius_uv * 0.5 * (bounded.metrics.world_size_x + bounded.metrics.world_size_z);
     let new_stroke = SculptStroke {
         kind: SculptStrokeKind::Pinch,
         points: vec![SculptPoint {

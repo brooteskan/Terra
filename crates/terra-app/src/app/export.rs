@@ -60,10 +60,14 @@ impl HeightPyramidExportController {
         if self.busy {
             return Err("height-pyramid export is already running".into());
         }
+        let bounded = document.bounded_settings().cloned().ok_or_else(|| {
+            "complete-world export is unavailable for Infinite Procedural World projects"
+                .to_string()
+        })?;
         document.sync_all_biome_paint_masks();
-        document
+        bounded
             .metrics
-            .at_resolution(document.export_resolution)
+            .at_resolution(bounded.export_resolution)
             .map_err(|error| error.to_string())?;
         let stack = document.preview_eval_stack();
         let revision = PlanStructureRevision::new(generation);
@@ -73,12 +77,12 @@ impl HeightPyramidExportController {
             .map_err(|error| format!("streaming export is unsupported: {error:?}"))?;
         let invalidation = propagate_plan_edits(&plan, &[TerrainEditClass::Structure]);
         let mut config = PyramidConfig::new(
-            document.export_resolution,
-            document.metrics.world_size_x,
-            document.metrics.world_size_z,
+            bounded.export_resolution,
+            bounded.metrics.world_size_x,
+            bounded.metrics.world_size_z,
         );
-        config.tile_size = document.metrics.tile_size;
-        config.halo = document.metrics.halo;
+        config.tile_size = bounded.metrics.tile_size;
+        config.halo = bounded.metrics.halo;
         let pyramid = TerrainPyramid::new(config);
         let total_tiles = pyramid.metadata_len() as usize;
         let finest_tiles = pyramid
@@ -355,7 +359,7 @@ mod tests {
 
     fn flat_document() -> TerrainDocument {
         let mut document = TerrainDocument::new_default();
-        document.export_resolution = 17;
+        document.bounded_settings_mut().unwrap().export_resolution = 17;
         document.stack = LayerStack::new();
         document.stack.push(Layer::new(
             "Export flat",

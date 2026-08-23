@@ -389,11 +389,11 @@ fn evaluation_dimensions(doc: &TerrainDocument, ui_state: &UiState) -> GridDimen
     if ui_state.profile.tex_w > 0 && ui_state.profile.tex_h > 0 {
         GridDimensions::new(ui_state.profile.tex_w, ui_state.profile.tex_h)
     } else {
-        GridDimensions::square(
+        GridDimensions::square(doc.bounded_settings().map_or(0, |bounded| {
             ui_state
                 .quality
-                .resolution(doc.preview_resolution, doc.export_resolution),
-        )
+                .resolution(bounded.preview_resolution, bounded.export_resolution)
+        }))
     }
 }
 
@@ -460,11 +460,10 @@ mod tests {
 
     #[test]
     fn evaluation_text_tracks_quality_and_presented_dimensions() {
-        let doc = TerrainDocument {
-            preview_resolution: 4096,
-            export_resolution: 8192,
-            ..TerrainDocument::default()
-        };
+        let mut doc = TerrainDocument::default();
+        let bounded = doc.bounded_settings_mut().unwrap();
+        bounded.preview_resolution = 4096;
+        bounded.export_resolution = 8192;
         let mut ui_state = UiState {
             quality: PreviewQuality::Draft,
             ..UiState::default()

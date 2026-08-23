@@ -1198,10 +1198,13 @@ fn accumulate_stroke_edit_footprint(
     prev: &terra_core::authoring::SculptStrokeParams,
     next: &terra_core::authoring::SculptStrokeParams,
 ) {
-    let m = app.session.document.metrics;
+    let Some(bounded) = app.session.document.bounded_settings() else {
+        return;
+    };
+    let m = bounded.metrics;
     // One Full-res texel of pad covers the reconcile 3×3 halo (see
     // `sculpt_edit_footprint`); matches the worker's Full resolution ceiling.
-    let pad = 1.0 / (app.session.document.preview_resolution.clamp(1, 8192) as f32);
+    let pad = 1.0 / (bounded.preview_resolution.clamp(1, 8192) as f32);
     if let Some(b) = terra_core::authoring::sculpt_edit_footprint(prev, next, &m, pad) {
         // Lift the resolution-free authoring footprint into the tiling UvRect the
         // worker scope speaks (authoring cannot depend on tiling — it sits below it).
@@ -1270,8 +1273,9 @@ mod tests {
         prev: &SculptStrokeParams,
         next: &SculptStrokeParams,
     ) -> UvRect {
-        let m = app.session.document.metrics;
-        let pad = 1.0 / (app.session.document.preview_resolution.clamp(1, 8192) as f32);
+        let bounded = app.session.document.bounded_settings().unwrap();
+        let m = bounded.metrics;
+        let pad = 1.0 / (bounded.preview_resolution.clamp(1, 8192) as f32);
         let b = sculpt_edit_footprint(prev, next, &m, pad).expect("bounded footprint");
         UvRect {
             min_u: b.min_u,

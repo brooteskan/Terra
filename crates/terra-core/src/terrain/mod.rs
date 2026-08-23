@@ -27,7 +27,7 @@ pub use pyramid::{
     PyramidConfig, TerrainLevel, TerrainPyramid, TerrainTileExtent, TerrainTileRange,
 };
 pub use refinement::{EditorRefinementState, RefinementController, RefinementTimings};
-pub use runtime::TerrainRuntime;
+pub use runtime::{TerrainRuntime, TerrainRuntimeConfig, TerrainRuntimeTopology};
 pub use tile::TerrainTileKey;
 pub use work::{
     TerrainContentStamp, TerrainTileWorkBudget, TerrainTileWorkKey, TerrainTileWorkLease,

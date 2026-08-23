@@ -93,9 +93,14 @@ pub(crate) fn try_apply(
             erase,
             mode,
         } => {
+            let Some(bounded) = app.session.document.bounded_settings().cloned() else {
+                app.ui_state.status =
+                    "Biome painting is unavailable for Infinite projects in this slice.".into();
+                return Ok(());
+            };
             let placement_id = app.session.document.ensure_placement_layer();
-            let world_x = app.session.document.metrics.world_size_x.max(1.0);
-            let world_z = app.session.document.metrics.world_size_z.max(1.0);
+            let world_x = bounded.metrics.world_size_x.max(1.0);
+            let world_z = bounded.metrics.world_size_z.max(1.0);
             let wx = u * world_x;
             let wz = v * world_z;
             let radius_m = radius * world_x.max(world_z);
@@ -134,7 +139,7 @@ pub(crate) fn try_apply(
                         .stamp_circle(key, wx, wz, radius_m, strength, false);
                 }
             }
-            let res = app.session.document.preview_resolution.clamp(64, 8192);
+            let res = bounded.preview_resolution.clamp(64, 8192);
             if let Some(layer) = app.session.document.selected_placement_layer_mut() {
                 match tool {
                     terra_core::biome_paint::BiomePaintTool::Smooth => {
@@ -239,7 +244,16 @@ pub(crate) fn try_apply(
             }
         }
         PanelAction::AddHoleLayer { name } => {
-            let res = app.session.document.preview_resolution.clamp(64, 512);
+            let Some(res) = app
+                .session
+                .document
+                .bounded_settings()
+                .map(|settings| settings.preview_resolution.clamp(64, 512))
+            else {
+                app.ui_state.status =
+                    "Hole layers are unavailable for Infinite projects in this slice.".into();
+                return Ok(());
+            };
             app.session
                 .document
                 .hole_layers
