@@ -285,6 +285,13 @@ Infinite admission never selects the complete-field checkpoint fallback. Catalog
 inspector, and scheduling use this shared result. See
 [Infinite-world spatial capabilities](algorithms/infinite_spatial_capabilities.md).
 
+Admitted Infinite height work is realized over a signed tile-plus-halo domain by
+the CPU tile evaluator or the compiled GPU tile producer. Neither path flattens
+the world address into an unsigned level rectangle. The GPU uses split-origin
+coordinates and performs backend preflight before allocation; its packed result
+removes operation guards without finite-world edge clamping. OpenSimplex and
+Worley use the CPU realization until matching GPU contracts exist.
+
 Output edits advance `TerrainRuntime::output_revision` through the app's single revision
 boundary, which drops old pyramid content and clears pending uploads, the cache and page
 table, and renderer streaming state. Document reset performs the same retirement while

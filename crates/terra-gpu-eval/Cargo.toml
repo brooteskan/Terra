@@ -15,6 +15,7 @@ profiling = { workspace = true }
 [dev-dependencies]
 terra-cpu-eval = { workspace = true }
 terra-test-gpu = { workspace = true }
+terra-world = { workspace = true }
 image = { workspace = true }
 
 [features]

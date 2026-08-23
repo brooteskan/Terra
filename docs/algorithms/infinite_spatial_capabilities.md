@@ -51,3 +51,20 @@ and the cached compatibility of the current compiled graph.
 The app resolves and caches graph compatibility before creating evaluation work.
 Rejected Infinite graphs enqueue no CPU, GPU, checkpoint, or tile work and retain
 the last valid presentation.
+
+## Backend realization
+
+Both tile backends consume the same admitted plan and signed
+`TerrainEvaluationDomain`. The CPU evaluator implements the initial direct set,
+including OpenSimplex and Worley. The GPU evaluator currently implements Flat,
+SculptBase, Value/Perlin noise, Value/Perlin fBm and ridged noise, and bounded
+Blur; OpenSimplex and Worley are explicit CPU boundaries. GPU preflight happens
+before command encoding or resource allocation.
+
+The CPU and GPU paths form world coordinates from the signed sample lattice and
+the topology's fixed `f64` origin. GPU shaders receive a split high/low origin and
+add local coordinates after scaling, preserving nearby variation at very large
+tile addresses. Regenerating a tile is deterministic within a backend, request
+order is irrelevant, and adjacent tile evaluation rectangles agree in their
+overlap. Packing removes only the cumulative operation guard and retains the
+requested publication halo.

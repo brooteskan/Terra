@@ -8,6 +8,7 @@ description = "Stateful CPU terrain evaluation and runtime support"
 [dependencies]
 terra-core = { workspace = true }
 terra-jobs = { workspace = true }
+terra-world = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

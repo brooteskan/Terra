@@ -3,8 +3,9 @@ use std::sync::mpsc;
 use std::sync::Arc;
 
 use terra_core::terrain_plan::{
-    resolve_plan_execution_strategy, FieldSlot, TerrainPlanCheckpoint, TerrainPlanDomainRejection,
-    TerrainPlanDomainSlice, TerrainPlanExecutionStrategy,
+    resolve_infinite_plan_domain, resolve_plan_execution_strategy, FieldSlot,
+    TerrainPlanCheckpoint, TerrainPlanDomainRejection, TerrainPlanDomainSlice,
+    TerrainPlanExecutionStrategy,
 };
 use terra_core::{TerrainContentStamp, TerrainEvaluationDomain};
 
@@ -253,6 +254,17 @@ impl GpuCompiledTileProducer {
         }
     }
 
+    pub fn analyze_infinite(
+        stack: &LayerStack,
+        mask_assets: &[MaskAsset],
+        plan: &CompiledTerrainPlan,
+    ) -> Result<TerrainPlanDomainSlice, GpuTileEvaluationError> {
+        let slice = resolve_infinite_plan_domain(stack, mask_assets, plan, plan.final_height())
+            .map_err(GpuTileEvaluationError::Domain)?;
+        preflight_tile_operations(stack, plan, &slice, &slice.operations)?;
+        Ok(slice)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn begin(
         &mut self,
@@ -273,17 +285,31 @@ impl GpuCompiledTileProducer {
                 requested: domain.content.plan_revision,
             });
         }
-        let strategy = resolve_plan_execution_strategy(plan, plan.final_height());
-        let slice = Self::analyze(stack, plan)?;
+        let (slice, checkpoint_descriptor) = if domain.is_infinite() {
+            (Self::analyze_infinite(stack, mask_assets, plan)?, None)
+        } else {
+            match resolve_plan_execution_strategy(plan, plan.final_height()) {
+                TerrainPlanExecutionStrategy::Local(slice) => {
+                    preflight_tile_operations(stack, plan, &slice, &slice.operations)?;
+                    (slice, None)
+                }
+                TerrainPlanExecutionStrategy::Checkpointed { checkpoint, suffix } => {
+                    let mut complete = checkpoint.prefix_operations.clone();
+                    complete.extend(suffix.operations.iter().copied());
+                    preflight_tile_operations(stack, plan, &suffix, &complete)?;
+                    (suffix, Some(checkpoint))
+                }
+            }
+        };
         if slice.operation_halo != domain.operation_halo {
             return Err(GpuTileEvaluationError::HaloMismatch {
                 resolved: slice.operation_halo,
                 supplied: domain.operation_halo,
             });
         }
-        let checkpoint_seed = match &strategy {
-            TerrainPlanExecutionStrategy::Local(_) => None,
-            TerrainPlanExecutionStrategy::Checkpointed { checkpoint, .. } => {
+        let checkpoint_seed = match checkpoint_descriptor.as_ref() {
+            None => None,
+            Some(checkpoint) => {
                 self.ensure_checkpoint(
                     device,
                     queue,
@@ -314,11 +340,22 @@ impl GpuCompiledTileProducer {
                 domain.evaluation.width.max(domain.evaluation.height),
             )
         };
-        engine.tile_sample_window = Some(TileSampleWindow {
-            origin_x: domain.evaluation.origin_x,
-            origin_z: domain.evaluation.origin_z,
-            level_width: domain.world.level_width,
-            level_height: domain.world.level_height,
+        engine.tile_sample_window = Some(if domain.is_infinite() {
+            let transform = domain.spatial.interior.transform;
+            let spacing = transform.spacing();
+            let origin = transform.origin();
+            let samples = domain.spatial.evaluation.origin;
+            TileSampleWindow::Infinite {
+                world_origin_x: origin.x_m() + samples.x as f64 * spacing.x_m(),
+                world_origin_z: origin.z_m() + samples.z as f64 * spacing.z_m(),
+            }
+        } else {
+            TileSampleWindow::Bounded {
+                origin_x: domain.evaluation.origin_x,
+                origin_z: domain.evaluation.origin_z,
+                level_width: domain.world.level_width,
+                level_height: domain.world.level_height,
+            }
         });
         engine.mark_all_dirty(stack);
         // A recycled evaluator retains tile-sized plan textures. Domain origin
@@ -484,16 +521,22 @@ impl GpuCompiledTileProducer {
                 let valid_height = domain.interior.height + domain.publication_halo * 2;
                 for pz in 0..valid_height {
                     for px in 0..valid_width {
-                        let global_x = (i64::from(domain.interior.origin_x) + i64::from(px)
-                            - i64::from(domain.publication_halo))
-                        .clamp(0, i64::from(domain.world.level_width) - 1)
-                            as u32;
-                        let global_z = (i64::from(domain.interior.origin_z) + i64::from(pz)
-                            - i64::from(domain.publication_halo))
-                        .clamp(0, i64::from(domain.world.level_height) - 1)
-                            as u32;
-                        let local_x = global_x - domain.evaluation.origin_x;
-                        let local_z = global_z - domain.evaluation.origin_z;
+                        let (local_x, local_z) = if domain.is_infinite() {
+                            (domain.operation_halo + px, domain.operation_halo + pz)
+                        } else {
+                            let global_x = (i64::from(domain.interior.origin_x) + i64::from(px)
+                                - i64::from(domain.publication_halo))
+                            .clamp(0, i64::from(domain.world.level_width) - 1)
+                                as u32;
+                            let global_z = (i64::from(domain.interior.origin_z) + i64::from(pz)
+                                - i64::from(domain.publication_halo))
+                            .clamp(0, i64::from(domain.world.level_height) - 1)
+                                as u32;
+                            (
+                                global_x - domain.evaluation.origin_x,
+                                global_z - domain.evaluation.origin_z,
+                            )
+                        };
                         samples[(pz * readback.page_extent + px) as usize] =
                             local[(local_z * domain.evaluation.width + local_x) as usize];
                     }
@@ -724,6 +767,8 @@ fn preflight_tile_operations(
                 | LayerKind::SculptBase(_)
                 | LayerKind::NoiseValue(_)
                 | LayerKind::NoisePerlin(_)
+                | LayerKind::Fbm(_)
+                | LayerKind::Ridged(_)
         ) {
             return Err(GpuTileEvaluationError::UnsupportedOperation {
                 operation: id,

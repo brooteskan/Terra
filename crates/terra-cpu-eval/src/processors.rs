@@ -204,25 +204,72 @@ impl ProcessorRegistry {
             LayerKind::Flat(p) => Ok(generators::flat(ctx.metrics, p.height)),
             LayerKind::Ramp(p) => Ok(generators::ramp(ctx.metrics, p)),
             LayerKind::NoiseValue(p) => {
-                generators::noise_field(ctx.metrics, &cancel, p, FractalNoiseType::Value)
-                    .ok_or(EvalError::Cancelled)
+                if let Some((transform, origin)) = ctx.absolute_coordinate_frame() {
+                    generators::noise_field_in_domain(
+                        ctx.metrics,
+                        &cancel,
+                        transform,
+                        origin,
+                        p,
+                        FractalNoiseType::Value,
+                    )
+                } else {
+                    generators::noise_field(ctx.metrics, &cancel, p, FractalNoiseType::Value)
+                }
+                .ok_or(EvalError::Cancelled)
             }
             LayerKind::NoisePerlin(p) => {
-                generators::noise_field(ctx.metrics, &cancel, p, FractalNoiseType::Perlin)
-                    .ok_or(EvalError::Cancelled)
+                if let Some((transform, origin)) = ctx.absolute_coordinate_frame() {
+                    generators::noise_field_in_domain(
+                        ctx.metrics,
+                        &cancel,
+                        transform,
+                        origin,
+                        p,
+                        FractalNoiseType::Perlin,
+                    )
+                } else {
+                    generators::noise_field(ctx.metrics, &cancel, p, FractalNoiseType::Perlin)
+                }
+                .ok_or(EvalError::Cancelled)
             }
             LayerKind::NoiseOpenSimplex(p) => {
-                generators::noise_field(ctx.metrics, &cancel, p, FractalNoiseType::OpenSimplex)
-                    .ok_or(EvalError::Cancelled)
+                if let Some((transform, origin)) = ctx.absolute_coordinate_frame() {
+                    generators::noise_field_in_domain(
+                        ctx.metrics,
+                        &cancel,
+                        transform,
+                        origin,
+                        p,
+                        FractalNoiseType::OpenSimplex,
+                    )
+                } else {
+                    generators::noise_field(ctx.metrics, &cancel, p, FractalNoiseType::OpenSimplex)
+                }
+                .ok_or(EvalError::Cancelled)
             }
             LayerKind::NoiseWorley(p) => {
-                generators::worley_field(ctx.metrics, &cancel, p).ok_or(EvalError::Cancelled)
+                if let Some((transform, origin)) = ctx.absolute_coordinate_frame() {
+                    generators::worley_field_in_domain(ctx.metrics, &cancel, transform, origin, p)
+                } else {
+                    generators::worley_field(ctx.metrics, &cancel, p)
+                }
+                .ok_or(EvalError::Cancelled)
             }
-            LayerKind::Fbm(p) => {
-                generators::fbm_field(ctx.metrics, &cancel, p).ok_or(EvalError::Cancelled)
+            LayerKind::Fbm(p) => if let Some((transform, origin)) = ctx.absolute_coordinate_frame()
+            {
+                generators::fbm_field_in_domain(ctx.metrics, &cancel, transform, origin, p)
+            } else {
+                generators::fbm_field(ctx.metrics, &cancel, p)
             }
+            .ok_or(EvalError::Cancelled),
             LayerKind::Ridged(p) => {
-                generators::ridged_field(ctx.metrics, &cancel, p).ok_or(EvalError::Cancelled)
+                if let Some((transform, origin)) = ctx.absolute_coordinate_frame() {
+                    generators::ridged_field_in_domain(ctx.metrics, &cancel, transform, origin, p)
+                } else {
+                    generators::ridged_field(ctx.metrics, &cancel, p)
+                }
+                .ok_or(EvalError::Cancelled)
             }
             LayerKind::DomainWarp(p) => {
                 generators::domain_warp_field(ctx.metrics, &cancel, p).ok_or(EvalError::Cancelled)

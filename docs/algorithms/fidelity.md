@@ -10,6 +10,7 @@
 - **Heightmap assets** are decoded to normalized R16-equivalent samples and uploaded to a source-texture cache keyed by canonical path plus file metadata. `ImportHeightmap` and transformed `Stamp2d` use nearest/clamp edge sampling; `Stamp3d` remains CPU-only.
 - **CPU fallback**: Coastal currently requires CPU evaluation. Materials, Biomes, and Vegetation also require CPU evaluation because their observable auxiliary fields are not published by the GPU path.
 - **Hybrid**: GPU preview may continue supported work speculatively above an unsupported layer when no readback is requested. A requested CPU checkpoint instead stops before the first unsupported layer, and its height is exactly the field entering `resume_cpu_from`. Prefixes that publish auxiliary fields or named outputs cannot be represented by height alone and conservatively restart the CPU evaluator from layer zero.
+- **Infinite tiles**: CPU evaluates the admitted direct generator set from signed sample coordinates, including OpenSimplex and Worley. GPU tile evaluation uses a split `f64`-derived origin for Flat, SculptBase, Value/Perlin noise, Value/Perlin fBm and ridged noise, and bounded Blur. OpenSimplex and Worley are explicit CPU boundaries; Infinite work never uses a complete-field checkpoint fallback.
 
 ## Executable parity matrix
 

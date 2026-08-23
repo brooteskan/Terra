@@ -6,6 +6,10 @@ struct Uniforms {
     height: u32,
     world_x: f32,
     world_z: f32,
+    domain_origin_x_hi: f32,
+    domain_origin_z_hi: f32,
+    domain_origin_x_lo: f32,
+    domain_origin_z_lo: f32,
     seed: u32,
     octaves: u32,
     frequency: f32,
@@ -72,11 +76,18 @@ fn legacy_fbm(p0: vec2<f32>) -> f32 {
 }
 
 fn legacy_value_height(world: vec2<f32>) -> f32 {
-    let p = (world + vec2<f32>(u.offset_x, u.offset_z)) * u.frequency;
+    let p = absolute_noise_position(world, u.frequency);
     let n = legacy_fbm(p);
     let span = max(u.remap_max - u.remap_min, 1e-5);
     let t = clamp((n - u.remap_min) / span, 0.0, 1.0);
     return (t * 2.0 - 1.0) * u.amplitude;
+}
+
+fn absolute_noise_position(world: vec2<f32>, frequency: f32) -> vec2<f32> {
+    let local = (world + vec2<f32>(u.offset_x, u.offset_z)) * frequency;
+    let high = vec2<f32>(u.domain_origin_x_hi, u.domain_origin_z_hi) * frequency;
+    let low = vec2<f32>(u.domain_origin_x_lo, u.domain_origin_z_lo) * frequency;
+    return high + (low + local);
 }
 
 // CPU-compatible hash and noise primitives (`terra_core::noise`). The planner
@@ -160,7 +171,7 @@ fn cpu_fbm_height(world: vec2<f32>, noise_type: u32) -> f32 {
     var norm = 0.0;
     let octaves = max(u.octaves, 1u);
     for (var octave = 0u; octave < octaves; octave++) {
-        let p = (world + vec2<f32>(u.offset_x, u.offset_z)) * frequency;
+        let p = absolute_noise_position(world, frequency);
         let n = cpu_sample_noise(p, u.seed + octave * 1013u, noise_type);
         sum += n * amplitude;
         norm += amplitude;
@@ -182,7 +193,7 @@ fn cpu_ridged_height(world: vec2<f32>, noise_type: u32) -> f32 {
     var weight = 1.0;
     let octaves = max(u.octaves, 1u);
     for (var octave = 0u; octave < octaves; octave++) {
-        let p = (world + vec2<f32>(u.offset_x, u.offset_z)) * frequency;
+        let p = absolute_noise_position(world, frequency);
         let n = cpu_sample_noise(p, u.seed + octave * 9173u, noise_type);
         let ridge = clamp(1.0 - abs(n), 0.0, 1.0);
         let signal = ridge * ridge * weight;
@@ -201,15 +212,14 @@ fn cpu_ridged_height(world: vec2<f32>, noise_type: u32) -> f32 {
 
 fn cpu_perlin_height(world: vec2<f32>) -> f32 {
     if (u.octaves <= 1u) {
-        let p = (world + vec2<f32>(u.offset_x, u.offset_z)) * u.frequency;
+        let p = absolute_noise_position(world, u.frequency);
         return cpu_perlin_noise(p, u.seed) * u.amplitude;
     }
     return cpu_fbm_height(world, 1u);
 }
 
 fn cpu_domain_warp_height(world: vec2<f32>) -> f32 {
-    let offset = vec2<f32>(u.offset_x, u.offset_z);
-    let warp_p = (world + offset) * u.warp_frequency;
+    let warp_p = absolute_noise_position(world, u.warp_frequency);
     let wx = cpu_perlin_noise(warp_p, u.seed) * u.warp_strength;
     let wz = cpu_perlin_noise(warp_p + vec2<f32>(19.1, 7.3), u.seed + 1u)
         * u.warp_strength;
@@ -239,7 +249,7 @@ fn cpu_worley_f1(p: vec2<f32>, seed: u32) -> f32 {
 }
 
 fn cpu_voronoi_regions_height(world: vec2<f32>) -> f32 {
-    let p = (world + vec2<f32>(u.offset_x, u.offset_z)) * u.frequency;
+    let p = absolute_noise_position(world, u.frequency);
     let f1 = cpu_worley_f1(p, u.seed);
     let t = clamp(f1 / 1.2, 0.0, 1.0);
     let worley = cpu_lerp(u.remap_min, u.remap_max, t) * u.amplitude;

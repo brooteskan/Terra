@@ -31,20 +31,50 @@ impl GpuTerrainEngine {
         dispatch: NoiseDispatch,
         destination: TexSlot,
     ) {
-        let (domain_origin_x, domain_origin_z) =
-            self.tile_sample_window.map_or((0.0, 0.0), |window| {
-                (
-                    window.origin_x as f32 * self.metrics.world_size_x
-                        / self.metrics.width.max(1) as f32,
-                    window.origin_z as f32 * self.metrics.world_size_z
-                        / self.metrics.height.max(1) as f32,
-                )
-            });
+        let (offset_x, offset_z, origin_x_hi, origin_z_hi, origin_x_lo, origin_z_lo) =
+            match self.tile_sample_window {
+                None => (p.offset_x, p.offset_z, 0.0, 0.0, 0.0, 0.0),
+                Some(TileSampleWindow::Bounded {
+                    origin_x, origin_z, ..
+                }) => {
+                    let domain_origin_x = origin_x as f32 * self.metrics.world_size_x
+                        / self.metrics.width.max(1) as f32;
+                    let domain_origin_z = origin_z as f32 * self.metrics.world_size_z
+                        / self.metrics.height.max(1) as f32;
+                    (
+                        p.offset_x + domain_origin_x,
+                        p.offset_z + domain_origin_z,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                    )
+                }
+                Some(TileSampleWindow::Infinite {
+                    world_origin_x,
+                    world_origin_z,
+                }) => {
+                    let x_hi = world_origin_x as f32;
+                    let z_hi = world_origin_z as f32;
+                    (
+                        p.offset_x,
+                        p.offset_z,
+                        x_hi,
+                        z_hi,
+                        (world_origin_x - f64::from(x_hi)) as f32,
+                        (world_origin_z - f64::from(z_hi)) as f32,
+                    )
+                }
+            };
         let u = NoiseU {
             width: self.metrics.width,
             height: self.metrics.height,
             world_x: self.metrics.world_size_x,
             world_z: self.metrics.world_size_z,
+            domain_origin_x_hi: origin_x_hi,
+            domain_origin_z_hi: origin_z_hi,
+            domain_origin_x_lo: origin_x_lo,
+            domain_origin_z_lo: origin_z_lo,
             seed: (p.seed & 0xFFFF_FFFF) as u32,
             octaves: p.octaves.max(1),
             frequency: p.frequency,
@@ -54,8 +84,8 @@ impl GpuTerrainEngine {
             // The shader's local world coordinate starts at zero. Shift the
             // authored offset by the domain origin so tiled and complete-field
             // dispatches address the same deterministic world lattice.
-            offset_x: p.offset_x + domain_origin_x,
-            offset_z: p.offset_z + domain_origin_z,
+            offset_x,
+            offset_z,
             remap_min: p.remap_min,
             remap_max: p.remap_max,
             noise_type: dispatch.noise_type,

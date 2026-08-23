@@ -258,6 +258,29 @@ const APPROVED_EXECUTION_SEAMS: &[ApprovedSeam] = &[
         },
     },
     ApprovedSeam {
+        name: "InfiniteTileEvaluator",
+        definition: "crates/terra-cpu-eval/src/tile_domain.rs",
+        role: SeamRole::Orchestrator,
+        justification: "validates and realizes one admitted Infinite tile while delegating the authored LayerStack walk to StackEvaluator",
+        entry_points: &[],
+        internal_methods: &[
+            InternalMethod {
+                method: "new",
+                justification: "constructs the public sparse-tile evaluator; production scheduling integration follows the existing request pipeline",
+            },
+            InternalMethod {
+                method: "evaluate",
+                justification: "public sparse-tile API covered by deterministic result tests; layer dispatch delegates to StackEvaluator",
+            },
+        ],
+        result_test: ResultTestEvidence {
+            path: "crates/terra-cpu-eval/tests/infinite_tile_evaluation.rs",
+            test_name: "negative_positive_tiles_regenerate_and_share_zero_halo_samples",
+            seam_needle: "InfiniteTileEvaluator::new",
+            result_needle: "tile.samples",
+        },
+    },
+    ApprovedSeam {
         name: "compile_gpu_graph",
         definition: "crates/terra-gpu/src/graph.rs",
         role: SeamRole::Planner,

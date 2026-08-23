@@ -5,6 +5,7 @@ mod processors;
 pub mod realism_benchmark;
 mod scheduler;
 mod smart_cache;
+mod tile_domain;
 mod worker;
 
 pub use cache::{CachedOutput, LayerCache, SeedState};
@@ -12,6 +13,7 @@ pub use processors::ProcessorRegistry;
 pub use realism_benchmark::measure_document;
 pub use scheduler::EvalScheduler;
 pub use smart_cache::DiskSmartCache;
+pub use tile_domain::{CpuPackedHeightTile, CpuTileEvaluationError, InfiniteTileEvaluator};
 pub use worker::{
     EvalWorkFailure, EvalWorkRequest, EvalWorkResult, EvalWorker, EvalWorkerEvent,
     EvalWorkerStatsSnapshot, EvalWorkerSubmitError,
@@ -104,6 +106,9 @@ pub struct LayerEvalTiming {
 
 pub struct EvalContext {
     pub metrics: HeightfieldMetrics,
+    /// Absolute sparse-tile coordinate context. `None` retains the historical
+    /// bounded grid whose local origin is world zero.
+    pub evaluation_domain: Option<terra_core::TerrainEvaluationDomain>,
     /// Project-wide progressive evaluation controls. Keeping this on the
     /// context makes CPU, worker, and hybrid evaluation use the document's
     /// authored world scale and level schedule instead of hidden defaults.
@@ -142,6 +147,7 @@ impl EvalContext {
     pub fn new(metrics: HeightfieldMetrics) -> Self {
         Self {
             metrics,
+            evaluation_domain: None,
             level_steps: terra_core::analyze::LevelStepSettings::default(),
             masks: HashMap::new(),
             mask_assets: Vec::new(),
@@ -155,6 +161,23 @@ impl EvalContext {
             initial_scope: None,
             pending_strokes_restamped: None,
         }
+    }
+
+    pub fn set_evaluation_domain(&mut self, domain: terra_core::TerrainEvaluationDomain) {
+        self.evaluation_domain = Some(domain);
+    }
+
+    pub fn absolute_coordinate_frame(
+        &self,
+    ) -> Option<(terra_world::SampleWorldTransform, terra_world::SampleCoord)> {
+        let domain = self.evaluation_domain.as_ref()?;
+        if !domain.is_infinite() {
+            return None;
+        }
+        Some((
+            domain.spatial.interior.transform,
+            domain.spatial.evaluation.origin,
+        ))
     }
 
     pub fn check_cancelled(&self) -> Result<(), EvalError> {

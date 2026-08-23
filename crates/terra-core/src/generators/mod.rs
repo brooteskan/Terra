@@ -31,6 +31,7 @@ use crate::noise::{self, domain_warp_fbm, fbm, ridged_mf, sample_worley};
 use crate::noise::{FractalNoiseType, NoiseParams, WorleyFeature, WorleyMetric, WorleyParams};
 use rayon::prelude::*;
 use terra_jobs::{try_par_fill, CancelToken};
+use terra_world::{SampleCoord, SampleWorldTransform};
 use thiserror::Error;
 
 pub fn flat(metrics: HeightfieldMetrics, height: f32) -> Heightfield {
@@ -97,6 +98,28 @@ pub fn noise_field(
     try_fill_world(metrics, cancel, noise_sampler(p, kind))
 }
 
+pub fn noise_field_in_domain(
+    metrics: HeightfieldMetrics,
+    cancel: &CancelToken,
+    transform: SampleWorldTransform,
+    sample_origin: SampleCoord,
+    p: &NoiseParams,
+    kind: FractalNoiseType,
+) -> Option<Heightfield> {
+    try_fill_absolute(metrics, cancel, transform, sample_origin, |x, z| {
+        if p.octaves <= 1 {
+            noise::sample_noise(
+                kind,
+                ((x + f64::from(p.offset_x)) * f64::from(p.frequency)) as f32,
+                ((z + f64::from(p.offset_z)) * f64::from(p.frequency)) as f32,
+                p.seed,
+            ) * p.amplitude
+        } else {
+            absolute_fbm(kind, x, z, p)
+        }
+    })
+}
+
 /// World-space sampler for [`noise_field`]. Shared with the tile-scoped entry
 /// ([`noise_field_tiles`]) so both paths evaluate identical arithmetic (#110).
 fn noise_sampler(p: &NoiseParams, kind: FractalNoiseType) -> impl Fn(f32, f32) -> f32 + Sync + '_ {
@@ -122,6 +145,30 @@ pub fn worley_field(
     try_fill_world(metrics, cancel, worley_sampler(p))
 }
 
+pub fn worley_field_in_domain(
+    metrics: HeightfieldMetrics,
+    cancel: &CancelToken,
+    transform: SampleWorldTransform,
+    sample_origin: SampleCoord,
+    p: &WorleyParams,
+) -> Option<Heightfield> {
+    try_fill_absolute(metrics, cancel, transform, sample_origin, |x, z| {
+        let base = &p.base;
+        let result = noise::worley2(
+            ((x + f64::from(base.offset_x)) * f64::from(base.frequency)) as f32,
+            ((z + f64::from(base.offset_z)) * f64::from(base.frequency)) as f32,
+            base.seed,
+            p.distance_metric,
+        );
+        let distance = match p.feature {
+            WorleyFeature::F1 => result.f1,
+            WorleyFeature::F2 => result.f2,
+            WorleyFeature::F2MinusF1 => result.f2 - result.f1,
+        };
+        noise::remap(distance, 0.0, 1.2, base.remap_min, base.remap_max) * base.amplitude
+    })
+}
+
 /// World-space sampler for [`worley_field`] (see [`noise_sampler`]).
 fn worley_sampler(p: &WorleyParams) -> impl Fn(f32, f32) -> f32 + Sync + '_ {
     move |x, z| sample_worley(x, z, p)
@@ -135,6 +182,18 @@ pub fn fbm_field(
     try_fill_world(metrics, cancel, fbm_sampler(p))
 }
 
+pub fn fbm_field_in_domain(
+    metrics: HeightfieldMetrics,
+    cancel: &CancelToken,
+    transform: SampleWorldTransform,
+    sample_origin: SampleCoord,
+    p: &FbmParams,
+) -> Option<Heightfield> {
+    try_fill_absolute(metrics, cancel, transform, sample_origin, |x, z| {
+        absolute_fbm(p.noise, x, z, &p.base)
+    })
+}
+
 /// World-space sampler for [`fbm_field`] (see [`noise_sampler`]).
 fn fbm_sampler(p: &FbmParams) -> impl Fn(f32, f32) -> f32 + Sync + '_ {
     move |x, z| fbm(p.noise, x, z, &p.base)
@@ -146,6 +205,67 @@ pub fn ridged_field(
     p: &FbmParams,
 ) -> Option<Heightfield> {
     try_fill_world(metrics, cancel, ridged_sampler(p))
+}
+
+pub fn ridged_field_in_domain(
+    metrics: HeightfieldMetrics,
+    cancel: &CancelToken,
+    transform: SampleWorldTransform,
+    sample_origin: SampleCoord,
+    p: &FbmParams,
+) -> Option<Heightfield> {
+    try_fill_absolute(metrics, cancel, transform, sample_origin, |x, z| {
+        absolute_ridged(p.noise, x, z, &p.base)
+    })
+}
+
+fn absolute_fbm(kind: FractalNoiseType, x: f64, z: f64, p: &NoiseParams) -> f32 {
+    let mut amplitude = 1.0;
+    let mut frequency = f64::from(p.frequency);
+    let mut sum = 0.0;
+    let mut norm = 0.0;
+    for octave in 0..p.octaves.max(1) {
+        let value = noise::sample_noise(
+            kind,
+            ((x + f64::from(p.offset_x)) * frequency) as f32,
+            ((z + f64::from(p.offset_z)) * frequency) as f32,
+            p.seed.wrapping_add(u64::from(octave) * 1013),
+        );
+        sum += value * amplitude;
+        norm += amplitude;
+        amplitude *= p.persistence;
+        frequency *= f64::from(p.lacunarity);
+    }
+    let value = if norm > 0.0 { sum / norm } else { 0.0 };
+    noise::remap(value, p.remap_min, p.remap_max, -1.0, 1.0) * p.amplitude
+}
+
+fn absolute_ridged(kind: FractalNoiseType, x: f64, z: f64, p: &NoiseParams) -> f32 {
+    let mut amplitude = 1.0;
+    let mut frequency = f64::from(p.frequency);
+    let mut sum = 0.0;
+    let mut norm = 0.0;
+    let mut weight = 1.0;
+    for octave in 0..p.octaves.max(1) {
+        let value = noise::sample_noise(
+            kind,
+            ((x + f64::from(p.offset_x)) * frequency) as f32,
+            ((z + f64::from(p.offset_z)) * frequency) as f32,
+            p.seed.wrapping_add(u64::from(octave) * 9173),
+        );
+        let ridge = (1.0 - value.abs()).clamp(0.0, 1.0);
+        let signal = ridge * ridge * weight;
+        weight = (signal * 2.0).clamp(0.0, 1.0);
+        sum += signal * amplitude;
+        norm += amplitude;
+        amplitude *= p.persistence;
+        frequency *= f64::from(p.lacunarity);
+    }
+    if norm > 0.0 {
+        (sum / norm).clamp(0.0, 1.0) * p.amplitude
+    } else {
+        0.0
+    }
 }
 
 /// World-space sampler for [`ridged_field`] (see [`noise_sampler`]).
@@ -1638,6 +1758,29 @@ fn try_fill_world<F: Fn(f32, f32) -> f32 + Sync>(
         let i = (idx as u32) % w;
         let j = (idx as u32) / w;
         f(metrics.world_x(i), metrics.world_z(j))
+    });
+    filled.then(|| Heightfield::from_dense(metrics, &data))
+}
+
+fn try_fill_absolute<F: Fn(f64, f64) -> f32 + Sync>(
+    metrics: HeightfieldMetrics,
+    cancel: &CancelToken,
+    transform: SampleWorldTransform,
+    sample_origin: SampleCoord,
+    f: F,
+) -> Option<Heightfield> {
+    let width = metrics.width;
+    let spacing = transform.spacing();
+    let origin = transform.origin();
+    let mut data = vec![0.0f32; (width * metrics.height) as usize];
+    let filled = try_par_fill(cancel, &mut data, width as usize, |index| {
+        let local_x = (index as u32) % width;
+        let local_z = (index as u32) / width;
+        let sample_x = sample_origin.x + i64::from(local_x);
+        let sample_z = sample_origin.z + i64::from(local_z);
+        let x = origin.x_m() + (sample_x as f64 + 0.5) * spacing.x_m();
+        let z = origin.z_m() + (sample_z as f64 + 0.5) * spacing.z_m();
+        f(x, z)
     });
     filled.then(|| Heightfield::from_dense(metrics, &data))
 }

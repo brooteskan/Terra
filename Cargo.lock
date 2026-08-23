@@ -2656,6 +2656,7 @@ dependencies = [
  "serde_json",
  "terra-core",
  "terra-jobs",
+ "terra-world",
  "thiserror 2.0.19",
  "uuid",
 ]
@@ -2686,6 +2687,7 @@ dependencies = [
  "terra-cpu-eval",
  "terra-gpu",
  "terra-test-gpu",
+ "terra-world",
  "wgpu",
 ]
 

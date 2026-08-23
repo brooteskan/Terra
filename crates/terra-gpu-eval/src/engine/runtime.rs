@@ -143,11 +143,17 @@ const PROJECT_RESET_TEXTURE_EXTENT: u32 = 8;
 static NEXT_DEVICE_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy)]
-struct TileSampleWindow {
-    origin_x: u32,
-    origin_z: u32,
-    level_width: u32,
-    level_height: u32,
+enum TileSampleWindow {
+    Bounded {
+        origin_x: u32,
+        origin_z: u32,
+        level_width: u32,
+        level_height: u32,
+    },
+    Infinite {
+        world_origin_x: f64,
+        world_origin_z: f64,
+    },
 }
 
 /// GPU stack evaluator for interactive preview.

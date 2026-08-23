@@ -26,15 +26,20 @@ impl GpuTerrainEngine {
             for local_x in 0..width {
                 let x = origin_x + local_x;
                 let y = origin_y + local_y;
-                let (sample_x, sample_y, sample_width, sample_height) =
-                    sample_window.map_or((x, y, full_width, full_height), |window| {
-                        (
-                            window.origin_x.saturating_add(x),
-                            window.origin_z.saturating_add(y),
-                            window.level_width,
-                            window.level_height,
-                        )
-                    });
+                let (sample_x, sample_y, sample_width, sample_height) = match sample_window {
+                    Some(TileSampleWindow::Bounded {
+                        origin_x,
+                        origin_z,
+                        level_width,
+                        level_height,
+                    }) => (
+                        origin_x.saturating_add(x),
+                        origin_z.saturating_add(y),
+                        level_width,
+                        level_height,
+                    ),
+                    _ => (x, y, full_width, full_height),
+                };
                 let u = (sample_x as f32 + 0.5) / sample_width.max(1) as f32;
                 let v = (sample_y as f32 + 0.5) / sample_height.max(1) as f32;
                 let sample = params.sample_bilinear(u, v);

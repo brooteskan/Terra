@@ -20,7 +20,8 @@ pub use demand::{
     TerrainDemandPlan, TerrainDemandPlanner, TerrainDemandView, TerrainTileDemand,
 };
 pub use domain::{
-    TerrainDomainError, TerrainEvaluationDomain, TerrainSampleExtent, TerrainWorldTransform,
+    TerrainDomainError, TerrainEvaluationDomain, TerrainEvaluationSpace, TerrainSampleExtent,
+    TerrainWorldTransform,
 };
 pub use geometric_error::measure_tile_geometric_error;
 pub use pyramid::{
