@@ -1043,11 +1043,11 @@ mod tests {
         let Some(gpu) = terra_test_gpu::headless() else {
             return;
         };
-        let context = GpuContext {
-            device: gpu.device.clone(),
-            queue: gpu.queue.clone(),
-            surface_format: wgpu::TextureFormat::Rgba8Unorm,
-        };
+        let context = GpuContext::new(
+            gpu.device.clone(),
+            gpu.queue.clone(),
+            wgpu::TextureFormat::Rgba8Unorm,
+        );
         let mut app = TerraApp::default();
         app.renderer = Some(TerrainRenderer::new_headless(&context, 64, 64));
         app.gpu = Some(context);
@@ -1140,11 +1140,11 @@ mod tests {
         TerrainTileKey,
         terra_core::TilePageHandle,
     ) {
-        let context = GpuContext {
-            device: gpu.device.clone(),
-            queue: gpu.queue.clone(),
-            surface_format: wgpu::TextureFormat::Rgba8Unorm,
-        };
+        let context = GpuContext::new(
+            gpu.device.clone(),
+            gpu.queue.clone(),
+            wgpu::TextureFormat::Rgba8Unorm,
+        );
         let mut app = TerraApp::default();
         app.renderer = Some(TerrainRenderer::new_headless(&context, 64, 64));
         app.gpu = Some(context);

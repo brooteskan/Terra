@@ -59,11 +59,7 @@ fn partial_upload_preserves_texels_outside_dirty_rect() {
 
     // Same GpuContext path the app takes: hand the renderer the device/queue
     // rather than sourcing them back through it.
-    let ctx = GpuContext {
-        device: gpu.device.clone(),
-        queue: gpu.queue.clone(),
-        surface_format: FORMAT,
-    };
+    let ctx = GpuContext::new(gpu.device.clone(), gpu.queue.clone(), FORMAT);
     let mut renderer = TerrainRenderer::new_headless(&ctx, W, H);
     // Pin raster so a future default change can't turn this into a PT test.
     renderer.set_renderer_mode(ViewportRendererMode::Raster);

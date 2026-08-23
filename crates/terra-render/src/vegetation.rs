@@ -37,7 +37,11 @@ pub struct VegetationOverlay {
 }
 
 impl VegetationOverlay {
-    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+    pub fn new(
+        device: &wgpu::Device,
+        pipelines: &terra_gpu::PipelineCacheRegistry,
+        format: wgpu::TextureFormat,
+    ) -> Self {
         terra_core::shader_progress::record_shader_compiled();
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("vegetation-shader"),
@@ -75,7 +79,7 @@ impl VegetationOverlay {
             bind_group_layouts: &[&bgl],
             push_constant_ranges: &[],
         });
-        let pipeline = terra_gpu::cached_render_pipeline(device, "vegetation-pipe", format, || {
+        let pipeline = pipelines.render_pipeline("vegetation-pipe", format, || {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("vegetation-pipe"),
                 layout: Some(&layout),
@@ -142,7 +146,7 @@ impl VegetationOverlay {
                 }),
                 multisample: wgpu::MultisampleState::default(),
                 multiview: None,
-                cache: terra_gpu::shared_pipeline_cache(device).as_ref(),
+                cache: pipelines.driver_cache(),
             })
         });
 

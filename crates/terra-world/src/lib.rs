@@ -164,7 +164,10 @@ mod tests {
             max_lod: Lod::try_new(4).unwrap(),
         })
         .unwrap();
-        assert_eq!(topology.spacing(Lod::try_new(3).unwrap()).unwrap().x_m, 4.0);
+        assert_eq!(
+            topology.spacing(Lod::try_new(3).unwrap()).unwrap().x_m(),
+            4.0
+        );
         let child = TileAddress::new(Lod::try_new(2).unwrap(), TileCoord { x: -1, z: 0 });
         let parent = topology.parent(child).unwrap();
         assert_eq!(
@@ -179,8 +182,8 @@ mod tests {
         let right = topology
             .tile_extent(TileAddress::new(Lod::FINEST, TileCoord { x: 0, z: 0 }))
             .unwrap();
-        assert_eq!(left.world.max.x_m, right.world.min.x_m);
-        assert_eq!(right.world.min.x_m, 100.0);
+        assert_eq!(left.world.max().x_m(), right.world.min().x_m());
+        assert_eq!(right.world.min().x_m(), 100.0);
     }
 
     #[test]
@@ -211,6 +214,22 @@ mod tests {
     }
 
     #[test]
+    fn world_geometry_deserialization_preserves_constructor_invariants() {
+        assert!(serde_json::from_str::<WorldPosition>(r#"{"x_m":null,"z_m":0.0}"#).is_err());
+        assert!(serde_json::from_str::<WorldRect>(
+            r#"{"min":{"x_m":2.0,"z_m":0.0},"max":{"x_m":1.0,"z_m":1.0}}"#
+        )
+        .is_err());
+        let rect = WorldRect::try_new(
+            WorldPosition::try_new(-2.0, -1.0).unwrap(),
+            WorldPosition::try_new(3.0, 4.0).unwrap(),
+        )
+        .unwrap();
+        let json = serde_json::to_string(&rect).unwrap();
+        assert_eq!(serde_json::from_str::<WorldRect>(&json).unwrap(), rect);
+    }
+
+    #[test]
     fn thousands_of_kilometres_retain_sub_metre_precision() {
         let transform = SampleWorldTransform::new(
             WorldPosition::try_new(5_000_000.0, -5_000_000.0).unwrap(),
@@ -218,7 +237,7 @@ mod tests {
         );
         let a = transform.sample_center(SampleCoord { x: 0, z: 0 }).unwrap();
         let b = transform.sample_center(SampleCoord { x: 1, z: 0 }).unwrap();
-        assert_eq!(b.x_m - a.x_m, 0.25);
+        assert_eq!(b.x_m() - a.x_m(), 0.25);
     }
 
     #[test]

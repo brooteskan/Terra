@@ -231,11 +231,7 @@ fn gpu_regional_present_matches_full_across_baseline_transitions() {
     let Some(gpu) = terra_test_gpu::headless() else {
         return;
     };
-    let ctx = GpuContext {
-        device: gpu.device.clone(),
-        queue: gpu.queue.clone(),
-        surface_format: FORMAT,
-    };
+    let ctx = GpuContext::new(gpu.device.clone(), gpu.queue.clone(), FORMAT);
 
     let source = HeightSource::new(gpu, 96, 96);
     let mut actual = renderer(&ctx);
@@ -302,11 +298,7 @@ fn traced_regional_transition_detects_outside_region_corruption_asynchronously()
     let Some(gpu) = terra_test_gpu::headless() else {
         return;
     };
-    let ctx = GpuContext {
-        device: gpu.device.clone(),
-        queue: gpu.queue.clone(),
-        surface_format: FORMAT,
-    };
+    let ctx = GpuContext::new(gpu.device.clone(), gpu.queue.clone(), FORMAT);
     let source = HeightSource::new(gpu, 96, 96);
     let mut renderer = renderer(&ctx);
 
@@ -406,11 +398,7 @@ fn traced_regional_transition_recovers_after_an_unpresented_output() {
     let Some(gpu) = terra_test_gpu::headless() else {
         return;
     };
-    let ctx = GpuContext {
-        device: gpu.device.clone(),
-        queue: gpu.queue.clone(),
-        surface_format: FORMAT,
-    };
+    let ctx = GpuContext::new(gpu.device.clone(), gpu.queue.clone(), FORMAT);
     let source = HeightSource::new(gpu, 96, 96);
     let mut actual = renderer(&ctx);
     let mut oracle = renderer(&ctx);

@@ -85,7 +85,11 @@ pub struct BrushOverlay {
 }
 
 impl BrushOverlay {
-    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+    pub fn new(
+        device: &wgpu::Device,
+        pipelines: &terra_gpu::PipelineCacheRegistry,
+        format: wgpu::TextureFormat,
+    ) -> Self {
         terra_core::shader_progress::record_shader_compiled();
         let render_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("brush-gizmo-shader"),
@@ -161,7 +165,7 @@ impl BrushOverlay {
             push_constant_ranges: &[],
         });
         let make_render_pipeline = |label: &'static str, depth_stencil| {
-            terra_gpu::cached_render_pipeline(device, label, format, || {
+            pipelines.render_pipeline(label, format, || {
                 device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                     label: Some(label),
                     layout: Some(&render_layout),
@@ -188,7 +192,7 @@ impl BrushOverlay {
                     depth_stencil,
                     multisample: wgpu::MultisampleState::default(),
                     multiview: None,
-                    cache: terra_gpu::shared_pipeline_cache(device).as_ref(),
+                    cache: pipelines.driver_cache(),
                 })
             })
         };
@@ -216,17 +220,16 @@ impl BrushOverlay {
             bind_group_layouts: &[&compute_bgl],
             push_constant_ranges: &[],
         });
-        let compute_pipeline =
-            terra_gpu::cached_compute_pipeline(device, "brush-pick-pipeline", || {
-                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some("brush-pick-pipeline"),
-                    layout: Some(&compute_layout),
-                    module: &compute_shader,
-                    entry_point: Some("main"),
-                    compilation_options: Default::default(),
-                    cache: terra_gpu::shared_pipeline_cache(device).as_ref(),
-                })
-            });
+        let compute_pipeline = pipelines.compute_pipeline("brush-pick-pipeline", || {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("brush-pick-pipeline"),
+                layout: Some(&compute_layout),
+                module: &compute_shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: pipelines.driver_cache(),
+            })
+        });
 
         let readback = (0..READBACK_SLOTS)
             .map(|index| ReadbackSlot {

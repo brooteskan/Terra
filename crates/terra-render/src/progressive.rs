@@ -118,6 +118,7 @@ pub struct ProgressiveRenderer {
 impl ProgressiveRenderer {
     pub fn new(
         device: &wgpu::Device,
+        pipelines: &terra_gpu::PipelineCacheRegistry,
         width: u32,
         height: u32,
         surface_format: wgpu::TextureFormat,
@@ -269,8 +270,7 @@ impl ProgressiveRenderer {
             push_constant_ranges: &[],
         });
 
-        let temporal_pipeline = terra_gpu::cached_render_pipeline(
-            device,
+        let temporal_pipeline = pipelines.render_pipeline(
             "progressive-temporal-pipeline",
             wgpu::TextureFormat::Rgba16Float,
             || {
@@ -297,12 +297,11 @@ impl ProgressiveRenderer {
                     depth_stencil: None,
                     multisample: wgpu::MultisampleState::default(),
                     multiview: None,
-                    cache: terra_gpu::shared_pipeline_cache(device).as_ref(),
+                    cache: pipelines.driver_cache(),
                 })
             },
         );
-        let atrous_pipeline = terra_gpu::cached_render_pipeline(
-            device,
+        let atrous_pipeline = pipelines.render_pipeline(
             "progressive-atrous-pipeline",
             wgpu::TextureFormat::Rgba16Float,
             || {
@@ -325,15 +324,12 @@ impl ProgressiveRenderer {
                     depth_stencil: None,
                     multisample: wgpu::MultisampleState::default(),
                     multiview: None,
-                    cache: terra_gpu::shared_pipeline_cache(device).as_ref(),
+                    cache: pipelines.driver_cache(),
                 })
             },
         );
-        let composite_pipeline = terra_gpu::cached_render_pipeline(
-            device,
-            "progressive-composite-pipeline",
-            surface_format,
-            || {
+        let composite_pipeline =
+            pipelines.render_pipeline("progressive-composite-pipeline", surface_format, || {
                 device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                     label: Some("progressive-composite-pipeline"),
                     layout: Some(&composite_pl),
@@ -353,10 +349,9 @@ impl ProgressiveRenderer {
                     depth_stencil: None,
                     multisample: wgpu::MultisampleState::default(),
                     multiview: None,
-                    cache: terra_gpu::shared_pipeline_cache(device).as_ref(),
+                    cache: pipelines.driver_cache(),
                 })
-            },
-        );
+            });
 
         let temporal_uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("progressive-temporal-uniform"),
@@ -407,9 +402,15 @@ impl ProgressiveRenderer {
         }
     }
 
-    pub fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
+    pub fn resize(
+        &mut self,
+        device: &wgpu::Device,
+        pipelines: &terra_gpu::PipelineCacheRegistry,
+        width: u32,
+        height: u32,
+    ) {
         let enabled = self.enabled;
-        *self = Self::new(device, width, height, self.surface_format);
+        *self = Self::new(device, pipelines, width, height, self.surface_format);
         self.enabled = enabled;
     }
 
@@ -747,8 +748,9 @@ mod tests {
         let device = gpu.device.clone();
         let queue = gpu.queue.clone();
 
+        let pipelines = terra_gpu::PipelineCacheRegistry::new(&device);
         let mut progressive =
-            ProgressiveRenderer::new(&device, 32, 24, wgpu::TextureFormat::Rgba8Unorm);
+            ProgressiveRenderer::new(&device, &pipelines, 32, 24, wgpu::TextureFormat::Rgba8Unorm);
         progressive.set_enabled(true);
         let hdr = make_view(
             &device,

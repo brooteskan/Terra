@@ -567,22 +567,16 @@ pub(super) struct Pipe {
     bgl: wgpu::BindGroupLayout,
 }
 
-type PipeCache = std::collections::HashMap<(wgpu::Device, &'static str), Pipe>;
-
-static PIPE_CACHE: std::sync::OnceLock<std::sync::Mutex<PipeCache>> = std::sync::OnceLock::new();
+type PipeCache = std::collections::HashMap<&'static str, Pipe>;
 
 pub(super) fn make_pipe(
+    cache: &mut PipeCache,
     device: &wgpu::Device,
     label: &'static str,
     wgsl: &str,
     bgl: wgpu::BindGroupLayout,
 ) -> Pipe {
-    let cache = PIPE_CACHE.get_or_init(|| std::sync::Mutex::new(PipeCache::new()));
-    let mut cache = cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let key = (device.clone(), label);
-    if let Some(pipe) = cache.get(&key) {
+    if let Some(pipe) = cache.get(label) {
         return pipe.clone();
     }
 
@@ -605,7 +599,7 @@ pub(super) fn make_pipe(
         cache: None,
     });
     let pipe = Pipe { pipeline, bgl };
-    cache.insert(key, pipe.clone());
+    cache.insert(label, pipe.clone());
     pipe
 }
 
@@ -689,6 +683,9 @@ pub(super) fn storage_rw_buffer_entry(binding: u32) -> wgpu::BindGroupLayoutEntr
 
 impl GpuTerrainEngine {
     pub fn new(device: &wgpu::Device, initial: u32) -> Self {
+        // Reuse duplicate pipelines only while assembling this engine. The
+        // engine owns the selected handles; no global retains its device.
+        let mut pipe_cache = PipeCache::new();
         let w = initial.max(PROJECT_RESET_TEXTURE_EXTENT);
         let fill_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("fill-bgl"),
@@ -862,132 +859,154 @@ impl GpuTerrainEngine {
             });
 
         let fill = make_pipe(
+            &mut pipe_cache,
             device,
             "fill",
             include_str!("../../shaders/fill.wgsl"),
             fill_bgl,
         );
         let noise = make_pipe(
+            &mut pipe_cache,
             device,
             "noise",
             include_str!("../../shaders/noise.wgsl"),
             noise_bgl,
         );
         let blend = make_pipe(
+            &mut pipe_cache,
             device,
             "blend",
             include_str!("../../shaders/blend.wgsl"),
             blend_bgl,
         );
         let copy = make_pipe(
+            &mut pipe_cache,
             device,
             "copy",
             include_str!("../../shaders/copy.wgsl"),
             copy_bgl,
         );
         let thermal = make_pipe(
+            &mut pipe_cache,
             device,
             "thermal",
             include_str!("../../shaders/thermal_tex.wgsl"),
             thermal_bgl,
         );
         let thermal_apply = make_pipe(
+            &mut pipe_cache,
             device,
             "thermal-apply",
             include_str!("../../shaders/thermal_apply.wgsl"),
             thermal_apply_bgl,
         );
         let hydraulic_outflow = make_pipe(
+            &mut pipe_cache,
             device,
             "hydraulic-outflow",
             include_str!("../../shaders/hydraulic_outflow.wgsl"),
             hydraulic_outflow_bgl,
         );
         let hydraulic = make_pipe(
+            &mut pipe_cache,
             device,
             "hydraulic",
             include_str!("../../shaders/hydraulic_tex.wgsl"),
             hydraulic_bgl,
         );
         let blur = make_pipe(
+            &mut pipe_cache,
             device,
             "blur",
             include_str!("../../shaders/blur.wgsl"),
             blur_bgl,
         );
         let terrace = make_pipe(
+            &mut pipe_cache,
             device,
             "terrace",
             include_str!("../../shaders/terrace.wgsl"),
             terrace_bgl,
         );
         let ramp = make_pipe(
+            &mut pipe_cache,
             device,
             "ramp",
             include_str!("../../shaders/ramp.wgsl"),
             ramp_bgl,
         );
         let shapes = make_pipe(
+            &mut pipe_cache,
             device,
             "shapes",
             include_str!("../../shaders/shapes.wgsl"),
             shapes_bgl,
         );
         let island = make_pipe(
+            &mut pipe_cache,
             device,
             "island",
             include_str!("../../shaders/island.wgsl"),
             island_bgl,
         );
         let plateau = make_pipe(
+            &mut pipe_cache,
             device,
             "plateau",
             include_str!("../../shaders/plateau.wgsl"),
             plateau_bgl,
         );
         let path_height = make_pipe(
+            &mut pipe_cache,
             device,
             "path-height",
             include_str!("../../shaders/path_height.wgsl"),
             path_height_bgl,
         );
         let polygon_height = make_pipe(
+            &mut pipe_cache,
             device,
             "polygon-height",
             include_str!("../../shaders/polygon_height.wgsl"),
             polygon_height_bgl,
         );
         let heightmap_sample = make_pipe(
+            &mut pipe_cache,
             device,
             "heightmap-sample",
             include_str!("../../shaders/heightmap_sample.wgsl"),
             heightmap_sample_bgl,
         );
         let river_accum = make_pipe(
+            &mut pipe_cache,
             device,
             "river-accum",
             include_str!("../../shaders/river_accum.wgsl"),
             river_accum_bgl,
         );
         let river_carve = make_pipe(
+            &mut pipe_cache,
             device,
             "river-carve",
             include_str!("../../shaders/river_carve.wgsl"),
             river_carve_bgl,
         );
         let stream_power = make_pipe(
+            &mut pipe_cache,
             device,
             "stream-power-incision",
             include_str!("../../shaders/stream_power_incision.wgsl"),
             stream_power_bgl,
         );
         let amplify_downsample = make_pipe(
+            &mut pipe_cache,
             device,
             "amplify-downsample",
             include_str!("../../shaders/amplify_downsample.wgsl"),
             amplify_downsample_bgl,
         );
         let amplify_upsample_blend = make_pipe(
+            &mut pipe_cache,
             device,
             "amplify-upsample-blend",
             include_str!("../../shaders/amplify_upsample_blend.wgsl"),
@@ -1003,6 +1022,7 @@ impl GpuTerrainEngine {
                 ],
             });
         let effect_filter_range = make_pipe(
+            &mut pipe_cache,
             device,
             "effect-filter-range",
             include_str!("../../shaders/effect_filter_range.wgsl"),
@@ -1018,6 +1038,7 @@ impl GpuTerrainEngine {
             ],
         });
         let effect_filter = make_pipe(
+            &mut pipe_cache,
             device,
             "effect-filter",
             include_str!("../../shaders/effect_filter.wgsl"),
@@ -1077,30 +1098,35 @@ impl GpuTerrainEngine {
                 ],
             });
         let sculpt_strokes = make_pipe(
+            &mut pipe_cache,
             device,
             "sculpt-strokes",
             include_str!("../../shaders/sculpt_strokes.wgsl"),
             sculpt_strokes_bgl,
         );
         let sculpt_strokes_edited = make_pipe(
+            &mut pipe_cache,
             device,
             "sculpt-strokes-edited",
             include_str!("../../shaders/sculpt_strokes_edited.wgsl"),
             sculpt_strokes_edited_bgl,
         );
         let sculpt_strokes_flatten_reduce = make_pipe(
+            &mut pipe_cache,
             device,
             "sculpt-strokes-flatten-reduce",
             include_str!("../../shaders/sculpt_strokes_flatten_reduce.wgsl"),
             sculpt_strokes_flatten_reduce_bgl,
         );
         let sculpt_strokes_flatten_resolve = make_pipe(
+            &mut pipe_cache,
             device,
             "sculpt-strokes-flatten-resolve",
             include_str!("../../shaders/sculpt_strokes_flatten_resolve.wgsl"),
             sculpt_strokes_flatten_resolve_bgl,
         );
         let sculpt_strokes_reconcile = make_pipe(
+            &mut pipe_cache,
             device,
             "sculpt-strokes-reconcile",
             include_str!("../../shaders/sculpt_strokes_reconcile.wgsl"),

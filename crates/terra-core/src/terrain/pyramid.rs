@@ -1,5 +1,5 @@
 use crate::heightfield::{HeightfieldMetrics, TileId, DEFAULT_HALO, DEFAULT_TILE_SIZE};
-use terra_world::{BoundedTopology, BoundedTopologyConfig, TileAddress};
+use terra_world::{BoundedTopology, BoundedTopologyConfig, TileAddress, WorldError};
 
 use super::TerrainTileKey;
 
@@ -66,15 +66,21 @@ pub struct TerrainPyramid {
 
 impl TerrainPyramid {
     pub fn new(config: PyramidConfig) -> Self {
+        Self::try_new(config).expect(
+            "pyramid configuration must contain finite positive world extents and tile size",
+        )
+    }
+
+    /// Build a pyramid from boundary data without panicking on invalid geometry.
+    pub fn try_new(config: PyramidConfig) -> Result<Self, WorldError> {
         let topology = BoundedTopology::try_new(BoundedTopologyConfig {
             target_resolution: config.target_resolution.max(2),
             world_size_x: f64::from(config.world_size_x),
             world_size_z: f64::from(config.world_size_z),
             tile_size: config.tile_size,
             halo: config.halo,
-        })
-        .expect("pyramid configuration must contain finite positive world extents and tile size");
-        Self { config, topology }
+        })?;
+        Ok(Self { config, topology })
     }
 
     pub fn topology(&self) -> &BoundedTopology {
@@ -209,6 +215,16 @@ impl TerrainPyramid {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fallible_constructor_rejects_invalid_boundary_geometry() {
+        let mut config = PyramidConfig::new(8, 8.0, 8.0);
+        config.tile_size = 0;
+        assert_eq!(
+            TerrainPyramid::try_new(config).unwrap_err(),
+            WorldError::InvalidTileSize(0)
+        );
+    }
 
     #[test]
     fn pyramid_builds_complete_upsample_chain() {

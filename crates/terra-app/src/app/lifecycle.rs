@@ -1707,7 +1707,9 @@ impl TerraApp {
         if let Some(window) = &self.window {
             renderer.resize(window.inner_size());
         }
+        let editor_overlays = super::editor_overlays::EditorOverlays::new(&boot.gpu, &renderer);
         self.renderer = Some(renderer);
+        self.editor_overlays = Some(editor_overlays);
         self.tile_atlas = tile_atlas;
         self.gpu_engine = Some(gpu_engine);
         self.gpu_pyramid_materializer = Some(gpu_pyramid_materializer);

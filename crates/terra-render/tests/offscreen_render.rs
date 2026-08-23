@@ -12,7 +12,7 @@
 //! test rather than adding another that pushes error scopes.
 
 use terra_core::heightfield::{Heightfield, HeightfieldMetrics};
-use terra_render::{GpuContext, TerrainRenderer, ViewportRendererMode};
+use terra_render::{BrushOverlay, GpuContext, TerrainRenderer, ViewportRendererMode};
 
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const W: u32 = 64;
@@ -55,11 +55,7 @@ fn raster_frame_covers_offscreen_target() {
     // Same GpuContext path the app takes: hand the renderer the device/queue,
     // never source them back through it. Cloning shares the harness's one device,
     // so the validation error scopes below still target the renderer's device.
-    let ctx = GpuContext {
-        device: gpu.device.clone(),
-        queue: gpu.queue.clone(),
-        surface_format: FORMAT,
-    };
+    let ctx = GpuContext::new(gpu.device.clone(), gpu.queue.clone(), FORMAT);
     let mut renderer = TerrainRenderer::new_headless(&ctx, W, H);
     // Raster is already the default; pin it so a future default change cannot
     // silently turn this into a path-tracer test — only the RasterLit backend
@@ -95,18 +91,32 @@ fn raster_frame_covers_offscreen_target() {
     // The brush picker must intersect the same uploaded GPU height texture used
     // by the frame. Its production path is non-blocking; the explicit waits are
     // test-only so the asynchronous result can be asserted deterministically.
-    renderer.request_brush_surface_pick(
+    let mut brush = BrushOverlay::new(&gpu.device, ctx.pipeline_registry(), FORMAT);
+    brush.rebind_height(&gpu.device, renderer.heights.display_height_view());
+    let aspect = W as f32 / H as f32;
+    brush.request_surface_pick(
+        &gpu.device,
+        &gpu.queue,
+        &renderer.camera,
+        aspect,
         (W as f32 * 0.5, H as f32 * 0.5),
         (W as f32, H as f32),
+        renderer.heights.world_size,
+        renderer.heights.height_range,
         0.05,
         [1.0, 1.0, 1.0, 1.0],
     );
     let _ = gpu.device.poll(wgpu::Maintain::Wait);
-    renderer.poll_brush_surface_pick();
+    brush.poll(&gpu.device);
     let _ = gpu.device.poll(wgpu::Maintain::Wait);
-    renderer.poll_brush_surface_pick();
-    let pick = renderer
-        .latest_brush_surface_pick((W as f32 * 0.5, H as f32 * 0.5), (W as f32, H as f32))
+    brush.poll(&gpu.device);
+    let pick = brush
+        .latest_pick_for(
+            &renderer.camera,
+            aspect,
+            (W as f32 * 0.5, H as f32 * 0.5),
+            (W as f32, H as f32),
+        )
         .expect("center cursor should hit the uploaded GPU terrain");
     assert!((pick.uv.0 - 0.5).abs() < 1.0e-3, "pick={pick:?}");
     assert!((pick.uv.1 - 0.5).abs() < 1.0e-3, "pick={pick:?}");

@@ -63,11 +63,7 @@ fn gui_composites_over_terrain_without_erasing_it() {
     // Same GpuContext path the app takes: hand the renderer the device/queue.
     // Cloning shares the harness's one device, so the validation error scopes
     // below still target the renderer's device.
-    let ctx = GpuContext {
-        device: gpu.device.clone(),
-        queue: gpu.queue.clone(),
-        surface_format: FORMAT,
-    };
+    let ctx = GpuContext::new(gpu.device.clone(), gpu.queue.clone(), FORMAT);
     let mut renderer = TerrainRenderer::new_headless(&ctx, W, H);
     // Only the RasterLit backend clears every pixel with the opaque atmosphere
     // colour, so it is the one whose frame can be proven to cover the target.

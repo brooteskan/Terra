@@ -22,7 +22,7 @@ impl InfiniteTopology {
             return Err(WorldError::InvalidTileSize(config.tile_size));
         }
         SampleSpacing::try_new(config.finest_spacing_m, config.finest_spacing_m)?;
-        WorldPosition::try_new(config.origin.x_m, config.origin.z_m)?;
+        WorldPosition::try_new(config.origin.x_m(), config.origin.z_m())?;
         Ok(Self { config })
     }
 
@@ -77,12 +77,12 @@ impl InfiniteTopology {
         let spacing = self.spacing(address.lod)?;
         let transform = SampleWorldTransform::new(self.config.origin, spacing);
         let min = WorldPosition::try_new(
-            self.config.origin.x_m + origin.x as f64 * spacing.x_m,
-            self.config.origin.z_m + origin.z as f64 * spacing.z_m,
+            self.config.origin.x_m() + origin.x as f64 * spacing.x_m(),
+            self.config.origin.z_m() + origin.z as f64 * spacing.z_m(),
         )?;
         let max = WorldPosition::try_new(
-            min.x_m + f64::from(self.config.tile_size) * spacing.x_m,
-            min.z_m + f64::from(self.config.tile_size) * spacing.z_m,
+            min.x_m() + f64::from(self.config.tile_size) * spacing.x_m(),
+            min.z_m() + f64::from(self.config.tile_size) * spacing.z_m(),
         )?;
         Ok(TileExtent {
             address,
@@ -122,10 +122,10 @@ impl InfiniteTopology {
         lod: Lod,
     ) -> Result<TileAddress, WorldError> {
         let spacing = self.spacing(lod)?;
-        let tile_span_x = spacing.x_m * f64::from(self.config.tile_size);
-        let tile_span_z = spacing.z_m * f64::from(self.config.tile_size);
-        let x = ((world.x_m - self.config.origin.x_m) / tile_span_x).floor();
-        let z = ((world.z_m - self.config.origin.z_m) / tile_span_z).floor();
+        let tile_span_x = spacing.x_m() * f64::from(self.config.tile_size);
+        let tile_span_z = spacing.z_m() * f64::from(self.config.tile_size);
+        let x = ((world.x_m() - self.config.origin.x_m()) / tile_span_x).floor();
+        let z = ((world.z_m() - self.config.origin.z_m()) / tile_span_z).floor();
         Ok(TileAddress::new(
             lod,
             TileCoord {
@@ -140,11 +140,11 @@ impl InfiniteTopology {
         rect: WorldRect,
         lod: Lod,
     ) -> Result<TileAddressRange, WorldError> {
-        let min = self.address_at_world(rect.min, lod)?;
+        let min = self.address_at_world(rect.min(), lod)?;
         // Rectangles are half-open. Move one representable value inward so an
         // exact maximum tile boundary does not include the following tile.
-        let max_x = next_down(rect.max.x_m);
-        let max_z = next_down(rect.max.z_m);
+        let max_x = next_down(rect.max().x_m());
+        let max_z = next_down(rect.max().z_m());
         let max = self.address_at_world(WorldPosition::try_new(max_x, max_z)?, lod)?;
         TileAddressRange::try_new(min, max)
     }

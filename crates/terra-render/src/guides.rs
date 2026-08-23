@@ -35,7 +35,11 @@ pub struct GuideOverlay {
 }
 
 impl GuideOverlay {
-    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+    pub fn new(
+        device: &wgpu::Device,
+        pipelines: &terra_gpu::PipelineCacheRegistry,
+        format: wgpu::TextureFormat,
+    ) -> Self {
         terra_core::shader_progress::record_shader_compiled();
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("guides-shader"),
@@ -78,7 +82,7 @@ impl GuideOverlay {
             push_constant_ranges: &[],
         });
 
-        let pipeline = terra_gpu::cached_render_pipeline(device, "guides-pipe", format, || {
+        let pipeline = pipelines.render_pipeline("guides-pipe", format, || {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("guides-pipe"),
                 layout: Some(&pipeline_layout),
@@ -130,7 +134,7 @@ impl GuideOverlay {
                 }),
                 multisample: wgpu::MultisampleState::default(),
                 multiview: None,
-                cache: terra_gpu::shared_pipeline_cache(device).as_ref(),
+                cache: pipelines.driver_cache(),
             })
         });
 

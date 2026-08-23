@@ -28,6 +28,7 @@ pub struct ShadowMap {
 impl ShadowMap {
     pub fn new(
         device: &wgpu::Device,
+        pipelines: &terra_gpu::PipelineCacheRegistry,
         height_view: &wgpu::TextureView,
         height_bgl_entry_compatible: bool,
     ) -> Self {
@@ -109,8 +110,7 @@ impl ShadowMap {
             bind_group_layouts: &[&bind_group_layout],
             push_constant_ranges: &[],
         });
-        let pipeline = terra_gpu::cached_render_pipeline(
-            device,
+        let pipeline = pipelines.render_pipeline(
             "shadow-depth-pipe",
             wgpu::TextureFormat::Depth32Float,
             || {
@@ -142,7 +142,7 @@ impl ShadowMap {
                     }),
                     multisample: wgpu::MultisampleState::default(),
                     multiview: None,
-                    cache: terra_gpu::shared_pipeline_cache(device).as_ref(),
+                    cache: pipelines.driver_cache(),
                 })
             },
         );

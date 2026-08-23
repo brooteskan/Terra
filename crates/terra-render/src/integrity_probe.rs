@@ -82,7 +82,10 @@ pub(crate) struct TerrainIntegrityProbe {
 }
 
 impl TerrainIntegrityProbe {
-    pub(crate) fn try_new(device: &wgpu::Device) -> Option<Self> {
+    pub(crate) fn try_new(
+        device: &wgpu::Device,
+        pipelines: &terra_gpu::PipelineCacheRegistry,
+    ) -> Option<Self> {
         let configured = std::env::var("TERRA_GPU_INTEGRITY_PROBE").ok();
         let probe_count = match configured.as_deref() {
             Some(value) if value.eq_ignore_ascii_case("off") || value == "0" => 0,
@@ -151,17 +154,16 @@ impl TerrainIntegrityProbe {
                 include_str!("shaders/outside_region_probe.wgsl").into(),
             ),
         });
-        let pipeline =
-            terra_gpu::cached_compute_pipeline(device, "terrain-integrity-probe-pipeline", || {
-                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some("terrain-integrity-probe-pipeline"),
-                    layout: Some(&layout),
-                    module: &shader,
-                    entry_point: Some("main"),
-                    compilation_options: Default::default(),
-                    cache: terra_gpu::shared_pipeline_cache(device).as_ref(),
-                })
-            });
+        let pipeline = pipelines.compute_pipeline("terrain-integrity-probe-pipeline", || {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("terrain-integrity-probe-pipeline"),
+                layout: Some(&layout),
+                module: &shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: pipelines.driver_cache(),
+            })
+        });
         let baseline = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("terrain-integrity-probe-baseline"),
             size: u64::from(probe_count) * 4,

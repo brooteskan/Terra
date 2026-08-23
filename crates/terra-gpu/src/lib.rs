@@ -29,81 +29,72 @@ pub use tile_cache::{
 
 use thiserror::Error;
 
-type PipelineCaches = std::collections::HashMap<wgpu::Device, wgpu::PipelineCache>;
-type RenderPipelineKey = (wgpu::Device, &'static str, wgpu::TextureFormat);
-type ComputePipelineKey = (wgpu::Device, &'static str);
-
-static PIPELINE_CACHES: std::sync::OnceLock<std::sync::Mutex<PipelineCaches>> =
-    std::sync::OnceLock::new();
-static RENDER_PIPELINES: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<RenderPipelineKey, wgpu::RenderPipeline>>,
-> = std::sync::OnceLock::new();
-static COMPUTE_PIPELINES: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<ComputePipelineKey, wgpu::ComputePipeline>>,
-> = std::sync::OnceLock::new();
-
-/// Process-local driver pipeline cache shared by all Terra GPU consumers using
-/// the same device.
+/// Pipeline reuse scoped to one owning GPU context.
 ///
-/// Renderer instances retain independent mutable resources while repeated
-/// pipeline creation can reuse backend compilation work.
-pub fn shared_pipeline_cache(device: &wgpu::Device) -> Option<wgpu::PipelineCache> {
-    if !device.features().contains(wgpu::Features::PIPELINE_CACHE) {
-        return None;
-    }
-    let caches = PIPELINE_CACHES.get_or_init(|| std::sync::Mutex::new(PipelineCaches::new()));
-    let mut caches = caches
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    Some(
-        caches
-            .entry(device.clone())
-            .or_insert_with(|| {
+/// The registry deliberately contains no device handle in its keys. Dropping
+/// the context drops this registry and all cached pipeline handles with it.
+pub struct PipelineCacheRegistry {
+    driver: Option<wgpu::PipelineCache>,
+    render: std::sync::Mutex<
+        std::collections::HashMap<(&'static str, wgpu::TextureFormat), wgpu::RenderPipeline>,
+    >,
+    compute: std::sync::Mutex<std::collections::HashMap<&'static str, wgpu::ComputePipeline>>,
+}
+
+impl PipelineCacheRegistry {
+    pub fn new(device: &wgpu::Device) -> Self {
+        let driver = device
+            .features()
+            .contains(wgpu::Features::PIPELINE_CACHE)
+            .then(|| {
                 // SAFETY: no externally supplied cache bytes are provided, so there
                 // is no data-validity invariant for the caller to uphold.
                 unsafe {
                     device.create_pipeline_cache(&wgpu::PipelineCacheDescriptor {
-                        label: Some("terra-shared-pipeline-cache"),
+                        label: Some("terra-context-pipeline-cache"),
                         data: None,
                         fallback: true,
                     })
                 }
-            })
-            .clone(),
-    )
-}
+            });
+        Self {
+            driver,
+            render: std::sync::Mutex::new(std::collections::HashMap::new()),
+            compute: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
 
-/// Return one exact render-pipeline handle per device, label, and target format.
-/// The creation closure runs at most once for a key in the current process.
-pub fn cached_render_pipeline(
-    device: &wgpu::Device,
-    label: &'static str,
-    format: wgpu::TextureFormat,
-    create: impl FnOnce() -> wgpu::RenderPipeline,
-) -> wgpu::RenderPipeline {
-    let pipelines =
-        RENDER_PIPELINES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    let mut pipelines = pipelines
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let key = (device.clone(), label, format);
-    pipelines.entry(key).or_insert_with(create).clone()
-}
+    pub fn driver_cache(&self) -> Option<&wgpu::PipelineCache> {
+        self.driver.as_ref()
+    }
 
-/// Return one exact compute-pipeline handle per device and label.
-/// The creation closure runs at most once for a key in the current process.
-pub fn cached_compute_pipeline(
-    device: &wgpu::Device,
-    label: &'static str,
-    create: impl FnOnce() -> wgpu::ComputePipeline,
-) -> wgpu::ComputePipeline {
-    let pipelines =
-        COMPUTE_PIPELINES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    let mut pipelines = pipelines
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let key = (device.clone(), label);
-    pipelines.entry(key).or_insert_with(create).clone()
+    /// Return one exact render-pipeline handle per label and target format.
+    pub fn render_pipeline(
+        &self,
+        label: &'static str,
+        format: wgpu::TextureFormat,
+        create: impl FnOnce() -> wgpu::RenderPipeline,
+    ) -> wgpu::RenderPipeline {
+        let mut pipelines = self
+            .render
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let key = (label, format);
+        pipelines.entry(key).or_insert_with(create).clone()
+    }
+
+    /// Return one exact compute-pipeline handle per label.
+    pub fn compute_pipeline(
+        &self,
+        label: &'static str,
+        create: impl FnOnce() -> wgpu::ComputePipeline,
+    ) -> wgpu::ComputePipeline {
+        let mut pipelines = self
+            .compute
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pipelines.entry(label).or_insert_with(create).clone()
+    }
 }
 
 #[derive(Debug, Error)]

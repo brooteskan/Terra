@@ -163,12 +163,12 @@ impl BoundedTopology {
         let spacing = self.spacing(address)?;
         let transform = SampleWorldTransform::new(WorldPosition::ORIGIN, spacing);
         let min = WorldPosition::try_new(
-            f64::from(origin_x) * spacing.x_m,
-            f64::from(origin_z) * spacing.z_m,
+            f64::from(origin_x) * spacing.x_m(),
+            f64::from(origin_z) * spacing.z_m(),
         )?;
         let max = WorldPosition::try_new(
-            f64::from(origin_x + width) * spacing.x_m,
-            f64::from(origin_z + height) * spacing.z_m,
+            f64::from(origin_x + width) * spacing.x_m(),
+            f64::from(origin_z + height) * spacing.z_m(),
         )?;
         Ok(TileExtent {
             address,

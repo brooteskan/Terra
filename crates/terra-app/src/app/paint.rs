@@ -500,13 +500,17 @@ impl TerraApp {
         }
         let window = self.window.as_ref()?;
         let ppp = window.scale_factor() as f32;
-        let renderer = self.renderer.as_mut()?;
+        let renderer = self.renderer.as_ref()?;
+        let gpu = self.gpu.as_ref()?;
+        let editor_overlays = self.editor_overlays.as_mut()?;
         let (surface_w, surface_h) = renderer.size();
         let screen_w = surface_w as f32 / ppp;
         let screen_h = surface_h as f32 / ppp;
         let aspect = surface_w as f32 / surface_h.max(1) as f32;
-        renderer.poll_brush_surface_pick();
-        if let Some(pick) = renderer.latest_brush_surface_pick((x, y), (screen_w, screen_h)) {
+        editor_overlays.brush.poll(&gpu.device);
+        if let Some(pick) =
+            editor_overlays.latest_surface_pick(renderer, (x, y), (screen_w, screen_h))
+        {
             return Some(pick.uv);
         }
         pick_terrain_uv_on_surface(
@@ -550,8 +554,10 @@ impl TerraApp {
             && !self.gui_wants_pointer
             && !self.modifiers_alt;
         if !show {
-            if let Some(renderer) = self.renderer.as_mut() {
-                renderer.hide_brush_gizmo();
+            if let (Some(editor_overlays), Some(gpu)) =
+                (self.editor_overlays.as_mut(), self.gpu.as_ref())
+            {
+                editor_overlays.brush.hide(&gpu.queue);
             }
             return;
         }
@@ -571,9 +577,15 @@ impl TerraApp {
         };
         let ppp = window.scale_factor() as f32;
         let color = self.brush_gizmo_color();
-        if let Some(renderer) = self.renderer.as_mut() {
+        if let (Some(renderer), Some(editor_overlays), Some(gpu)) = (
+            self.renderer.as_ref(),
+            self.editor_overlays.as_mut(),
+            self.gpu.as_ref(),
+        ) {
             let (surface_w, surface_h) = renderer.size();
-            renderer.request_brush_surface_pick(
+            editor_overlays.request_surface_pick(
+                gpu,
+                renderer,
                 (x, y),
                 (surface_w as f32 / ppp, surface_h as f32 / ppp),
                 radius,

@@ -1,6 +1,7 @@
 //! Application shell: window, eval, project I/O, paint, and UI action dispatch.
 
 mod actions;
+mod editor_overlays;
 mod eval;
 mod export;
 mod frame_trace;
@@ -209,6 +210,7 @@ pub struct TerraApp {
     /// `None` once the renderer is installed. Drives the animated splash.
     boot: Option<BootState>,
     renderer: Option<TerrainRenderer>,
+    editor_overlays: Option<editor_overlays::EditorOverlays>,
     /// App-owned GPU handles. Every GPU consumer (renderer, tile atlas, terrain
     /// engine, GUI) shares clones of this instead of sourcing device/queue
     /// through the renderer.
@@ -450,6 +452,7 @@ impl Default for TerraApp {
             window: None,
             boot: None,
             renderer: None,
+            editor_overlays: None,
             gpu: None,
             session,
             ui_state,

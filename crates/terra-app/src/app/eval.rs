@@ -2598,11 +2598,11 @@ mod tests {
         let Some(gpu) = terra_test_gpu::headless() else {
             return;
         };
-        let context = GpuContext {
-            device: gpu.device.clone(),
-            queue: gpu.queue.clone(),
-            surface_format: wgpu::TextureFormat::Rgba8Unorm,
-        };
+        let context = GpuContext::new(
+            gpu.device.clone(),
+            gpu.queue.clone(),
+            wgpu::TextureFormat::Rgba8Unorm,
+        );
         let metrics = HeightfieldMetrics {
             tile_size: 16,
             halo: 1,
@@ -2695,11 +2695,11 @@ mod tests {
         let Some(gpu) = terra_test_gpu::headless() else {
             return;
         };
-        let context = GpuContext {
-            device: gpu.device.clone(),
-            queue: gpu.queue.clone(),
-            surface_format: wgpu::TextureFormat::Rgba8Unorm,
-        };
+        let context = GpuContext::new(
+            gpu.device.clone(),
+            gpu.queue.clone(),
+            wgpu::TextureFormat::Rgba8Unorm,
+        );
         let resolution = 64;
         let mut stack = LayerStack::new();
         stack.push(flat(12.0));
@@ -2784,11 +2784,11 @@ mod tests {
         let Some(gpu) = terra_test_gpu::headless() else {
             return;
         };
-        let context = GpuContext {
-            device: gpu.device.clone(),
-            queue: gpu.queue.clone(),
-            surface_format: wgpu::TextureFormat::Rgba8Unorm,
-        };
+        let context = GpuContext::new(
+            gpu.device.clone(),
+            gpu.queue.clone(),
+            wgpu::TextureFormat::Rgba8Unorm,
+        );
         let resolution = 128;
         let mut config = PyramidConfig::new(resolution, 640.0, 640.0);
         config.tile_size = 16;
@@ -2964,11 +2964,11 @@ mod tests {
         let Some(gpu) = terra_test_gpu::headless() else {
             return;
         };
-        let context = GpuContext {
-            device: gpu.device.clone(),
-            queue: gpu.queue.clone(),
-            surface_format: wgpu::TextureFormat::Rgba8Unorm,
-        };
+        let context = GpuContext::new(
+            gpu.device.clone(),
+            gpu.queue.clone(),
+            wgpu::TextureFormat::Rgba8Unorm,
+        );
         let (document, ids) = untitled6_document(96, Untitled6Variant::ProductionTopology);
         let mut app = TerraApp::default();
         app.session.document = document;
@@ -3053,11 +3053,11 @@ mod tests {
                 dz: heights.world_size.1 / heights.tex_size.1.max(1) as f32,
             }
         };
-        let oracle_context = GpuContext {
-            device: gpu.device.clone(),
-            queue: gpu.queue.clone(),
-            surface_format: wgpu::TextureFormat::Rgba8Unorm,
-        };
+        let oracle_context = GpuContext::new(
+            gpu.device.clone(),
+            gpu.queue.clone(),
+            wgpu::TextureFormat::Rgba8Unorm,
+        );
         let mut oracle = TerrainRenderer::new_headless(&oracle_context, 96, 96);
         let engine = app.gpu_engine.as_ref().expect("GPU engine");
         oracle.present_gpu_height_shared(
@@ -3154,11 +3154,11 @@ mod tests {
         let Some(gpu) = terra_test_gpu::headless() else {
             return;
         };
-        let context = GpuContext {
-            device: gpu.device.clone(),
-            queue: gpu.queue.clone(),
-            surface_format: wgpu::TextureFormat::Rgba8Unorm,
-        };
+        let context = GpuContext::new(
+            gpu.device.clone(),
+            gpu.queue.clone(),
+            wgpu::TextureFormat::Rgba8Unorm,
+        );
         let resolution = 128;
         let shape = create_shape_layer("Raise strokes");
         let shape_id = shape.id();

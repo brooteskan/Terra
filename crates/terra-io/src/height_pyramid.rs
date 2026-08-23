@@ -538,7 +538,8 @@ impl HeightPyramidPackage {
         );
         config.tile_size = self.manifest.tile_size;
         config.halo = self.manifest.encoding.stored_halo;
-        Ok(TerrainPyramid::new(config))
+        TerrainPyramid::try_new(config)
+            .map_err(|error| IoError::Msg(format!("invalid height-pyramid geometry: {error}")))
     }
 
     pub fn validate(&self) -> Result<(), IoError> {
@@ -794,6 +795,37 @@ mod tests {
             .file_name()
             .to_string_lossy()
             .contains("partial")));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn malformed_package_geometry_is_a_load_error_not_a_panic() {
+        let root = std::env::temp_dir().join(format!(
+            "terra-height-pyramid-invalid-geometry-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let pyramid = TerrainPyramid::new(PyramidConfig::new(2, 8.0, 8.0));
+        let mut builder = HeightPyramidPackageBuilder::new(&root, pyramid.clone()).unwrap();
+        for key in pyramid.height_tiles() {
+            builder
+                .write_tile(&key, &packed_page(&pyramid, &key))
+                .unwrap();
+        }
+        let published = builder.finish().unwrap();
+        let mut manifest: HeightPyramidManifest =
+            serde_json::from_slice(&std::fs::read(&published.manifest_path).unwrap()).unwrap();
+        manifest.tile_size = 0;
+        std::fs::write(
+            &published.manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let result = HeightPyramidPackage::open(published.manifest_path.parent().unwrap());
+        assert!(
+            matches!(result, Err(IoError::Msg(message)) if message.contains("invalid height-pyramid geometry"))
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 }

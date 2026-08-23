@@ -225,7 +225,11 @@ impl HeightGpu {
         self.local_slots_coherent
     }
 
-    pub fn new(device: &wgpu::Device, initial: u32) -> Self {
+    pub fn new(
+        device: &wgpu::Device,
+        pipelines: &terra_gpu::PipelineCacheRegistry,
+        initial: u32,
+    ) -> Self {
         let w = initial.max(PROJECT_RESET_TEXTURE_EXTENT);
         let slots = [HeightSlot::new(device, w, w), HeightSlot::new(device, w, w)];
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -282,14 +286,14 @@ impl HeightGpu {
             bind_group_layouts: &[&normal_bgl],
             push_constant_ranges: &[],
         });
-        let normal_pipeline = terra_gpu::cached_compute_pipeline(device, "normal-pipe", || {
+        let normal_pipeline = pipelines.compute_pipeline("normal-pipe", || {
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("normal-pipe"),
                 layout: Some(&pl),
                 module: &shader,
                 entry_point: Some("main"),
                 compilation_options: Default::default(),
-                cache: terra_gpu::shared_pipeline_cache(device).as_ref(),
+                cache: pipelines.driver_cache(),
             })
         });
         let normal_uniform = device.create_buffer(&wgpu::BufferDescriptor {
@@ -1184,7 +1188,8 @@ mod tests {
         let Some(gpu) = terra_test_gpu::headless() else {
             return;
         };
-        let mut height = HeightGpu::new(&gpu.device, 64);
+        let pipelines = terra_gpu::PipelineCacheRegistry::new(&gpu.device);
+        let mut height = HeightGpu::new(&gpu.device, &pipelines, 64);
 
         height.reset_project_state(&gpu.device, &gpu.queue, (1000.0, 750.0));
 
@@ -1206,7 +1211,8 @@ mod tests {
         let Some(gpu) = terra_test_gpu::headless() else {
             return;
         };
-        let mut height = HeightGpu::new(&gpu.device, 64);
+        let pipelines = terra_gpu::PipelineCacheRegistry::new(&gpu.device);
+        let mut height = HeightGpu::new(&gpu.device, &pipelines, 64);
         height.reset_project_state(&gpu.device, &gpu.queue, (1000.0, 750.0));
 
         let metrics = HeightfieldMetrics::new(32, 48, 320.0, 480.0);
@@ -1221,7 +1227,8 @@ mod tests {
         let Some(gpu) = terra_test_gpu::headless() else {
             return;
         };
-        let mut height = HeightGpu::new(&gpu.device, 64);
+        let pipelines = terra_gpu::PipelineCacheRegistry::new(&gpu.device);
+        let mut height = HeightGpu::new(&gpu.device, &pipelines, 64);
         let metrics = HeightfieldMetrics::new(32, 32, 320.0, 320.0);
         let wetness = MaskField::filled(metrics, 1.0);
         height.upload_aux_maps_ex(

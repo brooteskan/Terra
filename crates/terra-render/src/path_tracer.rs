@@ -206,6 +206,7 @@ impl PathTracer {
     pub fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        pipelines: &terra_gpu::PipelineCacheRegistry,
         width: u32,
         height: u32,
         internal_scale: f32,
@@ -265,14 +266,14 @@ impl PathTracer {
             bind_group_layouts: &[&bind_group_layout],
             push_constant_ranges: &[],
         });
-        let pipeline = terra_gpu::cached_compute_pipeline(device, "path-trace-pipe", || {
+        let pipeline = pipelines.compute_pipeline("path-trace-pipe", || {
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("path-trace-pipe"),
                 layout: Some(&pl),
                 module: &shader,
                 entry_point: Some("main"),
                 compilation_options: Default::default(),
-                cache: terra_gpu::shared_pipeline_cache(device).as_ref(),
+                cache: pipelines.driver_cache(),
             })
         });
 
@@ -306,13 +307,14 @@ impl PathTracer {
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        pipelines: &terra_gpu::PipelineCacheRegistry,
         width: u32,
         height: u32,
         internal_scale: f32,
     ) {
         let accum = self.accum_index;
         let seed = self.frame_seed;
-        *self = Self::new(device, queue, width, height, internal_scale);
+        *self = Self::new(device, queue, pipelines, width, height, internal_scale);
         self.accum_index = accum;
         self.frame_seed = seed;
     }

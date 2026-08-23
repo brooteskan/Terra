@@ -62,11 +62,7 @@ fn stale_page_revision_falls_back_to_monolithic_height() {
     let Some(gpu) = terra_test_gpu::headless() else {
         return;
     };
-    let ctx = GpuContext {
-        device: gpu.device.clone(),
-        queue: gpu.queue.clone(),
-        surface_format: FORMAT,
-    };
+    let ctx = GpuContext::new(gpu.device.clone(), gpu.queue.clone(), FORMAT);
     let metrics = HeightfieldMetrics {
         width: 64,
         height: 64,
@@ -151,11 +147,7 @@ fn resident_child_refines_and_unpublish_returns_to_current_root() {
     let Some(gpu) = terra_test_gpu::headless() else {
         return;
     };
-    let ctx = GpuContext {
-        device: gpu.device.clone(),
-        queue: gpu.queue.clone(),
-        surface_format: FORMAT,
-    };
+    let ctx = GpuContext::new(gpu.device.clone(), gpu.queue.clone(), FORMAT);
     let pyramid = TerrainPyramid::new(PyramidConfig {
         target_resolution: 64,
         world_size_x: 1024.0,

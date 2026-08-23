@@ -290,6 +290,9 @@ impl TerraApp {
             contours: ov.contours,
             shading,
         });
+        if let Some(editor_overlays) = self.editor_overlays.as_mut() {
+            editor_overlays.set_guides(ov.grid, ov.world_bounds);
+        }
     }
 
     pub(crate) fn redraw(&mut self) {
@@ -415,6 +418,9 @@ impl TerraApp {
             let view = frame
                 .texture
                 .create_view(&wgpu::TextureViewDescriptor::default());
+            if let Some(editor_overlays) = self.editor_overlays.as_mut() {
+                editor_overlays.render(gpu, renderer, &view);
+            }
 
             let (surface_w, surface_h) = renderer.size();
             let screen_w = surface_w as f32 / pixels_per_point;

@@ -267,6 +267,7 @@ pub struct TerrainRenderer {
     surface: Option<wgpu::Surface<'static>>,
     device: wgpu::Device,
     queue: wgpu::Queue,
+    pipelines: std::sync::Arc<terra_gpu::PipelineCacheRegistry>,
     config: wgpu::SurfaceConfiguration,
     pub pipeline: wgpu::RenderPipeline,
     /// Grid edge LineList overlay for the Wireframe display aid.
@@ -313,10 +314,9 @@ pub struct TerrainRenderer {
     pub last_grid_resolution: u32,
     /// After first height present, leave orbit target alone so uploads don't fight the user.
     camera_framed: bool,
-    /// Sculpt / mask brush ring drawn on the height surface.
-    pub brush: BrushOverlay,
-    /// World grid + AABB bounds line guides.
-    pub guides: GuideOverlay,
+    /// Changes whenever the sampled height view is replaced, allowing app-owned
+    /// editor overlays to refresh their bind groups without reaching into internals.
+    height_binding_revision: u64,
     /// Phase J dual-height overhang / cave roof proxy (opt-in layers).
     pub overhang: OverhangOverlay,
     /// Instanced vegetation driven by the evaluated vegetation-density field.
@@ -415,6 +415,27 @@ pub struct GpuContext {
     /// Color format the renderer's targets are built for — negotiated from the
     /// window surface at runtime, or chosen directly for headless/offscreen use.
     pub surface_format: wgpu::TextureFormat,
+    pipelines: std::sync::Arc<terra_gpu::PipelineCacheRegistry>,
+}
+
+impl GpuContext {
+    pub fn new(
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        surface_format: wgpu::TextureFormat,
+    ) -> Self {
+        let pipelines = std::sync::Arc::new(terra_gpu::PipelineCacheRegistry::new(&device));
+        Self {
+            device,
+            queue,
+            surface_format,
+            pipelines,
+        }
+    }
+
+    pub fn pipeline_registry(&self) -> &terra_gpu::PipelineCacheRegistry {
+        &self.pipelines
+    }
 }
 
 /// The window surface plus its negotiated configuration, produced alongside a
@@ -519,11 +540,7 @@ pub async fn init_gpu(
     };
     surface.configure(&device, &config);
     Ok((
-        GpuContext {
-            device,
-            queue,
-            surface_format: format,
-        },
+        GpuContext::new(device, queue, format),
         SurfaceTarget {
             surface,
             config,
@@ -649,7 +666,14 @@ impl TerrainRenderer {
         config: wgpu::SurfaceConfiguration,
         size: winit::dpi::PhysicalSize<u32>,
     ) -> Self {
-        Self::init(ctx.device.clone(), ctx.queue.clone(), None, config, size)
+        Self::init(
+            ctx.device.clone(),
+            ctx.queue.clone(),
+            ctx.pipelines.clone(),
+            None,
+            config,
+            size,
+        )
     }
 }
 
@@ -662,6 +686,7 @@ impl TerrainRenderer {
         Self::init(
             ctx.device.clone(),
             ctx.queue.clone(),
+            ctx.pipelines.clone(),
             Some(target.surface),
             target.config,
             target.size,
@@ -707,7 +732,14 @@ impl TerrainRenderer {
             desired_maximum_frame_latency: 2,
         };
         let size = winit::dpi::PhysicalSize::new(config.width, config.height);
-        Self::init(ctx.device.clone(), ctx.queue.clone(), None, config, size)
+        Self::init(
+            ctx.device.clone(),
+            ctx.queue.clone(),
+            ctx.pipelines.clone(),
+            None,
+            config,
+            size,
+        )
     }
 
     /// Shared constructor tail: every device-only resource, after surface and
@@ -718,6 +750,7 @@ impl TerrainRenderer {
     fn init(
         device: wgpu::Device,
         queue: wgpu::Queue,
+        pipelines: std::sync::Arc<terra_gpu::PipelineCacheRegistry>,
         surface: Option<wgpu::Surface<'static>>,
         config: wgpu::SurfaceConfiguration,
         size: winit::dpi::PhysicalSize<u32>,
@@ -941,8 +974,8 @@ impl TerrainRenderer {
             ],
         });
 
-        let heights = HeightGpu::new(&device, 256);
-        let integrity_probe = integrity_probe::TerrainIntegrityProbe::try_new(&device);
+        let heights = HeightGpu::new(&device, &pipelines, 256);
+        let integrity_probe = integrity_probe::TerrainIntegrityProbe::try_new(&device, &pipelines);
         debug_assert!(std::mem::size_of::<FrameUniforms>() as u64 <= FRAME_UNIFORM_BUF_SIZE);
         let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("frame-u"),
@@ -972,7 +1005,8 @@ impl TerrainRenderer {
             virtual_page_table_buf,
             tile_level_table_buf,
         ) = create_dummy_tile_stream(&device);
-        let shadow_map = shadows::ShadowMap::new(&device, heights.display_height_view(), true);
+        let shadow_map =
+            shadows::ShadowMap::new(&device, &pipelines, heights.display_height_view(), true);
         let staging = staging::StagingRing::new(&device, 3, 4 * 1024 * 1024);
         let gpu_timer = gpu_timing::GpuTimestampTimer::try_new(&device, &queue);
 
@@ -998,7 +1032,7 @@ impl TerrainRenderer {
             push_constant_ranges: &[],
         });
 
-        let pipeline = terra_gpu::cached_render_pipeline(&device, "terrain-pipe", format, || {
+        let pipeline = pipelines.render_pipeline("terrain-pipe", format, || {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("terrain-pipe"),
                 layout: Some(&pipeline_layout),
@@ -1032,91 +1066,89 @@ impl TerrainRenderer {
                 }),
                 multisample: wgpu::MultisampleState::default(),
                 multiview: None,
-                cache: terra_gpu::shared_pipeline_cache(&device).as_ref(),
+                cache: pipelines.driver_cache(),
             })
         });
 
-        let ocean_pipeline =
-            terra_gpu::cached_render_pipeline(&device, "ocean-pipe", format, || {
-                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                    label: Some("ocean-pipe"),
-                    layout: Some(&pipeline_layout),
-                    vertex: wgpu::VertexState {
-                        module: &shader,
-                        entry_point: Some("vs_ocean"),
-                        buffers: &[TerrainGrid::vertex_layout()],
-                        compilation_options: Default::default(),
-                    },
-                    fragment: Some(wgpu::FragmentState {
-                        module: &shader,
-                        entry_point: Some("fs_ocean"),
-                        targets: &[Some(wgpu::ColorTargetState {
-                            format,
-                            blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                            write_mask: wgpu::ColorWrites::ALL,
-                        })],
-                        compilation_options: Default::default(),
-                    }),
-                    primitive: wgpu::PrimitiveState {
-                        topology: wgpu::PrimitiveTopology::TriangleList,
-                        cull_mode: None,
-                        ..Default::default()
-                    },
-                    depth_stencil: Some(wgpu::DepthStencilState {
-                        format: wgpu::TextureFormat::Depth32Float,
-                        depth_write_enabled: true,
-                        depth_compare: wgpu::CompareFunction::Less,
-                        stencil: Default::default(),
-                        bias: Default::default(),
-                    }),
-                    multisample: wgpu::MultisampleState::default(),
-                    multiview: None,
-                    cache: terra_gpu::shared_pipeline_cache(&device).as_ref(),
-                })
-            });
+        let ocean_pipeline = pipelines.render_pipeline("ocean-pipe", format, || {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("ocean-pipe"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_ocean"),
+                    buffers: &[TerrainGrid::vertex_layout()],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_ocean"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: true,
+                    depth_compare: wgpu::CompareFunction::Less,
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+                cache: pipelines.driver_cache(),
+            })
+        });
 
-        let wireframe_pipeline =
-            terra_gpu::cached_render_pipeline(&device, "wireframe-pipe", format, || {
-                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                    label: Some("wireframe-pipe"),
-                    layout: Some(&pipeline_layout),
-                    vertex: wgpu::VertexState {
-                        module: &shader,
-                        entry_point: Some("vs_main"),
-                        buffers: &[TerrainGrid::vertex_layout()],
-                        compilation_options: Default::default(),
+        let wireframe_pipeline = pipelines.render_pipeline("wireframe-pipe", format, || {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("wireframe-pipe"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[TerrainGrid::vertex_layout()],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_wireframe"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::LineList,
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: false,
+                    depth_compare: wgpu::CompareFunction::LessEqual,
+                    stencil: Default::default(),
+                    bias: wgpu::DepthBiasState {
+                        constant: -4,
+                        slope_scale: -2.0,
+                        clamp: 0.0,
                     },
-                    fragment: Some(wgpu::FragmentState {
-                        module: &shader,
-                        entry_point: Some("fs_wireframe"),
-                        targets: &[Some(wgpu::ColorTargetState {
-                            format,
-                            blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                            write_mask: wgpu::ColorWrites::ALL,
-                        })],
-                        compilation_options: Default::default(),
-                    }),
-                    primitive: wgpu::PrimitiveState {
-                        topology: wgpu::PrimitiveTopology::LineList,
-                        cull_mode: None,
-                        ..Default::default()
-                    },
-                    depth_stencil: Some(wgpu::DepthStencilState {
-                        format: wgpu::TextureFormat::Depth32Float,
-                        depth_write_enabled: false,
-                        depth_compare: wgpu::CompareFunction::LessEqual,
-                        stencil: Default::default(),
-                        bias: wgpu::DepthBiasState {
-                            constant: -4,
-                            slope_scale: -2.0,
-                            clamp: 0.0,
-                        },
-                    }),
-                    multisample: wgpu::MultisampleState::default(),
-                    multiview: None,
-                    cache: terra_gpu::shared_pipeline_cache(&device).as_ref(),
-                })
-            });
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+                cache: pipelines.driver_cache(),
+            })
+        });
         let depth = create_depth(&device, config.width, config.height);
         let clipmap = ClipmapConfig::for_world(4096.0, 1025);
         let world_grid = clipmap.fallback.clone();
@@ -1157,18 +1189,21 @@ impl TerrainRenderer {
             })
             .collect();
         let camera = OrbitCamera::default();
-        let mut brush = BrushOverlay::new(&device, format);
-        brush.rebind_height(&device, heights.display_height_view());
-        let guides = GuideOverlay::new(&device, format);
-        let overhang = OverhangOverlay::new(&device, format);
-        let vegetation = VegetationOverlay::new(&device, format);
-        let progressive =
-            progressive::ProgressiveRenderer::new(&device, config.width, config.height, format);
+        let overhang = OverhangOverlay::new(&device, &pipelines, format);
+        let vegetation = VegetationOverlay::new(&device, &pipelines, format);
+        let progressive = progressive::ProgressiveRenderer::new(
+            &device,
+            &pipelines,
+            config.width,
+            config.height,
+            format,
+        );
         let quality = ViewportQualityManager::default();
         let initial_internal_scale = quality.internal_scale;
         let mut path_tracer = PathTracer::new(
             &device,
             &queue,
+            &pipelines,
             config.width,
             config.height,
             initial_internal_scale,
@@ -1180,6 +1215,7 @@ impl TerrainRenderer {
             surface,
             device,
             queue,
+            pipelines,
             config,
             pipeline,
             wireframe_pipeline,
@@ -1211,8 +1247,7 @@ impl TerrainRenderer {
             integrity_probe,
             last_grid_resolution: 0,
             camera_framed: false,
-            brush,
-            guides,
+            height_binding_revision: 1,
             overhang,
             vegetation,
             lighting: EnvironmentLighting::default(),
@@ -1376,11 +1411,16 @@ impl TerrainRenderer {
         }
         let depth = create_depth(&self.device, self.config.width, self.config.height);
         self.depth = depth;
-        self.progressive
-            .resize(&self.device, self.config.width, self.config.height);
+        self.progressive.resize(
+            &self.device,
+            &self.pipelines,
+            self.config.width,
+            self.config.height,
+        );
         self.path_tracer.resize(
             &self.device,
             &self.queue,
+            &self.pipelines,
             self.config.width,
             self.config.height,
             self.quality.internal_scale,
@@ -1871,8 +1911,7 @@ impl TerrainRenderer {
     fn recreate_bind_group(&mut self) {
         self.shadow_map
             .recreate_bind_group(&self.device, self.heights.display_height_view());
-        self.brush
-            .rebind_height(&self.device, self.heights.display_height_view());
+        self.height_binding_revision = self.height_binding_revision.wrapping_add(1).max(1);
         self.bind_group = Self::make_bind_group(
             &self.device,
             &self.bind_group_layout,
@@ -1989,44 +2028,8 @@ impl TerrainRenderer {
         self.notify_invalidation(InvalidationReason::LightingChanged);
     }
 
-    pub fn request_brush_surface_pick(
-        &mut self,
-        cursor: (f32, f32),
-        screen: (f32, f32),
-        radius_uv: f32,
-        color: [f32; 4],
-    ) {
-        let aspect = self.config.width as f32 / self.config.height.max(1) as f32;
-        self.brush.request_surface_pick(
-            &self.device,
-            &self.queue,
-            &self.camera,
-            aspect,
-            cursor,
-            screen,
-            self.heights.world_size,
-            self.heights.height_range,
-            radius_uv,
-            color,
-        );
-    }
-
-    pub fn hide_brush_gizmo(&mut self) {
-        self.brush.hide(&self.queue);
-    }
-
-    pub fn poll_brush_surface_pick(&mut self) {
-        self.brush.poll(&self.device);
-    }
-
-    pub fn latest_brush_surface_pick(
-        &self,
-        cursor: (f32, f32),
-        screen: (f32, f32),
-    ) -> Option<SurfacePick> {
-        let aspect = self.config.width as f32 / self.config.height.max(1) as f32;
-        self.brush
-            .latest_pick_for(&self.camera, aspect, cursor, screen)
+    pub fn height_binding_revision(&self) -> u64 {
+        self.height_binding_revision
     }
 
     /// Upload or clear the Phase J overhang / cave roof proxy mesh.
@@ -2119,10 +2122,6 @@ impl TerrainRenderer {
             self.notify_invalidation(InvalidationReason::RenderModeChanged);
         }
         self.display_aids = aids;
-        self.guides.set_state(GuideState {
-            grid: aids.grid,
-            bounds: aids.world_bounds,
-        });
     }
 
     /// 0 = hide placement tint; ~0.55–0.7 is a readable artist overlay.
@@ -2184,7 +2183,7 @@ impl TerrainRenderer {
         Ok(frame)
     }
 
-    /// Record and submit one full frame (shadow, backend, overlays, post) into `view`.
+    /// Record and submit one terrain frame (shadow, backend, scene composite, post) into `view`.
     ///
     /// Target contract, until sizing is decoupled from the surface configuration:
     /// - `view` must be a RENDER_ATTACHMENT-usable view whose texture format equals
@@ -2201,7 +2200,6 @@ impl TerrainRenderer {
             "render_to_view target size must match the configured size; call resize() first"
         );
 
-        self.brush.poll(&self.device);
         self.scene_versions.begin_frame();
 
         let aspect = width as f32 / height.max(1) as f32;
@@ -2216,8 +2214,14 @@ impl TerrainRenderer {
 
         let internal_scale = self.quality.internal_scale;
         if (self.last_internal_scale - internal_scale).abs() > 1e-4 {
-            self.path_tracer
-                .resize(&self.device, &self.queue, width, height, internal_scale);
+            self.path_tracer.resize(
+                &self.device,
+                &self.queue,
+                &self.pipelines,
+                width,
+                height,
+                internal_scale,
+            );
             let mask = self.adaptive.prepare_all_active_mask();
             self.path_tracer.upload_sample_mask(&self.queue, &mask);
             self.notify_invalidation(InvalidationReason::ViewportResized);
@@ -2403,14 +2407,6 @@ impl TerrainRenderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("terrain-enc"),
             });
-        self.brush.upload_view_proj(&self.queue, view_proj);
-        self.guides.upload_view_proj(&self.queue, view_proj);
-        self.guides.sync_geometry(
-            &self.queue,
-            self.heights.world_size,
-            self.heights.height_range,
-            (self.camera.target.x, self.camera.target.z),
-        );
         self.overhang
             .upload_view_proj(&self.queue, view_proj, self.lighting.light_dir);
         self.vegetation
@@ -2623,9 +2619,9 @@ impl TerrainRenderer {
                     }
                 }
 
-                if self.frame_graph.schedule.overlays {
-                    self.frame_graph.mark(PassKind::Overlays);
-                    // Hole-free uniforms for ocean / overlays (shared main buffer).
+                if self.frame_graph.schedule.scene_composite {
+                    self.frame_graph.mark(PassKind::SceneComposite);
+                    // Hole-free uniforms for terrain-scene composition.
                     {
                         let mut uniforms = base_uniforms;
                         uniforms.clipmap =
@@ -2639,7 +2635,7 @@ impl TerrainRenderer {
                     }
                     {
                         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                            label: Some("raster-lit-overlays"),
+                            label: Some("raster-lit-scene-composite"),
                             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                                 view: color_view,
                                 resolve_target: None,
@@ -2683,8 +2679,6 @@ impl TerrainRenderer {
                         }
                         self.vegetation.draw(&mut pass);
                         self.overhang.draw(&mut pass);
-                        self.brush.draw(&mut pass, true);
-                        self.guides.draw(&mut pass);
                     }
                 }
             }
@@ -2720,50 +2714,6 @@ impl TerrainRenderer {
                 denoise_ts,
                 self.debug_viz_mode,
             );
-            if self.frame_graph.schedule.overlays {
-                self.frame_graph.mark(PassKind::Overlays);
-                {
-                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("progressive-guide-overlay-pass"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view,
-                            resolve_target: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Load,
-                                store: wgpu::StoreOp::Store,
-                            },
-                        })],
-                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                            view: &self.depth,
-                            depth_ops: Some(wgpu::Operations {
-                                load: wgpu::LoadOp::Load,
-                                store: wgpu::StoreOp::Store,
-                            }),
-                            stencil_ops: None,
-                        }),
-                        timestamp_writes: None,
-                        occlusion_query_set: None,
-                    });
-                    self.guides.draw(&mut pass);
-                }
-                {
-                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("progressive-brush-overlay-pass"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view,
-                            resolve_target: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Load,
-                                store: wgpu::StoreOp::Store,
-                            },
-                        })],
-                        depth_stencil_attachment: None,
-                        timestamp_writes: None,
-                        occlusion_query_set: None,
-                    });
-                    self.brush.draw(&mut pass, false);
-                }
-            }
         }
 
         self.frame_graph
@@ -3182,5 +3132,28 @@ mod render_error_tests {
             err,
             RenderError::Surface(wgpu::SurfaceError::Lost)
         ));
+    }
+}
+
+#[cfg(test)]
+mod pipeline_cache_lifecycle_tests {
+    use super::GpuContext;
+
+    #[test]
+    fn pipeline_registry_drops_with_its_gpu_context_owners() {
+        let Some(gpu) = terra_test_gpu::headless() else {
+            return;
+        };
+        let context = GpuContext::new(
+            gpu.device.clone(),
+            gpu.queue.clone(),
+            wgpu::TextureFormat::Rgba8Unorm,
+        );
+        let weak = std::sync::Arc::downgrade(&context.pipelines);
+        let clone = context.clone();
+        drop(context);
+        assert!(weak.upgrade().is_some());
+        drop(clone);
+        assert!(weak.upgrade().is_none());
     }
 }

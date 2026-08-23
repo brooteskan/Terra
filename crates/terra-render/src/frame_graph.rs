@@ -16,7 +16,7 @@ pub enum PassKind {
     RasterLit,
     ProgressivePt,
     ProgressivePost,
-    Overlays,
+    SceneComposite,
     ResolveTimestamps,
 }
 
@@ -53,7 +53,7 @@ pub struct FrameSchedule {
     /// progressive frames (spp 0), which still present the last HDR via post.
     pub pt_dispatch: bool,
     pub progressive_post: bool,
-    pub overlays: bool,
+    pub scene_composite: bool,
 }
 
 impl FrameSchedule {
@@ -69,14 +69,14 @@ impl FrameSchedule {
                 shadow: shadows_enabled,
                 pt_dispatch: false,
                 progressive_post: false,
-                overlays: true,
+                scene_composite: true,
             },
             PresentationBackendId::ProgressivePt => Self {
                 backend: Some(backend),
                 shadow: false,
                 pt_dispatch,
                 progressive_post: true,
-                overlays: true,
+                scene_composite: false,
             },
         }
     }
@@ -98,8 +98,8 @@ impl FrameSchedule {
         if self.progressive_post {
             out.push(PassKind::ProgressivePost);
         }
-        if self.overlays {
-            out.push(PassKind::Overlays);
+        if self.scene_composite {
+            out.push(PassKind::SceneComposite);
         }
         out.push(PassKind::ResolveTimestamps);
         out
@@ -158,7 +158,7 @@ mod tests {
                 PassKind::Begin,
                 PassKind::Shadow,
                 PassKind::RasterLit,
-                PassKind::Overlays,
+                PassKind::SceneComposite,
                 PassKind::ResolveTimestamps,
             ]
         );
@@ -172,7 +172,7 @@ mod tests {
             vec![
                 PassKind::Begin,
                 PassKind::RasterLit,
-                PassKind::Overlays,
+                PassKind::SceneComposite,
                 PassKind::ResolveTimestamps,
             ]
         );
@@ -187,7 +187,6 @@ mod tests {
                 PassKind::Begin,
                 PassKind::ProgressivePt,
                 PassKind::ProgressivePost,
-                PassKind::Overlays,
                 PassKind::ResolveTimestamps,
             ]
         );
@@ -202,7 +201,6 @@ mod tests {
             vec![
                 PassKind::Begin,
                 PassKind::ProgressivePost,
-                PassKind::Overlays,
                 PassKind::ResolveTimestamps,
             ]
         );
