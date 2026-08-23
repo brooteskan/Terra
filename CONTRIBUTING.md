@@ -31,6 +31,35 @@ Keep domain content (layer kinds, presets, archetypes) in `terra-core` when prac
 - Prefer `Result` at fallible boundaries; reserve `expect` for true invariants with a clear reason.
 - When adding a layer type, update the layer registry (and inspector family if needed) rather than hand-syncing multiple catalogs.
 
+## Clone ratchet
+
+Run the same pinned production clone gate used by CI with:
+
+```bash
+node tools/clone-audit/clone-audit.mjs check
+```
+
+The command scans `crates/*/src/**/*.rs` with jscpd 5.0.4 in mild mode at
+12 non-comment lines and 100 tokens. It preserves source line numbers while
+removing inline `#[cfg(test)]` items from production input. Tests, examples,
+source test modules, and the removed inline items receive a separate non-blocking
+report under `target/clone-audit/`.
+
+The gate compares normalized clone fingerprints and absolute duplicated lines
+with `tools/clone-audit/production-baseline.json`, and requires every accepted
+group to have a complete entry in `tools/clone-audit/exceptions.json`. It fails
+for a new or grown group, increased duplicated production LOC, a missing reason,
+or a stale baseline/exception. Percentage is reported but is never a gate.
+
+After consolidating a clone, run `update` and review both checked-in JSON files.
+New debt should not be accepted unless its exception documents the boundary,
+equivalence expectation, protecting invariant, and current audit cycle. Run the
+detector's add/remove and unrelated-growth proof with:
+
+```bash
+node tools/clone-audit/clone-audit.mjs self-test
+```
+
 ## Docs
 
 - User-facing guides live under `docs/` (workflow, creating terrain, editor overview); the root [README](README.md) lists them.

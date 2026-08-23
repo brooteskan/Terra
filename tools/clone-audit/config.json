@@ -1,0 +1,9 @@
+{
+  "package": "jscpd",
+  "version": "5.0.4",
+  "format": "rust",
+  "mode": "mild",
+  "minimumLines": 12,
+  "minimumTokens": 100,
+  "auditCycle": "A5-2026-08"
+}

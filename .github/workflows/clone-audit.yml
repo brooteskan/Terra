@@ -1,0 +1,36 @@
+name: Production clone ratchet
+
+on:
+  pull_request:
+  push:
+    branches: [master, wozzits, wozzits-codex, "release/**"]
+
+permissions:
+  contents: read
+
+jobs:
+  clone-ratchet:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Check production clone ratchet
+        run: node tools/clone-audit/clone-audit.mjs check
+      - name: Prove clone addition and revert behavior
+        run: node tools/clone-audit/clone-audit.mjs self-test
+      - name: Upload production and report-only clone reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clone-audit-reports
+          path: |
+            target/clone-audit/production.md
+            target/clone-audit/production.json
+            target/clone-audit/production-raw/jscpd-report.json
+            target/clone-audit/tests-examples.md
+            target/clone-audit/tests-examples.json
+            target/clone-audit/tests-examples-raw/jscpd-report.json
+          if-no-files-found: warn
