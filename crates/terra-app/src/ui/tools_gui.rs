@@ -9,7 +9,8 @@ use crate::ui::style::{
     self, FONT_SCALE, MODE_ROW_H, PAD, TOOL_CARD_GAP, TOOL_CARD_H, TOOL_THUMB_SIZE, TYPE_CAPTION,
 };
 use crate::ui::tool_catalog::{
-    instantiate_layer_preset, tools_for_workspace, ToolAction, ToolDef, ToolGroup,
+    instantiate_layer_preset, tool_infinite_rejection, tools_for_workspace, ToolAction, ToolDef,
+    ToolGroup,
 };
 use crate::ui::workspace::{workspace_definition, WorkspaceId};
 use crate::ui::{EditorTool, UiState};
@@ -489,8 +490,10 @@ fn tool_card(
     card: Rect,
 ) {
     let hovered = ui.pointer_in(card);
-    let disabled = selected_foundation_brush_support(doc, tool.sculpt_stroke_kind())
-        == Some(EditSupport::Unsupported);
+    let infinite_rejection = tool_infinite_rejection(doc, tool);
+    let disabled = infinite_rejection.is_some()
+        || selected_foundation_brush_support(doc, tool.sculpt_stroke_kind())
+            == Some(EditSupport::Unsupported);
     let interactive_hovered = hovered && !disabled;
     let selected = !disabled
         && match &tool.action {
@@ -643,9 +646,19 @@ fn tool_card(
 
     if hovered {
         if disabled {
-            let body = format!(
-                "{}\n\nNot supported by the selected Foundation layer.",
-                tool.description
+            let body = infinite_rejection.map_or_else(
+                || {
+                    format!(
+                        "{}\n\nNot supported by the selected Foundation layer.",
+                        tool.description
+                    )
+                },
+                |reason| {
+                    format!(
+                        "{}\n\nUnavailable in Infinite projects: {reason}.",
+                        tool.description
+                    )
+                },
             );
             ui.queue_tooltip(card, tool.label, &body, tool.shortcut);
         } else {

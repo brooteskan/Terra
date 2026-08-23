@@ -276,6 +276,15 @@ auxiliary dependencies, and kernels without a domain-coordinate contract defer
 explicitly to the existing complete-field pyramid. See
 [Compiled tile-domain GPU evaluation](algorithms/compiled_tile_evaluation.md).
 
+Infinite projects add a stricter admission layer over the same compiled plan and
+`Reach` vocabulary. Every live operation declares whether it can execute directly
+over sparse tiles; the dependency walk accumulates finite halos and rejects full
+reach, basin coupling, consumed global auxiliaries, bounded authored data, and
+unclassified work with an authored-owner diagnostic. Unlike bounded execution,
+Infinite admission never selects the complete-field checkpoint fallback. Catalog,
+inspector, and scheduling use this shared result. See
+[Infinite-world spatial capabilities](algorithms/infinite_spatial_capabilities.md).
+
 Output edits advance `TerrainRuntime::output_revision` through the app's single revision
 boundary, which drops old pyramid content and clears pending uploads, the cache and page
 table, and renderer streaming state. Document reset performs the same retirement while

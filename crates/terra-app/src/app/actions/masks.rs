@@ -3,6 +3,19 @@ use crate::ui::{MaskEditAction, PanelAction};
 use super::super::TerraApp;
 use super::ApplyCtx;
 
+fn reject_infinite_mask_source(app: &mut TerraApp, source: &terra_core::mask::MaskSource) -> bool {
+    if app.session.document.infinite_settings().is_none() {
+        return false;
+    }
+    let Some(reason) =
+        terra_core::terrain_plan::mask_source_infinite_capability(source).rejection()
+    else {
+        return false;
+    };
+    app.ui_state.status = format!("Mask is unavailable in Infinite projects: {reason}");
+    true
+}
+
 // Returns the unhandled action on `Err` so the next handler in the chain can try it
 // (see actions/mod.rs); that payload is the intrinsic-size `PanelAction` (`LayerKind`).
 #[allow(clippy::result_large_err)]
@@ -13,6 +26,10 @@ pub(crate) fn try_apply(
 ) -> Result<(), PanelAction> {
     match action {
         PanelAction::AddMask(mut asset) => {
+            if reject_infinite_mask_source(app, &asset.source) {
+                ctx.continue_loop = true;
+                return Ok(());
+            }
             asset.prepare_for_document();
             let id = asset.id;
             let painted = asset.is_painted();
@@ -51,6 +68,10 @@ pub(crate) fn try_apply(
             app.mask_overlay_dirty = true;
         }
         PanelAction::UpdateMaskAsset(asset) => {
+            if reject_infinite_mask_source(app, &asset.source) {
+                ctx.continue_loop = true;
+                return Ok(());
+            }
             if let Some(existing) = app
                 .session
                 .document
@@ -88,6 +109,18 @@ pub(crate) fn try_apply(
             }
         }
         PanelAction::BindMaskToLayer { layer, mask } => {
+            let rejected = app
+                .session
+                .document
+                .masks
+                .iter()
+                .find(|asset| asset.id == mask)
+                .map(|asset| asset.source.clone())
+                .is_some_and(|source| reject_infinite_mask_source(app, &source));
+            if rejected {
+                ctx.continue_loop = true;
+                return Ok(());
+            }
             if let Some(target) = app.session.document.stack.find_mut(layer) {
                 if !target
                     .common
@@ -387,6 +420,28 @@ mod tests {
     use terra_core::authoring::SculptStrokeKind;
     use terra_core::layer::LayerStack;
     use terra_core::shape_history::create_shape_layer;
+
+    #[test]
+    fn infinite_action_gate_rejects_bounded_painted_masks() {
+        let mut app = TerraApp::default();
+        app.session.document = terra_core::document::TerrainDocument::new_infinite(
+            terra_core::document::InfiniteProceduralWorldSettings::default(),
+        )
+        .unwrap();
+        let mask = terra_core::mask::MaskAsset::new_painted(
+            terra_core::mask::MaskId::new(),
+            "Painted",
+            32,
+        );
+
+        app.apply_actions(vec![PanelAction::AddMask(mask)]);
+
+        assert!(app.session.document.masks.is_empty());
+        assert!(app
+            .ui_state
+            .status
+            .contains("unavailable in Infinite projects"));
+    }
 
     /// A sculpt stamp retains its UV footprint through the full apply path
     /// (`masks::try_apply` → `actions::mod` dispatch → `track_worker_dirty_from`),

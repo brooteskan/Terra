@@ -84,6 +84,82 @@ impl Reach {
     pub fn is_full(self) -> bool {
         matches!(self, Reach::Full)
     }
+
+    /// Per-side halo for a localizable operation. `None` means the operation
+    /// requires a complete field and cannot be evaluated over sparse tiles.
+    pub const fn halo_samples(self) -> Option<u32> {
+        match self {
+            Self::Full => None,
+            Self::Localized { halo_samples } => Some(halo_samples),
+        }
+    }
+}
+
+/// Why an otherwise known terrain operation cannot execute directly over
+/// sparse Infinite-world tiles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SpatialRejectReason {
+    RequiresCompleteField,
+    FullFieldNormalization,
+    BasinDependent,
+    GlobalAuxiliary,
+    GlobalParameterReduction,
+    BoundedAuthoredData,
+    MissingDomainCoordinateContract,
+    UnclassifiedOperation,
+    RegionBakedNotImplemented,
+    HierarchicalNotImplemented,
+}
+
+impl std::fmt::Display for SpatialRejectReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::RequiresCompleteField => "requires complete-field evaluation",
+            Self::FullFieldNormalization => "uses full-field normalization",
+            Self::BasinDependent => "depends on basin-wide terrain state",
+            Self::GlobalAuxiliary => "consumes a globally-derived auxiliary field",
+            Self::GlobalParameterReduction => "reduces a complete field into a parameter",
+            Self::BoundedAuthoredData => "uses authored data tied to a bounded project",
+            Self::MissingDomainCoordinateContract => {
+                "does not yet have an Infinite-world coordinate contract"
+            }
+            Self::UnclassifiedOperation => "has no spatial capability classification",
+            Self::RegionBakedNotImplemented => "requires region-baked evaluation (not in Slice 1)",
+            Self::HierarchicalNotImplemented => "requires hierarchical evaluation (not in Slice 1)",
+        })
+    }
+}
+
+/// Sparse-world strategy declared by one configured operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum InfiniteOperationCapability {
+    /// The operation can evaluate directly over a tile plus its [`Reach`] halo.
+    Direct,
+    /// Reserved for a future finite-region bake strategy.
+    RegionBaked,
+    /// Reserved for a future multilevel/global-summary strategy.
+    Hierarchical,
+    Unsupported(SpatialRejectReason),
+}
+
+impl InfiniteOperationCapability {
+    pub const fn rejection(self) -> Option<SpatialRejectReason> {
+        match self {
+            Self::Direct => None,
+            Self::RegionBaked => Some(SpatialRejectReason::RegionBakedNotImplemented),
+            Self::Hierarchical => Some(SpatialRejectReason::HierarchicalNotImplemented),
+            Self::Unsupported(reason) => Some(reason),
+        }
+    }
+}
+
+/// Complete, machine-readable spatial contract for one compiled operation.
+/// Reach remains the single source of truth for halo calculations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OperationSpatialContract {
+    pub reach: Reach,
+    pub aux_reach: AuxReach,
+    pub infinite: InfiniteOperationCapability,
 }
 
 /// How a layer's published auxiliary fields (everything it emits besides height)

@@ -20,6 +20,7 @@ mod ids;
 mod impact;
 mod ir;
 mod provenance;
+mod spatial;
 
 pub use analysis::{ExpectedFieldKind, PlanAnalysis, PlanFieldLifetime};
 pub use cache::{PlanCacheStats, PlanCacheStatsSnapshot, PlanRevisionError, TerrainPlanCache};
@@ -29,9 +30,9 @@ pub use dirty::{
     PlanInvalidation,
 };
 pub use domain::{
-    resolve_plan_domain, resolve_plan_execution_strategy, TerrainPlanCheckpoint,
-    TerrainPlanDomainRejectReason, TerrainPlanDomainRejection, TerrainPlanDomainSlice,
-    TerrainPlanExecutionStrategy,
+    resolve_infinite_plan_domain, resolve_plan_domain, resolve_plan_execution_strategy,
+    TerrainPlanCheckpoint, TerrainPlanDomainRejectReason, TerrainPlanDomainRejection,
+    TerrainPlanDomainSlice, TerrainPlanExecutionStrategy,
 };
 pub use ids::{
     FieldSlot, PlanOpId, PlanStructureRevision, PlanStructureSignature, TerrainPlanStamp,
@@ -45,4 +46,7 @@ pub use ir::{
 };
 pub use provenance::{
     OutputProvenance, PlanAuthoredDependency, PlanNodeSelection, PlanOpSpan, PlanProvenance,
+};
+pub use spatial::{
+    distribution_infinite_capability, mask_source_infinite_capability, operation_spatial_contract,
 };

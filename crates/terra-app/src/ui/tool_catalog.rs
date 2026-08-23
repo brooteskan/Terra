@@ -14,6 +14,7 @@ use terra_core::layer::{
     ThermalErosionParams, VegetationParams, OPEN_HEIGHT_MAX, OPEN_HEIGHT_MIN,
 };
 use terra_core::mask::{DistNode, DistNodeKind, Distribution, MaskId, MaskSource};
+use terra_core::{document::TerrainDocument, invalidation::SpatialRejectReason};
 use terra_gui::Icon;
 
 use std::sync::OnceLock;
@@ -79,6 +80,22 @@ impl ToolDef {
             ToolAction::Sculpt(tool) => tool.sculpt_stroke_kind(),
             _ => None,
         }
+    }
+}
+
+/// Project-specific availability derived from the canonical layer kind rather
+/// than duplicated catalog metadata.
+pub(crate) fn tool_infinite_rejection(
+    doc: &TerrainDocument,
+    tool: &ToolDef,
+) -> Option<SpatialRejectReason> {
+    doc.infinite_settings()?;
+    match &tool.action {
+        ToolAction::AddLayer { kind, .. } => kind.infinite_capability().rejection(),
+        ToolAction::AddMask { source, .. } => {
+            terra_core::terrain_plan::mask_source_infinite_capability(source).rejection()
+        }
+        _ => None,
     }
 }
 
@@ -1958,6 +1975,65 @@ mod tests {
     use crate::ui::EditorTool;
     use std::collections::HashSet;
     use terra_core::mask::MaskSource;
+
+    #[test]
+    fn infinite_catalog_availability_comes_from_layer_contracts() {
+        let infinite = TerrainDocument::new_infinite(
+            terra_core::document::InfiniteProceduralWorldSettings::default(),
+        )
+        .unwrap();
+        let tools = all_tools();
+        let flat = tools
+            .iter()
+            .find(|tool| {
+                matches!(
+                    tool.action,
+                    ToolAction::AddLayer {
+                        kind: LayerKind::Flat(_),
+                        ..
+                    }
+                )
+            })
+            .expect("flat catalog route");
+        let hydraulic = tools
+            .iter()
+            .find(|tool| {
+                matches!(
+                    tool.action,
+                    ToolAction::AddLayer {
+                        kind: LayerKind::HydraulicErosion(_),
+                        ..
+                    }
+                )
+            })
+            .expect("hydraulic catalog route");
+        let painted_mask = tools
+            .iter()
+            .find(|tool| {
+                matches!(
+                    tool.action,
+                    ToolAction::AddMask {
+                        source: MaskSource::Painted { .. },
+                        ..
+                    }
+                )
+            })
+            .expect("painted-mask catalog route");
+
+        assert_eq!(tool_infinite_rejection(&infinite, flat), None);
+        assert_eq!(
+            tool_infinite_rejection(&infinite, hydraulic),
+            Some(SpatialRejectReason::BasinDependent)
+        );
+        assert_eq!(
+            tool_infinite_rejection(&infinite, painted_mask),
+            Some(SpatialRejectReason::BoundedAuthoredData)
+        );
+        assert_eq!(
+            tool_infinite_rejection(&TerrainDocument::new_default(), hydraulic),
+            None
+        );
+    }
 
     #[test]
     fn material_and_biome_catalog_layers_round_trip_without_null_bounds() {

@@ -14,7 +14,8 @@ use crate::ui::style::{
     self, FONT_SCALE, GAP, PAD, PAD_SM, ROW_H, TYPE_BODY, TYPE_CAPTION, TYPE_LABEL, TYPE_TITLE,
 };
 use crate::ui::tool_catalog::{
-    all_tools_cached, instantiate_layer_preset, quick_add_entries, ToolAction, ToolDef,
+    all_tools_cached, instantiate_layer_preset, quick_add_entries, tool_infinite_rejection,
+    ToolAction, ToolDef,
 };
 use crate::ui::UiState;
 use terra_core::document::TerrainDocument;
@@ -348,6 +349,16 @@ enum PickerItem {
         kind: DistNodeKind,
         is_effect: bool,
     },
+}
+
+fn item_infinite_rejection(
+    doc: &TerrainDocument,
+    item: &PickerItem,
+) -> Option<terra_core::invalidation::SpatialRejectReason> {
+    match item {
+        PickerItem::Tool(tool) => tool_infinite_rejection(doc, tool),
+        PickerItem::Org { .. } | PickerItem::Dist { .. } => None,
+    }
 }
 
 impl PickerItem {
@@ -1022,6 +1033,8 @@ pub fn draw_quick_add(
 
             let id = Id::new("qa_tile").child(item.id());
             let selected = state.selected_id.as_deref() == Some(item.id());
+            let rejection = item_infinite_rejection(doc, item);
+            let unavailable = rejection.is_some();
             let hovered = ui.pointer_in(tile) && ui.pointer_in(grid_area);
             if hovered {
                 ui.state.set_hot(id);
@@ -1030,7 +1043,7 @@ pub fn draw_quick_add(
                 ui.state.active = Some(id);
             }
             if ui.input.primary_released && ui.state.is_active(id) && hovered {
-                if selected {
+                if selected && !unavailable {
                     commit_item(item, ui_state, state, &mut actions);
                     ui.end_panel_scrolled(&mut state.scroll_y);
                     ui.end_overlay();
@@ -1039,7 +1052,7 @@ pub fn draw_quick_add(
                 state.selected_id = Some(item.id().to_string());
             }
 
-            if selected {
+            if selected && !unavailable {
                 draw_selection_border(ui, tile);
                 let inner = Rect::from_pos_size(
                     tile.min_x + BORDER,
@@ -1051,7 +1064,9 @@ pub fn draw_quick_add(
             } else {
                 ui.panel_rounded(
                     tile,
-                    if hovered {
+                    if unavailable {
+                        style::SURFACE
+                    } else if hovered {
                         style::HOVER_BG
                     } else {
                         style::SURFACE
@@ -1075,7 +1090,11 @@ pub fn draw_quick_add(
                 text_x,
                 tile.min_y + 16.0,
                 &name,
-                style::TEXT,
+                if unavailable {
+                    style::TEXT_DISABLED
+                } else {
+                    style::TEXT
+                },
                 FONT_SCALE * TYPE_BODY,
             );
             let desc = DrawList::truncate_to_width(
@@ -1087,7 +1106,11 @@ pub fn draw_quick_add(
                 text_x,
                 tile.min_y + 36.0,
                 &desc,
-                style::TEXT_MUTED,
+                if unavailable {
+                    style::TEXT_DISABLED
+                } else {
+                    style::TEXT_MUTED
+                },
                 FONT_SCALE * TYPE_CAPTION,
             );
         }
@@ -1100,7 +1123,7 @@ pub fn draw_quick_add(
         .iter()
         .find(|i| Some(i.id()) == state.selected_id.as_deref())
     {
-        draw_sidebar(ui, sidebar, sel);
+        draw_sidebar(ui, sidebar, sel, item_infinite_rejection(doc, sel));
     } else {
         ui.label_at(
             sidebar.min_x + PAD_SM + 4.0,
@@ -1147,7 +1170,11 @@ pub fn draw_quick_add(
         ui.end_overlay();
         return actions;
     }
-    let can_add = state.selected_id.is_some() && !items.is_empty();
+    let selected_rejection = items
+        .iter()
+        .find(|item| Some(item.id()) == state.selected_id.as_deref())
+        .and_then(|item| item_infinite_rejection(doc, item));
+    let can_add = state.selected_id.is_some() && !items.is_empty() && selected_rejection.is_none();
     if can_add && text_button(ui, Id::new("qa_add"), add_label, add_r, true) {
         if let Some(sel) = items
             .iter()
@@ -1189,7 +1216,12 @@ pub fn draw_quick_add(
     actions
 }
 
-fn draw_sidebar(ui: &mut GuiContext<'_>, sidebar: Rect, item: &PickerItem) {
+fn draw_sidebar(
+    ui: &mut GuiContext<'_>,
+    sidebar: Rect,
+    item: &PickerItem,
+    rejection: Option<terra_core::invalidation::SpatialRejectReason>,
+) {
     let mut y = sidebar.min_y + PAD;
     ui.label_at(
         sidebar.min_x + PAD,
@@ -1231,6 +1263,19 @@ fn draw_sidebar(ui: &mut GuiContext<'_>, sidebar: Rect, item: &PickerItem) {
         }
     }
     y += 8.0;
+
+    if let Some(reason) = rejection {
+        let message = format!("Unavailable in Infinite projects: {reason}.");
+        let message = DrawList::truncate_to_width(&message, FONT_SCALE * TYPE_LABEL, desc_w);
+        ui.label_at(
+            sidebar.min_x + PAD,
+            y,
+            &message,
+            style::TEXT_DISABLED,
+            FONT_SCALE * TYPE_LABEL,
+        );
+        y += 22.0;
+    }
 
     let preview_h = 140.0_f32.min(sidebar.height() * 0.35);
     let preview = Rect::from_pos_size(

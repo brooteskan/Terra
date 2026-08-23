@@ -8,6 +8,20 @@ use super::super::{
 };
 use super::ApplyCtx;
 
+fn reject_infinite_kind(app: &mut TerraApp, kind: &LayerKind) -> bool {
+    if app.session.document.infinite_settings().is_none() {
+        return false;
+    }
+    let Some(reason) = kind.infinite_capability().rejection() else {
+        return false;
+    };
+    app.ui_state.status = format!(
+        "{} is unavailable in Infinite projects: {reason}",
+        kind.type_display_name()
+    );
+    true
+}
+
 // Returns the unhandled action on `Err` so the next handler in the chain can try it
 // (see actions/mod.rs); that payload is the intrinsic-size `PanelAction` (`LayerKind`).
 #[allow(clippy::result_large_err)]
@@ -19,6 +33,10 @@ pub(crate) fn try_apply(
     match action {
         PanelAction::AddLayer(layer) => {
             let kind = layer.kind.clone();
+            if reject_infinite_kind(app, &kind) {
+                ctx.continue_loop = true;
+                return Ok(());
+            }
             if layer.kind.is_sculpt_base() {
                 // Only one sculpt Base allowed.
                 {
@@ -62,6 +80,10 @@ pub(crate) fn try_apply(
             ctx.doc_mutated = true;
         }
         PanelAction::AddLayerToCategory { category, layer } => {
+            if reject_infinite_kind(app, &layer.kind) {
+                ctx.continue_loop = true;
+                return Ok(());
+            }
             if layer.kind.is_sculpt_base() {
                 {
                     ctx.continue_loop = true;
@@ -278,6 +300,10 @@ pub(crate) fn try_apply(
             ctx.dirty_from = Some(id);
         }
         PanelAction::SetKind { id, kind } => {
+            if reject_infinite_kind(app, &kind) {
+                ctx.continue_loop = true;
+                return Ok(());
+            }
             let previous = app
                 .session
                 .document
@@ -758,6 +784,10 @@ pub(crate) fn try_apply(
             }
         }
         PanelAction::AddLayerInto { parent, layer } => {
+            if reject_infinite_kind(app, &layer.kind) {
+                ctx.continue_loop = true;
+                return Ok(());
+            }
             if layer.kind.is_sculpt_base() {
                 {
                     ctx.continue_loop = true;
@@ -1228,6 +1258,27 @@ mod tests {
     use terra_core::layer::{LayerId, LayerKind, LayerStack};
     use terra_core::shape_history::create_shape_layer;
     use terra_core::tiling::UvRect;
+
+    #[test]
+    fn infinite_action_gate_rejects_unsupported_layer_creation() {
+        let mut app = TerraApp::default();
+        app.session.document = terra_core::document::TerrainDocument::new_infinite(
+            terra_core::document::InfiniteProceduralWorldSettings::default(),
+        )
+        .unwrap();
+        let before = app.session.document.stack.layer_ids();
+
+        app.apply_actions(vec![PanelAction::AddLayer(terra_core::layer::Layer::new(
+            "Hydraulic",
+            LayerKind::HydraulicErosion(Default::default()),
+        ))]);
+
+        assert_eq!(app.session.document.stack.layer_ids(), before);
+        assert!(app
+            .ui_state
+            .status
+            .contains("unavailable in Infinite projects"));
+    }
 
     fn raise(u: f32, v: f32, radius_m: f32, strength: f32) -> SculptStroke {
         SculptStroke {

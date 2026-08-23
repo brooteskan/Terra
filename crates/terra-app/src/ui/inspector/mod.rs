@@ -762,6 +762,43 @@ pub fn draw_inspector_gui(
     // Resolution is selection context, so keep it visible regardless of the active tab.
     ui.gap(4.0);
     draw_layer_resolution(ui, doc, ui_state, state, &layer, &mut actions);
+    if doc.infinite_settings().is_some() {
+        ui.gap(4.0);
+        if let Some(reason) = layer.kind.infinite_capability().rejection() {
+            label(ui, &format!("Infinite: unavailable — {reason}"));
+        } else if let Some(status) = ui_state.infinite_spatial_status {
+            if let Some(reason) = status.reason {
+                let blocker = match status.blocker {
+                    Some(terra_core::deps::NodeRef::Layer(blocker)) => doc
+                        .stack
+                        .find(blocker)
+                        .map(|layer| layer.common.name.as_str()),
+                    Some(terra_core::deps::NodeRef::Group(blocker)) => doc
+                        .stack
+                        .find_group(blocker)
+                        .map(|group| group.name.as_str()),
+                    _ => None,
+                };
+                label(
+                    ui,
+                    &blocker.map_or_else(
+                        || format!("Infinite graph unavailable — {reason}"),
+                        |name| format!("Infinite graph unavailable — {name} {reason}"),
+                    ),
+                );
+            } else {
+                label_dim(
+                    ui,
+                    &format!(
+                        "Infinite compatible — {} sample halo",
+                        status.operation_halo.unwrap_or(0)
+                    ),
+                );
+            }
+        } else {
+            label_dim(ui, "Infinite compatible — pending graph analysis");
+        }
+    }
     ui.separator();
 
     let tab_icons: Vec<Icon> = tabs.iter().map(|t| t.icon()).collect();

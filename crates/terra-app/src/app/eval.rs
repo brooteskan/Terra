@@ -68,6 +68,79 @@ fn terrain_tile_work_budget(
 }
 
 impl TerraApp {
+    /// Compile and validate the current graph for direct Infinite sparse-tile
+    /// execution. This is the single admission gate shared by rebuild requests
+    /// and the future #185 sparse scheduler.
+    pub(crate) fn refresh_infinite_spatial_status(&mut self) -> bool {
+        if self.session.document.infinite_settings().is_none() {
+            self.ui_state.infinite_spatial_status = None;
+            return true;
+        }
+
+        let stack = self.session.document.preview_eval_stack();
+        let masks = self.session.document.masks.clone();
+        let plan = match self.terrain_plan_cache.acquire(&stack, &masks) {
+            Ok(plan) => plan.clone(),
+            Err(diagnostics) => {
+                self.ui_state.infinite_spatial_status =
+                    Some(crate::ui::InfiniteSpatialStatus::rejected(
+                        None,
+                        terra_core::invalidation::SpatialRejectReason::UnclassifiedOperation,
+                    ));
+                self.ui_state.status = format!(
+                    "Infinite graph is unavailable: {}",
+                    diagnostics
+                        .first()
+                        .map_or_else(|| "plan compilation failed".into(), ToString::to_string)
+                );
+                return false;
+            }
+        };
+        match terra_core::terrain_plan::resolve_infinite_plan_domain(
+            &stack,
+            &masks,
+            &plan,
+            plan.final_height(),
+        ) {
+            Ok(slice) => {
+                self.ui_state.infinite_spatial_status = Some(
+                    crate::ui::InfiniteSpatialStatus::available(slice.operation_halo),
+                );
+                true
+            }
+            Err(rejection) => {
+                let reason = match rejection.reason {
+                    terra_core::terrain_plan::TerrainPlanDomainRejectReason::Infinite(reason) => {
+                        reason
+                    }
+                    terra_core::terrain_plan::TerrainPlanDomainRejectReason::GlobalAuxiliary => {
+                        terra_core::invalidation::SpatialRejectReason::GlobalAuxiliary
+                    }
+                    terra_core::terrain_plan::TerrainPlanDomainRejectReason::FullReach => {
+                        terra_core::invalidation::SpatialRejectReason::RequiresCompleteField
+                    }
+                };
+                let owner_name = match rejection.owner {
+                    Some(terra_core::deps::NodeRef::Layer(id)) => {
+                        stack.find(id).map(|layer| layer.common.name.as_str())
+                    }
+                    Some(terra_core::deps::NodeRef::Group(id)) => {
+                        stack.find_group(id).map(|group| group.name.as_str())
+                    }
+                    _ => None,
+                };
+                self.ui_state.infinite_spatial_status = Some(
+                    crate::ui::InfiniteSpatialStatus::rejected(rejection.owner, reason),
+                );
+                self.ui_state.status = owner_name.map_or_else(
+                    || format!("Infinite graph is unavailable: {reason}"),
+                    |name| format!("Infinite graph is unavailable: {name} {reason}"),
+                );
+                false
+            }
+        }
+    }
+
     pub(crate) fn note_refinement_activity(&mut self) {
         let now = Instant::now();
         self.last_refine = now;
@@ -79,6 +152,13 @@ impl TerraApp {
     }
 
     pub(crate) fn request_rebuild(&mut self) {
+        if !self.refresh_infinite_spatial_status() {
+            self.pending_eval = false;
+            self.pending_eval_immediate = false;
+            self.ui_state.refining = false;
+            self.ui_state.build_progress = None;
+            return;
+        }
         self.eval_token = self.scheduler.request_rebuild();
         self.eval_worker.set_token(self.eval_token);
         self.supersede_gpu_refinement();
@@ -131,6 +211,11 @@ impl TerraApp {
     /// submitted to the existing eval worker, leaving last-good content on screen until
     /// the worker publishes its result.
     pub(crate) fn request_rebuild_immediate(&mut self) {
+        if !self.refresh_infinite_spatial_status() {
+            self.pending_eval = false;
+            self.pending_eval_immediate = false;
+            return;
+        }
         let Some(preview_resolution) = self
             .session
             .document
@@ -139,8 +224,14 @@ impl TerraApp {
         else {
             self.pending_eval = false;
             self.pending_eval_immediate = false;
-            self.ui_state.status =
-                "Infinite sparse evaluation is introduced by the next implementation slice.".into();
+            let halo = self
+                .ui_state
+                .infinite_spatial_status
+                .and_then(|status| status.operation_halo)
+                .unwrap_or(0);
+            self.ui_state.status = format!(
+                "Infinite graph is compatible (required halo: {halo} samples); sparse evaluation is introduced by the next implementation slice."
+            );
             return;
         };
         // Cancel any in-flight CPU job so a late Full result cannot pop the viewport.
@@ -2586,6 +2677,43 @@ mod tests {
         gpu_evaluation_trace_context, terrain_tile_work_budget, uv_to_texel_rect,
         DeferredFullField, TerraApp,
     };
+
+    #[test]
+    fn compatible_infinite_graph_publishes_machine_readable_halo() {
+        let mut app = TerraApp::default();
+        app.session.document = terra_core::document::TerrainDocument::new_infinite(
+            terra_core::document::InfiniteProceduralWorldSettings::default(),
+        )
+        .unwrap();
+
+        assert!(app.refresh_infinite_spatial_status());
+        let status = app.ui_state.infinite_spatial_status.unwrap();
+        assert_eq!(status.operation_halo, Some(0));
+        assert!(status.reason.is_none());
+    }
+
+    #[test]
+    fn unsupported_infinite_graph_is_rejected_before_scheduling() {
+        let mut app = TerraApp::default();
+        app.session.document = terra_core::document::TerrainDocument::new_infinite(
+            terra_core::document::InfiniteProceduralWorldSettings::default(),
+        )
+        .unwrap();
+        app.session.document.stack.push_into_category(Layer::new(
+            "Basin",
+            LayerKind::RiverCarve(Default::default()),
+        ));
+
+        app.request_rebuild();
+
+        assert!(!app.pending_eval);
+        assert!(!app.pending_eval_immediate);
+        assert_eq!(
+            app.ui_state.infinite_spatial_status.unwrap().reason,
+            Some(terra_core::invalidation::SpatialRejectReason::BasinDependent)
+        );
+        assert!(app.ui_state.status.contains("Basin"));
+    }
 
     fn flat(height: f32) -> Layer {
         Layer::new("Flat", LayerKind::Flat(FlatParams { height }))

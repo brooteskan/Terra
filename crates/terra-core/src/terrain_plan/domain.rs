@@ -1,7 +1,9 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::deps::NodeRef;
-use crate::invalidation::{AuxReach, Reach};
+use crate::invalidation::{AuxReach, Reach, SpatialRejectReason};
+use crate::layer::LayerStack;
+use crate::mask::MaskAsset;
 
 use super::{CompiledTerrainPlan, FieldSlot, LogicalFieldKind, PlanInvalidation, PlanOpId};
 
@@ -9,6 +11,7 @@ use super::{CompiledTerrainPlan, FieldSlot, LogicalFieldKind, PlanInvalidation, 
 pub enum TerrainPlanDomainRejectReason {
     FullReach,
     GlobalAuxiliary,
+    Infinite(SpatialRejectReason),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -262,6 +265,67 @@ pub fn resolve_plan_domain(
     plan: &CompiledTerrainPlan,
     output: FieldSlot,
 ) -> Result<TerrainPlanDomainSlice, TerrainPlanDomainRejection> {
+    resolve_plan_domain_with(plan, output, |plan, producer, field| {
+        let operation = plan.operation(producer).expect("validated plan operation");
+        if matches!(
+            plan.field(field).map(|field| &field.kind),
+            Some(LogicalFieldKind::Auxiliary(_))
+        ) && operation.aux_reach == AuxReach::Global
+        {
+            Some(TerrainPlanDomainRejectReason::GlobalAuxiliary)
+        } else if operation.reach == Reach::Full {
+            Some(TerrainPlanDomainRejectReason::FullReach)
+        } else {
+            None
+        }
+    })
+}
+
+/// Resolve the direct sparse-tile slice required for an Infinite project.
+///
+/// Unlike bounded execution, this never creates a complete-field checkpoint:
+/// every live dependency must declare a direct Infinite capability and a finite
+/// [`Reach`].
+pub fn resolve_infinite_plan_domain(
+    stack: &LayerStack,
+    mask_assets: &[MaskAsset],
+    plan: &CompiledTerrainPlan,
+    output: FieldSlot,
+) -> Result<TerrainPlanDomainSlice, TerrainPlanDomainRejection> {
+    resolve_plan_domain_with(plan, output, |plan, producer, field| {
+        let operation = plan.operation(producer).expect("validated plan operation");
+        if matches!(
+            plan.field(field).map(|field| &field.kind),
+            Some(LogicalFieldKind::Auxiliary(_))
+        ) && operation.aux_reach == AuxReach::Global
+        {
+            return Some(TerrainPlanDomainRejectReason::Infinite(
+                SpatialRejectReason::GlobalAuxiliary,
+            ));
+        }
+        let Some(contract) = super::operation_spatial_contract(stack, mask_assets, plan, producer)
+        else {
+            return Some(TerrainPlanDomainRejectReason::Infinite(
+                SpatialRejectReason::UnclassifiedOperation,
+            ));
+        };
+        if let Some(reason) = contract.infinite.rejection() {
+            return Some(TerrainPlanDomainRejectReason::Infinite(reason));
+        }
+        if contract.reach == Reach::Full {
+            return Some(TerrainPlanDomainRejectReason::Infinite(
+                SpatialRejectReason::RequiresCompleteField,
+            ));
+        }
+        None
+    })
+}
+
+fn resolve_plan_domain_with(
+    plan: &CompiledTerrainPlan,
+    output: FieldSlot,
+    reject: impl Fn(&CompiledTerrainPlan, PlanOpId, FieldSlot) -> Option<TerrainPlanDomainRejectReason>,
+) -> Result<TerrainPlanDomainSlice, TerrainPlanDomainRejection> {
     let mut required = HashMap::<FieldSlot, u32>::new();
     let mut pending = VecDeque::from([(output, 0u32)]);
     let mut selected = HashSet::new();
@@ -281,16 +345,12 @@ pub fn resolve_plan_domain(
             .producer_of(field)
             .expect("validated plan fields have producers");
         let operation = plan.operation(producer).expect("validated plan operation");
-        if matches!(
-            plan.field(field).map(|field| &field.kind),
-            Some(LogicalFieldKind::Auxiliary(_))
-        ) && operation.aux_reach == AuxReach::Global
-        {
+        if let Some(reason) = reject(plan, producer, field) {
             return Err(TerrainPlanDomainRejection {
                 operation: producer,
                 owner: plan.provenance().owner_of(producer),
                 field,
-                reason: TerrainPlanDomainRejectReason::GlobalAuxiliary,
+                reason,
             });
         }
         let input_halo = match operation.reach {
@@ -329,6 +389,19 @@ mod tests {
         LogicalFieldKind, PlanOrigin, PlanStructureRevision, SeedSource, TerrainOp, TerrainOpKind,
         TerrainPlanBuilder, TerrainPlanStamp,
     };
+
+    fn infinite_fixture_stack() -> crate::layer::LayerStack {
+        let mut first =
+            crate::layer::Layer::new("first", crate::layer::LayerKind::Flat(Default::default()));
+        first.common.id = LayerId::from_u128(1);
+        let mut second =
+            crate::layer::Layer::new("second", crate::layer::LayerKind::Flat(Default::default()));
+        second.common.id = LayerId::from_u128(2);
+        let mut stack = crate::layer::LayerStack::new();
+        stack.push(first);
+        stack.push(second);
+        stack
+    }
 
     fn local_chain(second: Reach, aux_reach: AuxReach, consume_aux: bool) -> CompiledTerrainPlan {
         let first_owner = LayerId::from_u128(1);
@@ -414,6 +487,22 @@ mod tests {
         assert_eq!(
             rejection.reason,
             TerrainPlanDomainRejectReason::GlobalAuxiliary
+        );
+    }
+
+    #[test]
+    fn infinite_consumed_global_auxiliary_has_project_reason() {
+        let plan = local_chain(Reach::LOCAL, AuxReach::Global, true);
+        let rejection = resolve_infinite_plan_domain(
+            &infinite_fixture_stack(),
+            &[],
+            &plan,
+            plan.final_height(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            rejection.reason,
+            TerrainPlanDomainRejectReason::Infinite(SpatialRejectReason::GlobalAuxiliary)
         );
     }
 

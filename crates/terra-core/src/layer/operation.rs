@@ -518,6 +518,77 @@ impl LayerKind {
         }
     }
 
+    /// Whether this configured kernel has a proven sparse Infinite-world
+    /// evaluation contract. This is deliberately narrower than `Local` dirty
+    /// reach: authored rasters and kernels still using bounded UV coordinates
+    /// must not be admitted merely because their stencil is local.
+    pub fn infinite_capability(&self) -> crate::invalidation::InfiniteOperationCapability {
+        use crate::invalidation::{InfiniteOperationCapability as Capability, SpatialRejectReason};
+
+        match self {
+            LayerKind::Flat(_)
+            | LayerKind::NoiseValue(_)
+            | LayerKind::NoisePerlin(_)
+            | LayerKind::NoiseOpenSimplex(_)
+            | LayerKind::NoiseWorley(_)
+            | LayerKind::Fbm(_)
+            | LayerKind::Ridged(_)
+            | LayerKind::Blur(_) => Capability::Direct,
+
+            LayerKind::Terrace(_) => {
+                Capability::Unsupported(SpatialRejectReason::FullFieldNormalization)
+            }
+
+            LayerKind::ThermalErosion(_)
+            | LayerKind::HydraulicErosion(_)
+            | LayerKind::DebrisFlow(_)
+            | LayerKind::SandSimulation(_)
+            | LayerKind::FluidSimulation(_)
+            | LayerKind::GradientReconstruct(_)
+            | LayerKind::LandscapeEvolution(_)
+            | LayerKind::HydrologyRepair(_)
+            | LayerKind::GeomorphicDetail(_)
+            | LayerKind::Biomes(_)
+            | LayerKind::Vegetation(_)
+            | LayerKind::StreamPowerErosion(_)
+            | LayerKind::MultiScaleAmplify(_)
+            | LayerKind::RiverCarve(_)
+            | LayerKind::RiverNetwork(_)
+            | LayerKind::Dunes(_) => Capability::Unsupported(SpatialRejectReason::BasinDependent),
+
+            LayerKind::SculptBase(_)
+            | LayerKind::SculptStrokes(_)
+            | LayerKind::TerrainConstraints(_)
+            | LayerKind::ImportHeightmap(_)
+            | LayerKind::ProceduralShape(_)
+            | LayerKind::Stamp2d(_)
+            | LayerKind::Stamp3d(_)
+            | LayerKind::PolygonHeight(_)
+            | LayerKind::Path(_)
+            | LayerKind::OverhangStamp(_)
+            | LayerKind::LocalSdf(_) => {
+                Capability::Unsupported(SpatialRejectReason::BoundedAuthoredData)
+            }
+
+            LayerKind::Ramp(_)
+            | LayerKind::DomainWarp(_)
+            | LayerKind::Mesa(_)
+            | LayerKind::Island(_)
+            | LayerKind::Mountains(_)
+            | LayerKind::Volcano(_)
+            | LayerKind::Uplift(_)
+            | LayerKind::Canyons(_)
+            | LayerKind::VoronoiRegions(_)
+            | LayerKind::Plateau(_)
+            | LayerKind::Coastal(_)
+            | LayerKind::Materials(_)
+            | LayerKind::EffectFilter(_)
+            | LayerKind::EcosystemFeedback(_) => {
+                Capability::Unsupported(SpatialRejectReason::MissingDomainCoordinateContract)
+            }
+        }
+    }
+
     /// How this layer's published auxiliary fields behave under a localized edit.
     ///
     /// Exhaustive; see [`AuxReach`]. `PerTexel` aux (max-merged stamp footprints,

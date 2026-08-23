@@ -141,8 +141,10 @@ fn execute_command(
     }
 
     match id {
-        CommandId::ADD_MOUNTAIN => add_catalog_layer("shape.procedural", actions),
-        CommandId::ADD_HYDRAULIC_EROSION => add_catalog_layer("sim.hydraulic", actions),
+        CommandId::ADD_MOUNTAIN => add_catalog_layer("shape.procedural", doc, ui_state, actions),
+        CommandId::ADD_HYDRAULIC_EROSION => {
+            add_catalog_layer("sim.hydraulic", doc, ui_state, actions)
+        }
         CommandId::FRAME_TERRAIN => actions.push(PaletteAction::CameraReset),
         CommandId::TOP_VIEW => actions.push(PaletteAction::CameraTopView),
         CommandId::FRAME_SELECTION => actions.push(PaletteAction::CameraFrameSelection),
@@ -205,12 +207,24 @@ fn execute_command(
     }
 }
 
-fn add_catalog_layer(id: &str, actions: &mut Vec<PaletteAction>) {
+fn add_catalog_layer(
+    id: &str,
+    doc: &terra_core::document::TerrainDocument,
+    ui_state: &mut UiState,
+    actions: &mut Vec<PaletteAction>,
+) {
     if let Some(tool) = all_tools_cached()
         .iter()
         .find(|tool| tool.id == id)
         .cloned()
     {
+        if let Some(reason) = crate::ui::tool_catalog::tool_infinite_rejection(doc, &tool) {
+            ui_state.status = format!(
+                "{} is unavailable in Infinite projects: {reason}",
+                tool.label
+            );
+            return;
+        }
         match tool.action {
             ToolAction::AddLayer { name, kind } => {
                 let layer = instantiate_layer_preset(name, &kind);
