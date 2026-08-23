@@ -9,7 +9,7 @@
     "minimumTokens": 100,
     "auditCycle": "A5-2026-08"
   },
-  "duplicatedProductionLines": 994,
+  "duplicatedProductionLines": 607,
   "clones": [
     {
       "fingerprint": "00e7e57c97d27cdb0a91a6ae",
@@ -126,44 +126,6 @@
       ]
     },
     {
-      "fingerprint": "1f53232972cf575d8a305b95",
-      "lines": 18,
-      "tokens": 134,
-      "occurrences": [
-        {
-          "path": "crates/terra-core/src/analyze/erosion.rs",
-          "symbol": "fn thermal_erode_height_only",
-          "startLine": 77,
-          "endLine": 94
-        },
-        {
-          "path": "crates/terra-core/src/analyze/erosion.rs",
-          "symbol": "fn thermal_erode_with_strata_ex",
-          "startLine": 215,
-          "endLine": 232
-        }
-      ]
-    },
-    {
-      "fingerprint": "25496917e3539df2afabe99c",
-      "lines": 15,
-      "tokens": 100,
-      "occurrences": [
-        {
-          "path": "crates/terra-core/src/analyze/erosion.rs",
-          "symbol": "fn thermal_erode_height_only",
-          "startLine": 96,
-          "endLine": 110
-        },
-        {
-          "path": "crates/terra-core/src/analyze/erosion.rs",
-          "symbol": "fn thermal_erode_with_strata_ex",
-          "startLine": 241,
-          "endLine": 255
-        }
-      ]
-    },
-    {
       "fingerprint": "377a77cc7b3bcaa8d6f84f4c",
       "lines": 14,
       "tokens": 109,
@@ -198,25 +160,6 @@
           "symbol": "fn normalize_mask",
           "startLine": 574,
           "endLine": 590
-        }
-      ]
-    },
-    {
-      "fingerprint": "4c87b6f839357deb8922169b",
-      "lines": 46,
-      "tokens": 299,
-      "occurrences": [
-        {
-          "path": "crates/terra-gui/src/widgets.rs",
-          "symbol": "fn combo",
-          "startLine": 919,
-          "endLine": 964
-        },
-        {
-          "path": "crates/terra-gui/src/widgets.rs",
-          "symbol": "fn combo_in_rect",
-          "startLine": 987,
-          "endLine": 1032
         }
       ]
     },
@@ -259,25 +202,6 @@
       ]
     },
     {
-      "fingerprint": "55a31f2ac893759067b693ed",
-      "lines": 19,
-      "tokens": 120,
-      "occurrences": [
-        {
-          "path": "crates/terra-app/src/ui/project_home_gui.rs",
-          "symbol": "fn draw_setting_row",
-          "startLine": 1691,
-          "endLine": 1709
-        },
-        {
-          "path": "crates/terra-gui/src/widgets.rs",
-          "symbol": "fn slider_inner",
-          "startLine": 695,
-          "endLine": 713
-        }
-      ]
-    },
-    {
       "fingerprint": "58f18480c741a90604ef0c7c",
       "lines": 15,
       "tokens": 108,
@@ -285,14 +209,14 @@
         {
           "path": "crates/terra-core/src/generators/filter_kernels/mod.rs",
           "symbol": "fn phasor_noise_oriented",
-          "startLine": 446,
-          "endLine": 460
+          "startLine": 434,
+          "endLine": 448
         },
         {
           "path": "crates/terra-core/src/generators/filter_kernels/mod.rs",
           "symbol": "fn sparse_gabor_oriented",
-          "startLine": 334,
-          "endLine": 348
+          "startLine": 322,
+          "endLine": 336
         }
       ]
     },
@@ -312,25 +236,6 @@
           "symbol": "fn new",
           "startLine": 220,
           "endLine": 232
-        }
-      ]
-    },
-    {
-      "fingerprint": "595737bdbd97503979799e72",
-      "lines": 43,
-      "tokens": 170,
-      "occurrences": [
-        {
-          "path": "crates/terra-app/src/ui/presets.rs",
-          "symbol": "fn builtin_presets",
-          "startLine": 1624,
-          "endLine": 1666
-        },
-        {
-          "path": "crates/terra-app/src/ui/recipe.rs",
-          "symbol": "fn builtin_recipes",
-          "startLine": 162,
-          "endLine": 204
         }
       ]
     },
@@ -392,44 +297,6 @@
       ]
     },
     {
-      "fingerprint": "6864046bc9565d57eabefc8d",
-      "lines": 18,
-      "tokens": 135,
-      "occurrences": [
-        {
-          "path": "crates/terra-core/src/generators/filter_kernels/mod.rs",
-          "symbol": "fn box_blur",
-          "startLine": 120,
-          "endLine": 137
-        },
-        {
-          "path": "crates/terra-core/src/mask_execution/dist_nodes.rs",
-          "symbol": "fn box_blur",
-          "startLine": 791,
-          "endLine": 808
-        }
-      ]
-    },
-    {
-      "fingerprint": "6c5fdec08bc10ad27f781b90",
-      "lines": 28,
-      "tokens": 145,
-      "occurrences": [
-        {
-          "path": "crates/terra-gui/src/scroll.rs",
-          "symbol": "fn scrollbar_x",
-          "startLine": 197,
-          "endLine": 224
-        },
-        {
-          "path": "crates/terra-gui/src/scroll.rs",
-          "symbol": "fn scrollbar_y",
-          "startLine": 70,
-          "endLine": 97
-        }
-      ]
-    },
-    {
       "fingerprint": "73a6ff4cdc6a848b5dfef059",
       "lines": 14,
       "tokens": 102,
@@ -445,25 +312,6 @@
           "symbol": "fn icon_toggle",
           "startLine": 281,
           "endLine": 294
-        }
-      ]
-    },
-    {
-      "fingerprint": "79f9a15885b62b7a3ec6b547",
-      "lines": 28,
-      "tokens": 150,
-      "occurrences": [
-        {
-          "path": "crates/terra-gpu/src/derivatives.rs",
-          "symbol": "fn run_derivative_gpu",
-          "startLine": 64,
-          "endLine": 91
-        },
-        {
-          "path": "crates/terra-gpu/src/tile_cache.rs",
-          "symbol": "fn new",
-          "startLine": 269,
-          "endLine": 295
         }
       ]
     },
@@ -487,25 +335,6 @@
       ]
     },
     {
-      "fingerprint": "80c9793efa5ad5b14965b6cb",
-      "lines": 46,
-      "tokens": 178,
-      "occurrences": [
-        {
-          "path": "crates/terra-gpu-eval/src/engine/pipelines/sculpt.rs",
-          "symbol": "fn stroke_runtime_buffers",
-          "startLine": 161,
-          "endLine": 206
-        },
-        {
-          "path": "crates/terra-gpu-eval/src/engine/pipelines/sculpt.rs",
-          "symbol": "fn stroke_runtime_buffers",
-          "startLine": 207,
-          "endLine": 252
-        }
-      ]
-    },
-    {
       "fingerprint": "822c6cd253f336771a9dee39",
       "lines": 13,
       "tokens": 113,
@@ -525,25 +354,6 @@
       ]
     },
     {
-      "fingerprint": "8450edd1b8574e97a707cc85",
-      "lines": 24,
-      "tokens": 174,
-      "occurrences": [
-        {
-          "path": "crates/terra-core/src/analyze/erosion.rs",
-          "symbol": "fn thermal_erode_height_only",
-          "startLine": 49,
-          "endLine": 72
-        },
-        {
-          "path": "crates/terra-core/src/analyze/erosion.rs",
-          "symbol": "fn thermal_erode_with_strata_ex",
-          "startLine": 188,
-          "endLine": 211
-        }
-      ]
-    },
-    {
       "fingerprint": "84ada1d3605db88a7f63f0ce",
       "lines": 16,
       "tokens": 173,
@@ -551,8 +361,8 @@
         {
           "path": "crates/terra-core/src/generators/filter_kernels/mod.rs",
           "symbol": "fn anisotropic_blur",
-          "startLine": 188,
-          "endLine": 203
+          "startLine": 176,
+          "endLine": 191
         },
         {
           "path": "crates/terra-core/src/generators/morphology.rs",
@@ -570,14 +380,14 @@
         {
           "path": "crates/terra-core/src/generators/filter_kernels/mod.rs",
           "symbol": "fn phasor_noise_fbm",
-          "startLine": 506,
-          "endLine": 524
+          "startLine": 494,
+          "endLine": 512
         },
         {
           "path": "crates/terra-core/src/generators/filter_kernels/mod.rs",
           "symbol": "fn sparse_gabor_fbm",
-          "startLine": 402,
-          "endLine": 420
+          "startLine": 390,
+          "endLine": 408
         }
       ]
     },
@@ -601,25 +411,6 @@
       ]
     },
     {
-      "fingerprint": "96c2e11ce42cca5a4a23e6fe",
-      "lines": 34,
-      "tokens": 199,
-      "occurrences": [
-        {
-          "path": "crates/terra-gpu/src/derivatives.rs",
-          "symbol": "fn run_derivative_gpu",
-          "startLine": 56,
-          "endLine": 89
-        },
-        {
-          "path": "crates/terra-gpu/src/tile_cache.rs",
-          "symbol": "fn new",
-          "startLine": 261,
-          "endLine": 294
-        }
-      ]
-    },
-    {
       "fingerprint": "98a0ed6de3e6db8bcf773c9b",
       "lines": 13,
       "tokens": 128,
@@ -633,8 +424,8 @@
         {
           "path": "crates/terra-app/src/ui/project_home_gui.rs",
           "symbol": "fn draw_discard_confirm",
-          "startLine": 1866,
-          "endLine": 1878
+          "startLine": 1745,
+          "endLine": 1757
         }
       ]
     },
@@ -673,25 +464,6 @@
           "symbol": "fn spatial_dependency",
           "startLine": 396,
           "endLine": 410
-        }
-      ]
-    },
-    {
-      "fingerprint": "a24155ae5b598b84f480d717",
-      "lines": 28,
-      "tokens": 174,
-      "occurrences": [
-        {
-          "path": "crates/terra-gpu/src/derivatives.rs",
-          "symbol": "fn run_derivative_gpu",
-          "startLine": 56,
-          "endLine": 83
-        },
-        {
-          "path": "crates/terra-render/src/height_gpu.rs",
-          "symbol": "fn new",
-          "startLine": 250,
-          "endLine": 277
         }
       ]
     },
@@ -874,14 +646,14 @@
         {
           "path": "crates/terra-gpu/src/derivatives.rs",
           "symbol": "fn create_r32_texture",
-          "startLine": 206,
-          "endLine": 218
+          "startLine": 176,
+          "endLine": 188
         },
         {
           "path": "crates/terra-gpu/src/derivatives.rs",
           "symbol": "fn create_r32_texture_storage",
-          "startLine": 225,
-          "endLine": 237
+          "startLine": 195,
+          "endLine": 207
         }
       ]
     },
@@ -905,25 +677,6 @@
       ]
     },
     {
-      "fingerprint": "f59b2a39594c276de2a98d85",
-      "lines": 29,
-      "tokens": 220,
-      "occurrences": [
-        {
-          "path": "crates/terra-app/src/ui/project_home_gui.rs",
-          "symbol": "fn draw_setting_row",
-          "startLine": 1710,
-          "endLine": 1738
-        },
-        {
-          "path": "crates/terra-gui/src/widgets.rs",
-          "symbol": "fn slider_inner",
-          "startLine": 715,
-          "endLine": 743
-        }
-      ]
-    },
-    {
       "fingerprint": "f5ec30c83ce9d2e3728674e4",
       "lines": 22,
       "tokens": 110,
@@ -931,14 +684,14 @@
         {
           "path": "crates/terra-gpu/src/tile_cache.rs",
           "symbol": "fn publish_evaluated_tile_current_at_frame",
-          "startLine": 883,
-          "endLine": 904
+          "startLine": 853,
+          "endLine": 874
         },
         {
           "path": "crates/terra-gpu/src/tile_cache.rs",
           "symbol": "fn publish_pyramid_tile_with_identity",
-          "startLine": 733,
-          "endLine": 754
+          "startLine": 703,
+          "endLine": 724
         }
       ]
     },
@@ -958,25 +711,6 @@
           "symbol": "fn eval_layer",
           "startLine": 527,
           "endLine": 545
-        }
-      ]
-    },
-    {
-      "fingerprint": "f963bbc7e4a2def61b1fd220",
-      "lines": 25,
-      "tokens": 143,
-      "occurrences": [
-        {
-          "path": "crates/terra-gpu/src/derivatives.rs",
-          "symbol": "fn run_derivative_gpu",
-          "startLine": 57,
-          "endLine": 81
-        },
-        {
-          "path": "crates/terra-gpu/src/pyramid.rs",
-          "symbol": "fn texture_compute_layout",
-          "startLine": 494,
-          "endLine": 518
         }
       ]
     }

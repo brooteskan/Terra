@@ -3,6 +3,31 @@
 use crate::heightfield::Heightfield;
 use crate::mask_field::MaskField;
 
+/// Clamped-window mean over a row-major scalar field.
+pub(crate) fn box_blur_clamped(input: &[f32], width: u32, height: u32, radius: u32) -> Vec<f32> {
+    assert_eq!(input.len(), width as usize * height as usize);
+    let radius = radius.max(1) as i32;
+    let width = width as i32;
+    let height = height as i32;
+    let mut output = vec![0.0; input.len()];
+    for y in 0..height {
+        for x in 0..width {
+            let mut sum = 0.0;
+            let mut count = 0u32;
+            for offset_y in -radius..=radius {
+                for offset_x in -radius..=radius {
+                    let sample_x = (x + offset_x).clamp(0, width - 1) as usize;
+                    let sample_y = (y + offset_y).clamp(0, height - 1) as usize;
+                    sum += input[sample_y * width as usize + sample_x];
+                    count += 1;
+                }
+            }
+            output[y as usize * width as usize + x as usize] = sum / count.max(1) as f32;
+        }
+    }
+    output
+}
+
 /// Slope in degrees from central differences, normalized to `[0, 1]` by `/ 90`.
 pub fn slope_degrees(hf: &Heightfield) -> MaskField {
     let m = hf.metrics;
@@ -250,5 +275,13 @@ mod tests {
         }
         let v = slope_degrees(&hf).get(16, 16);
         assert!((v - 0.5).abs() < 0.05, "slope mask {v}");
+    }
+
+    #[test]
+    fn box_blur_clamps_samples_at_edges() {
+        assert_eq!(
+            box_blur_clamped(&[0.0, 3.0, 6.0], 3, 1, 1),
+            vec![1.0, 3.0, 5.0]
+        );
     }
 }

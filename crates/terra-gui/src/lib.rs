@@ -30,5 +30,5 @@ pub use widgets::{
     chip_icon_button, collapsible_section, combo, combo_in_rect, icon_button, icon_toggle,
     inspector_tab_bar, label, label_dim, menu_button, radio_toggle, section_header,
     segmented_button, selectable, selection_card, slider_f32, slider_f32_id, slider_i32,
-    slider_i32_id, status_pill, widget_lab, WidgetLabState,
+    slider_i32_id, slider_in_rect, status_pill, widget_lab, WidgetLabState,
 };

@@ -3,6 +3,7 @@
 //! Interactive hard rules: GPU-resident heightfields, no UI-thread readback, no mesh rebuild,
 //! dirty-tile compute, incomplete GPU prefixes are never treated as finished Draft.
 
+mod binding_layout;
 pub mod compiled_plan;
 pub mod derivatives;
 pub mod effect_filter;
@@ -12,6 +13,10 @@ pub mod parity;
 pub mod pyramid;
 pub mod tile_cache;
 
+pub use binding_layout::{
+    uniform_texture_compute_layout, uniform_texture_compute_layout_entries,
+    write_storage_texture_binding,
+};
 pub use derivatives::{cpu_slope_oracle, run_derivative_gpu, GpuDerivativeMode};
 pub use graph::{
     compile_gpu_graph, expand_dirty_rect, layer_gpu_supported, GpuComputeGraph, GpuDirtyPolicy,

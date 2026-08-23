@@ -5,7 +5,7 @@
 //! `GuiContext` frame lifecycle (press edge, then hold) with no GPU and assert on
 //! `open_combo` — the persistent flag that keeps a dropdown visible across frames.
 
-use terra_gui::{combo, GuiContext, GuiInput, GuiState, Id, Rect};
+use terra_gui::{combo, combo_in_rect, GuiContext, GuiInput, GuiState, Id, Rect};
 
 const SW: f32 = 900.0;
 const SH: f32 = 700.0;
@@ -88,6 +88,26 @@ fn combo_in_window_stays_open_after_click() {
         Some(Id::new("Mode").child("combo")),
         "after clicking the field the dropdown must stay open across the frame boundary"
     );
+}
+
+#[test]
+fn rect_combo_consumes_the_same_deferred_pick_handoff() {
+    let id = Id::new("rect_combo");
+    let mut state = GuiState::default();
+    state.combo_pick = Some((id, 2));
+    let mut selected = 0;
+    let mut ctx = GuiContext::begin(SW, SH, 1.0, GuiInput::default(), &mut state);
+    let changed = combo_in_rect(
+        &mut ctx,
+        id,
+        Rect::from_pos_size(40.0, 40.0, 180.0, 28.0),
+        &mut selected,
+        &["Draft", "Full", "Export"],
+    );
+    ctx.end();
+    assert!(changed);
+    assert_eq!(selected, 2);
+    assert_eq!(state.combo_pick, None);
 }
 
 /// Control: the same combo in a plain scrolled panel (the inspector's situation).

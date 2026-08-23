@@ -688,10 +688,69 @@ fn slider_inner(
         value_w,
         ROW_H - 6.0,
     );
+    slider_in_rect_with_skin(
+        ui,
+        id,
+        rect,
+        track,
+        value_box,
+        value,
+        min,
+        max,
+        integer,
+        SliderSkin::Standard,
+    )
+}
+
+/// Slider interaction and painting in caller-provided geometry, without domain
+/// labels or layout assumptions. Intended for compact custom rows.
+#[allow(clippy::too_many_arguments)]
+pub fn slider_in_rect(
+    ui: &mut GuiContext<'_>,
+    id: Id,
+    row: Rect,
+    track: Rect,
+    value_box: Rect,
+    value: &mut f32,
+    min: f32,
+    max: f32,
+    integer: bool,
+) -> bool {
+    slider_in_rect_with_skin(
+        ui,
+        id,
+        row,
+        track,
+        value_box,
+        value,
+        min,
+        max,
+        integer,
+        SliderSkin::Compact,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum SliderSkin {
+    Standard,
+    Compact,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn slider_in_rect_with_skin(
+    ui: &mut GuiContext<'_>,
+    id: Id,
+    row: Rect,
+    track: Rect,
+    value_box: Rect,
+    value: &mut f32,
+    min: f32,
+    max: f32,
+    integer: bool,
+    skin: SliderSkin,
+) -> bool {
     let edit_id = id.child("edit");
     let editing = ui.state.text_focus == Some(edit_id);
-
-    // Value box interaction — click to edit.
     let value_hovered = ui.pointer_in(value_box);
     if value_hovered {
         ui.state.set_hot(edit_id);
@@ -709,9 +768,7 @@ fn slider_inner(
 
     let mut changed = false;
     let span = (max - min).max(1e-6);
-
     if editing {
-        // Type into buffer.
         if !ui.input.text.is_empty() {
             for ch in ui.input.text.chars() {
                 if ch.is_ascii_digit() || ch == '.' || ch == '-' {
@@ -727,12 +784,12 @@ fn slider_inner(
         let clicked_away = ui.input.primary_pressed && !value_hovered;
         if commit || clicked_away {
             if let Ok(parsed) = ui.state.text_buffer.parse::<f32>() {
-                let mut v = parsed.clamp(min, max);
+                let mut next = parsed.clamp(min, max);
                 if integer {
-                    v = v.round();
+                    next = next.round();
                 }
-                if (v - *value).abs() > 1e-6 {
-                    *value = v;
+                if (next - *value).abs() > 1e-6 {
+                    *value = next;
                     changed = true;
                 }
             }
@@ -741,9 +798,8 @@ fn slider_inner(
             ui.state.clear_text_focus();
         }
     } else {
-        // Slider drag on track area (not the value box).
         let track_hit =
-            Rect::from_min_max(track.min_x - 4.0, rect.min_y, track.max_x + 4.0, rect.max_y);
+            Rect::from_min_max(track.min_x - 4.0, row.min_y, track.max_x + 4.0, row.max_y);
         let hovered = ui.pointer_in(track_hit);
         if hovered {
             ui.state.set_hot(id);
@@ -753,21 +809,19 @@ fn slider_inner(
         }
         if ui.state.is_active(id) {
             if let Some((px, _)) = ui.input.pointer {
-                let t = ((px - track.min_x) / track.width()).clamp(0.0, 1.0);
-                let mut v = min + t * span;
+                let t = ((px - track.min_x) / track.width().max(1.0)).clamp(0.0, 1.0);
+                let mut next = min + t * span;
                 if integer {
-                    v = v.round();
+                    next = next.round();
                 }
-                if (v - *value).abs() > 1e-6 {
-                    *value = v.clamp(min, max);
+                if (next - *value).abs() > 1e-6 {
+                    *value = next.clamp(min, max);
                     changed = true;
                 }
             }
         }
     }
 
-    let t = ((*value - min) / span).clamp(0.0, 1.0);
-    // Thin track with accent fill — vertically centered in the row.
     let track_h = 4.0;
     let track_line = Rect::from_min_max(
         track.min_x,
@@ -775,8 +829,9 @@ fn slider_inner(
         track.max_x,
         track.center_y() + track_h * 0.5,
     );
+    let fraction = ((*value - min) / span).clamp(0.0, 1.0);
     ui.panel_rounded(track_line, style::TRACK_BG, track_h * 0.5);
-    let fill_w = track_line.width() * t;
+    let fill_w = track_line.width() * fraction;
     if fill_w > 0.5 {
         ui.panel_rounded(
             Rect::from_pos_size(
@@ -797,56 +852,59 @@ fn slider_inner(
         thumb_s,
         thumb_s,
     );
-    // Soft shadow disc under the knob.
-    ui.panel_rounded(
-        Rect::from_pos_size(thumb.min_x + 1.0, thumb.min_y + 1.5, thumb_s, thumb_s),
-        Color::rgba(0.0, 0.0, 0.0, 0.35),
-        thumb_s * 0.5,
-    );
-    ui.panel_rounded(
-        thumb,
-        if ui.state.is_active(id) {
-            style::THUMB_ACTIVE
-        } else {
-            style::THUMB_BG
-        },
-        thumb_s * 0.5,
-    );
+    if matches!(skin, SliderSkin::Standard) {
+        ui.panel_rounded(
+            Rect::from_pos_size(thumb.min_x + 1.0, thumb.min_y + 1.5, thumb_s, thumb_s),
+            Color::rgba(0.0, 0.0, 0.0, 0.35),
+            thumb_s * 0.5,
+        );
+    }
+    let thumb_color = if matches!(skin, SliderSkin::Standard) && ui.state.is_active(id) {
+        style::THUMB_ACTIVE
+    } else {
+        style::THUMB_BG
+    };
+    ui.panel_rounded(thumb, thumb_color, thumb_s * 0.5);
 
-    // Value box (editable).
-    ui.panel_rounded(
-        value_box,
-        if editing {
-            style::INPUT_BG
-        } else if value_hovered {
-            style::BUTTON_HOVER
-        } else {
-            style::SURFACE
-        },
-        style::RADIUS_SM,
-    );
-    let display = if editing {
+    let value_bg = match skin {
+        SliderSkin::Standard if editing => style::INPUT_BG,
+        SliderSkin::Standard if value_hovered => style::BUTTON_HOVER,
+        SliderSkin::Standard => style::SURFACE,
+        SliderSkin::Compact if editing || value_hovered => style::BUTTON_HOVER,
+        SliderSkin::Compact => style::INPUT_BG,
+    };
+    ui.panel_rounded(value_box, value_bg, style::RADIUS_SM);
+    let full = if editing {
         ui.state.text_buffer.clone()
     } else if integer {
         format!("{:.0}", *value)
     } else {
         format!("{:.2}", *value)
     };
-    let val_scale = FONT_SCALE * TYPE_LABEL;
-    let pad = style::SPACE_1;
-    let max_tw = (value_box.width() - pad * 2.0).max(0.0);
-    let full = display;
-    let truncated = DrawList::text_width(&full, val_scale) > max_tw;
-    let display = DrawList::truncate_to_width(&full, val_scale, max_tw);
-    let tw = DrawList::text_width(&display, val_scale);
+    let value_scale = match skin {
+        SliderSkin::Standard => FONT_SCALE * TYPE_LABEL,
+        SliderSkin::Compact => FONT_SCALE * 0.88,
+    };
+    let max_width = (value_box.width() - style::SPACE_1 * 2.0).max(0.0);
+    let shown = match skin {
+        SliderSkin::Standard => DrawList::truncate_to_width(&full, value_scale, max_width),
+        SliderSkin::Compact => full.clone(),
+    };
+    let text_width = DrawList::text_width(&shown, value_scale);
+    let text_y = match skin {
+        SliderSkin::Standard => {
+            font::text_top_in_row(value_box.min_y, value_box.height(), value_scale)
+        }
+        SliderSkin::Compact => value_box.min_y + (value_box.height() - 12.0) * 0.5,
+    };
     ui.label_at_raw(
-        value_box.min_x + (value_box.width() - tw).max(pad) * 0.5,
-        font::text_top_in_row(value_box.min_y, value_box.height(), val_scale),
-        &display,
+        value_box.min_x + (value_box.width() - text_width).max(style::SPACE_1) * 0.5,
+        text_y,
+        &shown,
         style::TEXT,
-        val_scale,
+        value_scale,
     );
-    if truncated && !editing && value_hovered {
+    if shown != full && !editing && value_hovered {
         ui.queue_tooltip(value_box, &full, "", None);
     }
     changed
@@ -886,20 +944,6 @@ pub fn selectable(ui: &mut GuiContext<'_>, text: &str, selected: bool) -> bool {
 
 pub fn combo(ui: &mut GuiContext<'_>, text: &str, selected: &mut usize, items: &[&str]) -> bool {
     let id = Id::new(text).child("combo");
-    let mut changed = false;
-
-    if let Some((pick_id, idx)) = ui.state.combo_pick.take() {
-        if pick_id == id {
-            if idx < items.len() && *selected != idx {
-                *selected = idx;
-                changed = true;
-            }
-        } else {
-            // Not ours — put back for another combo this frame (unlikely).
-            ui.state.combo_pick = Some((pick_id, idx));
-        }
-    }
-
     let rect = ui.allocate(style::CONTROL_ROW_H);
     let label_w = style::CONTROL_LABEL_W.min(rect.width() * 0.42).max(72.0);
     let gap = style::CONTROL_GAP;
@@ -916,55 +960,21 @@ pub fn combo(ui: &mut GuiContext<'_>, text: &str, selected: &mut usize, items: &
         rect.max_x,
         rect.max_y - 2.0,
     );
-    let hovered = ui.pointer_in(field);
-    if hovered {
-        ui.state.set_hot(id);
-    }
-    if hovered && ui.input.primary_pressed {
-        ui.state.active = Some(id);
-        if ui.state.open_combo == Some(id) {
-            ui.state.open_combo = None;
-        } else {
-            ui.state.open_combo = Some(id);
-            ui.state.combo_scroll.remove(&id.0);
-        }
-    }
-
-    let current = items.get(*selected).copied().unwrap_or("?");
-    let bg = if hovered || ui.state.open_combo == Some(id) {
-        style::BUTTON_HOVER
-    } else {
-        style::BUTTON_BG
-    };
-    ui.panel_rounded(field, bg, style::RADIUS_SM);
-    ui.label_in_rect(
-        Rect::from_pos_size(
-            field.min_x + 8.0,
-            field.min_y,
-            field.width() - 28.0,
-            field.height(),
-        ),
-        current,
-        style::TEXT,
-        FONT_SCALE,
-    );
-    ui.icon_centered(
-        Rect::from_pos_size(field.max_x - 22.0, field.min_y, 18.0, field.height()),
-        Icon::ChevronDown,
-        style::TEXT_DIM,
-        14.0,
-    );
-
-    if ui.state.open_combo == Some(id) {
-        let menu = combo_menu_rect(ui.screen_h, field, items.len());
-        ui.queue_combo_menu(id, menu, field, items, *selected);
-    }
-
-    changed
+    combo_in_rect_core(ui, id, field, selected, items)
 }
 
 /// Compact combo drawn into a fixed `field` rect (no side label) — for panel headers.
 pub fn combo_in_rect(
+    ui: &mut GuiContext<'_>,
+    id: Id,
+    field: Rect,
+    selected: &mut usize,
+    items: &[&str],
+) -> bool {
+    combo_in_rect_core(ui, id, field, selected, items)
+}
+
+fn combo_in_rect_core(
     ui: &mut GuiContext<'_>,
     id: Id,
     field: Rect,
@@ -980,6 +990,7 @@ pub fn combo_in_rect(
                 changed = true;
             }
         } else {
+            // Not ours — put back for another combo this frame (unlikely).
             ui.state.combo_pick = Some((pick_id, idx));
         }
     }

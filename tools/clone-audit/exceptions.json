@@ -102,40 +102,6 @@
     "auditCycle": "A5-2026-08"
   },
   {
-    "fingerprint": "1f53232972cf575d8a305b95",
-    "occurrences": [
-      {
-        "path": "crates/terra-core/src/analyze/erosion.rs",
-        "symbol": "fn thermal_erode_height_only"
-      },
-      {
-        "path": "crates/terra-core/src/analyze/erosion.rs",
-        "symbol": "fn thermal_erode_with_strata_ex"
-      }
-    ],
-    "rationale": "The fragments are local procedural steps whose extraction would hide surrounding state or control flow and reduce clarity.",
-    "behaviorallyEquivalent": false,
-    "invariant": "These are not intended mirrors; the owning modules' focused tests independently protect their behavior.",
-    "auditCycle": "A5-2026-08"
-  },
-  {
-    "fingerprint": "25496917e3539df2afabe99c",
-    "occurrences": [
-      {
-        "path": "crates/terra-core/src/analyze/erosion.rs",
-        "symbol": "fn thermal_erode_height_only"
-      },
-      {
-        "path": "crates/terra-core/src/analyze/erosion.rs",
-        "symbol": "fn thermal_erode_with_strata_ex"
-      }
-    ],
-    "rationale": "The fragments are local procedural steps whose extraction would hide surrounding state or control flow and reduce clarity.",
-    "behaviorallyEquivalent": false,
-    "invariant": "These are not intended mirrors; the owning modules' focused tests independently protect their behavior.",
-    "auditCycle": "A5-2026-08"
-  },
-  {
     "fingerprint": "377a77cc7b3bcaa8d6f84f4c",
     "occurrences": [
       {
@@ -162,23 +128,6 @@
       {
         "path": "crates/terra-core/src/analyze/terrain_amplification.rs",
         "symbol": "fn normalize_mask"
-      }
-    ],
-    "rationale": "The fragments are local procedural steps whose extraction would hide surrounding state or control flow and reduce clarity.",
-    "behaviorallyEquivalent": false,
-    "invariant": "These are not intended mirrors; the owning modules' focused tests independently protect their behavior.",
-    "auditCycle": "A5-2026-08"
-  },
-  {
-    "fingerprint": "4c87b6f839357deb8922169b",
-    "occurrences": [
-      {
-        "path": "crates/terra-gui/src/widgets.rs",
-        "symbol": "fn combo"
-      },
-      {
-        "path": "crates/terra-gui/src/widgets.rs",
-        "symbol": "fn combo_in_rect"
       }
     ],
     "rationale": "The fragments are local procedural steps whose extraction would hide surrounding state or control flow and reduce clarity.",
@@ -221,23 +170,6 @@
     "auditCycle": "A5-2026-08"
   },
   {
-    "fingerprint": "55a31f2ac893759067b693ed",
-    "occurrences": [
-      {
-        "path": "crates/terra-app/src/ui/project_home_gui.rs",
-        "symbol": "fn draw_setting_row"
-      },
-      {
-        "path": "crates/terra-gui/src/widgets.rs",
-        "symbol": "fn slider_inner"
-      }
-    ],
-    "rationale": "The fragments belong to separate module responsibilities; sharing this incidental shape would couple their evolution and obscure domain ownership.",
-    "behaviorallyEquivalent": false,
-    "invariant": "These are not intended mirrors; the owning modules' focused tests independently protect their behavior.",
-    "auditCycle": "A5-2026-08"
-  },
-  {
     "fingerprint": "58f18480c741a90604ef0c7c",
     "occurrences": [
       {
@@ -267,23 +199,6 @@
       }
     ],
     "rationale": "The fragments are local procedural steps whose extraction would hide surrounding state or control flow and reduce clarity.",
-    "behaviorallyEquivalent": false,
-    "invariant": "These are not intended mirrors; the owning modules' focused tests independently protect their behavior.",
-    "auditCycle": "A5-2026-08"
-  },
-  {
-    "fingerprint": "595737bdbd97503979799e72",
-    "occurrences": [
-      {
-        "path": "crates/terra-app/src/ui/presets.rs",
-        "symbol": "fn builtin_presets"
-      },
-      {
-        "path": "crates/terra-app/src/ui/recipe.rs",
-        "symbol": "fn builtin_recipes"
-      }
-    ],
-    "rationale": "The fragments belong to separate module responsibilities; sharing this incidental shape would couple their evolution and obscure domain ownership.",
     "behaviorallyEquivalent": false,
     "invariant": "These are not intended mirrors; the owning modules' focused tests independently protect their behavior.",
     "auditCycle": "A5-2026-08"
@@ -340,40 +255,6 @@
     "auditCycle": "A5-2026-08"
   },
   {
-    "fingerprint": "6864046bc9565d57eabefc8d",
-    "occurrences": [
-      {
-        "path": "crates/terra-core/src/generators/filter_kernels/mod.rs",
-        "symbol": "fn box_blur"
-      },
-      {
-        "path": "crates/terra-core/src/mask_execution/dist_nodes.rs",
-        "symbol": "fn box_blur"
-      }
-    ],
-    "rationale": "The fragments belong to separate module responsibilities; sharing this incidental shape would couple their evolution and obscure domain ownership.",
-    "behaviorallyEquivalent": false,
-    "invariant": "These are not intended mirrors; the owning modules' focused tests independently protect their behavior.",
-    "auditCycle": "A5-2026-08"
-  },
-  {
-    "fingerprint": "6c5fdec08bc10ad27f781b90",
-    "occurrences": [
-      {
-        "path": "crates/terra-gui/src/scroll.rs",
-        "symbol": "fn scrollbar_x"
-      },
-      {
-        "path": "crates/terra-gui/src/scroll.rs",
-        "symbol": "fn scrollbar_y"
-      }
-    ],
-    "rationale": "The fragments are local procedural steps whose extraction would hide surrounding state or control flow and reduce clarity.",
-    "behaviorallyEquivalent": false,
-    "invariant": "These are not intended mirrors; the owning modules' focused tests independently protect their behavior.",
-    "auditCycle": "A5-2026-08"
-  },
-  {
     "fingerprint": "73a6ff4cdc6a848b5dfef059",
     "occurrences": [
       {
@@ -386,23 +267,6 @@
       }
     ],
     "rationale": "The fragments are local procedural steps whose extraction would hide surrounding state or control flow and reduce clarity.",
-    "behaviorallyEquivalent": false,
-    "invariant": "These are not intended mirrors; the owning modules' focused tests independently protect their behavior.",
-    "auditCycle": "A5-2026-08"
-  },
-  {
-    "fingerprint": "79f9a15885b62b7a3ec6b547",
-    "occurrences": [
-      {
-        "path": "crates/terra-gpu/src/derivatives.rs",
-        "symbol": "fn run_derivative_gpu"
-      },
-      {
-        "path": "crates/terra-gpu/src/tile_cache.rs",
-        "symbol": "fn new"
-      }
-    ],
-    "rationale": "The fragments belong to separate module responsibilities; sharing this incidental shape would couple their evolution and obscure domain ownership.",
     "behaviorallyEquivalent": false,
     "invariant": "These are not intended mirrors; the owning modules' focused tests independently protect their behavior.",
     "auditCycle": "A5-2026-08"
@@ -425,23 +289,6 @@
     "auditCycle": "A5-2026-08"
   },
   {
-    "fingerprint": "80c9793efa5ad5b14965b6cb",
-    "occurrences": [
-      {
-        "path": "crates/terra-gpu-eval/src/engine/pipelines/sculpt.rs",
-        "symbol": "fn stroke_runtime_buffers"
-      },
-      {
-        "path": "crates/terra-gpu-eval/src/engine/pipelines/sculpt.rs",
-        "symbol": "fn stroke_runtime_buffers"
-      }
-    ],
-    "rationale": "The fragments are local procedural steps whose extraction would hide surrounding state or control flow and reduce clarity.",
-    "behaviorallyEquivalent": false,
-    "invariant": "These are not intended mirrors; the owning modules' focused tests independently protect their behavior.",
-    "auditCycle": "A5-2026-08"
-  },
-  {
     "fingerprint": "822c6cd253f336771a9dee39",
     "occurrences": [
       {
@@ -451,23 +298,6 @@
       {
         "path": "crates/terra-core/src/analyze/level_step.rs",
         "symbol": "fn hydraulic_erode_leveled_with_fields"
-      }
-    ],
-    "rationale": "The fragments are local procedural steps whose extraction would hide surrounding state or control flow and reduce clarity.",
-    "behaviorallyEquivalent": false,
-    "invariant": "These are not intended mirrors; the owning modules' focused tests independently protect their behavior.",
-    "auditCycle": "A5-2026-08"
-  },
-  {
-    "fingerprint": "8450edd1b8574e97a707cc85",
-    "occurrences": [
-      {
-        "path": "crates/terra-core/src/analyze/erosion.rs",
-        "symbol": "fn thermal_erode_height_only"
-      },
-      {
-        "path": "crates/terra-core/src/analyze/erosion.rs",
-        "symbol": "fn thermal_erode_with_strata_ex"
       }
     ],
     "rationale": "The fragments are local procedural steps whose extraction would hide surrounding state or control flow and reduce clarity.",
@@ -527,23 +357,6 @@
     "auditCycle": "A5-2026-08"
   },
   {
-    "fingerprint": "96c2e11ce42cca5a4a23e6fe",
-    "occurrences": [
-      {
-        "path": "crates/terra-gpu/src/derivatives.rs",
-        "symbol": "fn run_derivative_gpu"
-      },
-      {
-        "path": "crates/terra-gpu/src/tile_cache.rs",
-        "symbol": "fn new"
-      }
-    ],
-    "rationale": "The fragments belong to separate module responsibilities; sharing this incidental shape would couple their evolution and obscure domain ownership.",
-    "behaviorallyEquivalent": false,
-    "invariant": "These are not intended mirrors; the owning modules' focused tests independently protect their behavior.",
-    "auditCycle": "A5-2026-08"
-  },
-  {
     "fingerprint": "98a0ed6de3e6db8bcf773c9b",
     "occurrences": [
       {
@@ -590,23 +403,6 @@
       }
     ],
     "rationale": "The fragments are local procedural steps whose extraction would hide surrounding state or control flow and reduce clarity.",
-    "behaviorallyEquivalent": false,
-    "invariant": "These are not intended mirrors; the owning modules' focused tests independently protect their behavior.",
-    "auditCycle": "A5-2026-08"
-  },
-  {
-    "fingerprint": "a24155ae5b598b84f480d717",
-    "occurrences": [
-      {
-        "path": "crates/terra-gpu/src/derivatives.rs",
-        "symbol": "fn run_derivative_gpu"
-      },
-      {
-        "path": "crates/terra-render/src/height_gpu.rs",
-        "symbol": "fn new"
-      }
-    ],
-    "rationale": "The fragments belong to separate module responsibilities; sharing this incidental shape would couple their evolution and obscure domain ownership.",
     "behaviorallyEquivalent": false,
     "invariant": "These are not intended mirrors; the owning modules' focused tests independently protect their behavior.",
     "auditCycle": "A5-2026-08"
@@ -799,23 +595,6 @@
     "auditCycle": "A5-2026-08"
   },
   {
-    "fingerprint": "f59b2a39594c276de2a98d85",
-    "occurrences": [
-      {
-        "path": "crates/terra-app/src/ui/project_home_gui.rs",
-        "symbol": "fn draw_setting_row"
-      },
-      {
-        "path": "crates/terra-gui/src/widgets.rs",
-        "symbol": "fn slider_inner"
-      }
-    ],
-    "rationale": "The fragments belong to separate module responsibilities; sharing this incidental shape would couple their evolution and obscure domain ownership.",
-    "behaviorallyEquivalent": false,
-    "invariant": "These are not intended mirrors; the owning modules' focused tests independently protect their behavior.",
-    "auditCycle": "A5-2026-08"
-  },
-  {
     "fingerprint": "f5ec30c83ce9d2e3728674e4",
     "occurrences": [
       {
@@ -842,23 +621,6 @@
       {
         "path": "crates/terra-gpu-eval/src/engine/pipelines/dispatch.rs",
         "symbol": "fn eval_layer"
-      }
-    ],
-    "rationale": "The fragments belong to separate module responsibilities; sharing this incidental shape would couple their evolution and obscure domain ownership.",
-    "behaviorallyEquivalent": false,
-    "invariant": "These are not intended mirrors; the owning modules' focused tests independently protect their behavior.",
-    "auditCycle": "A5-2026-08"
-  },
-  {
-    "fingerprint": "f963bbc7e4a2def61b1fd220",
-    "occurrences": [
-      {
-        "path": "crates/terra-gpu/src/derivatives.rs",
-        "symbol": "fn run_derivative_gpu"
-      },
-      {
-        "path": "crates/terra-gpu/src/pyramid.rs",
-        "symbol": "fn texture_compute_layout"
       }
     ],
     "rationale": "The fragments belong to separate module responsibilities; sharing this incidental shape would couple their evolution and obscure domain ownership.",

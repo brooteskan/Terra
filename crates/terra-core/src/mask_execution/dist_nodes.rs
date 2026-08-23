@@ -785,26 +785,13 @@ fn apply_effect(kind: &DistNodeKind, input: &MaskField, opacity: f32) -> MaskFie
 
 fn box_blur(input: &MaskField, radius: u32) -> MaskField {
     let metrics = input.metrics;
-    let w = metrics.width as i32;
-    let h = metrics.height as i32;
-    let r = radius as i32;
-    let mut out = MaskField::zeros(metrics);
-    for j in 0..h {
-        for i in 0..w {
-            let mut sum = 0.0f32;
-            let mut count = 0u32;
-            for dj in -r..=r {
-                for di in -r..=r {
-                    let x = (i + di).clamp(0, w - 1) as u32;
-                    let y = (j + dj).clamp(0, h - 1) as u32;
-                    sum += input.get(x, y);
-                    count += 1;
-                }
-            }
-            out.set(i as u32, j as u32, sum / count.max(1) as f32);
-        }
-    }
-    out
+    let blurred = crate::spatial_kernels::box_blur_clamped(
+        input.data(),
+        metrics.width,
+        metrics.height,
+        radius,
+    );
+    MaskField::from_raw(metrics, &blurred)
 }
 
 fn meters_to_radius_samples(metrics: HeightfieldMetrics, radius_m: f32) -> u32 {

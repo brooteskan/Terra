@@ -7,8 +7,8 @@ use std::time::{Duration, SystemTime};
 use crate::ui::style::{self, FONT_SCALE, PAD, TYPE_LABEL};
 use serde::{Deserialize, Serialize};
 use terra_gui::{
-    chip_button, chip_icon_button, icon_button, icon_toggle, segmented_button, Color, DrawList,
-    GuiContext, Icon, Id, Rect, INSET_TOP,
+    chip_button, chip_icon_button, icon_button, icon_toggle, segmented_button, slider_in_rect,
+    Color, DrawList, GuiContext, Icon, Id, Rect, INSET_TOP,
 };
 
 use crate::ui::chrome_gui::{apply_borderless_window_frame, draw_caption_controls};
@@ -1640,8 +1640,7 @@ fn paint_design_thumb(ui: &mut GuiContext<'_>, template_id: &str, thumb: Rect) {
     );
 }
 
-// egui slider-row helper: ui + layout rect/id + icon/label + value and its
-// bounds + integer flag, consumed once to draw one row. Kept flat.
+// Project-specific icon/label layout composed with terra-gui's rect slider core.
 #[allow(clippy::too_many_arguments)]
 fn draw_setting_row(
     ui: &mut GuiContext<'_>,
@@ -1685,127 +1684,7 @@ fn draw_setting_row(
         value_box.min_x - style::SPACE_3,
         row.min_y + (row.height() + 4.0) * 0.5,
     );
-
-    let edit_id = id.child("edit");
-    let editing = ui.state.text_focus == Some(edit_id);
-    let value_hovered = ui.pointer_in(value_box);
-    if value_hovered {
-        ui.state.set_hot(edit_id);
-    }
-    if value_hovered && ui.input.primary_pressed {
-        ui.state.text_focus = Some(edit_id);
-        ui.state.text_buffer = if integer {
-            format!("{:.0}", *value)
-        } else {
-            format!("{:.2}", *value)
-        };
-        ui.state.text_enter = false;
-        ui.state.active = Some(edit_id);
-    }
-
-    let mut changed = false;
-    let span = (max - min).max(1e-6);
-
-    if editing {
-        if !ui.input.text.is_empty() {
-            for ch in ui.input.text.chars() {
-                if ch.is_ascii_digit() || ch == '.' || ch == '-' {
-                    ui.state.text_buffer.push(ch);
-                }
-            }
-        }
-        if ui.input.backspace_pressed {
-            ui.state.text_buffer.pop();
-        }
-        let commit = ui.state.text_enter || ui.input.enter_pressed;
-        let cancel = ui.input.escape_pressed;
-        let clicked_away = ui.input.primary_pressed && !value_hovered;
-        if commit || clicked_away {
-            if let Ok(parsed) = ui.state.text_buffer.parse::<f32>() {
-                let mut v = parsed.clamp(min, max);
-                if integer {
-                    v = v.round();
-                }
-                if (v - *value).abs() > 1e-6 {
-                    *value = v;
-                    changed = true;
-                }
-            }
-            ui.state.clear_text_focus();
-        } else if cancel {
-            ui.state.clear_text_focus();
-        }
-    } else {
-        let track_hit =
-            Rect::from_min_max(track.min_x - 4.0, row.min_y, track.max_x + 4.0, row.max_y);
-        let hovered = ui.pointer_in(track_hit);
-        if hovered {
-            ui.state.set_hot(id);
-        }
-        if hovered && ui.input.primary_pressed {
-            ui.state.active = Some(id);
-        }
-        if ui.state.is_active(id) {
-            if let Some((px, _)) = ui.input.pointer {
-                let t = ((px - track.min_x) / track.width().max(1.0)).clamp(0.0, 1.0);
-                let mut v = min + t * span;
-                if integer {
-                    v = v.round();
-                }
-                if (v - *value).abs() > 1e-6 {
-                    *value = v.clamp(min, max);
-                    changed = true;
-                }
-            }
-        }
-    }
-
-    let t = ((*value - min) / span).clamp(0.0, 1.0);
-    ui.panel_rounded(track, style::TRACK_BG, 2.0);
-    let fill_w = track.width() * t;
-    if fill_w > 0.5 {
-        ui.panel_rounded(
-            Rect::from_pos_size(track.min_x, track.min_y, fill_w, track.height()),
-            style::ACCENT,
-            2.0,
-        );
-    }
-    let thumb_s = style::SLIDER_THUMB;
-    let thumb_x = track.min_x + fill_w - thumb_s * 0.5;
-    let thumb = Rect::from_pos_size(
-        thumb_x.clamp(track.min_x - 2.0, track.max_x - thumb_s + 2.0),
-        track.center_y() - thumb_s * 0.5,
-        thumb_s,
-        thumb_s,
-    );
-    ui.panel_rounded(thumb, style::THUMB_BG, thumb_s * 0.5);
-
-    ui.panel_rounded(
-        value_box,
-        if editing || value_hovered {
-            style::BUTTON_HOVER
-        } else {
-            style::INPUT_BG
-        },
-        style::RADIUS_SM,
-    );
-    let shown = if editing {
-        ui.state.text_buffer.clone()
-    } else if integer {
-        format!("{:.0}", *value)
-    } else {
-        format!("{:.2}", *value)
-    };
-    let tw = DrawList::text_width(&shown, FONT_SCALE * 0.88);
-    ui.label_at(
-        value_box.min_x + (value_box.width() - tw) * 0.5,
-        value_box.min_y + (value_box.height() - 12.0) * 0.5,
-        &shown,
-        style::TEXT,
-        FONT_SCALE * 0.88,
-    );
-
-    changed
+    slider_in_rect(ui, id, row, track, value_box, value, min, max, integer)
 }
 
 fn split_desc(text: &str, approx_chars: usize) -> (&str, &str) {

@@ -491,46 +491,19 @@ fn texture_compute_layout(
     label: &str,
     with_error_buffer: bool,
 ) -> wgpu::BindGroupLayout {
-    let mut entries = vec![
-        wgpu::BindGroupLayoutEntry {
-            binding: 0,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        },
-        wgpu::BindGroupLayoutEntry {
-            binding: 1,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Texture {
-                sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                view_dimension: wgpu::TextureViewDimension::D2,
-                multisampled: false,
-            },
-            count: None,
-        },
-        wgpu::BindGroupLayoutEntry {
-            binding: 2,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: if with_error_buffer {
-                wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
-                }
-            } else {
-                wgpu::BindingType::StorageTexture {
-                    access: wgpu::StorageTextureAccess::WriteOnly,
-                    format: wgpu::TextureFormat::R32Float,
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                }
-            },
-            count: None,
-        },
-    ];
+    let third_binding = if with_error_buffer {
+        wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        }
+    } else {
+        crate::write_storage_texture_binding(wgpu::TextureFormat::R32Float)
+    };
+    if !with_error_buffer {
+        return crate::uniform_texture_compute_layout(device, label, third_binding);
+    }
+    let mut entries = crate::uniform_texture_compute_layout_entries(third_binding).to_vec();
     if with_error_buffer {
         entries.push(wgpu::BindGroupLayoutEntry {
             binding: 3,

@@ -40,73 +40,10 @@ fn thermal_erode_height_only(
     p: &ThermalErosionParams,
     hardness: &MaskField,
 ) -> (Heightfield, MaskField, MaskField) {
-    let mut h = input.to_dense();
-    let w = input.metrics.width as usize;
-    let hh = input.metrics.height as usize;
-    let dx = input.metrics.dx();
-    let dz = input.metrics.dz();
-    let talus_slope = p.talus_angle_deg.to_radians().tan();
-    let strength = p.strength.clamp(0.0, 1.0);
-
-    let mut erosion = vec![0.0f32; w * hh];
-    let mut deposit = vec![0.0f32; w * hh];
-
-    let diagonal = dx.hypot(dz);
-    let neighbors = [
-        (-1i32, 0i32, dx),
-        (1, 0, dx),
-        (0, -1, dz),
-        (0, 1, dz),
-        (-1, -1, diagonal),
-        (1, -1, diagonal),
-        (-1, 1, diagonal),
-        (1, 1, diagonal),
-    ];
-
-    for _ in 0..p.iterations {
-        let src = h.clone();
-        for j in 0..hh as i32 {
-            for i in 0..w as i32 {
-                let idx = j as usize * w + i as usize;
-                let h0 = src[idx];
-                let k = hardness.get(i as u32, j as u32).clamp(0.0, 1.0);
-                let soft = 1.0 - k;
-                if soft <= 1e-6 {
-                    continue;
-                }
-                let mut deltas = Vec::with_capacity(8);
-                let mut sum = 0.0f32;
-                for &(di, dj, distance) in &neighbors {
-                    let ni = i + di;
-                    let nj = j + dj;
-                    if ni < 0 || nj < 0 || ni >= w as i32 || nj >= hh as i32 {
-                        continue;
-                    }
-                    let nidx = nj as usize * w + ni as usize;
-                    let diff = h0 - src[nidx] - talus_slope * distance;
-                    if diff > 0.0 {
-                        deltas.push((nidx, diff));
-                        sum += diff;
-                    }
-                }
-                if sum <= 0.0 {
-                    continue;
-                }
-                let move_amt = sum * strength * 0.125 * soft;
-                h[idx] -= move_amt;
-                erosion[idx] += move_amt;
-                for (nidx, diff) in deltas {
-                    let share = move_amt * (diff / sum);
-                    h[nidx] += share;
-                    deposit[nidx] += share;
-                }
-            }
-        }
-    }
-
-    let height = Heightfield::from_dense(input.metrics, &h);
-    let (e_mask, d_mask) = normalize_pair(&erosion, &deposit, input.metrics);
-    (height, e_mask, d_mask)
+    thermal_transport(input, p, |i, j, _height, potential| {
+        let softness = 1.0 - hardness.get(i, j).clamp(0.0, 1.0);
+        (softness > 1e-6).then_some(potential * softness)
+    })
 }
 
 fn strata_limited_move(
@@ -178,6 +115,27 @@ pub fn thermal_erode_with_strata_ex(
     default_hardness: f32,
     geom: &BedGeometry,
 ) -> (Heightfield, MaskField, MaskField) {
+    let metrics = input.metrics;
+    thermal_transport(input, p, |i, j, height, potential| {
+        let x = metrics.world_x(i);
+        let z = metrics.world_z(j);
+        let depth = strata_depth_m(reference.get(i, j), height, x, z, geom);
+        let stability = stability_at_strata_depth(strata, depth, default_hardness);
+        // Stable lithology resists talus motion; soft beds shed freely.
+        let mobility = (1.0 - stability * 0.85).clamp(0.05, 1.0);
+        let move_amount =
+            strata_limited_move(strata, depth, potential * mobility, default_hardness);
+        (move_amount > 1e-6).then_some(move_amount)
+    })
+}
+
+/// Deterministic Musgrave transport shared by height-map and strata policies.
+/// The monomorphized callback owns only per-cell mobility and depth limiting.
+fn thermal_transport(
+    input: &Heightfield,
+    p: &ThermalErosionParams,
+    mut move_policy: impl FnMut(u32, u32, f32, f32) -> Option<f32>,
+) -> (Heightfield, MaskField, MaskField) {
     let mut h = input.to_dense();
     let w = input.metrics.width as usize;
     let hh = input.metrics.height as usize;
@@ -185,8 +143,6 @@ pub fn thermal_erode_with_strata_ex(
     let dz = input.metrics.dz();
     let talus_slope = p.talus_angle_deg.to_radians().tan();
     let strength = p.strength.clamp(0.0, 1.0);
-    let metrics = input.metrics;
-
     let mut erosion = vec![0.0f32; w * hh];
     let mut deposit = vec![0.0f32; w * hh];
 
@@ -208,10 +164,6 @@ pub fn thermal_erode_with_strata_ex(
             for i in 0..w as i32 {
                 let idx = j as usize * w + i as usize;
                 let h0 = src[idx];
-                let x = metrics.world_x(i as u32);
-                let z = metrics.world_z(j as u32);
-                let depth = strata_depth_m(reference.get(i as u32, j as u32), h0, x, z, geom);
-                let stability = stability_at_strata_depth(strata, depth, default_hardness);
                 let mut deltas = Vec::with_capacity(8);
                 let mut sum = 0.0f32;
                 for &(di, dj, distance) in &neighbors {
@@ -230,14 +182,10 @@ pub fn thermal_erode_with_strata_ex(
                 if sum <= 0.0 {
                     continue;
                 }
-                // Stable lithology resists talus motion; soft beds shed freely.
-                let mobility = (1.0 - stability * 0.85).clamp(0.05, 1.0);
-                let erosion_potential = sum * strength * 0.125 * mobility;
-                let move_amt =
-                    strata_limited_move(strata, depth, erosion_potential, default_hardness);
-                if move_amt <= 1e-6 {
+                let Some(move_amt) = move_policy(i as u32, j as u32, h0, sum * strength * 0.125)
+                else {
                     continue;
-                }
+                };
                 h[idx] -= move_amt;
                 erosion[idx] += move_amt;
                 for (nidx, diff) in deltas {
@@ -1046,6 +994,39 @@ mod tests {
             soft_drop > 5.0,
             "soft terrain should erode: soft drop {soft_drop}"
         );
+    }
+
+    #[test]
+    fn shared_thermal_transport_is_deterministic_and_mass_conserving_for_both_policies() {
+        let metrics = HeightfieldMetrics::new(12, 12, 24.0, 24.0);
+        let mut input = Heightfield::filled(metrics, 10.0);
+        input.set(6, 6, 42.0);
+        let params = ThermalErosionParams {
+            talus_angle_deg: 22.0,
+            iterations: 12,
+            strength: 0.7,
+            layered_materials: false,
+            ..ThermalErosionParams::default()
+        };
+        let hardness = MaskField::filled(metrics, 0.25);
+        let height_a = thermal_erode_with_hardness(&input, &params, &hardness).0;
+        let height_b = thermal_erode_with_hardness(&input, &params, &hardness).0;
+        assert_eq!(height_a.to_dense(), height_b.to_dense());
+
+        let reference = MaskField::from_raw(metrics, &input.to_dense());
+        let strata = [Stratum::soft_cap(8.0), Stratum::hard_base()];
+        let strata_a = thermal_erode_with_strata(&input, &params, &reference, &strata, 0.5).0;
+        let strata_b = thermal_erode_with_strata(&input, &params, &reference, &strata, 0.5).0;
+        assert_eq!(strata_a.to_dense(), strata_b.to_dense());
+
+        let before: f32 = input.to_dense().iter().sum();
+        for output in [height_a, strata_a] {
+            let after: f32 = output.to_dense().iter().sum();
+            assert!(
+                (after - before).abs() < 1e-3,
+                "mass drift: {after} vs {before}"
+            );
+        }
     }
 
     #[test]

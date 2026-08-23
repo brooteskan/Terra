@@ -114,26 +114,14 @@ pub fn normalize_field(values: &[f32]) -> Vec<f32> {
 
 /// Box blur helper used by several filters.
 pub fn box_blur(input: &Heightfield, radius: u32) -> Heightfield {
-    let r = radius.max(1) as i32;
-    let w = input.metrics.width as i32;
-    let h = input.metrics.height as i32;
-    let mut out = input.clone();
-    for j in 0..h {
-        for i in 0..w {
-            let mut sum = 0.0f32;
-            let mut count = 0u32;
-            for dj in -r..=r {
-                for di in -r..=r {
-                    let x = (i + di).clamp(0, w - 1) as u32;
-                    let y = (j + dj).clamp(0, h - 1) as u32;
-                    sum += input.get(x, y);
-                    count += 1;
-                }
-            }
-            out.set(i as u32, j as u32, sum / count.max(1) as f32);
-        }
-    }
-    out
+    let metrics = input.metrics;
+    let blurred = crate::spatial_kernels::box_blur_clamped(
+        &input.to_dense(),
+        metrics.width,
+        metrics.height,
+        radius,
+    );
+    Heightfield::from_dense(metrics, &blurred)
 }
 
 /// Bilateral (edge-aware) filter — Tomasi & Manduchi style on heightfields.

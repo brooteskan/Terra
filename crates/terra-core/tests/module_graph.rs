@@ -238,6 +238,7 @@ const MODULE_DEPENDENCIES: &[(&str, &[&str])] = &[
             "material_schema",
             "noise",
             "raster",
+            "spatial_kernels",
         ],
     ),
     ("geology", &["noise"]),

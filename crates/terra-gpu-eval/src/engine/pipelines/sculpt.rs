@@ -159,100 +159,67 @@ impl GpuTerrainEngine {
                 runtime.uploaded_points = points;
                 runtime
             } else {
-                let header_capacity = headers
-                    .len()
-                    .max(INITIAL_STROKE_HEADER_CAPACITY)
-                    .next_power_of_two();
-                let point_capacity = points
-                    .len()
-                    .max(INITIAL_STROKE_POINT_CAPACITY)
-                    .next_power_of_two();
-                let header_bytes = bytemuck::cast_slice(&headers);
-                let point_bytes = bytemuck::cast_slice(&points);
-                self.last_eval_stats.stroke_header_upload_bytes = self
-                    .last_eval_stats
-                    .stroke_header_upload_bytes
-                    .saturating_add(header_bytes.len() as u64);
-                self.last_eval_stats.stroke_point_upload_bytes = self
-                    .last_eval_stats
-                    .stroke_point_upload_bytes
-                    .saturating_add(point_bytes.len() as u64);
-                self.last_eval_stats.stroke_payload_rebuilds = self
-                    .last_eval_stats
-                    .stroke_payload_rebuilds
-                    .saturating_add(1);
-                StrokeRuntimeBuffers {
-                    headers: make_runtime_storage_buffer(
-                        device,
-                        queue,
-                        "sculpt-stroke-headers",
-                        header_size,
-                        header_capacity,
-                        header_bytes,
-                    ),
-                    points: make_runtime_storage_buffer(
-                        device,
-                        queue,
-                        "sculpt-stroke-points",
-                        point_size,
-                        point_capacity,
-                        point_bytes,
-                    ),
-                    header_capacity,
-                    point_capacity,
-                    uploaded_headers: headers,
-                    uploaded_points: points,
-                }
+                self.rebuild_stroke_runtime_buffers(device, queue, headers, points)
             }
         } else {
-            let header_capacity = headers
-                .len()
-                .max(INITIAL_STROKE_HEADER_CAPACITY)
-                .next_power_of_two();
-            let point_capacity = points
-                .len()
-                .max(INITIAL_STROKE_POINT_CAPACITY)
-                .next_power_of_two();
-            let header_bytes = bytemuck::cast_slice(&headers);
-            let point_bytes = bytemuck::cast_slice(&points);
-            self.last_eval_stats.stroke_header_upload_bytes = self
-                .last_eval_stats
-                .stroke_header_upload_bytes
-                .saturating_add(header_bytes.len() as u64);
-            self.last_eval_stats.stroke_point_upload_bytes = self
-                .last_eval_stats
-                .stroke_point_upload_bytes
-                .saturating_add(point_bytes.len() as u64);
-            self.last_eval_stats.stroke_payload_rebuilds = self
-                .last_eval_stats
-                .stroke_payload_rebuilds
-                .saturating_add(1);
-            StrokeRuntimeBuffers {
-                headers: make_runtime_storage_buffer(
-                    device,
-                    queue,
-                    "sculpt-stroke-headers",
-                    header_size,
-                    header_capacity,
-                    header_bytes,
-                ),
-                points: make_runtime_storage_buffer(
-                    device,
-                    queue,
-                    "sculpt-stroke-points",
-                    point_size,
-                    point_capacity,
-                    point_bytes,
-                ),
-                header_capacity,
-                point_capacity,
-                uploaded_headers: headers,
-                uploaded_points: points,
-            }
+            self.rebuild_stroke_runtime_buffers(device, queue, headers, points)
         };
         let result = (runtime.headers.clone(), runtime.points.clone());
         self.stroke_runtime.insert(layer, runtime);
         result
+    }
+
+    fn rebuild_stroke_runtime_buffers(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        headers: Vec<StrokeHeaderGpu>,
+        points: Vec<[f32; 4]>,
+    ) -> StrokeRuntimeBuffers {
+        let header_capacity = headers
+            .len()
+            .max(INITIAL_STROKE_HEADER_CAPACITY)
+            .next_power_of_two();
+        let point_capacity = points
+            .len()
+            .max(INITIAL_STROKE_POINT_CAPACITY)
+            .next_power_of_two();
+        let header_bytes = bytemuck::cast_slice(&headers);
+        let point_bytes = bytemuck::cast_slice(&points);
+        self.last_eval_stats.stroke_header_upload_bytes = self
+            .last_eval_stats
+            .stroke_header_upload_bytes
+            .saturating_add(header_bytes.len() as u64);
+        self.last_eval_stats.stroke_point_upload_bytes = self
+            .last_eval_stats
+            .stroke_point_upload_bytes
+            .saturating_add(point_bytes.len() as u64);
+        self.last_eval_stats.stroke_payload_rebuilds = self
+            .last_eval_stats
+            .stroke_payload_rebuilds
+            .saturating_add(1);
+        StrokeRuntimeBuffers {
+            headers: make_runtime_storage_buffer(
+                device,
+                queue,
+                "sculpt-stroke-headers",
+                std::mem::size_of::<StrokeHeaderGpu>(),
+                header_capacity,
+                header_bytes,
+            ),
+            points: make_runtime_storage_buffer(
+                device,
+                queue,
+                "sculpt-stroke-points",
+                std::mem::size_of::<[f32; 4]>(),
+                point_capacity,
+                point_bytes,
+            ),
+            header_capacity,
+            point_capacity,
+            uploaded_headers: headers,
+            uploaded_points: points,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]

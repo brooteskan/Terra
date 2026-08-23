@@ -44,6 +44,126 @@ fn default_true() -> bool {
     true
 }
 
+pub(crate) const VALLEY_WITH_CREEKS_NAME: &str = "Valley with Creeks";
+pub(crate) const VALLEY_WITH_CREEKS_DESCRIPTION: &str =
+    "Uplift valley, guide paths, wetness-biased river carve, and ridge-spring creeks.";
+
+/// Canonical product content shared by the flat preset and grouped recipe.
+pub(crate) fn valley_with_creeks_layers() -> Vec<(String, LayerKind)> {
+    vec![
+        (
+            "Uplift".into(),
+            LayerKind::Uplift(UpliftParams {
+                amplitude: 360.0,
+                corridor_width: 0.4,
+                ..UpliftParams::default()
+            }),
+        ),
+        (
+            "Stream Power".into(),
+            LayerKind::StreamPowerErosion(StreamPowerParams {
+                iterations: 28,
+                k: 0.08,
+                dendritic_seed: 0.55,
+                level_step_strength: 1.1,
+                ..StreamPowerParams::default()
+            }),
+        ),
+        (
+            "Valley Fill".into(),
+            LayerKind::HydraulicErosion(HydraulicErosionParams::depositional()),
+        ),
+        (
+            "Guide Paths".into(),
+            LayerKind::Path(PathParams {
+                nodes: vec![
+                    PathNode {
+                        u: 0.22,
+                        v: 0.12,
+                        height: 0.0,
+                        width: 0.7,
+                    },
+                    PathNode {
+                        u: 0.42,
+                        v: 0.38,
+                        height: 0.0,
+                        width: 1.0,
+                    },
+                    PathNode {
+                        u: 0.50,
+                        v: 0.52,
+                        height: 0.0,
+                        width: 1.2,
+                    },
+                ],
+                width: 28.0,
+                falloff: 40.0,
+                height_offset: -14.0,
+                carve: true,
+                ..PathParams::default()
+            }),
+        ),
+        (
+            "River Carve".into(),
+            LayerKind::RiverCarve(RiverCarveParams {
+                accumulation_threshold: 28.0,
+                depth: 36.0,
+                width: 7.0,
+                guide: terra_core::mask::MaskSource::Wetness,
+                guide_boost: 3.5,
+                ..RiverCarveParams::default()
+            }),
+        ),
+        (
+            "Creek Network".into(),
+            LayerKind::RiverNetwork(RiverNetworkParams {
+                springs: vec![
+                    RiverNode {
+                        u: 0.22,
+                        v: 0.18,
+                        flow: 1.2,
+                        width: 1.0,
+                    },
+                    RiverNode {
+                        u: 0.78,
+                        v: 0.20,
+                        flow: 1.1,
+                        width: 0.95,
+                    },
+                    RiverNode {
+                        u: 0.35,
+                        v: 0.12,
+                        flow: 1.0,
+                        width: 0.85,
+                    },
+                    RiverNode {
+                        u: 0.62,
+                        v: 0.14,
+                        flow: 1.0,
+                        width: 0.9,
+                    },
+                ],
+                auto_generate: true,
+                max_length: 512,
+                carve_depth: 28.0,
+                valley_width: 100.0,
+                seed: 7,
+            }),
+        ),
+        (
+            "Coastal Edge".into(),
+            LayerKind::Coastal(CoastalParams {
+                sea_level: 30.0,
+                ..CoastalParams::default()
+            }),
+        ),
+        (
+            "Materials".into(),
+            LayerKind::Materials(MaterialsParams::default()),
+        ),
+    ]
+}
+
 impl GroupRecipe {
     pub fn to_group(&self) -> LayerGroup {
         if self.as_biome {
@@ -125,103 +245,9 @@ pub fn builtin_recipes() -> Vec<GroupRecipe> {
         },
         GroupRecipe {
             id: RecipeId::new(),
-            name: "Valley with Creeks".into(),
-            description:
-                "Uplift valley, guide paths, wetness-biased river carve, and ridge-spring creeks."
-                    .into(),
-            layers: vec![
-                (
-                    "Uplift".into(),
-                    LayerKind::Uplift(UpliftParams {
-                        amplitude: 360.0,
-                        corridor_width: 0.4,
-                        ..UpliftParams::default()
-                    }),
-                ),
-                (
-                    "Stream Power".into(),
-                    LayerKind::StreamPowerErosion(StreamPowerParams {
-                        iterations: 24,
-                        k: 0.08,
-                        dendritic_seed: 0.55,
-                        ..StreamPowerParams::default()
-                    }),
-                ),
-                (
-                    "Valley Fill".into(),
-                    LayerKind::HydraulicErosion(HydraulicErosionParams::depositional()),
-                ),
-                (
-                    "Guide Paths".into(),
-                    LayerKind::Path(PathParams {
-                        nodes: vec![
-                            PathNode {
-                                u: 0.22,
-                                v: 0.12,
-                                height: 0.0,
-                                width: 0.7,
-                            },
-                            PathNode {
-                                u: 0.50,
-                                v: 0.52,
-                                height: 0.0,
-                                width: 1.2,
-                            },
-                        ],
-                        width: 28.0,
-                        falloff: 40.0,
-                        height_offset: -14.0,
-                        carve: true,
-                        ..PathParams::default()
-                    }),
-                ),
-                (
-                    "River Carve".into(),
-                    LayerKind::RiverCarve(RiverCarveParams {
-                        accumulation_threshold: 28.0,
-                        depth: 36.0,
-                        width: 7.0,
-                        guide: terra_core::mask::MaskSource::Wetness,
-                        guide_boost: 3.5,
-                        ..RiverCarveParams::default()
-                    }),
-                ),
-                (
-                    "Creek Network".into(),
-                    LayerKind::RiverNetwork(RiverNetworkParams {
-                        springs: vec![
-                            RiverNode {
-                                u: 0.22,
-                                v: 0.18,
-                                flow: 1.2,
-                                width: 1.0,
-                            },
-                            RiverNode {
-                                u: 0.78,
-                                v: 0.20,
-                                flow: 1.1,
-                                width: 0.95,
-                            },
-                        ],
-                        auto_generate: true,
-                        max_length: 512,
-                        carve_depth: 28.0,
-                        valley_width: 100.0,
-                        seed: 7,
-                    }),
-                ),
-                (
-                    "Coastal Edge".into(),
-                    LayerKind::Coastal(CoastalParams {
-                        sea_level: 30.0,
-                        ..CoastalParams::default()
-                    }),
-                ),
-                (
-                    "Materials".into(),
-                    LayerKind::Materials(MaterialsParams::default()),
-                ),
-            ],
+            name: VALLEY_WITH_CREEKS_NAME.into(),
+            description: VALLEY_WITH_CREEKS_DESCRIPTION.into(),
+            layers: valley_with_creeks_layers(),
             eval_mode: GroupEvalMode::IsolatedComposite,
             input_mode: GroupInputMode::CopyInput,
             as_biome: true,

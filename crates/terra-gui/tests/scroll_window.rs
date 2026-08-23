@@ -167,3 +167,46 @@ fn advanced_window_thumb_drag_scrolls_content() {
         "dragging the scrollbar thumb should move content, scroll_y = {scroll_y}"
     );
 }
+
+#[test]
+fn horizontal_thumb_drag_uses_horizontal_identity_and_clamping() {
+    let viewport = Rect::from_pos_size(100.0, 100.0, 400.0, 100.0);
+    let id = Id::new("horizontal-scroll");
+    let thumb_point = (150.0, 193.0);
+    let mut state = GuiState::default();
+    let mut scroll_x = 0.0;
+    let frame = |state: &mut GuiState, input: GuiInput, scroll_x: &mut f32| {
+        let mut ctx = GuiContext::begin(SW, SH, 1.0, input, state);
+        ctx.scrollbar_x(id, viewport, 800.0, scroll_x);
+        ctx.end();
+    };
+
+    frame(
+        &mut state,
+        GuiInput {
+            pointer: Some(thumb_point),
+            ..Default::default()
+        },
+        &mut scroll_x,
+    );
+    frame(
+        &mut state,
+        GuiInput {
+            pointer: Some(thumb_point),
+            primary_down: true,
+            ..Default::default()
+        },
+        &mut scroll_x,
+    );
+    assert_eq!(state.scroll_drag.map(|drag| drag.vertical), Some(false));
+    frame(
+        &mut state,
+        GuiInput {
+            pointer: Some((thumb_point.0 + 100.0, thumb_point.1)),
+            primary_down: true,
+            ..Default::default()
+        },
+        &mut scroll_x,
+    );
+    assert!(scroll_x > 0.0 && scroll_x <= 400.0, "scroll_x={scroll_x}");
+}
