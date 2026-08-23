@@ -16,6 +16,7 @@ Use a recent stable Rust toolchain. GPU features need a working wgpu backend (DX
 
 | Crate | Must not depend on |
 |-------|--------------------|
+| `terra-world` | `terra-core`, evaluation, GPU, renderer, IO, or app crates |
 | `terra-core` | `wgpu`, any UI crate |
 | `terra-gui` | `terra-core` or other domain crates |
 

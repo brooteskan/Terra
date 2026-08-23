@@ -14,6 +14,10 @@ const POINTER_FILE: &str = "height-pyramid.current";
 const PACKAGES_DIR: &str = "packages";
 static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+fn bounded_key(pyramid: &TerrainPyramid, key: &TerrainTileKey) -> Option<(u8, TileId)> {
+    pyramid.level_and_tile(key.address)
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct HeightPyramidWorld {
     pub size_x: f32,
@@ -118,7 +122,7 @@ impl HeightPyramidPackageBuilder {
         }
         std::fs::create_dir_all(staging.join("height"))?;
         let levels = pyramid
-            .levels
+            .levels()
             .iter()
             .map(|level| {
                 let metrics = pyramid
@@ -199,20 +203,28 @@ impl HeightPyramidPackageBuilder {
                 packed.len()
             )));
         }
-        self.advance_level(key.level);
+        let (level, tile) = bounded_key(&self.pyramid, key)
+            .ok_or_else(|| IoError::Msg(format!("invalid pyramid tile {key:?}")))?;
+        self.advance_level(level);
         let extent = self
             .pyramid
-            .tile_extent(key.level, key.tile)
+            .tile_extent(level, tile)
             .ok_or_else(|| IoError::Msg(format!("invalid pyramid tile {key:?}")))?;
         let level_metrics = self
             .pyramid
-            .level_metrics(key.level)
+            .level_metrics(level)
             .expect("valid tile belongs to a level");
-        let local_error = if key.level == 0 {
+        let local_error = if level == 0 {
             0.0
         } else {
             measure_tile_geometric_error(&self.pyramid, key, |level, x, z| {
-                if level == key.level {
+                if level
+                    == self
+                        .pyramid
+                        .topology()
+                        .level_index(key.address)
+                        .unwrap_or(u8::MAX)
+                {
                     packed_sample(
                         packed,
                         page_extent,
@@ -239,7 +251,7 @@ impl HeightPyramidPackageBuilder {
         let payload_hash = blake3::hash(&bytes).to_hex().to_string();
         let relative = format!(
             "height/l{:02}/{:06}_{:06}.{}.r32",
-            key.level, key.tile.tx, key.tile.tz, payload_hash
+            level, tile.tx, tile.tz, payload_hash
         );
         let path = self
             .staging
@@ -252,9 +264,9 @@ impl HeightPyramidPackageBuilder {
         writer.write_all(&bytes)?;
         writer.flush()?;
         self.manifest.tiles.push(HeightPyramidTileManifest {
-            level: key.level,
-            tx: key.tile.tx,
-            tz: key.tile.tz,
+            level,
+            tx: tile.tx,
+            tz: tile.tz,
             origin_x: extent.origin_x,
             origin_z: extent.origin_z,
             interior_width: extent.width,
@@ -277,8 +289,8 @@ impl HeightPyramidPackageBuilder {
             local_geometric_error_m: local_error,
             geometric_error_m: local_error,
         });
-        if key.level < self.pyramid.max_level() {
-            self.current_tiles.insert(key.tile, packed.to_vec());
+        if level < self.pyramid.max_level() {
+            self.current_tiles.insert(tile, packed.to_vec());
         }
         self.next_index += 1;
         Ok(())
@@ -534,12 +546,12 @@ impl HeightPyramidPackage {
             return Err(IoError::Msg("unsupported height-pyramid manifest".into()));
         }
         let pyramid = self.descriptor()?;
-        if self.manifest.levels.len() != pyramid.levels.len()
+        if self.manifest.levels.len() != pyramid.levels().len()
             || self.manifest.tiles.len() != pyramid.metadata_len() as usize
         {
             return Err(IoError::Msg("incomplete pyramid metadata".into()));
         }
-        for (actual, expected) in self.manifest.levels.iter().zip(&pyramid.levels) {
+        for (actual, expected) in self.manifest.levels.iter().zip(pyramid.levels()) {
             let metrics = pyramid
                 .level_metrics(expected.index)
                 .expect("descriptor owns valid level");
@@ -561,10 +573,11 @@ impl HeightPyramidPackage {
                 .tiles
                 .get(index)
                 .ok_or_else(|| IoError::Msg("missing ordered tile entry".into()))?;
-            let extent = pyramid.tile_extent(key.level, key.tile).expect("valid key");
-            if entry.level != key.level
-                || entry.tx != key.tile.tx
-                || entry.tz != key.tile.tz
+            let (level, tile) = bounded_key(&pyramid, &key).expect("valid bounded key");
+            let extent = pyramid.tile_extent(level, tile).expect("valid key");
+            if entry.level != level
+                || entry.tx != tile.tx
+                || entry.tz != tile.tz
                 || entry.origin_x != extent.origin_x
                 || entry.origin_z != extent.origin_z
                 || entry.interior_width != extent.width
@@ -678,8 +691,9 @@ mod tests {
     use super::*;
 
     fn packed_page(pyramid: &TerrainPyramid, key: &TerrainTileKey) -> Vec<f32> {
-        let extent = pyramid.tile_extent(key.level, key.tile).unwrap();
-        let metrics = pyramid.level_metrics(key.level).unwrap();
+        let (level, tile) = bounded_key(pyramid, key).unwrap();
+        let extent = pyramid.tile_extent(level, tile).unwrap();
+        let metrics = pyramid.level_metrics(level).unwrap();
         let halo = pyramid.config.halo;
         let stride = pyramid.config.tile_size + halo * 2;
         let mut page = vec![0.0; (stride * stride) as usize];

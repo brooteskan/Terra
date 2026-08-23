@@ -64,7 +64,7 @@ mod tests {
         let mut runtime = TerrainRuntime::new(PyramidConfig::new(512, 1024.0, 1024.0));
         runtime.reconfigure(PyramidConfig::new(1000, 8000.0, 4000.0));
         assert_eq!(runtime.output_revision(), 1);
-        assert_eq!(runtime.pyramid.levels.last().unwrap().resolution, 1000);
+        assert_eq!(runtime.pyramid.levels().last().unwrap().resolution, 1000);
         assert_eq!(runtime.pyramid.config.world_size_x, 8000.0);
         assert_eq!(runtime.pyramid.config.world_size_z, 4000.0);
     }

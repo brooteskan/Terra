@@ -102,9 +102,10 @@ fn create_gpu() -> Result<TestGpu, String> {
     let force_fallback_adapter = std::env::var("TERRA_TEST_GPU_FORCE_FALLBACK")
         .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "yes"));
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-        // Tests are tiny; prefer the low-power adapter and leave the discrete
-        // GPU free. `compatible_surface: None` is what makes this headless.
-        power_preference: wgpu::PowerPreference::LowPower,
+        // GPU suites compile many pipelines and exercise full evaluator paths.
+        // Prefer the faster adapter by default; allow low-power coverage when
+        // explicitly requested on developer machines.
+        power_preference: test_power_preference(),
         compatible_surface: None,
         force_fallback_adapter,
     }))
@@ -118,7 +119,7 @@ fn create_gpu() -> Result<TestGpu, String> {
     let (device, queue) = pollster::block_on(adapter.request_device(
         &wgpu::DeviceDescriptor {
             label: Some("terra-test-gpu"),
-            required_features: wgpu::Features::empty(),
+            required_features: adapter.features() & wgpu::Features::PIPELINE_CACHE,
             required_limits: wgpu::Limits::default(),
             memory_hints: wgpu::MemoryHints::default(),
         },
@@ -130,6 +131,14 @@ fn create_gpu() -> Result<TestGpu, String> {
         queue,
         adapter_info,
     })
+}
+
+fn test_power_preference() -> wgpu::PowerPreference {
+    match std::env::var("TERRA_TEST_GPU_POWER") {
+        Ok(value) if value.eq_ignore_ascii_case("low") => wgpu::PowerPreference::LowPower,
+        Ok(value) if value.eq_ignore_ascii_case("none") => wgpu::PowerPreference::None,
+        _ => wgpu::PowerPreference::HighPerformance,
+    }
 }
 
 /// Mirrors the application's backend choice so tests exercise the same path.

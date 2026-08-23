@@ -2639,6 +2639,7 @@ dependencies = [
  "serde",
  "serde_json",
  "terra-jobs",
+ "terra-world",
  "thiserror 2.0.19",
  "uuid",
 ]
@@ -2750,6 +2751,14 @@ version = "0.1.0-beta.1"
 dependencies = [
  "pollster",
  "wgpu",
+]
+
+[[package]]
+name = "terra-world"
+version = "0.1.0-beta.1"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

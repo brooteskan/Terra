@@ -391,7 +391,14 @@ fn compare_entries(a: &QueuedEntry, b: &QueuedEntry, epoch: u64) -> Ordering {
         })
         .then_with(|| b.request.visible.cmp(&a.request.visible))
         .then_with(|| a.request.class.cmp(&b.request.class))
-        .then_with(|| a.request.key.tile.level.cmp(&b.request.key.tile.level))
+        .then_with(|| {
+            b.request
+                .key
+                .tile
+                .address
+                .lod
+                .cmp(&a.request.key.tile.address.lod)
+        })
         .then_with(|| {
             b.request
                 .projected_error_px
@@ -399,8 +406,24 @@ fn compare_entries(a: &QueuedEntry, b: &QueuedEntry, epoch: u64) -> Ordering {
         })
         .then_with(|| a.request.distance_m.total_cmp(&b.request.distance_m))
         .then_with(|| b_age.cmp(&a_age))
-        .then_with(|| a.request.key.tile.tile.tz.cmp(&b.request.key.tile.tile.tz))
-        .then_with(|| a.request.key.tile.tile.tx.cmp(&b.request.key.tile.tile.tx))
+        .then_with(|| {
+            a.request
+                .key
+                .tile
+                .address
+                .coord
+                .z
+                .cmp(&b.request.key.tile.address.coord.z)
+        })
+        .then_with(|| {
+            a.request
+                .key
+                .tile
+                .address
+                .coord
+                .x
+                .cmp(&b.request.key.tile.address.coord.x)
+        })
 }
 
 fn micros_u64(duration: std::time::Duration) -> u64 {
@@ -410,7 +433,7 @@ fn micros_u64(duration: std::time::Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{FieldId, TileId};
+    use crate::FieldId;
 
     fn stamp(content_revision: u64) -> TerrainContentStamp {
         TerrainContentStamp {
@@ -431,12 +454,17 @@ mod tests {
     ) -> TerrainTileWorkRequest {
         TerrainTileWorkRequest {
             key: TerrainTileWorkKey {
-                tile: TerrainTileKey {
-                    layer: None,
-                    field: FieldId::Height,
-                    level,
-                    tile: TileId { tx, tz: 0 },
-                },
+                tile: TerrainTileKey::new(
+                    None,
+                    FieldId::Height,
+                    crate::TileAddress::new(
+                        crate::Lod::try_new(10 - level).unwrap(),
+                        crate::TileCoord {
+                            x: i64::from(tx),
+                            z: 0,
+                        },
+                    ),
+                ),
                 plan_revision: 5,
                 output_revision: 7,
             },
@@ -458,7 +486,7 @@ mod tests {
         let coarse = request(0, 2, TerrainDemandClass::CoarseCoverage, true, 1.0, 10);
         scheduler.reconcile(stamp(11), [fine, offscreen, coarse]);
         let selected = scheduler.dequeue_budgeted(TerrainTileWorkBudget::new(10, 1, 8));
-        assert_eq!(selected[0].request.key.tile.tile.tx, 2);
+        assert_eq!(selected[0].request.key.tile.address.coord.x, 2);
     }
 
     #[test]
@@ -519,7 +547,7 @@ mod tests {
         b2.projected_error_px = 20.0;
         scheduler.reconcile(stamp(11), [a2, b2]);
         let selected = scheduler.dequeue_budgeted(TerrainTileWorkBudget::new(10, 1, 8));
-        assert_eq!(selected[0].request.key.tile.tile.tx, 2);
+        assert_eq!(selected[0].request.key.tile.address.coord.x, 2);
         assert_eq!(scheduler.stats().reprioritized, 2);
     }
 

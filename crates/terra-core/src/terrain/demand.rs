@@ -252,7 +252,7 @@ impl TerrainDemandPlanner {
                 }
             }
             demands.entry(key).or_insert_with(|| TerrainTileDemand {
-                key: terrain_key(key),
+                key: terrain_key(pyramid, key),
                 class: if key.level == 0 {
                     TerrainDemandClass::CoarseCoverage
                 } else {
@@ -295,14 +295,19 @@ impl TerrainDemandPlanner {
         self.previously_refined = refined;
         let mut tiles: Vec<_> = demands.into_values().collect();
         tiles.sort_by(|a, b| {
-            a.key
-                .level
-                .cmp(&b.key.level)
+            let (a_level, a_tile) = pyramid
+                .level_and_tile(a.key.address)
+                .expect("demand address belongs to bounded pyramid");
+            let (b_level, b_tile) = pyramid
+                .level_and_tile(b.key.address)
+                .expect("demand address belongs to bounded pyramid");
+            a_level
+                .cmp(&b_level)
                 .then_with(|| a.class.cmp(&b.class))
                 .then_with(|| b.projected_error_px.total_cmp(&a.projected_error_px))
                 .then_with(|| a.distance_m.total_cmp(&b.distance_m))
-                .then_with(|| a.key.tile.tz.cmp(&b.key.tile.tz))
-                .then_with(|| a.key.tile.tx.cmp(&b.key.tile.tx))
+                .then_with(|| a_tile.tz.cmp(&b_tile.tz))
+                .then_with(|| a_tile.tx.cmp(&b_tile.tx))
         });
         Ok(TerrainDemandPlan {
             tiles,
@@ -354,13 +359,14 @@ fn validate_inputs(
     Ok(())
 }
 
-fn terrain_key(key: NodeKey) -> TerrainTileKey {
-    TerrainTileKey {
-        layer: None,
-        field: FieldId::Height,
-        level: key.level,
-        tile: key.tile(),
-    }
+fn terrain_key(pyramid: &TerrainPyramid, key: NodeKey) -> TerrainTileKey {
+    TerrainTileKey::new(
+        None,
+        FieldId::Height,
+        pyramid
+            .address(key.level, key.tile())
+            .expect("demand node belongs to bounded pyramid"),
+    )
 }
 
 fn node_error(pyramid: &TerrainPyramid, errors: &[f32], key: NodeKey) -> f32 {
@@ -429,7 +435,7 @@ fn insert_ancestor_demands(
         demands.insert(
             ancestor,
             TerrainTileDemand {
-                key: terrain_key(ancestor),
+                key: terrain_key(pyramid, ancestor),
                 class: if ancestor.level == 0 {
                     TerrainDemandClass::CoarseCoverage
                 } else {
@@ -529,10 +535,10 @@ mod tests {
         errors
     }
 
-    fn deepest(plan: &TerrainDemandPlan) -> u8 {
+    fn deepest(pyramid: &TerrainPyramid, plan: &TerrainDemandPlan) -> u8 {
         plan.tiles
             .iter()
-            .map(|demand| demand.key.level)
+            .filter_map(|demand| pyramid.topology().level_index(demand.key.address))
             .max()
             .unwrap_or(0)
     }
@@ -560,7 +566,7 @@ mod tests {
                 TerrainDemandConfig::default(),
             )
             .unwrap();
-        assert!(deepest(&near) > deepest(&far));
+        assert!(deepest(&pyramid, &near) > deepest(&pyramid, &far));
     }
 
     #[test]
@@ -596,8 +602,8 @@ mod tests {
                 TerrainDemandConfig::default(),
             )
             .unwrap();
-        assert!(deepest(&tall) >= deepest(&short));
-        assert!(deepest(&narrow) >= deepest(&short));
+        assert!(deepest(&pyramid, &tall) >= deepest(&pyramid, &short));
+        assert!(deepest(&pyramid, &narrow) >= deepest(&pyramid, &short));
     }
 
     #[test]
@@ -618,7 +624,7 @@ mod tests {
                 TerrainDemandConfig::default(),
             )
             .unwrap();
-        assert_eq!(deepest(&coarse), 0);
+        assert_eq!(deepest(&pyramid, &coarse), 0);
 
         let errors = uniform_errors(&pyramid, 100.0);
         planner.reset();
@@ -664,7 +670,7 @@ mod tests {
             *value *= 0.75;
         }
         let held = planner.plan(&pyramid, &lowered, camera, config).unwrap();
-        assert_eq!(deepest(&held), deepest(&first));
+        assert_eq!(deepest(&pyramid, &held), deepest(&pyramid, &first));
     }
 
     #[test]
@@ -694,15 +700,11 @@ mod tests {
             .unwrap();
         assert!(plan.tiles.len() <= config.max_demand_tiles);
         assert!(plan.visited_nodes <= config.max_visited_nodes);
-        assert!(plan
-            .tiles
-            .windows(2)
-            .all(|pair| pair[0].key.level <= pair[1].key.level));
-        let unique: BTreeSet<_> = plan
-            .tiles
-            .iter()
-            .map(|demand| NodeKey::new(demand.key.level, demand.key.tile))
-            .collect();
+        assert!(plan.tiles.windows(2).all(|pair| {
+            pyramid.topology().level_index(pair[0].key.address)
+                <= pyramid.topology().level_index(pair[1].key.address)
+        }));
+        let unique: BTreeSet<_> = plan.tiles.iter().map(|demand| demand.key.address).collect();
         assert_eq!(unique.len(), plan.tiles.len());
         let finest = pyramid.level_metrics(pyramid.max_level()).unwrap();
         assert!(plan.visited_nodes < (finest.tiles_x() * finest.tiles_z()) as usize);
@@ -737,6 +739,6 @@ mod tests {
                 TerrainDemandConfig::default(),
             )
             .unwrap();
-        assert_eq!(deepest(&plan), finest);
+        assert_eq!(deepest(&pyramid, &plan), finest);
     }
 }

@@ -2,7 +2,7 @@
 //! page is visible, and its output-revision stamp rejects stale pages (#171).
 
 use terra_core::{
-    FieldId, Heightfield, HeightfieldMetrics, PyramidConfig, TerrainContentStamp, TerrainPyramid,
+    Heightfield, HeightfieldMetrics, PyramidConfig, TerrainContentStamp, TerrainPyramid,
     TerrainTileKey, TileId,
 };
 use terra_gpu::GpuTileAtlas;
@@ -86,12 +86,7 @@ fn stale_page_revision_falls_back_to_monolithic_height() {
         halo: metrics.halo,
     });
     let level = pyramid.max_level();
-    let key = TerrainTileKey {
-        layer: None,
-        field: FieldId::Height,
-        level,
-        tile: TileId { tx: 0, tz: 0 },
-    };
+    let key = TerrainTileKey::height(pyramid.address(level, TileId { tx: 0, tz: 0 }).unwrap());
     let mut atlas = GpuTileAtlas::new(&gpu.device, metrics.tile_size, metrics.halo, 1)
         .expect("one-page test atlas");
     atlas.configure_hierarchy(&gpu.device, &gpu.queue, &pyramid);
@@ -174,18 +169,9 @@ fn resident_child_refines_and_unpublish_returns_to_current_root() {
         output_revision: 19,
         content_revision: 23,
     };
-    let root_key = TerrainTileKey {
-        layer: None,
-        field: FieldId::Height,
-        level: 0,
-        tile: TileId { tx: 0, tz: 0 },
-    };
-    let child_key = TerrainTileKey {
-        layer: None,
-        field: FieldId::Height,
-        level: pyramid.max_level(),
-        tile: TileId { tx: 0, tz: 0 },
-    };
+    let tile_id = TileId { tx: 0, tz: 0 };
+    let root_key = TerrainTileKey::height(pyramid.address(0, tile_id).unwrap());
+    let child_key = TerrainTileKey::height(pyramid.address(pyramid.max_level(), tile_id).unwrap());
     let root = Heightfield::filled(pyramid.level_metrics(0).unwrap(), 20.0);
     let fine = Heightfield::filled(pyramid.level_metrics(pyramid.max_level()).unwrap(), 100.0);
     let monolithic = Heightfield::filled(HeightfieldMetrics::new(64, 64, 1024.0, 1024.0), 0.0);
@@ -195,7 +181,7 @@ fn resident_child_refines_and_unpublish_returns_to_current_root() {
         .upload_height_tile_current(
             &gpu.queue,
             root_key.clone(),
-            root.tile(root_key.tile).unwrap(),
+            root.tile(tile_id).unwrap(),
             content,
         )
         .unwrap();
@@ -216,7 +202,7 @@ fn resident_child_refines_and_unpublish_returns_to_current_root() {
         .upload_height_tile_current(
             &gpu.queue,
             child_key.clone(),
-            fine.tile(child_key.tile).unwrap(),
+            fine.tile(tile_id).unwrap(),
             content,
         )
         .unwrap();

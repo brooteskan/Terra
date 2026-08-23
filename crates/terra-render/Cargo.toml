@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "wgpu terrain viewport rendering"
+autotests = false
 
 [dependencies]
 terra-core = { workspace = true }
@@ -21,6 +22,10 @@ profiling = { workspace = true }
 naga = { version = "24.0.0", features = ["wgsl-in"] }
 pollster = { workspace = true }
 terra-test-gpu = { workspace = true }
+
+[[test]]
+name = "gpu_tests"
+path = "tests/gpu_tests.rs"
 
 [lints]
 workspace = true

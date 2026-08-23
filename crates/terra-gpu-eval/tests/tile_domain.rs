@@ -113,12 +113,11 @@ fn compiled_tile_matches_full_gpu_and_allocates_only_the_domain() {
     };
     let domain = TerrainEvaluationDomain::for_tile(
         &pyramid,
-        TerrainTileKey {
-            layer: None,
-            field: FieldId::Height,
-            level: pyramid.max_level(),
-            tile: TileId { tx: 1, tz: 1 },
-        },
+        TerrainTileKey::height(
+            pyramid
+                .address(pyramid.max_level(), TileId { tx: 1, tz: 1 })
+                .unwrap(),
+        ),
         config.halo,
         slice.operation_halo,
         stamp,
@@ -211,12 +210,11 @@ fn adjacent_domains_share_samples_and_cancelled_resources_recycle_after_fence() 
     let make_domain = |tx| {
         TerrainEvaluationDomain::for_tile(
             &pyramid,
-            TerrainTileKey {
-                layer: None,
-                field: FieldId::Height,
-                level: pyramid.max_level(),
-                tile: TileId { tx, tz: 0 },
-            },
+            TerrainTileKey::height(
+                pyramid
+                    .address(pyramid.max_level(), TileId { tx, tz: 0 })
+                    .unwrap(),
+            ),
             config.halo,
             slice.operation_halo,
             stamp,
@@ -389,12 +387,11 @@ fn basin_checkpoint_tiles_are_seamless_and_match_complete_gpu() {
     let make_domain = |tx| {
         TerrainEvaluationDomain::for_tile(
             &pyramid,
-            TerrainTileKey {
-                layer: None,
-                field: FieldId::Height,
-                level: pyramid.max_level(),
-                tile: TileId { tx, tz: 0 },
-            },
+            TerrainTileKey::height(
+                pyramid
+                    .address(pyramid.max_level(), TileId { tx, tz: 0 })
+                    .unwrap(),
+            ),
             config.halo,
             slice.operation_halo,
             stamp,
@@ -498,12 +495,11 @@ fn basin_checkpoint_tiles_are_seamless_and_match_complete_gpu() {
     };
     let next_domain = TerrainEvaluationDomain::for_tile(
         &pyramid,
-        TerrainTileKey {
-            layer: None,
-            field: FieldId::Height,
-            level: pyramid.max_level(),
-            tile: TileId { tx: 0, tz: 0 },
-        },
+        TerrainTileKey::height(
+            pyramid
+                .address(pyramid.max_level(), TileId { tx: 0, tz: 0 })
+                .unwrap(),
+        ),
         config.halo,
         slice.operation_halo,
         next_stamp,

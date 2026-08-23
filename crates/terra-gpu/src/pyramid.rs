@@ -144,11 +144,15 @@ impl GpuHeightPyramid {
     }
 
     pub fn tile_error_index(&self, key: &TerrainTileKey) -> Result<u32, GpuPyramidError> {
-        if key.level > self.source_level {
+        let (level, _) = self
+            .descriptor
+            .level_and_tile(key.address)
+            .ok_or_else(|| GpuPyramidError::InvalidTile { key: key.clone() })?;
+        if level > self.source_level {
             return Err(GpuPyramidError::InvalidTile { key: key.clone() });
         }
         self.descriptor
-            .tile_metadata_index(key.level, key.tile)
+            .address_metadata_index(key.address)
             .ok_or_else(|| GpuPyramidError::InvalidTile { key: key.clone() })
     }
 
@@ -296,7 +300,7 @@ impl GpuHeightPyramidMaterializer {
         identity: GpuPyramidContentIdentity,
     ) -> Result<GpuHeightPyramid, GpuPyramidError> {
         let source_level = descriptor
-            .levels
+            .levels()
             .iter()
             .find(|level| {
                 level.resolution == source_extent.0 && level.resolution == source_extent.1
@@ -308,7 +312,7 @@ impl GpuHeightPyramidMaterializer {
             })?;
 
         let mut levels = Vec::with_capacity(source_level as usize + 1);
-        for level in descriptor.levels.iter().take(source_level as usize + 1) {
+        for level in descriptor.levels().iter().take(source_level as usize + 1) {
             let texture = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("terrain-pyramid-level"),
                 size: wgpu::Extent3d {

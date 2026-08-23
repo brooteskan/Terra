@@ -3,7 +3,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use terra_core::{
     FieldId, HeightTile, TerrainContentStamp, TerrainEvaluationDomain, TerrainPyramid,
-    TerrainTileKey, TileCacheError, TileCacheInsert, TilePageHandle, TileResidencyCache,
+    TerrainTileKey, TileCacheError, TileCacheInsert, TileId, TilePageHandle, TileResidencyCache,
 };
 use thiserror::Error;
 use wgpu::util::DeviceExt;
@@ -37,8 +37,7 @@ pub struct GpuPageTableEntry {
 
 impl GpuPageTableEntry {
     fn resident(
-        key: &TerrainTileKey,
-        handle: TilePageHandle,
+        identity: GpuResidentIdentity<'_>,
         width: u32,
         height: u32,
         halo: u32,
@@ -46,16 +45,16 @@ impl GpuPageTableEntry {
         published_frame: u64,
     ) -> Self {
         let mut hasher = DefaultHasher::new();
-        key.hash(&mut hasher);
+        identity.key.hash(&mut hasher);
         let hash = hasher.finish();
         Self {
             key_hash_lo: hash as u32,
             key_hash_hi: (hash >> 32) as u32,
-            generation: handle.generation,
+            generation: identity.handle.generation,
             valid: 1,
-            level: key.level as u32,
-            tile_x: key.tile.tx,
-            tile_z: key.tile.tz,
+            level: u32::from(identity.level),
+            tile_x: identity.tile.tx,
+            tile_z: identity.tile.tz,
             width,
             height,
             halo,
@@ -78,6 +77,14 @@ impl GpuPageTableEntry {
             ..Zeroable::zeroed()
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GpuResidentIdentity<'a> {
+    key: &'a TerrainTileKey,
+    level: u8,
+    tile: TileId,
+    handle: TilePageHandle,
 }
 
 /// Dense virtual-to-physical page mapping. The index is supplied by
@@ -337,7 +344,7 @@ impl GpuTileAtlas {
         self.clear(queue);
         let mut offset = 0u32;
         let levels: Vec<_> = hierarchy
-            .levels
+            .levels()
             .iter()
             .map(|level| {
                 let metrics = hierarchy
@@ -372,19 +379,29 @@ impl GpuTileAtlas {
             contents: bytemuck::cast_slice(&level_entries),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
-        self.level_count = hierarchy.levels.len() as u32;
+        self.level_count = hierarchy.levels().len() as u32;
         self.virtual_page_count = hierarchy.metadata_len();
         self.hierarchy = Some(hierarchy.clone());
     }
 
     fn virtual_index(&self, key: &TerrainTileKey) -> Option<u32> {
         (key.layer.is_none() && key.field == FieldId::Height)
-            .then(|| {
-                self.hierarchy
-                    .as_ref()?
-                    .tile_metadata_index(key.level, key.tile)
-            })
+            .then(|| self.hierarchy.as_ref()?.address_metadata_index(key.address))
             .flatten()
+    }
+
+    fn bounded_key_parts(&self, key: &TerrainTileKey) -> Option<(u8, TileId)> {
+        if let Some(hierarchy) = &self.hierarchy {
+            hierarchy.level_and_tile(key.address)
+        } else {
+            Some((
+                key.address.lod.get(),
+                TileId {
+                    tx: u32::try_from(key.address.coord.x).ok()?,
+                    tz: u32::try_from(key.address.coord.z).ok()?,
+                },
+            ))
+        }
     }
 
     fn require_virtual_index(&self, key: &TerrainTileKey) -> Result<u32, GpuTileCacheError> {
@@ -502,6 +519,9 @@ impl GpuTileAtlas {
             });
         }
         let insert = self.allocate_page(queue, &key, revision, input_revision_hash, content)?;
+        let (level, bounded_tile) = self
+            .bounded_key_parts(&key)
+            .ok_or_else(|| GpuTileCacheError::UnaddressableTile(key.clone()))?;
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &self.texture,
@@ -529,8 +549,12 @@ impl GpuTileAtlas {
             queue,
             insert.handle.slot,
             GpuPageTableEntry::resident(
-                &key,
-                insert.handle,
+                GpuResidentIdentity {
+                    key: &key,
+                    level,
+                    tile: bounded_tile,
+                    handle: insert.handle,
+                },
                 tile.interior_width,
                 tile.interior_height,
                 tile.halo,
@@ -625,13 +649,17 @@ impl GpuTileAtlas {
         published_frame: u64,
     ) -> Result<GpuTileUpload, GpuTileCacheError> {
         pyramid.tile_error_index(&key)?;
+        let (level, tile) = pyramid
+            .descriptor()
+            .level_and_tile(key.address)
+            .ok_or_else(|| GpuPyramidError::InvalidTile { key: key.clone() })?;
         let metrics = pyramid
             .descriptor()
-            .level_metrics(key.level)
+            .level_metrics(level)
             .ok_or_else(|| GpuPyramidError::InvalidTile { key: key.clone() })?;
         let extent = pyramid
             .descriptor()
-            .tile_extent(key.level, key.tile)
+            .tile_extent(level, tile)
             .ok_or_else(|| GpuPyramidError::InvalidTile { key: key.clone() })?;
         if extent.width + self.halo * 2 > self.page_extent
             || extent.height + self.halo * 2 > self.page_extent
@@ -642,7 +670,7 @@ impl GpuTileAtlas {
                 page_extent: self.page_extent,
             });
         }
-        let source_view = pyramid.level_view(key.level)?;
+        let source_view = pyramid.level_view(level)?;
         let insert = self.allocate_page(
             queue,
             &key,
@@ -718,8 +746,12 @@ impl GpuTileAtlas {
             queue,
             insert.handle.slot,
             GpuPageTableEntry::resident(
-                &key,
-                insert.handle,
+                GpuResidentIdentity {
+                    key: &key,
+                    level,
+                    tile,
+                    handle: insert.handle,
+                },
                 extent.width,
                 extent.height,
                 self.halo,
@@ -763,7 +795,8 @@ impl GpuTileAtlas {
             .as_ref()
             .ok_or_else(|| GpuTileCacheError::UnaddressableTile(domain.key.clone()))?;
         let expected = hierarchy
-            .tile_extent(domain.key.level, domain.key.tile)
+            .level_and_tile(domain.key.address)
+            .and_then(|(level, tile)| hierarchy.tile_extent(level, tile))
             .ok_or_else(|| GpuTileCacheError::UnaddressableTile(domain.key.clone()))?;
         if expected != domain.interior {
             return Err(GpuTileCacheError::UnaddressableTile(domain.key.clone()));
@@ -786,6 +819,9 @@ impl GpuTileAtlas {
         }
 
         let key = domain.key.clone();
+        let (level, tile) = hierarchy
+            .level_and_tile(key.address)
+            .ok_or_else(|| GpuTileCacheError::UnaddressableTile(key.clone()))?;
         let insert = self.allocate_page(
             queue,
             &key,
@@ -860,8 +896,12 @@ impl GpuTileAtlas {
             queue,
             insert.handle.slot,
             GpuPageTableEntry::resident(
-                &key,
-                insert.handle,
+                GpuResidentIdentity {
+                    key: &key,
+                    level,
+                    tile,
+                    handle: insert.handle,
+                },
                 expected.width,
                 expected.height,
                 self.halo,
@@ -1158,16 +1198,26 @@ impl GpuTileAtlas {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use terra_core::{FieldId, LayerId, TileId};
+    use terra_core::{FieldId, LayerId, Lod, TileAddress, TileCoord, TileId};
+
+    fn test_key(layer: Option<LayerId>, level: u8, tile: TileId) -> TerrainTileKey {
+        TerrainTileKey::new(
+            layer,
+            FieldId::Height,
+            TileAddress::new(
+                Lod::try_new(level).unwrap(),
+                TileCoord {
+                    x: i64::from(tile.tx),
+                    z: i64::from(tile.tz),
+                },
+            ),
+        )
+    }
 
     #[test]
     fn page_entry_carries_generation_and_virtual_identity() {
-        let key = TerrainTileKey {
-            layer: Some(LayerId::new()),
-            field: FieldId::Height,
-            level: 5,
-            tile: TileId { tx: 1, tz: 1 },
-        };
+        let tile_id = TileId { tx: 1, tz: 1 };
+        let key = test_key(Some(LayerId::new()), 5, tile_id);
         let metrics = terra_core::heightfield::HeightfieldMetrics {
             width: 256,
             height: 256,
@@ -1176,12 +1226,16 @@ mod tests {
             tile_size: 128,
             halo: 2,
         };
-        let tile = HeightTile::new(key.tile, &metrics);
+        let tile = HeightTile::new(tile_id, &metrics);
         let entry = GpuPageTableEntry::resident(
-            &key,
-            TilePageHandle {
-                slot: 4,
-                generation: 11,
+            GpuResidentIdentity {
+                key: &key,
+                level: 5,
+                tile: tile_id,
+                handle: TilePageHandle {
+                    slot: 4,
+                    generation: 11,
+                },
             },
             tile.interior_width,
             tile.interior_height,
@@ -1216,13 +1270,9 @@ mod tests {
             tile_size: 8,
             halo: 1,
         };
-        let old_key = TerrainTileKey {
-            layer: Some(LayerId::new()),
-            field: FieldId::Height,
-            level: 0,
-            tile: TileId { tx: 0, tz: 0 },
-        };
-        let tile = HeightTile::new(old_key.tile, &metrics);
+        let tile_id = TileId { tx: 0, tz: 0 };
+        let old_key = test_key(Some(LayerId::new()), 0, tile_id);
+        let tile = HeightTile::new(tile_id, &metrics);
         let old = atlas
             .upload_height_tile(&gpu.queue, old_key, &tile, 1, 1)
             .unwrap()
@@ -1242,12 +1292,7 @@ mod tests {
             .iter()
             .all(|entry| entry.valid == 0));
 
-        let new_key = TerrainTileKey {
-            layer: Some(LayerId::new()),
-            field: FieldId::Height,
-            level: 0,
-            tile: TileId { tx: 0, tz: 0 },
-        };
+        let new_key = test_key(Some(LayerId::new()), 0, tile_id);
         let new = atlas
             .upload_height_tile(&gpu.queue, new_key.clone(), &tile, 2, 2)
             .unwrap()
@@ -1276,12 +1321,7 @@ mod tests {
             halo: 1,
         };
         let layer = LayerId::new();
-        let make_key = |tx| TerrainTileKey {
-            layer: Some(layer),
-            field: FieldId::Height,
-            level: 0,
-            tile: TileId { tx, tz: 0 },
-        };
+        let make_key = |tx| test_key(Some(layer), 0, TileId { tx, tz: 0 });
         let first = make_key(0);
         let second = make_key(1);
         let third = make_key(2);
@@ -1289,7 +1329,7 @@ mod tests {
             .upload_height_tile(
                 &gpu.queue,
                 first.clone(),
-                &HeightTile::new(first.tile, &metrics),
+                &HeightTile::new(TileId { tx: 0, tz: 0 }, &metrics),
                 7,
                 7,
             )
@@ -1299,7 +1339,7 @@ mod tests {
             .upload_height_tile(
                 &gpu.queue,
                 second.clone(),
-                &HeightTile::new(second.tile, &metrics),
+                &HeightTile::new(TileId { tx: 1, tz: 0 }, &metrics),
                 7,
                 7,
             )
@@ -1313,7 +1353,7 @@ mod tests {
             .upload_height_tile(
                 &gpu.queue,
                 third.clone(),
-                &HeightTile::new(third.tile, &metrics),
+                &HeightTile::new(TileId { tx: 2, tz: 0 }, &metrics),
                 8,
                 8,
             )
@@ -1357,7 +1397,7 @@ mod tests {
         });
         let mut atlas = GpuTileAtlas::new(&gpu.device, 16, 1, 4).unwrap();
         atlas.configure_hierarchy(&gpu.device, &gpu.queue, &hierarchy);
-        assert_eq!(atlas.level_count(), hierarchy.levels.len() as u32);
+        assert_eq!(atlas.level_count(), hierarchy.levels().len() as u32);
         assert_eq!(atlas.virtual_page_count(), hierarchy.metadata_len());
 
         let content = TerrainContentStamp {
@@ -1366,18 +1406,14 @@ mod tests {
             output_revision: 7,
             content_revision: 11,
         };
-        let root_key = TerrainTileKey {
-            layer: None,
-            field: FieldId::Height,
-            level: 0,
-            tile: TileId { tx: 0, tz: 0 },
-        };
-        let child_key = TerrainTileKey {
-            layer: None,
-            field: FieldId::Height,
-            level: hierarchy.max_level(),
-            tile: TileId { tx: 1, tz: 2 },
-        };
+        let root_tile = TileId { tx: 0, tz: 0 };
+        let child_tile = TileId { tx: 1, tz: 2 };
+        let root_key = TerrainTileKey::height(hierarchy.address(0, root_tile).unwrap());
+        let child_key = TerrainTileKey::height(
+            hierarchy
+                .address(hierarchy.max_level(), child_tile)
+                .unwrap(),
+        );
         let root_metrics = hierarchy.level_metrics(0).unwrap();
         let child_metrics = hierarchy.level_metrics(hierarchy.max_level()).unwrap();
         let root = terra_core::Heightfield::filled(root_metrics, 10.0);
@@ -1386,7 +1422,7 @@ mod tests {
             .upload_height_tile_current(
                 &gpu.queue,
                 root_key.clone(),
-                root.tile(root_key.tile).unwrap(),
+                root.tile(root_tile).unwrap(),
                 content,
             )
             .unwrap();
@@ -1394,15 +1430,15 @@ mod tests {
             .upload_height_tile_current(
                 &gpu.queue,
                 child_key.clone(),
-                child.tile(child_key.tile).unwrap(),
+                child.tile(child_tile).unwrap(),
                 content,
             )
             .unwrap();
 
         let mappings = atlas.read_virtual_page_table_blocking(&gpu.device, &gpu.queue);
-        let root_index = hierarchy.tile_metadata_index(0, root_key.tile).unwrap() as usize;
+        let root_index = hierarchy.tile_metadata_index(0, root_tile).unwrap() as usize;
         let child_index = hierarchy
-            .tile_metadata_index(child_key.level, child_key.tile)
+            .tile_metadata_index(hierarchy.max_level(), child_tile)
             .unwrap() as usize;
         assert_eq!(mappings[root_index].valid, 1);
         assert_eq!(mappings[child_index].valid, 1);

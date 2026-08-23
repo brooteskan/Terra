@@ -6,6 +6,7 @@ license.workspace = true
 description = "Backend-neutral terrain domain: heightfields, layers, masks, and algorithms"
 
 [dependencies]
+terra-world = { workspace = true }
 terra-jobs = { workspace = true }
 glam = { workspace = true }
 serde = { workspace = true }

@@ -1,0 +1,15 @@
+[package]
+name = "terra-world"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Backend-independent world coordinates, tile addressing, and topology contracts for Terra"
+
+[dependencies]
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

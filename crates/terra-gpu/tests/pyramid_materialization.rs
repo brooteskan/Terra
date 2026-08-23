@@ -1,4 +1,4 @@
-use terra_core::{FieldId, PyramidConfig, TerrainPyramid, TerrainTileKey, TileId};
+use terra_core::{PyramidConfig, TerrainPyramid, TerrainTileKey, TileId};
 use terra_gpu::output_identity::GpuOutputId;
 use terra_gpu::{
     GpuHeightPyramidMaterializer, GpuPyramidContentIdentity, GpuTileAtlas, GpuTileCacheError,
@@ -98,7 +98,7 @@ fn materializes_three_levels_without_cpu_evaluator_and_is_deterministic() {
     let descriptor = TerrainPyramid::new(config);
     assert_eq!(
         descriptor
-            .levels
+            .levels()
             .iter()
             .map(|level| level.resolution)
             .collect::<Vec<_>>(),
@@ -203,12 +203,11 @@ fn measured_error_is_finite_zero_for_flat_and_increases_for_lost_feature() {
         let value = f32::from_bits(*bits);
         value.is_finite() && value >= 0.0
     }));
-    let key = TerrainTileKey {
-        layer: None,
-        field: FieldId::Height,
-        level: featured.source_level(),
-        tile: TileId { tx: 1, tz: 1 },
-    };
+    let key = TerrainTileKey::height(
+        descriptor
+            .address(featured.source_level(), TileId { tx: 1, tz: 1 })
+            .unwrap(),
+    );
     let feature_error = f32::from_bits(errors[featured.tile_error_index(&key).unwrap() as usize]);
     assert!(feature_error > 0.0, "lost spike must produce error");
 }
@@ -282,12 +281,8 @@ fn gpu_publication_preserves_neighbor_halos_partial_edges_and_revision_authority
         .unwrap();
     let level = pyramid.source_level();
     let mut atlas = GpuTileAtlas::new(&gpu.device, 4, 1, 8).unwrap();
-    let make_key = |tx| TerrainTileKey {
-        layer: None,
-        field: FieldId::Height,
-        level,
-        tile: TileId { tx, tz: 0 },
-    };
+    let make_key =
+        |tx| TerrainTileKey::height(descriptor.address(level, TileId { tx, tz: 0 }).unwrap());
     let live_identity = pyramid.identity();
     let left_key = make_key(0);
     let left = atlas
@@ -347,12 +342,7 @@ fn gpu_publication_preserves_neighbor_halos_partial_edges_and_revision_authority
         &gpu.device,
         &gpu.queue,
         &pyramid,
-        TerrainTileKey {
-            layer: None,
-            field: FieldId::Height,
-            level,
-            tile: TileId { tx: 0, tz: 1 },
-        },
+        TerrainTileKey::height(descriptor.address(level, TileId { tx: 0, tz: 1 }).unwrap()),
         18,
     );
     assert!(matches!(

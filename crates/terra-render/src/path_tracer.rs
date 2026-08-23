@@ -265,13 +265,15 @@ impl PathTracer {
             bind_group_layouts: &[&bind_group_layout],
             push_constant_ranges: &[],
         });
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("path-trace-pipe"),
-            layout: Some(&pl),
-            module: &shader,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
+        let pipeline = terra_gpu::cached_compute_pipeline(device, "path-trace-pipe", || {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("path-trace-pipe"),
+                layout: Some(&pl),
+                module: &shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: terra_gpu::shared_pipeline_cache(device).as_ref(),
+            })
         });
 
         let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {

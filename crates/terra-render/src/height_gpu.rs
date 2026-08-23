@@ -282,13 +282,15 @@ impl HeightGpu {
             bind_group_layouts: &[&normal_bgl],
             push_constant_ranges: &[],
         });
-        let normal_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("normal-pipe"),
-            layout: Some(&pl),
-            module: &shader,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
+        let normal_pipeline = terra_gpu::cached_compute_pipeline(device, "normal-pipe", || {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("normal-pipe"),
+                layout: Some(&pl),
+                module: &shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: terra_gpu::shared_pipeline_cache(device).as_ref(),
+            })
         });
         let normal_uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("normal-u"),

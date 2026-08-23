@@ -561,17 +561,31 @@ struct HeightmapSampleU {
     _pad1: [f32; 3],
 }
 
+#[derive(Clone)]
 pub(super) struct Pipe {
     pipeline: wgpu::ComputePipeline,
     bgl: wgpu::BindGroupLayout,
 }
 
+type PipeCache = std::collections::HashMap<(wgpu::Device, &'static str), Pipe>;
+
+static PIPE_CACHE: std::sync::OnceLock<std::sync::Mutex<PipeCache>> = std::sync::OnceLock::new();
+
 pub(super) fn make_pipe(
     device: &wgpu::Device,
-    label: &str,
+    label: &'static str,
     wgsl: &str,
     bgl: wgpu::BindGroupLayout,
 ) -> Pipe {
+    let cache = PIPE_CACHE.get_or_init(|| std::sync::Mutex::new(PipeCache::new()));
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let key = (device.clone(), label);
+    if let Some(pipe) = cache.get(&key) {
+        return pipe.clone();
+    }
+
     terra_core::shader_progress::record_shader_compiled();
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some(label),
@@ -590,7 +604,9 @@ pub(super) fn make_pipe(
         compilation_options: Default::default(),
         cache: None,
     });
-    Pipe { pipeline, bgl }
+    let pipe = Pipe { pipeline, bgl };
+    cache.insert(key, pipe.clone());
+    pipe
 }
 
 pub(super) fn storage_write_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {

@@ -269,73 +269,94 @@ impl ProgressiveRenderer {
             push_constant_ranges: &[],
         });
 
-        let temporal_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("progressive-temporal-pipeline"),
-            layout: Some(&temporal_pl),
-            vertex: wgpu::VertexState {
-                module: &temporal_shader,
-                entry_point: Some("vs_fullscreen"),
-                buffers: &[],
-                compilation_options: Default::default(),
+        let temporal_pipeline = terra_gpu::cached_render_pipeline(
+            device,
+            "progressive-temporal-pipeline",
+            wgpu::TextureFormat::Rgba16Float,
+            || {
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("progressive-temporal-pipeline"),
+                    layout: Some(&temporal_pl),
+                    vertex: wgpu::VertexState {
+                        module: &temporal_shader,
+                        entry_point: Some("vs_fullscreen"),
+                        buffers: &[],
+                        compilation_options: Default::default(),
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &temporal_shader,
+                        entry_point: Some("fs_temporal"),
+                        targets: &[
+                            target(wgpu::TextureFormat::Rgba16Float),
+                            target(wgpu::TextureFormat::Rgba16Float),
+                            target(wgpu::TextureFormat::R32Float),
+                        ],
+                        compilation_options: Default::default(),
+                    }),
+                    primitive: wgpu::PrimitiveState::default(),
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview: None,
+                    cache: terra_gpu::shared_pipeline_cache(device).as_ref(),
+                })
             },
-            fragment: Some(wgpu::FragmentState {
-                module: &temporal_shader,
-                entry_point: Some("fs_temporal"),
-                targets: &[
-                    target(wgpu::TextureFormat::Rgba16Float),
-                    target(wgpu::TextureFormat::Rgba16Float),
-                    target(wgpu::TextureFormat::R32Float),
-                ],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-            cache: None,
-        });
-        let atrous_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("progressive-atrous-pipeline"),
-            layout: Some(&atrous_pl),
-            vertex: wgpu::VertexState {
-                module: &atrous_shader,
-                entry_point: Some("vs_fullscreen"),
-                buffers: &[],
-                compilation_options: Default::default(),
+        );
+        let atrous_pipeline = terra_gpu::cached_render_pipeline(
+            device,
+            "progressive-atrous-pipeline",
+            wgpu::TextureFormat::Rgba16Float,
+            || {
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("progressive-atrous-pipeline"),
+                    layout: Some(&atrous_pl),
+                    vertex: wgpu::VertexState {
+                        module: &atrous_shader,
+                        entry_point: Some("vs_fullscreen"),
+                        buffers: &[],
+                        compilation_options: Default::default(),
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &atrous_shader,
+                        entry_point: Some("fs_atrous"),
+                        targets: &[target(wgpu::TextureFormat::Rgba16Float)],
+                        compilation_options: Default::default(),
+                    }),
+                    primitive: wgpu::PrimitiveState::default(),
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview: None,
+                    cache: terra_gpu::shared_pipeline_cache(device).as_ref(),
+                })
             },
-            fragment: Some(wgpu::FragmentState {
-                module: &atrous_shader,
-                entry_point: Some("fs_atrous"),
-                targets: &[target(wgpu::TextureFormat::Rgba16Float)],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-            cache: None,
-        });
-        let composite_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("progressive-composite-pipeline"),
-            layout: Some(&composite_pl),
-            vertex: wgpu::VertexState {
-                module: &composite_shader,
-                entry_point: Some("vs_fullscreen"),
-                buffers: &[],
-                compilation_options: Default::default(),
+        );
+        let composite_pipeline = terra_gpu::cached_render_pipeline(
+            device,
+            "progressive-composite-pipeline",
+            surface_format,
+            || {
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("progressive-composite-pipeline"),
+                    layout: Some(&composite_pl),
+                    vertex: wgpu::VertexState {
+                        module: &composite_shader,
+                        entry_point: Some("vs_fullscreen"),
+                        buffers: &[],
+                        compilation_options: Default::default(),
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &composite_shader,
+                        entry_point: Some("fs_composite"),
+                        targets: &[target(surface_format)],
+                        compilation_options: Default::default(),
+                    }),
+                    primitive: wgpu::PrimitiveState::default(),
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview: None,
+                    cache: terra_gpu::shared_pipeline_cache(device).as_ref(),
+                })
             },
-            fragment: Some(wgpu::FragmentState {
-                module: &composite_shader,
-                entry_point: Some("fs_composite"),
-                targets: &[target(surface_format)],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-            cache: None,
-        });
+        );
 
         let temporal_uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("progressive-temporal-uniform"),

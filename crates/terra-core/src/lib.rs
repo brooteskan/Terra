@@ -75,6 +75,11 @@ pub use geomorph::{
 /// and fixtures have one canonical path and sibling crates need no direct
 /// `terra-jobs` dependency.
 pub use terra_jobs::CancelToken;
+pub use terra_world::{
+    BoundedLevel, BoundedTopology, BoundedTopologyConfig, InfiniteTopology, InfiniteTopologyConfig,
+    Lod, SampleCoord, SampleExtent, SampleSpacing, SampleWorldTransform, SpatialDomain,
+    TileAddress, TileAddressRange, TileCoord, TileExtent, WorldError, WorldPosition, WorldRect,
+};
 pub use terrain_recipe::{
     build_terrain_recipe_from_stack, recipe_matches_stack, RecipeItem, RecipeItemKind,
     RecipeRebuildStatus,

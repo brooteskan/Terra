@@ -1,4 +1,5 @@
 use crate::heightfield::TileId;
+use terra_world::SpatialDomain;
 
 use super::{TerrainContentStamp, TerrainPyramid, TerrainTileExtent, TerrainTileKey};
 
@@ -36,6 +37,9 @@ impl TerrainWorldTransform {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TerrainEvaluationDomain {
     pub key: TerrainTileKey,
+    /// Authoritative backend-independent spatial contract. The flattened
+    /// bounded fields below remain as migration adapters for current GPU code.
+    pub spatial: SpatialDomain,
     pub interior: TerrainTileExtent,
     pub evaluation: TerrainSampleExtent,
     pub publication_halo: u32,
@@ -61,46 +65,44 @@ impl TerrainEvaluationDomain {
         operation_halo: u32,
         content: TerrainContentStamp,
     ) -> Result<Self, TerrainDomainError> {
-        let metrics = pyramid
-            .level_metrics(key.level)
-            .ok_or(TerrainDomainError::InvalidLevel(key.level))?;
-        let interior =
+        let (level, tile) =
             pyramid
-                .tile_extent(key.level, key.tile)
+                .level_and_tile(key.address)
                 .ok_or(TerrainDomainError::InvalidTile {
-                    level: key.level,
-                    tile: key.tile,
+                    level: key.address.lod.get(),
+                    tile: TileId {
+                        tx: u32::try_from(key.address.coord.x).unwrap_or(u32::MAX),
+                        tz: u32::try_from(key.address.coord.z).unwrap_or(u32::MAX),
+                    },
                 })?;
-        let total_halo = publication_halo
-            .checked_add(operation_halo)
-            .ok_or(TerrainDomainError::HaloOverflow)?;
-        let origin_x = interior.origin_x.saturating_sub(total_halo);
-        let origin_z = interior.origin_z.saturating_sub(total_halo);
-        let end_x = interior
-            .origin_x
-            .checked_add(interior.width)
-            .and_then(|end| end.checked_add(total_halo))
-            .ok_or(TerrainDomainError::HaloOverflow)?
-            .min(metrics.width);
-        let end_z = interior
-            .origin_z
-            .checked_add(interior.height)
-            .and_then(|end| end.checked_add(total_halo))
-            .ok_or(TerrainDomainError::HaloOverflow)?
-            .min(metrics.height);
+        let metrics = pyramid
+            .level_metrics(level)
+            .ok_or(TerrainDomainError::InvalidLevel(level))?;
+        let interior = pyramid
+            .tile_extent(level, tile)
+            .ok_or(TerrainDomainError::InvalidTile { level, tile })?;
+        let spatial = pyramid
+            .topology()
+            .spatial_domain(key.address, publication_halo, operation_halo)
+            .map_err(|_| TerrainDomainError::HaloOverflow)?;
+        let evaluation_origin_x = u32::try_from(spatial.evaluation.origin.x)
+            .map_err(|_| TerrainDomainError::HaloOverflow)?;
+        let evaluation_origin_z = u32::try_from(spatial.evaluation.origin.z)
+            .map_err(|_| TerrainDomainError::HaloOverflow)?;
         Ok(Self {
             key,
+            spatial,
             interior,
             evaluation: TerrainSampleExtent {
-                origin_x,
-                origin_z,
-                width: end_x.saturating_sub(origin_x),
-                height: end_z.saturating_sub(origin_z),
+                origin_x: evaluation_origin_x,
+                origin_z: evaluation_origin_z,
+                width: spatial.evaluation.width,
+                height: spatial.evaluation.height,
             },
             publication_halo,
             operation_halo,
-            publish_offset_x: interior.origin_x.saturating_sub(publication_halo) - origin_x,
-            publish_offset_z: interior.origin_z.saturating_sub(publication_halo) - origin_z,
+            publish_offset_x: spatial.publish_offset_x,
+            publish_offset_z: spatial.publish_offset_z,
             world: TerrainWorldTransform {
                 level_width: metrics.width,
                 level_height: metrics.height,
@@ -136,7 +138,7 @@ impl TerrainEvaluationDomain {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{FieldId, PyramidConfig};
+    use crate::PyramidConfig;
 
     fn stamp() -> TerrainContentStamp {
         TerrainContentStamp {
@@ -155,12 +157,7 @@ mod tests {
         let level = pyramid.max_level();
         let domain = TerrainEvaluationDomain::for_tile(
             &pyramid,
-            TerrainTileKey {
-                layer: None,
-                field: FieldId::Height,
-                level,
-                tile: TileId { tx: 3, tz: 3 },
-            },
+            TerrainTileKey::height(pyramid.address(level, TileId { tx: 3, tz: 3 }).unwrap()),
             2,
             7,
             stamp(),

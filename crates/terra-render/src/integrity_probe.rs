@@ -151,14 +151,17 @@ impl TerrainIntegrityProbe {
                 include_str!("shaders/outside_region_probe.wgsl").into(),
             ),
         });
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("terrain-integrity-probe-pipeline"),
-            layout: Some(&layout),
-            module: &shader,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
+        let pipeline =
+            terra_gpu::cached_compute_pipeline(device, "terrain-integrity-probe-pipeline", || {
+                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("terrain-integrity-probe-pipeline"),
+                    layout: Some(&layout),
+                    module: &shader,
+                    entry_point: Some("main"),
+                    compilation_options: Default::default(),
+                    cache: terra_gpu::shared_pipeline_cache(device).as_ref(),
+                })
+            });
         let baseline = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("terrain-integrity-probe-baseline"),
             size: u64::from(probe_count) * 4,

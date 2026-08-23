@@ -773,7 +773,7 @@ impl TerraApp {
         let width = self.last_height.as_ref()?.metrics.width;
         self.terrain_runtime
             .pyramid
-            .levels
+            .levels()
             .iter()
             .find(|level| level.resolution == width)
             .map(|level| (level.index, level.resolution))
@@ -823,12 +823,12 @@ impl TerraApp {
             .iter()
             .map(|tile| terra_core::TerrainTileWorkRequest {
                 key: terra_core::TerrainTileWorkKey {
-                    tile: terra_core::TerrainTileKey {
-                        layer: None,
-                        field: terra_core::FieldId::Height,
-                        level,
-                        tile: tile.id,
-                    },
+                    tile: terra_core::TerrainTileKey::height(
+                        self.terrain_runtime
+                            .pyramid
+                            .address(level, tile.id)
+                            .expect("height tile belongs to streamed bounded level"),
+                    ),
                     plan_revision: stamp.plan_revision,
                     output_revision: stamp.output_revision,
                 },
@@ -909,12 +909,12 @@ impl TerraApp {
                     for tx in 0..root_metrics.tiles_x() {
                         requests.push(terra_core::TerrainTileWorkRequest {
                             key: terra_core::TerrainTileWorkKey {
-                                tile: terra_core::TerrainTileKey {
-                                    layer: None,
-                                    field: terra_core::FieldId::Height,
-                                    level: 0,
-                                    tile: terra_core::TileId { tx, tz },
-                                },
+                                tile: terra_core::TerrainTileKey::height(
+                                    self.terrain_runtime
+                                        .pyramid
+                                        .address(0, terra_core::TileId { tx, tz })
+                                        .expect("root tile belongs to bounded pyramid"),
+                                ),
                                 plan_revision: stamp.plan_revision,
                                 output_revision: stamp.output_revision,
                             },
@@ -1193,7 +1193,13 @@ impl TerraApp {
                 match result {
                     Ok(_) => {
                         uploaded += 1;
-                        if key.level == 0 {
+                        if self
+                            .terrain_runtime
+                            .pyramid
+                            .topology()
+                            .level_index(key.address)
+                            == Some(0)
+                        {
                             let _ = self.tile_atlas.as_mut().unwrap().pin(&key);
                         }
                         self.terrain_tile_scheduler.complete(lease, live_stamp);
@@ -1207,11 +1213,12 @@ impl TerraApp {
             }
             let result = match lease.request.source {
                 terra_core::TerrainTileWorkSource::CpuHeight => {
-                    let Some(tile) = self
-                        .last_height
-                        .as_ref()
-                        .and_then(|height| height.tile(key.tile))
-                    else {
+                    let Some(tile) = self.last_height.as_ref().and_then(|height| {
+                        self.terrain_runtime
+                            .pyramid
+                            .level_and_tile(key.address)
+                            .and_then(|(_, tile)| height.tile(tile))
+                    }) else {
                         self.terrain_tile_scheduler.fail(lease);
                         continue;
                     };
@@ -1252,7 +1259,13 @@ impl TerraApp {
             match result {
                 Ok(_) => {
                     uploaded += 1;
-                    if key.level == 0 {
+                    if self
+                        .terrain_runtime
+                        .pyramid
+                        .topology()
+                        .level_index(key.address)
+                        == Some(0)
+                    {
                         let _ = self.tile_atlas.as_mut().unwrap().pin(&key);
                     }
                     self.terrain_tile_scheduler.complete(lease, live_stamp);
@@ -1318,7 +1331,13 @@ impl TerraApp {
             match result {
                 Ok(_) => {
                     uploaded += 1;
-                    if key.level == 0 {
+                    if self
+                        .terrain_runtime
+                        .pyramid
+                        .topology()
+                        .level_index(key.address)
+                        == Some(0)
+                    {
                         let _ = self.tile_atlas.as_mut().unwrap().pin(&key);
                     }
                     self.terrain_tile_scheduler.complete(work.lease, live_stamp);
@@ -1382,12 +1401,12 @@ impl TerraApp {
                 (0..metrics.tiles_z()).all(|tz| {
                     (0..metrics.tiles_x()).all(|tx| {
                         atlas.is_current(
-                            &terra_core::TerrainTileKey {
-                                layer: None,
-                                field: terra_core::FieldId::Height,
-                                level: 0,
-                                tile: terra_core::TileId { tx, tz },
-                            },
+                            &terra_core::TerrainTileKey::height(
+                                self.terrain_runtime
+                                    .pyramid
+                                    .address(0, terra_core::TileId { tx, tz })
+                                    .expect("root tile belongs to bounded pyramid"),
+                            ),
                             content,
                         )
                     })
@@ -2608,12 +2627,12 @@ mod tests {
         };
         let make_request = |tx, class, visible, error| terra_core::TerrainTileWorkRequest {
             key: terra_core::TerrainTileWorkKey {
-                tile: terra_core::TerrainTileKey {
-                    layer: None,
-                    field: terra_core::FieldId::Height,
-                    level,
-                    tile: terra_core::TileId { tx, tz: 0 },
-                },
+                tile: terra_core::TerrainTileKey::height(
+                    app.terrain_runtime
+                        .pyramid
+                        .address(level, terra_core::TileId { tx, tz: 0 })
+                        .unwrap(),
+                ),
                 plan_revision: stamp.plan_revision,
                 output_revision: stamp.output_revision,
             },
@@ -2841,10 +2860,17 @@ mod tests {
         let demand = app.latest_terrain_demand.as_ref().expect("camera demand");
         assert!(!demand.tiles.is_empty());
         assert!(demand.tiles.len() <= app.tile_atlas.as_ref().unwrap().max_pages() as usize);
-        assert!(demand
-            .tiles
-            .windows(2)
-            .all(|pair| pair[0].key.level <= pair[1].key.level));
+        assert!(demand.tiles.windows(2).all(|pair| {
+            app.terrain_runtime
+                .pyramid
+                .topology()
+                .level_index(pair[0].key.address)
+                <= app
+                    .terrain_runtime
+                    .pyramid
+                    .topology()
+                    .level_index(pair[1].key.address)
+        }));
 
         // Exercise the production camera adapter with constructed measured-error
         // metadata: the same immutable pyramid demands deeper tiles when close.
@@ -2870,7 +2896,12 @@ mod tests {
             .unwrap()
             .tiles
             .iter()
-            .map(|demand| demand.key.level)
+            .filter_map(|demand| {
+                app.terrain_runtime
+                    .pyramid
+                    .topology()
+                    .level_index(demand.key.address)
+            })
             .max()
             .unwrap();
         app.renderer.as_mut().unwrap().camera.distance = 500.0;
@@ -2881,7 +2912,12 @@ mod tests {
             .unwrap()
             .tiles
             .iter()
-            .map(|demand| demand.key.level)
+            .filter_map(|demand| {
+                app.terrain_runtime
+                    .pyramid
+                    .topology()
+                    .level_index(demand.key.address)
+            })
             .max()
             .unwrap();
         assert!(near_level > far_level);

@@ -8,6 +8,7 @@ design was reached, but they do not override this document.
 
 | Crate | Responsibility |
 |-------|----------------|
+| `terra-world` | Fixed-origin coordinates, signed tile addresses, LODs, sample/world transforms, and bounded/infinite topology contracts |
 | `terra-core` | Backend-neutral domain model: heightfields, layer stack, masks, biomes, and editor commands |
 | `terra-cpu-eval` | Stateful CPU terrain evaluation, caches, scheduling, workers, timing, and output lifecycle |
 | `terra-jobs` | Cancellation primitive (`CancelToken`) and cancellable parallel-fill helpers shared by core algorithms and CPU evaluation |
@@ -19,6 +20,8 @@ design was reached, but they do not override this document.
 | `terra-app` | Application shell: winit event loop, editor panels and tools, `PanelAction` dispatch, and renderer integration |
 | `terra-test-gpu` | Non-published headless GPU harness used by render and UI tests |
 
+`terra-world` depends only on backend-independent serialization support and must
+stay free of domain content, evaluators, GPU, renderer, IO, and app crates.
 `terra-core` must stay free of evaluator, `wgpu`, and UI crates. `terra-cpu-eval`
 depends on `terra-core`, never the reverse. `terra-gpu-eval` depends on
 `terra-gpu`, never the reverse. `terra-gui` must stay free
@@ -228,10 +231,18 @@ evictions, explicit removals, and clears directly into both GPU table layers. Th
 directory is not a second CPU residency database. Reported residency counts are
 derived from this path and are tested against valid page-table rows.
 
-`TerrainPyramid` is the immutable addressing descriptor for a complete ceil-halving
-resolution hierarchy. It defines level dimensions, tile extents, normalized-footprint
-parent/child coverage, and stable dense metadata indices; it owns no resident tiles,
-page handles, or copy of the page table. `terra-gpu::GpuHeightPyramid` materializes a
+`terra-world` owns the fixed-origin `f64` CPU coordinate system, signed `i64` tile
+addresses, validated finest-first LODs, sample/world transforms, and both bounded and
+infinite topology contracts. The infinite topology exposes only direct addressing and
+finite rectangle queries: it has no total dimensions, root tile, dense metadata index,
+or complete-world iterator. Content identity remains in `terra-core` and composes a
+world tile address with layer and field identity.
+
+`TerrainPyramid` is the bounded adapter over `terra-world::BoundedTopology` for a complete
+ceil-halving resolution hierarchy. It preserves the legacy coarse-first bounded level
+index, partial edge tiles, normalized-footprint parent/child coverage, and stable dense
+metadata indices; it owns no resident tiles, page handles, or copy of the page table.
+`terra-gpu::GpuHeightPyramid` materializes a
 completed GPU result into immutable R32Float level textures and an output-identity-stamped
 dense geometric-error buffer. Those errors describe content, not residency.
 

@@ -6,6 +6,14 @@ global-operation evaluation are separate concerns.
 
 ## Levels and coordinates
 
+The spatial math is implemented by `terra-world::BoundedTopology`; `TerrainPyramid`
+is the existing bounded-world adapter and content-facing iterator. Shared `TileAddress`
+values use signed `i64` coordinates and finest-first LODs (LOD 0 is finest). At the
+bounded boundary, the adapter maps `bounded_level = max_level - lod` so the package,
+dense metadata, GPU directory, and traversal order remain coarse to fine exactly as
+before. Infinite topology uses the same address type without total world dimensions or
+complete enumeration.
+
 Level 0 is 2×2. Starting at the requested finest resolution, each parent dimension is
 `ceil(child / 2)`, then the sequence is stored coarse to fine. Thus 512 produces
 `2, 4, ..., 512`, while 1000 produces

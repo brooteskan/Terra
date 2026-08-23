@@ -854,7 +854,7 @@ impl TerraApp {
 mod tests {
     use super::*;
     use crate::ui::PanelAction;
-    use terra_core::{FieldId, Heightfield, HeightfieldMetrics, TerrainTileKey};
+    use terra_core::{Heightfield, HeightfieldMetrics, TerrainTileKey};
     use terra_gpu::{GpuPageTableEntry, GpuTileAtlas};
     use terra_render::{GpuContext, TerrainRenderer};
 
@@ -1071,14 +1071,8 @@ mod tests {
             .queued_requests()
             .next()
             .expect("old document upload queued");
-        let (old_level, old_tile) = (old_pending.key.tile.level, old_pending.key.tile.tile);
+        let old_key = old_pending.key.tile.clone();
         assert_eq!(app.upload_pending_terrain_tiles(), 1);
-        let old_key = TerrainTileKey {
-            layer: None,
-            field: FieldId::Height,
-            level: old_level,
-            tile: old_tile,
-        };
         let old_handle = app
             .tile_atlas
             .as_mut()
@@ -1125,14 +1119,8 @@ mod tests {
             .queued_requests()
             .next()
             .expect("new document upload queued");
-        let (new_level, new_tile) = (new_pending.key.tile.level, new_pending.key.tile.tile);
+        let new_key = new_pending.key.tile.clone();
         assert_eq!(app.upload_pending_terrain_tiles(), 1);
-        let new_key = TerrainTileKey {
-            layer: None,
-            field: FieldId::Height,
-            level: new_level,
-            tile: new_tile,
-        };
         let atlas = app.tile_atlas.as_mut().expect("atlas after upload");
         let new_handle = atlas.lookup(&new_key).expect("new page resident");
         assert_eq!(new_handle.slot, old_handle.slot);
@@ -1179,14 +1167,8 @@ mod tests {
             .queued_requests()
             .next()
             .expect("page upload queued");
-        let (level, tile) = (pending.key.tile.level, pending.key.tile.tile);
+        let key = pending.key.tile.clone();
         assert_eq!(app.upload_pending_terrain_tiles(), 1);
-        let key = TerrainTileKey {
-            layer: None,
-            field: FieldId::Height,
-            level,
-            tile,
-        };
         let handle = app
             .tile_atlas
             .as_mut()
@@ -1258,10 +1240,15 @@ mod tests {
             .collect();
         assert_eq!(live.len(), 1, "exactly one page resident after sync");
         let entry = live[0];
-        assert_eq!(entry.level as u8, key.level, "page level matches key");
+        let (level, tile) = app
+            .terrain_runtime
+            .pyramid
+            .level_and_tile(key.address)
+            .expect("resident key belongs to bounded pyramid");
+        assert_eq!(entry.level as u8, level, "page level matches key");
         assert_eq!(
             (entry.tile_x, entry.tile_z),
-            (key.tile.tx, key.tile.tz),
+            (tile.tx, tile.tz),
             "page tile coords match key"
         );
         assert_eq!(
@@ -1367,14 +1354,8 @@ mod tests {
             .queued_requests()
             .next()
             .expect("resync upload queued");
-        let (new_level, new_tile) = (new_pending.key.tile.level, new_pending.key.tile.tile);
+        let new_key = new_pending.key.tile.clone();
         assert_eq!(app.upload_pending_terrain_tiles(), 1);
-        let new_key = TerrainTileKey {
-            layer: None,
-            field: FieldId::Height,
-            level: new_level,
-            tile: new_tile,
-        };
         // Re-enable ratchet: the page repopulates and the renderer streams again,
         // now stamped with the post-edit revision (not the retired one).
         assert_ne!(app.terrain_runtime.output_revision(), revision_before);

@@ -1,15 +1,14 @@
 use super::{TerrainContentStamp, TerrainTileKey};
-use crate::heightfield::TileId;
 use crate::layer::LayerId;
 use std::collections::HashMap;
+use terra_world::TileAddress;
 
 /// Composite cache identity for a resident terrain tile payload.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TerrainCacheKey {
     pub layer_id: Option<LayerId>,
     pub generation: u32,
-    pub tile: TileId,
-    pub level: u8,
+    pub address: TileAddress,
     pub param_hash: u64,
 }
 
@@ -330,15 +329,20 @@ impl TileResidencyCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{FieldId, LayerId, TileId};
+    use crate::{FieldId, LayerId, Lod, TileAddress, TileCoord};
 
     fn key(layer: LayerId, tx: u32) -> TerrainTileKey {
-        TerrainTileKey {
-            layer: Some(layer),
-            field: FieldId::Height,
-            level: 3,
-            tile: TileId { tx, tz: 0 },
-        }
+        TerrainTileKey::new(
+            Some(layer),
+            FieldId::Height,
+            TileAddress::new(
+                Lod::try_new(3).unwrap(),
+                TileCoord {
+                    x: i64::from(tx),
+                    z: 0,
+                },
+            ),
+        )
     }
 
     #[test]
@@ -438,8 +442,7 @@ mod tests {
         let a = TerrainCacheKey {
             layer_id: Some(layer),
             generation: 1,
-            tile: TileId { tx: 0, tz: 0 },
-            level: 2,
+            address: TileAddress::new(Lod::try_new(2).unwrap(), TileCoord::ZERO),
             param_hash: 42,
         };
         let b = TerrainCacheKey {

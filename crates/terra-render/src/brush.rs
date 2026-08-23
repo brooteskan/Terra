@@ -161,33 +161,35 @@ impl BrushOverlay {
             push_constant_ranges: &[],
         });
         let make_render_pipeline = |label: &'static str, depth_stencil| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(&render_layout),
-                vertex: wgpu::VertexState {
-                    module: &render_shader,
-                    entry_point: Some("vs_main"),
-                    buffers: &[],
-                    compilation_options: Default::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &render_shader,
-                    entry_point: Some("fs_main"),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format,
-                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                    compilation_options: Default::default(),
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::LineStrip,
-                    ..Default::default()
-                },
-                depth_stencil,
-                multisample: wgpu::MultisampleState::default(),
-                multiview: None,
-                cache: None,
+            terra_gpu::cached_render_pipeline(device, label, format, || {
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some(label),
+                    layout: Some(&render_layout),
+                    vertex: wgpu::VertexState {
+                        module: &render_shader,
+                        entry_point: Some("vs_main"),
+                        buffers: &[],
+                        compilation_options: Default::default(),
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &render_shader,
+                        entry_point: Some("fs_main"),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format,
+                            blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                        compilation_options: Default::default(),
+                    }),
+                    primitive: wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::LineStrip,
+                        ..Default::default()
+                    },
+                    depth_stencil,
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview: None,
+                    cache: terra_gpu::shared_pipeline_cache(device).as_ref(),
+                })
             })
         };
         let depth_pipeline = make_render_pipeline(
@@ -214,14 +216,17 @@ impl BrushOverlay {
             bind_group_layouts: &[&compute_bgl],
             push_constant_ranges: &[],
         });
-        let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("brush-pick-pipeline"),
-            layout: Some(&compute_layout),
-            module: &compute_shader,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
+        let compute_pipeline =
+            terra_gpu::cached_compute_pipeline(device, "brush-pick-pipeline", || {
+                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("brush-pick-pipeline"),
+                    layout: Some(&compute_layout),
+                    module: &compute_shader,
+                    entry_point: Some("main"),
+                    compilation_options: Default::default(),
+                    cache: terra_gpu::shared_pipeline_cache(device).as_ref(),
+                })
+            });
 
         let readback = (0..READBACK_SLOTS)
             .map(|index| ReadbackSlot {

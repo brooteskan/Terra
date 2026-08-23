@@ -1,5 +1,5 @@
-use crate::fields::FieldId;
 use crate::heightfield::{HeightfieldMetrics, TileId, DEFAULT_HALO, DEFAULT_TILE_SIZE};
+use terra_world::{BoundedTopology, BoundedTopologyConfig, TileAddress};
 
 use super::TerrainTileKey;
 
@@ -24,11 +24,7 @@ impl PyramidConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct TerrainLevel {
-    pub index: u8,
-    pub resolution: u32,
-}
+pub type TerrainLevel = terra_world::BoundedLevel;
 
 /// Interior sample extent of one tile in a pyramid level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,38 +61,36 @@ impl TerrainTileRange {
 #[derive(Debug, Clone)]
 pub struct TerrainPyramid {
     pub config: PyramidConfig,
-    pub levels: Vec<TerrainLevel>,
+    topology: BoundedTopology,
 }
 
 impl TerrainPyramid {
     pub fn new(config: PyramidConfig) -> Self {
-        // Build from the requested output down so every parent dimension is the
-        // exact ceil-half of its child. This preserves a complete hierarchy for
-        // non-power-of-two outputs instead of ending with an irregular 512→1000
-        // transition.
-        let mut resolutions = vec![config.target_resolution.max(2)];
-        while resolutions.last().copied().unwrap_or(2) > 2 {
-            let child = resolutions.last().copied().unwrap_or(2);
-            resolutions.push(child.div_ceil(2).max(2));
-        }
-        resolutions.reverse();
-        let levels = resolutions
-            .into_iter()
-            .enumerate()
-            .map(|(index, resolution)| TerrainLevel {
-                index: index as u8,
-                resolution,
-            })
-            .collect();
-        Self { config, levels }
+        let topology = BoundedTopology::try_new(BoundedTopologyConfig {
+            target_resolution: config.target_resolution.max(2),
+            world_size_x: f64::from(config.world_size_x),
+            world_size_z: f64::from(config.world_size_z),
+            tile_size: config.tile_size,
+            halo: config.halo,
+        })
+        .expect("pyramid configuration must contain finite positive world extents and tile size");
+        Self { config, topology }
+    }
+
+    pub fn topology(&self) -> &BoundedTopology {
+        &self.topology
+    }
+
+    pub fn levels(&self) -> &[TerrainLevel] {
+        self.topology.levels()
     }
 
     pub fn max_level(&self) -> u8 {
-        self.levels.len().saturating_sub(1) as u8
+        self.topology.max_level()
     }
 
     pub fn level(&self, index: u8) -> Option<&TerrainLevel> {
-        self.levels.get(index as usize)
+        self.topology.level(index)
     }
 
     pub fn level_metrics(&self, index: u8) -> Option<HeightfieldMetrics> {
@@ -112,63 +106,48 @@ impl TerrainPyramid {
     }
 
     pub fn tile_extent(&self, level: u8, tile: TileId) -> Option<TerrainTileExtent> {
-        let metrics = self.level_metrics(level)?;
-        if tile.tx >= metrics.tiles_x() || tile.tz >= metrics.tiles_z() {
-            return None;
-        }
-        let origin_x = tile.tx * metrics.tile_size;
-        let origin_z = tile.tz * metrics.tile_size;
+        let address = self.address(level, tile)?;
+        let extent = self.topology.tile_extent(address).ok()?.samples;
         Some(TerrainTileExtent {
-            origin_x,
-            origin_z,
-            width: (metrics.width - origin_x).min(metrics.tile_size),
-            height: (metrics.height - origin_z).min(metrics.tile_size),
+            origin_x: u32::try_from(extent.origin.x).ok()?,
+            origin_z: u32::try_from(extent.origin.z).ok()?,
+            width: extent.width,
+            height: extent.height,
         })
+    }
+
+    pub fn address(&self, level: u8, tile: TileId) -> Option<TileAddress> {
+        self.topology.address(level, tile.tx, tile.tz).ok()
+    }
+
+    pub fn level_and_tile(&self, address: TileAddress) -> Option<(u8, TileId)> {
+        Some((
+            self.topology.level_index(address)?,
+            TileId {
+                tx: u32::try_from(address.coord.x).ok()?,
+                tz: u32::try_from(address.coord.z).ok()?,
+            },
+        ))
     }
 
     /// Stable dense index used by immutable per-content metadata buffers.
     pub fn tile_metadata_index(&self, level: u8, tile: TileId) -> Option<u32> {
-        self.tile_extent(level, tile)?;
-        let before = self
-            .levels
-            .iter()
-            .take(level as usize)
-            .map(|entry| {
-                let tile_size = self.config.tile_size.min(entry.resolution).max(1);
-                entry.resolution.div_ceil(tile_size).pow(2)
-            })
-            .sum::<u32>();
-        let metrics = self.level_metrics(level)?;
-        Some(before + tile.tz * metrics.tiles_x() + tile.tx)
+        self.topology.metadata_index(self.address(level, tile)?)
+    }
+
+    pub fn address_metadata_index(&self, address: TileAddress) -> Option<u32> {
+        self.topology.metadata_index(address)
     }
 
     pub fn metadata_len(&self) -> u32 {
-        self.levels
-            .iter()
-            .map(|level| {
-                let tile_size = self.config.tile_size.min(level.resolution).max(1);
-                level.resolution.div_ceil(tile_size).pow(2)
-            })
-            .sum()
+        self.topology.metadata_len()
     }
 
     /// Every final-height tile in stable package order: levels coarse to fine,
     /// then tile rows and columns. The iterator is complete by construction and
     /// its position agrees with [`Self::tile_metadata_index`].
     pub fn height_tiles(&self) -> impl Iterator<Item = TerrainTileKey> + '_ {
-        self.levels.iter().flat_map(|level| {
-            let metrics = self
-                .level_metrics(level.index)
-                .expect("pyramid owns valid level metadata");
-            (0..metrics.tiles_z()).flat_map(move |tz| {
-                (0..metrics.tiles_x()).map(move |tx| TerrainTileKey {
-                    layer: None,
-                    field: FieldId::Height,
-                    level: level.index,
-                    tile: TileId { tx, tz },
-                })
-            })
-        })
+        self.topology.addresses().map(TerrainTileKey::height)
     }
 
     /// Stable final-height traversal for one level.
@@ -176,15 +155,11 @@ impl TerrainPyramid {
         &self,
         level: u8,
     ) -> Option<impl Iterator<Item = TerrainTileKey> + '_> {
-        let metrics = self.level_metrics(level)?;
-        Some((0..metrics.tiles_z()).flat_map(move |tz| {
-            (0..metrics.tiles_x()).map(move |tx| TerrainTileKey {
-                layer: None,
-                field: FieldId::Height,
-                level,
-                tile: TileId { tx, tz },
-            })
-        }))
+        Some(
+            self.topology
+                .addresses_at_level(level)?
+                .map(TerrainTileKey::height),
+        )
     }
 
     /// Parent tiles whose normalized sample footprint intersects `tile`.
@@ -212,45 +187,23 @@ impl TerrainPyramid {
         source_tile: TileId,
         target_level: u8,
     ) -> Option<TerrainTileRange> {
-        let source = self.level_metrics(source_level)?;
-        let target = self.level_metrics(target_level)?;
-        let extent = self.tile_extent(source_level, source_tile)?;
-        let x0 = scaled_floor(extent.origin_x, target.width, source.width);
-        let z0 = scaled_floor(extent.origin_z, target.height, source.height);
-        let x1 = scaled_ceil(
-            extent.origin_x.saturating_add(extent.width),
-            target.width,
-            source.width,
-        )
-        .saturating_sub(1)
-        .min(target.width - 1);
-        let z1 = scaled_ceil(
-            extent.origin_z.saturating_add(extent.height),
-            target.height,
-            source.height,
-        )
-        .saturating_sub(1)
-        .min(target.height - 1);
+        let source = self.address(source_level, source_tile)?;
+        let range = if target_level < source_level {
+            self.topology.covering_parent_tiles(source)?
+        } else {
+            self.topology.covering_child_tiles(source)?
+        };
         Some(TerrainTileRange {
             min: TileId {
-                tx: x0 / target.tile_size,
-                tz: z0 / target.tile_size,
+                tx: u32::try_from(range.min.coord.x).ok()?,
+                tz: u32::try_from(range.min.coord.z).ok()?,
             },
             max: TileId {
-                tx: x1 / target.tile_size,
-                tz: z1 / target.tile_size,
+                tx: u32::try_from(range.max.coord.x).ok()?,
+                tz: u32::try_from(range.max.coord.z).ok()?,
             },
         })
     }
-}
-
-fn scaled_floor(value: u32, target: u32, source: u32) -> u32 {
-    ((u64::from(value) * u64::from(target)) / u64::from(source)) as u32
-}
-
-fn scaled_ceil(value: u32, target: u32, source: u32) -> u32 {
-    let numerator = u64::from(value) * u64::from(target);
-    numerator.div_ceil(u64::from(source)) as u32
 }
 
 #[cfg(test)]
@@ -260,18 +213,18 @@ mod tests {
     #[test]
     fn pyramid_builds_complete_upsample_chain() {
         let pyramid = TerrainPyramid::new(PyramidConfig::new(1000, 4096.0, 4096.0));
-        assert_eq!(pyramid.levels.first().unwrap().resolution, 2);
-        assert_eq!(pyramid.levels.last().unwrap().resolution, 1000);
+        assert_eq!(pyramid.levels().first().unwrap().resolution, 2);
+        assert_eq!(pyramid.levels().last().unwrap().resolution, 1000);
         assert_eq!(
             pyramid
-                .levels
+                .levels()
                 .iter()
                 .map(|level| level.resolution)
                 .collect::<Vec<_>>(),
             vec![2, 4, 8, 16, 32, 63, 125, 250, 500, 1000]
         );
         assert!(pyramid
-            .levels
+            .levels()
             .windows(2)
             .all(|pair| pair[0].resolution == pair[1].resolution.div_ceil(2)));
     }
@@ -292,7 +245,7 @@ mod tests {
             })
         );
         let mut indices = Vec::new();
-        for level in &pyramid.levels {
+        for level in pyramid.levels() {
             let metrics = pyramid.level_metrics(level.index).unwrap();
             for tz in 0..metrics.tiles_z() {
                 for tx in 0..metrics.tiles_x() {
@@ -309,7 +262,7 @@ mod tests {
         assert_eq!(keys.len(), pyramid.metadata_len() as usize);
         for (index, key) in keys.iter().enumerate() {
             assert_eq!(
-                pyramid.tile_metadata_index(key.level, key.tile),
+                pyramid.address_metadata_index(key.address),
                 Some(index as u32)
             );
         }
@@ -357,7 +310,7 @@ mod tests {
         let pyramid = TerrainPyramid::new(config);
         assert_eq!(
             pyramid
-                .levels
+                .levels()
                 .iter()
                 .map(|level| level.resolution)
                 .collect::<Vec<_>>(),
