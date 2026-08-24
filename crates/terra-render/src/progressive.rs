@@ -232,21 +232,18 @@ impl ProgressiveRenderer {
             ],
         });
 
-        terra_core::shader_progress::record_shader_compiled();
         let temporal_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("progressive-temporal"),
             source: wgpu::ShaderSource::Wgsl(
                 include_str!("shaders/progressive_temporal.wgsl").into(),
             ),
         });
-        terra_core::shader_progress::record_shader_compiled();
         let atrous_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("progressive-atrous"),
             source: wgpu::ShaderSource::Wgsl(
                 include_str!("shaders/progressive_atrous.wgsl").into(),
             ),
         });
-        terra_core::shader_progress::record_shader_compiled();
         let composite_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("progressive-composite"),
             source: wgpu::ShaderSource::Wgsl(

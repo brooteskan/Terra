@@ -1065,7 +1065,6 @@ fn make_pipe(
     shader: &str,
     entries: &[wgpu::BindGroupLayoutEntry],
 ) -> Pipe {
-    terra_core::shader_progress::record_shader_compiled();
     let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some(label),
         entries,
@@ -1079,14 +1078,20 @@ fn make_pipe(
         bind_group_layouts: &[&layout],
         push_constant_ranges: &[],
     });
-    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some(label),
-        layout: Some(&pipeline_layout),
-        module: &module,
-        entry_point: Some("main"),
-        compilation_options: Default::default(),
-        cache: None,
-    });
+    let pipeline = terra_telemetry::measure(
+        terra_telemetry::CompilationKind::ComputePipeline,
+        label,
+        || {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pipeline_layout),
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        },
+    );
     Pipe { pipeline, layout }
 }
 

@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/terra-telemetry",
     "crates/terra-world",
     "crates/terra-core",
     "crates/terra-cpu-eval",
@@ -23,6 +24,7 @@ authors = ["Terra Contributors"]
 repository = "https://github.com/brooteskan/Terra"
 
 [workspace.dependencies]
+terra-telemetry = { path = "crates/terra-telemetry" }
 terra-world = { path = "crates/terra-world" }
 terra-core = { path = "crates/terra-core" }
 terra-cpu-eval = { path = "crates/terra-cpu-eval" }

@@ -528,7 +528,6 @@ fn compute_pipeline(
     source: &str,
     bind_group_layout: &wgpu::BindGroupLayout,
 ) -> wgpu::ComputePipeline {
-    terra_core::shader_progress::record_shader_compiled();
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some(label),
         source: wgpu::ShaderSource::Wgsl(source.into()),
@@ -538,14 +537,20 @@ fn compute_pipeline(
         bind_group_layouts: &[bind_group_layout],
         push_constant_ranges: &[],
     });
-    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some(label),
-        layout: Some(&layout),
-        module: &shader,
-        entry_point: Some("main"),
-        compilation_options: Default::default(),
-        cache: None,
-    })
+    terra_telemetry::measure(
+        terra_telemetry::CompilationKind::ComputePipeline,
+        label,
+        || {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(label),
+                layout: Some(&layout),
+                module: &shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        },
+    )
 }
 
 fn read_r32_texture_blocking(

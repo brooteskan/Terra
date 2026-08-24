@@ -85,7 +85,16 @@ impl PipelineCacheRegistry {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let key = (label, format);
-        pipelines.entry(key).or_insert_with(create).clone()
+        pipelines
+            .entry(key)
+            .or_insert_with(|| {
+                terra_telemetry::measure(
+                    terra_telemetry::CompilationKind::RenderPipeline,
+                    label,
+                    create,
+                )
+            })
+            .clone()
     }
 
     /// Return one exact compute-pipeline handle per label.
@@ -98,7 +107,16 @@ impl PipelineCacheRegistry {
             .compute
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        pipelines.entry(label).or_insert_with(create).clone()
+        pipelines
+            .entry(label)
+            .or_insert_with(|| {
+                terra_telemetry::measure(
+                    terra_telemetry::CompilationKind::ComputePipeline,
+                    label,
+                    create,
+                )
+            })
+            .clone()
     }
 }
 

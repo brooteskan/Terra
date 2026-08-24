@@ -466,6 +466,22 @@ pub struct GpuContext {
     /// window surface at runtime, or chosen directly for headless/offscreen use.
     pub surface_format: wgpu::TextureFormat,
     pipelines: std::sync::Arc<terra_gpu::PipelineCacheRegistry>,
+    adapter_metadata: std::sync::Arc<AdapterMetadata>,
+}
+
+/// Stable adapter facts included in startup logs and benchmark reports.
+#[derive(Debug, Clone, Default)]
+pub struct AdapterMetadata {
+    pub name: String,
+    pub vendor: u32,
+    pub device: u32,
+    pub device_type: String,
+    pub backend: String,
+    pub driver: String,
+    pub driver_info: String,
+    pub downlevel_shader_model: String,
+    pub pipeline_cache_supported: bool,
+    pub pipeline_cache_enabled: bool,
 }
 
 impl GpuContext {
@@ -474,17 +490,31 @@ impl GpuContext {
         queue: wgpu::Queue,
         surface_format: wgpu::TextureFormat,
     ) -> Self {
+        Self::with_adapter_metadata(device, queue, surface_format, AdapterMetadata::default())
+    }
+
+    fn with_adapter_metadata(
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        surface_format: wgpu::TextureFormat,
+        adapter_metadata: AdapterMetadata,
+    ) -> Self {
         let pipelines = std::sync::Arc::new(terra_gpu::PipelineCacheRegistry::new(&device));
         Self {
             device,
             queue,
             surface_format,
             pipelines,
+            adapter_metadata: std::sync::Arc::new(adapter_metadata),
         }
     }
 
     pub fn pipeline_registry(&self) -> &terra_gpu::PipelineCacheRegistry {
         &self.pipelines
+    }
+
+    pub fn adapter_metadata(&self) -> &AdapterMetadata {
+        &self.adapter_metadata
     }
 }
 
@@ -526,6 +556,9 @@ pub async fn init_gpu(
         })
         .await
         .ok_or_else(|| RenderError::Msg("no adapter".into()))?;
+    let adapter_info = adapter.get_info();
+    let downlevel = adapter.get_downlevel_capabilities();
+    let pipeline_cache_supported = adapter.features().contains(wgpu::Features::PIPELINE_CACHE);
 
     let mut limits = wgpu::Limits::default();
     let adapter_limits = adapter.limits();
@@ -589,8 +622,20 @@ pub async fn init_gpu(
         desired_maximum_frame_latency: 2,
     };
     surface.configure(&device, &config);
+    let adapter_metadata = AdapterMetadata {
+        name: adapter_info.name,
+        vendor: adapter_info.vendor,
+        device: adapter_info.device,
+        device_type: format!("{:?}", adapter_info.device_type),
+        backend: format!("{:?}", adapter_info.backend),
+        driver: adapter_info.driver,
+        driver_info: adapter_info.driver_info,
+        downlevel_shader_model: format!("{:?}", downlevel.shader_model),
+        pipeline_cache_supported,
+        pipeline_cache_enabled: device.features().contains(wgpu::Features::PIPELINE_CACHE),
+    };
     Ok((
-        GpuContext::new(device, queue, format),
+        GpuContext::with_adapter_metadata(device, queue, format, adapter_metadata),
         SurfaceTarget {
             surface,
             config,
@@ -873,7 +918,6 @@ impl TerrainRenderer {
         let format = config.format;
 
         log::info!("terra-render: compiling bounded terrain shader/pipelines…");
-        terra_core::shader_progress::record_shader_compiled();
         let terrain_source = terrain_shader::compose(TerrainShaderVariant::Bounded);
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some(TerrainShaderVariant::Bounded.shader_label()),

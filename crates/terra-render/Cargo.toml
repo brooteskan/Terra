@@ -7,6 +7,7 @@ description = "wgpu terrain viewport rendering"
 autotests = false
 
 [dependencies]
+terra-telemetry = { workspace = true }
 terra-core = { workspace = true }
 terra-gpu = { workspace = true }
 wgpu = { workspace = true }

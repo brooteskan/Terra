@@ -6,6 +6,7 @@ license.workspace = true
 description = "Reusable wgpu immediate-mode UI toolkit and design system"
 
 [dependencies]
+terra-telemetry = { workspace = true }
 wgpu = { workspace = true }
 bytemuck = { workspace = true }
 glam = { workspace = true }

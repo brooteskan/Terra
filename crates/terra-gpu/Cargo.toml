@@ -6,6 +6,7 @@ license.workspace = true
 description = "GPU compute pipelines for terrain simulation (WGSL)"
 
 [dependencies]
+terra-telemetry = { workspace = true }
 terra-core = { workspace = true }
 wgpu = { workspace = true }
 bytemuck = { workspace = true }

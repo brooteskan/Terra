@@ -303,7 +303,6 @@ impl GpuTileAtlas {
             "terrain-pyramid-pack-bgl",
             crate::write_storage_texture_binding(wgpu::TextureFormat::R32Float),
         );
-        terra_core::shader_progress::record_shader_compiled();
         let pack_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("terrain-pyramid-pack"),
             source: wgpu::ShaderSource::Wgsl(
@@ -315,14 +314,20 @@ impl GpuTileAtlas {
             bind_group_layouts: &[&pack_layout],
             push_constant_ranges: &[],
         });
-        let pack_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("terrain-pyramid-pack"),
-            layout: Some(&pack_pipeline_layout),
-            module: &pack_shader,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
+        let pack_pipeline = terra_telemetry::measure(
+            terra_telemetry::CompilationKind::ComputePipeline,
+            "terrain-pyramid-pack",
+            || {
+                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("terrain-pyramid-pack"),
+                    layout: Some(&pack_pipeline_layout),
+                    module: &pack_shader,
+                    entry_point: Some("main"),
+                    compilation_options: Default::default(),
+                    cache: None,
+                })
+            },
+        );
         Ok(Self {
             texture,
             view,

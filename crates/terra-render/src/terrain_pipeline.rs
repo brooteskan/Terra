@@ -84,7 +84,6 @@ impl TerrainPipelineCompiler {
             "terra-render: compiling {} terrain shader/pipelines…",
             variant.name()
         );
-        terra_core::shader_progress::record_shader_compiled();
         let shader = self
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {

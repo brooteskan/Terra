@@ -8,6 +8,7 @@ design was reached, but they do not override this document.
 
 | Crate | Responsibility |
 |-------|----------------|
+| `terra-telemetry` | Backend-neutral startup-stage and pipeline-compilation tracking shared by GPU-facing crates |
 | `terra-world` | Fixed-origin coordinates, signed tile addresses, LODs, sample/world transforms, and bounded/infinite topology contracts |
 | `terra-core` | Backend-neutral domain model: heightfields, layer stack, masks, biomes, and editor commands |
 | `terra-cpu-eval` | Stateful CPU terrain evaluation, caches, scheduling, workers, timing, and output lifecycle |
@@ -20,6 +21,7 @@ design was reached, but they do not override this document.
 | `terra-app` | Application shell: winit event loop, editor panels and tools, `PanelAction` dispatch, and renderer integration |
 | `terra-test-gpu` | Non-published headless GPU harness used by render and UI tests |
 
+`terra-telemetry` is `wgpu`-free and depends only on the standard library.
 `terra-world` depends only on backend-independent serialization support and must
 stay free of domain content, evaluators, GPU, renderer, IO, and app crates.
 `terra-core` must stay free of evaluator, `wgpu`, and UI crates. `terra-cpu-eval`

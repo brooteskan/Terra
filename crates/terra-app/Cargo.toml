@@ -9,7 +9,12 @@ description = "Terra terrain editor application"
 name = "terra"
 path = "src/main.rs"
 
+[[bin]]
+name = "terra-startup-bench"
+path = "src/bin/terra_startup_bench.rs"
+
 [dependencies]
+terra-telemetry = { workspace = true }
 terra-core = { workspace = true }
 terra-world = { workspace = true }
 terra-cpu-eval = { workspace = true }

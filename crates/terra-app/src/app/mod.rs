@@ -74,6 +74,7 @@ pub(crate) struct BootResult {
     tile_atlas: Option<GpuTileAtlas>,
     gpu_engine: GpuTerrainEngine,
     gpu_pyramid_materializer: GpuHeightPyramidMaterializer,
+    editor_overlays: editor_overlays::EditorOverlays,
 }
 
 /// Startup state held while the renderer's pipelines/shaders compile on a worker
@@ -87,6 +88,8 @@ pub(crate) struct BootState {
     pub(crate) started: Instant,
     /// Boot worker failure, parked here while the failure splash is shown.
     pub(crate) failure: Option<crate::startup::StartupError>,
+    /// Frozen telemetry retained after a worker panic clears the active stage.
+    pub(crate) failure_telemetry: Option<terra_telemetry::CompilationSnapshot>,
 }
 
 /// Continuous fly keys for the game-engine-style viewport camera.

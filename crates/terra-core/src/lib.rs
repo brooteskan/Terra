@@ -46,7 +46,6 @@ pub mod realism_benchmark;
 pub mod rebuild_feedback;
 pub mod rebuild_state;
 pub mod scatter;
-pub mod shader_progress;
 pub mod shape_history;
 pub mod shape_object;
 pub mod simd_ops;

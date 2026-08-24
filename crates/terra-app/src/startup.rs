@@ -111,9 +111,21 @@ pub(crate) fn classify_boot_poll<T>(poll: Option<Result<T, terra_jobs::JobError>
 }
 
 /// Build the text lines for the boot-failure splash frame.
-pub(crate) fn failure_splash_lines(error: &StartupError, log_file: Option<&Path>) -> Vec<String> {
+pub(crate) fn failure_splash_lines_with_telemetry(
+    error: &StartupError,
+    log_file: Option<&Path>,
+    telemetry: Option<&terra_telemetry::CompilationSnapshot>,
+) -> Vec<String> {
     let mut lines = Vec::with_capacity(5);
     lines.push(format!("{error}"));
+    if let Some(failed) = telemetry.and_then(|snapshot| snapshot.last_failure()) {
+        lines.push(format!(
+            "Failed during {}: {} ({})",
+            failed.kind.as_str(),
+            failed.label,
+            format_elapsed(failed.duration)
+        ));
+    }
     lines.push(String::new());
     lines.push(error.advice().to_string());
     if let Some(path) = log_file {
@@ -123,6 +135,49 @@ pub(crate) fn failure_splash_lines(error: &StartupError, log_file: Option<&Path>
     lines.push(String::new());
     lines.push("Press any key or click to close.".to_string());
     lines
+}
+
+/// User-facing live startup status. Pipeline identity takes precedence over a
+/// containing coarse stage so a long synchronous compile is never hidden.
+pub(crate) fn startup_status(snapshot: &terra_telemetry::CompilationSnapshot) -> String {
+    if let Some(active) = snapshot.active_pipeline() {
+        let pipeline_count = snapshot
+            .active
+            .iter()
+            .filter(|entry| entry.kind.is_pipeline())
+            .count();
+        let kind = match active.kind {
+            terra_telemetry::CompilationKind::RenderPipeline => "render pipeline",
+            terra_telemetry::CompilationKind::ComputePipeline => "compute pipeline",
+            terra_telemetry::CompilationKind::StartupStage => unreachable!(),
+        };
+        let more = if pipeline_count > 1 {
+            format!(" (+{} more)", pipeline_count - 1)
+        } else {
+            String::new()
+        };
+        return format!(
+            "Compiling {kind}: {} ({}){more}",
+            active.label,
+            format_elapsed(active.elapsed)
+        );
+    }
+    if let Some(stage) = snapshot.active_stage() {
+        return format!("{}...", stage.label);
+    }
+    if snapshot.completed.is_empty() {
+        "Preparing GPU startup...".to_string()
+    } else {
+        "Finalizing GPU startup...".to_string()
+    }
+}
+
+fn format_elapsed(elapsed: std::time::Duration) -> String {
+    if elapsed.as_secs_f64() < 1.0 {
+        format!("{} ms", elapsed.as_millis())
+    } else {
+        format!("{:.1} s", elapsed.as_secs_f64())
+    }
 }
 
 /// Debug-only fault injection for the smoke-test matrix.
@@ -144,7 +199,16 @@ pub fn injected_fault(_stage: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
     use terra_jobs::JobError;
+
+    fn telemetry_isolated() -> std::sync::MutexGuard<'static, ()> {
+        static TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     #[test]
     fn startup_error_variants_are_distinguishable() {
@@ -203,7 +267,7 @@ mod tests {
     #[test]
     fn failure_splash_lines_include_error_and_advice() {
         let error = StartupError::BootWorker(JobError::Panicked("oops".into()));
-        let lines = failure_splash_lines(&error, None);
+        let lines = failure_splash_lines_with_telemetry(&error, None, None);
         let joined = lines.join("\n");
         assert!(joined.contains("oops"), "error text missing");
         assert!(joined.contains("driver"), "advice missing");
@@ -213,9 +277,52 @@ mod tests {
     #[test]
     fn failure_splash_lines_include_log_path() {
         let error = StartupError::Gpu(terra_render::RenderError::Msg("nope".into()));
-        let lines = failure_splash_lines(&error, Some(Path::new("/tmp/terra.log")));
+        let lines =
+            failure_splash_lines_with_telemetry(&error, Some(Path::new("/tmp/terra.log")), None);
         let joined = lines.join("\n");
         assert!(joined.contains("/tmp/terra.log"));
+    }
+
+    #[test]
+    fn startup_status_prefers_exact_pipeline_over_coarse_stage() {
+        let _isolated = telemetry_isolated();
+        terra_telemetry::reset();
+        let stage = terra_telemetry::begin_stage("Building renderer");
+        let pipeline = terra_telemetry::begin(
+            terra_telemetry::CompilationKind::RenderPipeline,
+            "terrain-bounded-pipe",
+        );
+        let status = startup_status(&terra_telemetry::snapshot());
+        assert!(status.contains("render pipeline: terrain-bounded-pipe"));
+        drop(pipeline);
+        drop(stage);
+    }
+
+    #[test]
+    fn startup_status_uses_coarse_stage_when_no_pipeline_is_active() {
+        let _isolated = telemetry_isolated();
+        terra_telemetry::reset();
+        let stage = terra_telemetry::begin_stage("Building terrain evaluator");
+        assert_eq!(
+            startup_status(&terra_telemetry::snapshot()),
+            "Building terrain evaluator..."
+        );
+        stage.complete();
+    }
+
+    #[test]
+    fn failure_lines_retain_failed_pipeline_label() {
+        let _isolated = telemetry_isolated();
+        terra_telemetry::reset();
+        terra_telemetry::begin(
+            terra_telemetry::CompilationKind::ComputePipeline,
+            "pyramid-error",
+        )
+        .fail();
+        let snapshot = terra_telemetry::snapshot();
+        let error = StartupError::BootWorker(JobError::Panicked("boom".into()));
+        let joined = failure_splash_lines_with_telemetry(&error, None, Some(&snapshot)).join("\n");
+        assert!(joined.contains("pyramid-error"));
     }
 
     fn variant_name<T>(poll: &BootPoll<T>) -> &'static str {

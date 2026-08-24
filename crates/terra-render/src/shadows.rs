@@ -100,7 +100,6 @@ impl ShadowMap {
         let bind_group =
             make_shadow_bind_group(device, &bind_group_layout, &uniform_buf, height_view);
 
-        terra_core::shader_progress::record_shader_compiled();
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("shadow-depth"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/shadow.wgsl").into()),

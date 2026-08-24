@@ -90,12 +90,10 @@ impl BrushOverlay {
         pipelines: &terra_gpu::PipelineCacheRegistry,
         format: wgpu::TextureFormat,
     ) -> Self {
-        terra_core::shader_progress::record_shader_compiled();
         let render_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("brush-gizmo-shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/brush.wgsl").into()),
         });
-        terra_core::shader_progress::record_shader_compiled();
         let compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("brush-pick-shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/brush_pick.wgsl").into()),

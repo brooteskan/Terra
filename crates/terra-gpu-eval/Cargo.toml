@@ -6,6 +6,7 @@ license.workspace = true
 description = "Stateful GPU terrain evaluation lifecycle"
 
 [dependencies]
+terra-telemetry = { workspace = true }
 terra-core = { workspace = true }
 terra-gpu = { workspace = true }
 wgpu = { workspace = true }

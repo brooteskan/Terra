@@ -40,7 +40,6 @@ impl GuideOverlay {
         pipelines: &terra_gpu::PipelineCacheRegistry,
         format: wgpu::TextureFormat,
     ) -> Self {
-        terra_core::shader_progress::record_shader_compiled();
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("guides-shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/guides.wgsl").into()),

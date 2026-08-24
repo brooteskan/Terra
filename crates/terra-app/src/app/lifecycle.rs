@@ -587,6 +587,9 @@ impl ApplicationHandler<RuntimeEvent> for TerraApp {
             return;
         }
 
+        let boot_started = Instant::now();
+        terra_telemetry::reset();
+
         let window = match event_loop.create_window(
             Window::default_attributes()
                 .with_title("Terra")
@@ -611,14 +614,17 @@ impl ApplicationHandler<RuntimeEvent> for TerraApp {
             return;
         }
 
+        let gpu_stage = terra_telemetry::begin_stage("Initializing GPU adapter and device");
         let (gpu, target) = match pollster::block_on(terra_render::init_gpu(window.clone())) {
             Ok(result) => result,
             Err(error) => {
+                gpu_stage.fail();
                 self.startup_failure = Some(StartupError::Gpu(error));
                 event_loop.exit();
                 return;
             }
         };
+        gpu_stage.complete();
         if let Some(proxy) = self.runtime_event_proxy.clone() {
             gpu.device.set_device_lost_callback(move |reason, message| {
                 let _ = proxy.send_event(RuntimeEvent::DeviceLost { reason, message });
@@ -630,9 +636,11 @@ impl ApplicationHandler<RuntimeEvent> for TerraApp {
         // the window, then build the heavy GPU pipelines on a worker thread while
         // the main loop keeps animating the splash — the window stays responsive
         // instead of freezing on a white void.
-        let mut gui_renderer = GuiRenderer::new(&gpu.device, &gpu.queue, gpu.surface_format);
-        // Count shader compiles from zero for this boot's splash status line.
-        terra_core::shader_progress::reset();
+        let mut gui_renderer = terra_telemetry::measure(
+            terra_telemetry::CompilationKind::StartupStage,
+            "Creating splash renderer",
+            || GuiRenderer::new(&gpu.device, &gpu.queue, gpu.surface_format),
+        );
         let pending = target.into_pending();
         Self::paint_splash_frame(&pending, &gpu, &mut gui_renderer, &window);
         window.set_visible(true);
@@ -654,23 +662,44 @@ impl ApplicationHandler<RuntimeEvent> for TerraApp {
             if inject_boot_fault {
                 panic!("injected boot-worker fault");
             }
-            let renderer = TerrainRenderer::new_detached(&worker_gpu, config, size);
-            let gpu_engine = GpuTerrainEngine::new(&worker_gpu.device, 256);
-            let gpu_pyramid_materializer =
-                terra_gpu::GpuHeightPyramidMaterializer::new(&worker_gpu.device);
-            let tile_atlas = match GpuTileAtlas::new(&worker_gpu.device, tile_size, tile_halo, 128)
-            {
+            let renderer = terra_telemetry::measure(
+                terra_telemetry::CompilationKind::StartupStage,
+                "Building terrain renderer",
+                || TerrainRenderer::new_detached(&worker_gpu, config, size),
+            );
+            let gpu_engine = terra_telemetry::measure(
+                terra_telemetry::CompilationKind::StartupStage,
+                "Building terrain evaluator",
+                || GpuTerrainEngine::new(&worker_gpu.device, 256),
+            );
+            let gpu_pyramid_materializer = terra_telemetry::measure(
+                terra_telemetry::CompilationKind::StartupStage,
+                "Building height pyramid pipelines",
+                || terra_gpu::GpuHeightPyramidMaterializer::new(&worker_gpu.device),
+            );
+            let tile_atlas_result = terra_telemetry::measure(
+                terra_telemetry::CompilationKind::StartupStage,
+                "Building tile atlas",
+                || GpuTileAtlas::new(&worker_gpu.device, tile_size, tile_halo, 128),
+            );
+            let tile_atlas = match tile_atlas_result {
                 Ok(atlas) => Some(atlas),
                 Err(error) => {
                     log::warn!("GPU tile atlas disabled: {error}");
                     None
                 }
             };
+            let editor_overlays = terra_telemetry::measure(
+                terra_telemetry::CompilationKind::StartupStage,
+                "Building editor overlays",
+                || super::editor_overlays::EditorOverlays::new(&worker_gpu, &renderer),
+            );
             super::BootResult {
                 renderer,
                 tile_atlas,
                 gpu_engine,
                 gpu_pyramid_materializer,
+                editor_overlays,
             }
         });
 
@@ -680,8 +709,9 @@ impl ApplicationHandler<RuntimeEvent> for TerraApp {
             gpu,
             pending,
             job,
-            started: Instant::now(),
+            started: boot_started,
             failure: None,
+            failure_telemetry: None,
         });
         // Animate: keep repainting the splash until the worker result lands
         // (about_to_wait polls `boot.job` and finalizes).
@@ -1607,7 +1637,11 @@ impl TerraApp {
         let gui_state = &mut self.gui_state;
 
         if let Some(error) = &boot.failure {
-            let lines = startup::failure_splash_lines(error, None);
+            let lines = startup::failure_splash_lines_with_telemetry(
+                error,
+                None,
+                boot.failure_telemetry.as_ref(),
+            );
             boot.pending.present_splash(&boot.gpu, SPLASH_BG, |view| {
                 let mut gui =
                     GuiContext::begin(screen_w, screen_h, ppp, GuiInput::default(), gui_state);
@@ -1624,11 +1658,11 @@ impl TerraApp {
             });
         } else {
             let elapsed = boot.started.elapsed().as_secs_f32();
-            let shaders = terra_core::shader_progress::shaders_compiled();
+            let status = startup::startup_status(&terra_telemetry::snapshot());
             boot.pending.present_splash(&boot.gpu, SPLASH_BG, |view| {
                 let mut gui =
                     GuiContext::begin(screen_w, screen_h, ppp, GuiInput::default(), gui_state);
-                paint_splash(&mut gui, screen_w, screen_h, elapsed, shaders);
+                paint_splash(&mut gui, screen_w, screen_h, elapsed, &status);
                 gui.end();
                 gui_renderer.render(
                     &boot.gpu.device,
@@ -1655,11 +1689,11 @@ impl TerraApp {
         let screen_w = (phys.width as f32 / ppp).max(1.0);
         let screen_h = (phys.height as f32 / ppp).max(1.0);
         let mut gui_state = GuiState::default();
-        let shaders = terra_core::shader_progress::shaders_compiled();
+        let status = startup::startup_status(&terra_telemetry::snapshot());
         pending.present_splash(gpu, SPLASH_BG, |view| {
             let mut gui =
                 GuiContext::begin(screen_w, screen_h, ppp, GuiInput::default(), &mut gui_state);
-            paint_splash(&mut gui, screen_w, screen_h, 0.0, shaders);
+            paint_splash(&mut gui, screen_w, screen_h, 0.0, &status);
             gui.end();
             gui_renderer.render(
                 &gpu.device,
@@ -1690,7 +1724,29 @@ impl TerraApp {
             startup::BootPoll::Ready(value) => value,
             startup::BootPoll::Failed(error) => {
                 startup::report_failure(&error, None, false);
-                self.boot.as_mut().expect("boot present").failure = Some(error);
+                terra_telemetry::fail_active();
+                let telemetry = terra_telemetry::snapshot();
+                let benchmark_requested = crate::startup_benchmark::is_requested();
+                {
+                    let boot = self.boot.as_mut().expect("boot present");
+                    log_compilation_summary(&boot.gpu, &telemetry, false);
+                    if let Err(report_error) = crate::startup_benchmark::write_requested_report(
+                        Some(&boot.gpu),
+                        &telemetry,
+                        Some(error.to_string()),
+                    ) {
+                        log::error!("{report_error}");
+                    }
+                    boot.failure_telemetry = Some(telemetry);
+                }
+                if benchmark_requested {
+                    self.boot.take();
+                    self.startup_failure = Some(error);
+                    self.failure_presented = true;
+                    self.pending_exit = true;
+                } else {
+                    self.boot.as_mut().expect("boot present").failure = Some(error);
+                }
                 return false;
             }
             startup::BootPoll::Shutdown => {
@@ -1700,29 +1756,36 @@ impl TerraApp {
             }
         };
         let boot = self.boot.take().expect("boot present");
-        log::info!(
-            "terra: GPU init complete — {} shaders compiled in {} ms",
-            terra_core::shader_progress::shaders_compiled(),
-            boot.started.elapsed().as_millis()
-        );
+        let install_stage = terra_telemetry::begin_stage("Installing renderer");
         let super::BootResult {
             mut renderer,
             tile_atlas,
             gpu_engine,
             gpu_pyramid_materializer,
+            editor_overlays,
         } = result;
         boot.pending.attach(&mut renderer);
         // Reconcile against the live window size in case it changed during init.
         if let Some(window) = &self.window {
             renderer.resize(window.inner_size());
         }
-        let editor_overlays = super::editor_overlays::EditorOverlays::new(&boot.gpu, &renderer);
         self.renderer = Some(renderer);
         self.editor_overlays = Some(editor_overlays);
         self.tile_atlas = tile_atlas;
         self.gpu_engine = Some(gpu_engine);
         self.gpu_pyramid_materializer = Some(gpu_pyramid_materializer);
         self.device_generation = self.device_generation.wrapping_add(1);
+        install_stage.complete();
+        let telemetry = terra_telemetry::snapshot();
+        log_compilation_summary(&boot.gpu, &telemetry, true);
+        let benchmark_requested = crate::startup_benchmark::is_requested();
+        match crate::startup_benchmark::write_requested_report(Some(&boot.gpu), &telemetry, None) {
+            Ok(_) => {}
+            Err(error) => log::error!("{error}"),
+        }
+        if benchmark_requested {
+            self.pending_exit = true;
+        }
         self.gpu = Some(boot.gpu);
         self.refresh_window_title();
         self.refresh_viewport_rect();
@@ -1779,12 +1842,53 @@ impl TerraApp {
 /// (see redraw.rs, AppScreen::Home lighting.clear).
 const SPLASH_BG: [f32; 3] = [0.071, 0.082, 0.102];
 
+fn log_compilation_summary(
+    gpu: &terra_render::GpuContext,
+    telemetry: &terra_telemetry::CompilationSnapshot,
+    success: bool,
+) {
+    for record in telemetry
+        .completed
+        .iter()
+        .filter(|record| record.kind.is_pipeline())
+    {
+        log::info!(
+            target: "terra_app::startup_compilation",
+            "pipeline_compile generation={} kind={} label={:?} status={} duration_ms={}",
+            record.generation,
+            record.kind.as_str(),
+            record.label,
+            record.status.as_str(),
+            record.duration.as_millis()
+        );
+    }
+    let adapter = gpu.adapter_metadata();
+    let dominant = telemetry.dominant_pipeline();
+    log::info!(
+        target: "terra_app::startup_compilation",
+        "boot_compilation_summary success={} generation={} total_ms={} dominant_label={:?} dominant_ms={} adapter={:?} vendor={:#06x} device={:#06x} device_type={} backend={} driver={:?} driver_info={:?} downlevel_shader_model={} pipeline_cache_supported={} pipeline_cache_enabled={}",
+        success,
+        telemetry.generation,
+        telemetry.elapsed.as_millis(),
+        dominant.map(|record| record.label.as_str()),
+        dominant.map_or(0, |record| record.duration.as_millis()),
+        adapter.name,
+        adapter.vendor,
+        adapter.device,
+        adapter.device_type,
+        adapter.backend,
+        adapter.driver,
+        adapter.driver_info,
+        adapter.downlevel_shader_model,
+        adapter.pipeline_cache_supported,
+        adapter.pipeline_cache_enabled
+    );
+}
+
 /// Draw the Terra wordmark, an indeterminate progress sweep, and a status line
-/// with the live shader-compile count. `t` is elapsed seconds; the sweep is purely
-/// time-based so it keeps animating while the GPU-init worker is busy (the window
-/// never looks frozen). `shaders` is the count reported by the render/GPU crates as
-/// each shader module compiles. Uses ASCII "..." — the GUI font has no `…` glyph.
-fn paint_splash(gui: &mut GuiContext, screen_w: f32, screen_h: f32, t: f32, shaders: u32) {
+/// naming the exact active pipeline or coarse startup stage. `t` is elapsed
+/// seconds; the sweep stays animated while the GPU-init worker is busy.
+fn paint_splash(gui: &mut GuiContext, screen_w: f32, screen_h: f32, t: f32, status: &str) {
     // Opaque plate (the clear already matches; this also guards platforms where
     // the clear color space differs slightly).
     gui.panel(
@@ -1820,16 +1924,10 @@ fn paint_splash(gui: &mut GuiContext, screen_w: f32, screen_h: f32, t: f32, shad
         bar_h * 0.5,
     );
 
-    // Status line: "Compiling shaders..." with the live count once it starts.
-    let status = if shaders > 0 {
-        format!("Compiling shaders... {shaders}")
-    } else {
-        "Compiling shaders...".to_string()
-    };
     gui.label_centered(
         screen_w * 0.5,
         bar_y + 16.0,
-        &status,
+        status,
         Color::rgba(0.72, 0.78, 0.85, 0.85),
         1.05,
     );

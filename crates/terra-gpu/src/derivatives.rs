@@ -46,7 +46,6 @@ pub fn run_derivative_gpu(
     let h = m.height;
     let radius_texels = world_radius_texels(radius_m, m).round().max(1.0) as u32;
 
-    terra_core::shader_progress::record_shader_compiled();
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("derivatives"),
         source: wgpu::ShaderSource::Wgsl(include_str!("shaders/derivatives.wgsl").into()),
@@ -63,14 +62,20 @@ pub fn run_derivative_gpu(
         bind_group_layouts: &[&bgl],
         push_constant_ranges: &[],
     });
-    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some("derivatives-pipe"),
-        layout: Some(&pipeline_layout),
-        module: &shader,
-        entry_point: Some("main"),
-        compilation_options: Default::default(),
-        cache: None,
-    });
+    let pipeline = terra_telemetry::measure(
+        terra_telemetry::CompilationKind::ComputePipeline,
+        "derivatives-pipe",
+        || {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("derivatives-pipe"),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        },
+    );
 
     let src = create_r32_texture(device, "deriv-src", w, h);
     let dst = create_r32_texture_storage(device, "deriv-dst", w, h);

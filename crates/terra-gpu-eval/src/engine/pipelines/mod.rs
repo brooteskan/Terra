@@ -584,7 +584,6 @@ pub(super) fn make_pipe(
         return pipe.clone();
     }
 
-    terra_core::shader_progress::record_shader_compiled();
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some(label),
         source: wgpu::ShaderSource::Wgsl(wgsl.into()),
@@ -594,14 +593,20 @@ pub(super) fn make_pipe(
         bind_group_layouts: &[&bgl],
         push_constant_ranges: &[],
     });
-    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some(label),
-        layout: Some(&pl),
-        module: &module,
-        entry_point: Some("main"),
-        compilation_options: Default::default(),
-        cache: None,
-    });
+    let pipeline = terra_telemetry::measure(
+        terra_telemetry::CompilationKind::ComputePipeline,
+        label,
+        || {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pl),
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        },
+    );
     let pipe = Pipe { pipeline, bgl };
     cache.insert(label, pipe.clone());
     pipe

@@ -2620,6 +2620,7 @@ dependencies = [
  "terra-io",
  "terra-jobs",
  "terra-render",
+ "terra-telemetry",
  "terra-test-gpu",
  "terra-world",
  "thiserror 2.0.19",
@@ -2671,6 +2672,7 @@ dependencies = [
  "profiling",
  "terra-core",
  "terra-cpu-eval",
+ "terra-telemetry",
  "terra-test-gpu",
  "thiserror 2.0.19",
  "wgpu",
@@ -2686,6 +2688,7 @@ dependencies = [
  "terra-core",
  "terra-cpu-eval",
  "terra-gpu",
+ "terra-telemetry",
  "terra-test-gpu",
  "terra-world",
  "wgpu",
@@ -2702,6 +2705,7 @@ dependencies = [
  "lucide-icons",
  "serde",
  "serde_json",
+ "terra-telemetry",
  "terra-test-gpu",
  "wgpu",
 ]
@@ -2742,11 +2746,16 @@ dependencies = [
  "profiling",
  "terra-core",
  "terra-gpu",
+ "terra-telemetry",
  "terra-test-gpu",
  "thiserror 2.0.19",
  "wgpu",
  "winit",
 ]
+
+[[package]]
+name = "terra-telemetry"
+version = "0.1.0-beta.1"
 
 [[package]]
 name = "terra-test-gpu"
