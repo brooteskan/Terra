@@ -327,6 +327,81 @@ pub(crate) fn try_apply(
                 .push_coalesced(cmd, Some((coalesce_layer_id(id), "kind")));
             ctx.dirty_from = Some(id);
         }
+        PanelAction::AddPathNode { layer, position } => {
+            let terra_core::AuthoringPoint::Bounded { uv, .. } = position else {
+                app.ui_state.status =
+                    "World-space path storage is not available until issue #206.".into();
+                return Ok(());
+            };
+            let Some(previous) = app
+                .session
+                .document
+                .stack
+                .find(layer)
+                .map(|target| target.kind.clone())
+            else {
+                return Ok(());
+            };
+            let mut kind = previous.clone();
+            let LayerKind::Path(params) = &mut kind else {
+                return Ok(());
+            };
+            let (u, v) = uv.tuple();
+            params.nodes.push(terra_core::layer::PathNode {
+                u,
+                v,
+                height: 0.0,
+                width: 1.0,
+            });
+            let command = EditorCommand::SetKind {
+                id: layer,
+                kind,
+                previous,
+            };
+            apply(&command, &mut app.session.document.stack);
+            app.session.history.push_executed(command);
+            ctx.dirty_from = Some(layer);
+            ctx.doc_mutated = true;
+        }
+        PanelAction::MovePathNode {
+            layer,
+            index,
+            position,
+        } => {
+            let terra_core::AuthoringPoint::Bounded { uv, .. } = position else {
+                app.ui_state.status =
+                    "World-space path storage is not available until issue #206.".into();
+                return Ok(());
+            };
+            let Some(previous) = app
+                .session
+                .document
+                .stack
+                .find(layer)
+                .map(|target| target.kind.clone())
+            else {
+                return Ok(());
+            };
+            let mut kind = previous.clone();
+            let LayerKind::Path(params) = &mut kind else {
+                return Ok(());
+            };
+            let Some(node) = params.nodes.get_mut(index) else {
+                return Ok(());
+            };
+            (node.u, node.v) = uv.tuple();
+            let command = EditorCommand::SetKind {
+                id: layer,
+                kind,
+                previous,
+            };
+            apply(&command, &mut app.session.document.stack);
+            app.session
+                .history
+                .push_coalesced(command, Some((coalesce_layer_id(layer), "path-point")));
+            ctx.dirty_from = Some(layer);
+            ctx.doc_mutated = true;
+        }
         PanelAction::Rename { id, name } => {
             let name = name.trim().to_string();
             if name.is_empty() {
@@ -665,7 +740,7 @@ pub(crate) fn try_apply(
             app.ui_state.set_editor_tool(tool);
             if tool.is_move() {
                 app.sculpt_stroke_active = false;
-                app.last_paint_uv = None;
+                app.last_paint_point = None;
                 app.dragging_shape_point = None;
                 app.dragging_layer_point = None;
             }
@@ -1027,13 +1102,13 @@ pub(crate) fn try_apply(
         PanelAction::OpenViewportContextMenu {
             x,
             y,
-            uv,
+            position,
             locked_owner,
         } => {
             app.ui_state.viewport_context_menu = Some(crate::ui::ViewportContextMenu {
                 x,
                 y,
-                uv,
+                position,
                 locked_owner,
                 picking_owner_for: None,
                 owner_override: locked_owner,
@@ -1058,7 +1133,11 @@ pub(crate) fn try_apply(
                 app.inspector_gui.tabs_for = Some(id);
             }
         }
-        PanelAction::ContextualCreate { kind, owner, uv } => {
+        PanelAction::ContextualCreate {
+            kind,
+            owner,
+            position,
+        } => {
             use crate::ui::{create_to_workspace, workspace_to_create};
             use terra_core::contextual_create::{
                 execute_create, CreateContext, CreateToolHint, CreatedEntity,
@@ -1068,7 +1147,7 @@ pub(crate) fn try_apply(
                 workspace_to_create(app.ui_state.active_workspace),
                 app.ui_state.auto_switch_workspace_on_create,
             )
-            .with_cursor(uv);
+            .with_cursor(position);
             if let Some(terra_core::contextual_create::CreateOwner::Biome(id)) = owner {
                 create_ctx.active_biome = Some(id);
             }
@@ -1259,6 +1338,15 @@ mod tests {
     use terra_core::shape_history::create_shape_layer;
     use terra_core::tiling::UvRect;
 
+    fn bounded_stamp(u: f32, v: f32, radius: f32) -> terra_core::AuthoringBrushStamp {
+        terra_core::AuthoringBrushStamp::bounded(
+            terra_core::BoundedUv::try_new(u, v).unwrap(),
+            radius,
+            0.0,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn infinite_action_gate_rejects_unsupported_layer_creation() {
         let mut app = TerraApp::default();
@@ -1315,7 +1403,7 @@ mod tests {
         app.worker_mark_all_dirty = false;
         app.worker_dirty_from = None;
         app.worker_dirty_region = None;
-        app.last_paint_uv = None;
+        app.last_paint_point = None;
         (app, id, params)
     }
 
@@ -1464,13 +1552,11 @@ mod tests {
         assert_eq!(app.worker_dirty_region, Some(edit_fp));
 
         // A fresh dab on the same layer: its footprint must union in, never escalate.
-        app.last_paint_uv = None;
+        app.last_paint_point = None;
         let (u, v, radius) = (0.7f32, 0.7f32, 0.05f32);
         app.apply_actions(vec![PanelAction::PaintSculptStamp {
             layer: id,
-            u,
-            v,
-            radius,
+            stamp: bounded_stamp(u, v, radius),
             strength: 10.0,
             stroke_kind: SculptStrokeKind::Raise,
             target_height: 0.0,

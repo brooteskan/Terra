@@ -3086,6 +3086,20 @@ mod tests {
         DeferredFullField, TerraApp,
     };
 
+    fn bounded_stamp(u: f32, v: f32, radius: f32) -> terra_core::AuthoringBrushStamp {
+        terra_core::AuthoringBrushStamp::bounded(
+            terra_core::BoundedUv::try_new(u, v).unwrap(),
+            radius,
+            0.0,
+        )
+        .unwrap()
+    }
+
+    fn bounded_point(u: f32, v: f32) -> terra_core::AuthoringPoint {
+        terra_core::AuthoringPoint::bounded(terra_core::BoundedUv::try_new(u, v).unwrap(), 0.0)
+            .unwrap()
+    }
+
     #[test]
     fn compatible_infinite_graph_publishes_machine_readable_halo() {
         let mut app = TerraApp::default();
@@ -3792,14 +3806,12 @@ mod tests {
         for u in [0.47, 0.50, 0.53] {
             app.apply_actions(vec![PanelAction::PaintSculptStamp {
                 layer: target,
-                u,
-                v: 0.5,
-                radius: 0.04,
+                stamp: bounded_stamp(u, 0.5, 0.04),
                 strength: 5.0,
                 stroke_kind: SculptStrokeKind::Raise,
                 target_height: 0.0,
             }]);
-            app.last_paint_uv = Some((u, 0.5));
+            app.last_paint_point = Some(bounded_point(u, 0.5));
             app.run_eval_step_with_intent(GpuEvaluationIntent::InteractiveLocal);
 
             assert_eq!(app.ui_state.profile.path, "GPU");
@@ -3924,9 +3936,7 @@ mod tests {
 
         app.apply_actions(vec![PanelAction::PaintSculptStamp {
             layer: target,
-            u: 0.56,
-            v: 0.5,
-            radius: 0.04,
+            stamp: bounded_stamp(0.56, 0.5, 0.04),
             strength: 1.0,
             stroke_kind: SculptStrokeKind::Raise,
             target_height: 0.0,
@@ -4005,12 +4015,10 @@ mod tests {
             app.mouse_pressed = Some(winit::event::MouseButton::Left);
             let u = 0.35 + (stroke % 10) as f32 * 0.03;
             let v = 0.40 + (stroke / 10) as f32 * 0.05;
-            app.last_paint_uv = None;
+            app.last_paint_point = None;
             app.apply_actions(vec![PanelAction::PaintSculptStamp {
                 layer: shape_id,
-                u,
-                v,
-                radius: 0.04,
+                stamp: bounded_stamp(u, v, 0.04),
                 strength: 5.0,
                 stroke_kind: SculptStrokeKind::Raise,
                 target_height: 0.0,

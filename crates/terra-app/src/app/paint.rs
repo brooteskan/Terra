@@ -87,6 +87,55 @@ impl TerraApp {
             GuiContext::viewport_rect_for(screen_w, screen_h, &self.ui_state.layout);
     }
 
+    fn authoring_stamp(
+        &self,
+        point: terra_core::AuthoringPoint,
+        bounded_radius_uv: f32,
+    ) -> terra_core::AuthoringBrushStamp {
+        terra_core::AuthoringBrushStamp::from_point(
+            point,
+            bounded_radius_uv,
+            f64::from(self.ui_state.infinite_brush_radius_m),
+        )
+        .expect("UI brush radii and picker points are validated")
+    }
+
+    fn interpolated_brush_points(
+        &self,
+        point: terra_core::AuthoringPoint,
+        bounded_radius_uv: f32,
+        spacing_fraction: f32,
+    ) -> Vec<terra_core::AuthoringPoint> {
+        let Some(previous) = self.last_paint_point else {
+            return Vec::new();
+        };
+        let Some(distance) = previous.horizontal_distance(point) else {
+            return Vec::new();
+        };
+        let radius = match point {
+            terra_core::AuthoringPoint::Bounded { .. } => f64::from(bounded_radius_uv),
+            terra_core::AuthoringPoint::Infinite { .. } => {
+                f64::from(self.ui_state.infinite_brush_radius_m)
+            }
+        };
+        let minimum = match point {
+            terra_core::AuthoringPoint::Bounded { .. } => 0.002,
+            terra_core::AuthoringPoint::Infinite { .. } => self
+                .session
+                .document
+                .infinite_settings()
+                .map_or(0.01, |settings| settings.finest_spacing_m.max(0.01)),
+        };
+        let spacing = (radius * f64::from(spacing_fraction)).max(minimum);
+        if distance <= spacing {
+            return Vec::new();
+        }
+        let steps = ((distance / spacing).ceil() as u32).clamp(1, 32);
+        (1..steps)
+            .filter_map(|index| previous.lerp(point, f64::from(index) / f64::from(steps)))
+            .collect()
+    }
+
     pub(crate) fn paint_at_cursor(&mut self) {
         if self.ui_state.editor_tool.is_sculpt()
             && !self.active_sculpt_brush_available_for_selection()
@@ -95,9 +144,11 @@ impl TerraApp {
                 "That brush isn't supported by the selected Foundation layer.".into();
             return;
         }
-        let Some((u, v)) = self.pick_paint_uv() else {
+        let Some(hit) = self.pick_terrain_surface() else {
             return;
         };
+        let point = hit.authoring_point(self.session.document.infinite_settings().is_some());
+        let bounded_uv = point.bounded_uv().map(|uv| uv.tuple());
 
         if let Some(shape_tool) = self.ui_state.editor_tool.shape_tool() {
             let Some(layer_id) = self.ensure_shape_history_target(shape_tool) else {
@@ -122,60 +173,36 @@ impl TerraApp {
                 // cursor. Flatten needs no target here — the sculpt kernel derives
                 // it from the mean of the terrain within the brush footprint.
                 terra_core::shape_history::ShapeTool::HeightStamp
-                | terra_core::shape_history::ShapeTool::PlateauStamp => {
-                    // Sample approx from last height field centre if available.
-                    self.last_height
-                        .as_ref()
-                        .map(|h| {
-                            let i = (u.clamp(0.0, 1.0) * (h.metrics.width - 1) as f32) as u32;
-                            let j = (v.clamp(0.0, 1.0) * (h.metrics.height - 1) as f32) as u32;
-                            h.get(i.min(h.metrics.width - 1), j.min(h.metrics.height - 1))
-                        })
-                        .unwrap_or(50.0)
-                }
+                | terra_core::shape_history::ShapeTool::PlateauStamp => point.height_m(),
                 _ => 0.0,
             };
             let stroke_kind = shape_tool.stroke_kind();
             let mut actions = Vec::new();
-            let stamp_once = shape_tool.is_stamp() && self.last_paint_uv.is_some();
+            let stamp_once = shape_tool.is_stamp() && self.last_paint_point.is_some();
             if stamp_once {
                 // Stamps are one-shot per click (drag doesn't spam new mountains).
                 return;
             }
             if !shape_tool.is_stamp() {
-                if let Some((pu, pv)) = self.last_paint_uv {
-                    let du = u - pu;
-                    let dv = v - pv;
-                    let dist = (du * du + dv * dv).sqrt();
-                    let spacing = (radius * 0.35).max(0.002);
-                    if dist > spacing {
-                        let steps = ((dist / spacing).ceil() as u32).clamp(1, 32);
-                        for i in 1..steps {
-                            let t = i as f32 / steps as f32;
-                            actions.push(PanelAction::PaintSculptStamp {
-                                layer: layer_id,
-                                u: pu + du * t,
-                                v: pv + dv * t,
-                                radius,
-                                strength,
-                                stroke_kind,
-                                target_height,
-                            });
-                        }
-                    }
+                for intermediate in self.interpolated_brush_points(point, radius, 0.35) {
+                    actions.push(PanelAction::PaintSculptStamp {
+                        layer: layer_id,
+                        stamp: self.authoring_stamp(intermediate, radius),
+                        strength,
+                        stroke_kind,
+                        target_height,
+                    });
                 }
             }
             actions.push(PanelAction::PaintSculptStamp {
                 layer: layer_id,
-                u,
-                v,
-                radius,
+                stamp: self.authoring_stamp(point, radius),
                 strength,
                 stroke_kind,
                 target_height,
             });
             self.apply_actions(actions);
-            self.last_paint_uv = Some((u, v));
+            self.last_paint_point = Some(point);
             // Draft preview while painting â€” do not force simulation rebuilds.
             self.force_draft = true;
             return;
@@ -203,15 +230,13 @@ impl TerraApp {
             let radius = self.ui_state.sculpt_radius;
             let actions = vec![PanelAction::PaintSculptStamp {
                 layer: layer_id,
-                u,
-                v,
-                radius,
+                stamp: self.authoring_stamp(point, radius),
                 strength,
                 stroke_kind,
                 target_height: 0.0,
             }];
             self.apply_actions(actions);
-            self.last_paint_uv = Some((u, v));
+            self.last_paint_point = Some(point);
             self.force_draft = true;
             return;
         }
@@ -240,27 +265,30 @@ impl TerraApp {
             }
 
             if tool == terra_core::biome_paint::BiomePaintTool::FloodFill {
-                if self.last_paint_uv.is_some() {
+                if self.last_paint_point.is_some() {
                     return; // one-shot per click
                 }
                 actions.push(PanelAction::BeginBiomePaintStroke { biome });
                 actions.push(PanelAction::PaintBiomeStamp {
                     biome,
-                    u,
-                    v,
-                    radius,
+                    stamp: self.authoring_stamp(point, radius),
                     strength,
                     erase,
                     mode: Some(tool),
                 });
                 actions.push(PanelAction::EndBiomePaintStroke);
                 self.apply_actions(actions);
-                self.last_paint_uv = Some((u, v));
+                self.last_paint_point = Some(point);
                 self.placement_tint_dirty = true;
                 return;
             }
 
             if tool == terra_core::biome_paint::BiomePaintTool::PolygonFill {
+                let Some((u, v)) = bounded_uv else {
+                    self.ui_state.status =
+                        "Biome polygon fill is unavailable for Infinite projects.".into();
+                    return;
+                };
                 // Close polygon when clicking near the first vertex.
                 if let Some(&(fu, fv)) = self.biome_polygon_points.first() {
                     if (fu - u).hypot(fv - v) < 0.025 && self.biome_polygon_points.len() >= 3 {
@@ -298,42 +326,28 @@ impl TerraApp {
                     "Polygon vertex {} â€” click near first point to close",
                     self.biome_polygon_points.len()
                 );
-                self.last_paint_uv = Some((u, v));
+                self.last_paint_point = Some(point);
                 return;
             }
 
             // Capture undo snapshot at the start of a drag.
-            if self.last_paint_uv.is_none() {
+            if self.last_paint_point.is_none() {
                 actions.push(PanelAction::BeginBiomePaintStroke { biome });
             }
 
             if tool.paints_mask() {
-                if let Some((pu, pv)) = self.last_paint_uv {
-                    let du = u - pu;
-                    let dv = v - pv;
-                    let dist = (du * du + dv * dv).sqrt();
-                    let spacing = (radius * 0.35).max(0.002);
-                    if dist > spacing {
-                        let steps = ((dist / spacing).ceil() as u32).clamp(1, 32);
-                        for i in 1..steps {
-                            let t = i as f32 / steps as f32;
-                            actions.push(PanelAction::PaintBiomeStamp {
-                                biome,
-                                u: pu + du * t,
-                                v: pv + dv * t,
-                                radius,
-                                strength,
-                                erase,
-                                mode: Some(tool),
-                            });
-                        }
-                    }
+                for intermediate in self.interpolated_brush_points(point, radius, 0.35) {
+                    actions.push(PanelAction::PaintBiomeStamp {
+                        biome,
+                        stamp: self.authoring_stamp(intermediate, radius),
+                        strength,
+                        erase,
+                        mode: Some(tool),
+                    });
                 }
                 actions.push(PanelAction::PaintBiomeStamp {
                     biome,
-                    u,
-                    v,
-                    radius,
+                    stamp: self.authoring_stamp(point, radius),
                     strength,
                     erase,
                     mode: Some(tool),
@@ -371,41 +385,19 @@ impl TerraApp {
                     } else {
                         self.ui_state.sculpt_strength
                     };
-                    let target_height = self
-                        .last_height
-                        .as_ref()
-                        .map(|h| {
-                            let i = (u.clamp(0.0, 1.0) * (h.metrics.width - 1) as f32) as u32;
-                            let j = (v.clamp(0.0, 1.0) * (h.metrics.height - 1) as f32) as u32;
-                            h.get(i.min(h.metrics.width - 1), j.min(h.metrics.height - 1))
-                        })
-                        .unwrap_or(0.0);
-                    if let Some((pu, pv)) = self.last_paint_uv {
-                        let du = u - pu;
-                        let dv = v - pv;
-                        let dist = (du * du + dv * dv).sqrt();
-                        let spacing = (radius * 0.35).max(0.002);
-                        if dist > spacing {
-                            let steps = ((dist / spacing).ceil() as u32).clamp(1, 32);
-                            for i in 1..steps {
-                                let t = i as f32 / steps as f32;
-                                actions.push(PanelAction::PaintSculptStamp {
-                                    layer: layer_id,
-                                    u: pu + du * t,
-                                    v: pv + dv * t,
-                                    radius,
-                                    strength: sculpt_strength,
-                                    stroke_kind,
-                                    target_height,
-                                });
-                            }
-                        }
+                    let target_height = point.height_m();
+                    for intermediate in self.interpolated_brush_points(point, radius, 0.35) {
+                        actions.push(PanelAction::PaintSculptStamp {
+                            layer: layer_id,
+                            stamp: self.authoring_stamp(intermediate, radius),
+                            strength: sculpt_strength,
+                            stroke_kind,
+                            target_height,
+                        });
                     }
                     actions.push(PanelAction::PaintSculptStamp {
                         layer: layer_id,
-                        u,
-                        v,
-                        radius,
+                        stamp: self.authoring_stamp(point, radius),
                         strength: sculpt_strength,
                         stroke_kind,
                         target_height,
@@ -415,7 +407,7 @@ impl TerraApp {
 
             self.sculpt_stroke_active = true;
             self.apply_actions(actions);
-            self.last_paint_uv = Some((u, v));
+            self.last_paint_point = Some(point);
             return;
         }
 
@@ -437,38 +429,28 @@ impl TerraApp {
         }
         let strength = (0.18 * self.ui_state.brush_flow).clamp(0.002, 0.18);
         let mut actions = Vec::new();
-        if let Some((pu, pv)) = self.last_paint_uv {
-            let du = u - pu;
-            let dv = v - pv;
-            let dist = (du * du + dv * dv).sqrt();
-            let spacing = (radius * self.ui_state.brush_spacing.clamp(0.05, 1.0)).max(0.002);
-            if dist > spacing {
-                let steps = ((dist / spacing).ceil() as u32).clamp(1, 32);
-                for i in 1..steps {
-                    let t = i as f32 / steps as f32;
-                    actions.push(PanelAction::PaintMaskStamp {
-                        mask_id,
-                        u: pu + du * t,
-                        v: pv + dv * t,
-                        radius,
-                        strength,
-                        hardness,
-                        tool,
-                    });
-                }
-            }
+        for intermediate in self.interpolated_brush_points(
+            point,
+            radius,
+            self.ui_state.brush_spacing.clamp(0.05, 1.0),
+        ) {
+            actions.push(PanelAction::PaintMaskStamp {
+                mask_id,
+                stamp: self.authoring_stamp(intermediate, radius),
+                strength,
+                hardness,
+                tool,
+            });
         }
         actions.push(PanelAction::PaintMaskStamp {
             mask_id,
-            u,
-            v,
-            radius,
+            stamp: self.authoring_stamp(point, radius),
             strength,
             hardness,
             tool,
         });
         self.apply_actions(actions);
-        self.last_paint_uv = Some((u, v));
+        self.last_paint_point = Some(point);
     }
 
     /// Push Draft heights to the GPU while a brush stroke is active.
@@ -505,8 +487,8 @@ impl TerraApp {
         self.ui_state.status = format!("Polygon fill ({} pts)", pts.len());
     }
 
-    /// Raycast cursor onto the height surface â†’ terrain UV (same mapping as the brush gizmo).
-    pub(crate) fn pick_paint_uv(&mut self) -> Option<(f32, f32)> {
+    /// Raycast the cursor onto the visible terrain in an explicit project frame.
+    pub(crate) fn pick_terrain_surface(&mut self) -> Option<terra_core::TerrainSurfaceHit> {
         let (x, y) = self.cursor_logical()?;
         if !self.viewport_rect.contains(x, y) {
             return None;
@@ -529,16 +511,40 @@ impl TerraApp {
         if let Some(pick) =
             editor_overlays.latest_surface_pick(renderer, (x, y), (screen_w, screen_h))
         {
-            return Some(pick.uv);
+            return Some(pick.hit);
         }
-        pick_terrain_uv_on_surface(
+        if renderer.traversal_mode() == terra_render::TerrainTraversalMode::Infinite {
+            // Infinite has no monolithic CPU heightfield whose UV could be used
+            // as a truthful fallback. Wait for the current GPU depth result.
+            return None;
+        }
+        let uv = pick_terrain_uv_on_surface(
             &renderer.camera,
             aspect,
             (x, y),
             (screen_w, screen_h),
             renderer.heights.world_size,
             self.last_height.as_ref(),
+        )?;
+        let bounded_uv = terra_core::BoundedUv::try_new(uv.0, uv.1).ok()?;
+        let height_m = self.last_height.as_ref().map_or(0.0, |heightfield| {
+            let x = ((uv.0 * (heightfield.metrics.width.saturating_sub(1)) as f32).round() as u32)
+                .min(heightfield.metrics.width.saturating_sub(1));
+            let z = ((uv.1 * (heightfield.metrics.height.saturating_sub(1)) as f32).round() as u32)
+                .min(heightfield.metrics.height.saturating_sub(1));
+            heightfield.get(x, z)
+        });
+        let world = terra_core::WorldPosition::try_new(
+            f64::from(uv.0 * renderer.heights.world_size.0),
+            f64::from(uv.1 * renderer.heights.world_size.1),
         )
+        .ok()?;
+        terra_core::TerrainSurfaceHit::try_new(world, height_m, Some(bounded_uv)).ok()
+    }
+
+    /// Legacy bounded helper retained for bounded-only shape editing paths.
+    pub(crate) fn pick_paint_uv(&mut self) -> Option<(f32, f32)> {
+        self.pick_terrain_surface()?.bounded_uv.map(|uv| uv.tuple())
     }
 
     pub(crate) fn brush_gizmo_color(&self) -> [f32; 4] {
@@ -567,11 +573,8 @@ impl TerraApp {
     /// Click empty terrain to add a node. Existing Path/Polygon nodes can be
     /// dragged, Shift-dragged vertically, or Ctrl-clicked to delete.
     pub(crate) fn update_brush_gizmo(&mut self) {
-        let show = self.viewport_paint_tool_armed()
-            && self.cursor_in_viewport()
-            && !self.gui_wants_pointer
-            && !self.modifiers_alt;
-        if !show {
+        let can_pick = self.cursor_in_viewport() && !self.gui_wants_pointer && !self.modifiers_alt;
+        if !can_pick {
             if let (Some(editor_overlays), Some(gpu)) =
                 (self.editor_overlays.as_mut(), self.gpu.as_ref())
             {
@@ -579,16 +582,35 @@ impl TerraApp {
             }
             return;
         }
-        if self.renderer.as_ref().is_some_and(|renderer| {
-            renderer.traversal_mode() == terra_render::TerrainTraversalMode::Bounded
-        }) {
+        // Keep an authoritative surface hit warm even for Move/context-menu
+        // interactions. Infinite projects deliberately have no imprecise CPU
+        // fallback, so right-click placement consumes this asynchronous result.
+        let show = self.viewport_paint_tool_armed();
+        if self.renderer.is_some() {
             self.request_presentation_pipeline(
                 terra_render::PresentationPipelineFeature::Brush,
                 false,
             );
         }
         self.ui_state.ensure_sculpt_defaults();
-        let radius = if self.ui_state.editor_tool.is_place_point() {
+        let infinite = self.renderer.as_ref().is_some_and(|renderer| {
+            renderer.traversal_mode() == terra_render::TerrainTraversalMode::Infinite
+        });
+        let radius = if !show {
+            self.session
+                .document
+                .infinite_settings()
+                .map_or(0.012, |settings| settings.finest_spacing_m as f32 * 3.0)
+        } else if infinite {
+            if self.ui_state.editor_tool.is_place_point() {
+                self.session
+                    .document
+                    .infinite_settings()
+                    .map_or(1.0, |settings| settings.finest_spacing_m as f32 * 3.0)
+            } else {
+                self.ui_state.infinite_brush_radius_m
+            }
+        } else if self.ui_state.editor_tool.is_place_point() {
             0.012
         } else if self.ui_state.editor_tool.is_sculpt() {
             self.ui_state.sculpt_radius
@@ -616,6 +638,7 @@ impl TerraApp {
                 (surface_w as f32 / ppp, surface_h as f32 / ppp),
                 radius,
                 color,
+                show,
             );
         }
     }

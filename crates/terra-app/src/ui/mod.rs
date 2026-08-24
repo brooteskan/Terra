@@ -191,6 +191,8 @@ pub struct UiState {
     pub inspector_advanced: bool,
     /// Sculpt brush radius in normalized UV (Base raise/lower/smooth).
     pub sculpt_radius: f32,
+    /// Sculpt/paint radius in fixed-origin world metres for Infinite projects.
+    pub infinite_brush_radius_m: f32,
     /// Raise/lower peak meters per stamp, or smooth blend 0â€“1.
     pub sculpt_strength: f32,
     /// Brush edge hardness: 0 is soft and 1 is hard.
@@ -742,6 +744,9 @@ impl UiState {
         if self.sculpt_radius <= 0.0 {
             self.sculpt_radius = 0.04;
         }
+        if self.infinite_brush_radius_m <= 0.0 {
+            self.infinite_brush_radius_m = 32.0;
+        }
         if self.sculpt_strength <= 0.0 {
             self.sculpt_strength = 4.0;
         }
@@ -797,6 +802,7 @@ impl UiState {
             inspector_advanced: self.inspector_advanced,
             brush: BrushWorkspaceState {
                 radius: self.sculpt_radius,
+                infinite_radius_m: self.infinite_brush_radius_m,
                 strength: self.sculpt_strength,
                 falloff: self.brush_falloff,
                 spacing: self.brush_spacing,
@@ -839,6 +845,7 @@ impl UiState {
         self.lighting_customized = ws.lighting_customized;
         self.inspector_advanced = ws.inspector_advanced;
         self.sculpt_radius = ws.brush.radius;
+        self.infinite_brush_radius_m = ws.brush.infinite_radius_m;
         self.sculpt_strength = ws.brush.strength;
         self.brush_falloff = ws.brush.falloff;
         self.brush_spacing = ws.brush.spacing;

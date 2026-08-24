@@ -1298,6 +1298,20 @@ mod tests {
     use terra_gpu::{GpuPageTableEntry, GpuTileAtlas};
     use terra_render::{GpuContext, TerrainRenderer};
 
+    fn bounded_stamp(u: f32, v: f32, radius: f32) -> terra_core::AuthoringBrushStamp {
+        terra_core::AuthoringBrushStamp::bounded(
+            terra_core::BoundedUv::try_new(u, v).unwrap(),
+            radius,
+            0.0,
+        )
+        .unwrap()
+    }
+
+    fn bounded_point(u: f32, v: f32) -> terra_core::AuthoringPoint {
+        terra_core::AuthoringPoint::bounded(terra_core::BoundedUv::try_new(u, v).unwrap(), 0.0)
+            .unwrap()
+    }
+
     #[test]
     fn new_world_settings_document_round_trips_material_bounds() {
         let doc = document_from_world_settings("alpine", 2_048.0, 0.0);
@@ -1377,9 +1391,7 @@ mod tests {
 
         let dab = |u| PanelAction::PaintSculptStamp {
             layer,
-            u,
-            v: 0.5,
-            radius: 0.04,
+            stamp: bounded_stamp(u, 0.5, 0.04),
             strength: 8.0,
             stroke_kind: SculptStrokeKind::Raise,
             target_height: 0.0,
@@ -1392,7 +1404,7 @@ mod tests {
             .expect("compile the gesture-start topology");
 
         for (previous, u) in [(0.48, 0.50), (0.50, 0.52)] {
-            app.last_paint_uv = Some((previous, 0.5));
+            app.last_paint_point = Some(bounded_point(previous, 0.5));
             app.apply_actions(vec![dab(u)]);
             let edits = std::mem::take(&mut app.pending_plan_edits);
             assert!(edits.iter().all(|edit| matches!(
@@ -1451,9 +1463,7 @@ mod tests {
         for u in [0.48, 0.50, 0.52] {
             app.apply_actions(vec![PanelAction::PaintSculptStamp {
                 layer: base_id,
-                u,
-                v: 0.5,
-                radius: 0.04,
+                stamp: bounded_stamp(u, 0.5, 0.04),
                 strength: 3.0,
                 stroke_kind: SculptStrokeKind::Raise,
                 target_height: 0.0,

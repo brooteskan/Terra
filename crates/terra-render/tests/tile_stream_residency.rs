@@ -8,7 +8,7 @@ use terra_core::{
 };
 use terra_gpu::GpuTileAtlas;
 use terra_render::{
-    GpuContext, InfinitePresentationConfig, TerrainRenderer, TerrainShaderVariant,
+    BrushOverlay, GpuContext, InfinitePresentationConfig, TerrainRenderer, TerrainShaderVariant,
     TerrainTerminalFallback, TerrainTileStreamResources, TerrainTraversalMode,
     ViewportRendererMode,
 };
@@ -367,6 +367,60 @@ fn infinite_sparse_page_renders_at_large_signed_coordinates() {
     assert!(
         differing_pixels(&before, &after) > 0,
         "a resident signed sparse page must affect camera-relative presentation"
+    );
+
+    let mut brush = BrushOverlay::new(&gpu.device, ctx.pipeline_registry(), FORMAT);
+    brush.rebind_depth(&gpu.device, &renderer.depth);
+    let aspect = W as f32 / H as f32;
+    let render_origin = renderer.render_origin_xz();
+    brush.request_surface_pick(
+        &gpu.device,
+        &gpu.queue,
+        &renderer.camera,
+        aspect,
+        (W as f32 * 0.5, H as f32 * 0.5),
+        (W as f32, H as f32),
+        renderer.heights.world_size,
+        renderer.heights.height_range,
+        32.0,
+        [1.0; 4],
+        false,
+        TerrainTraversalMode::Infinite,
+        render_origin,
+        renderer.height_binding_revision(),
+    );
+    let _ = gpu.device.poll(wgpu::Maintain::Wait);
+    brush.poll(&gpu.device);
+    let _ = gpu.device.poll(wgpu::Maintain::Wait);
+    brush.poll(&gpu.device);
+    let pick = brush
+        .latest_pick_for(
+            &renderer.camera,
+            aspect,
+            (W as f32 * 0.5, H as f32 * 0.5),
+            (W as f32, H as f32),
+            TerrainTraversalMode::Infinite,
+            render_origin,
+            renderer.height_binding_revision(),
+        )
+        .expect("the center cursor must hit streamed Infinite terrain");
+    assert!(pick.hit.bounded_uv.is_none());
+    assert!(pick.hit.world.x_m() > 4_999_000.0, "pick={pick:?}");
+    assert!(pick.hit.world.z_m() < -4_999_000.0, "pick={pick:?}");
+    assert!(pick.hit.height_m.is_finite());
+    assert!(
+        brush
+            .latest_pick_for(
+                &renderer.camera,
+                aspect,
+                (W as f32 * 0.5, H as f32 * 0.5),
+                (W as f32, H as f32),
+                TerrainTraversalMode::Infinite,
+                render_origin + glam::DVec2::new(128.0, 0.0),
+                renderer.height_binding_revision(),
+            )
+            .is_none(),
+        "an origin shift must reject the old asynchronous result"
     );
 
     renderer.set_tile_stream_debug_mode(0);

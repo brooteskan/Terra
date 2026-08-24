@@ -132,11 +132,17 @@ impl TerraApp {
     }
 
     pub(crate) fn place_point_at_cursor(&mut self) {
-        let Some((u, v)) = self.pick_paint_uv() else {
+        let Some(hit) = self.pick_terrain_surface() else {
             return;
         };
+        let position = hit.authoring_point(self.session.document.infinite_settings().is_some());
         if self.ui_state.editor_tool == crate::ui::EditorTool::Measure {
-            self.handle_measure_click(u, v);
+            let Some(uv) = position.bounded_uv() else {
+                self.ui_state.status =
+                    "Measuring authored terrain is unavailable for Infinite projects.".into();
+                return;
+            };
+            self.handle_measure_click(uv.u(), uv.v());
             return;
         }
         let Some(id) = self.session.document.selected else {
@@ -148,6 +154,14 @@ impl TerraApp {
         let mut kind = layer.kind.clone();
         match (&mut kind, self.ui_state.editor_tool) {
             (LayerKind::Path(p), crate::ui::EditorTool::EditPath) => {
+                let Some(uv) = position.bounded_uv() else {
+                    self.apply_actions(vec![PanelAction::AddPathNode {
+                        layer: id,
+                        position,
+                    }]);
+                    return;
+                };
+                let (u, v) = uv.tuple();
                 let nearest = p
                     .nodes
                     .iter()
@@ -179,14 +193,20 @@ impl TerraApp {
                         "Dragging path node Â· Shift: elevation Â· Ctrl-click: delete".into();
                     return;
                 }
-                p.nodes.push(terra_core::layer::PathNode {
-                    u,
-                    v,
-                    height: 0.0,
-                    width: 1.0,
-                });
+                self.apply_actions(vec![PanelAction::AddPathNode {
+                    layer: id,
+                    position,
+                }]);
+                return;
             }
             (LayerKind::PolygonHeight(p), crate::ui::EditorTool::EditPolygon) => {
+                let Some(uv) = position.bounded_uv() else {
+                    self.ui_state.status =
+                        "Polygon storage is unavailable for Infinite projects in this slice."
+                            .into();
+                    return;
+                };
+                let (u, v) = uv.tuple();
                 let nearest = p
                     .points
                     .iter()
@@ -221,6 +241,12 @@ impl TerraApp {
                 p.points.push([u, v]);
             }
             (LayerKind::RiverNetwork(p), crate::ui::EditorTool::EditRiverSpring) => {
+                let Some(uv) = position.bounded_uv() else {
+                    self.ui_state.status =
+                        "River storage is unavailable for Infinite projects in this slice.".into();
+                    return;
+                };
+                let (u, v) = uv.tuple();
                 p.springs.push(terra_core::layer::RiverNode {
                     u,
                     v,
@@ -277,22 +303,30 @@ impl TerraApp {
                 _ => return,
             }
         } else {
-            let Some((u, v)) = self.pick_paint_uv() else {
+            let Some(hit) = self.pick_terrain_surface() else {
                 return;
             };
+            let position = hit.authoring_point(self.session.document.infinite_settings().is_some());
             match (&mut kind, drag.kind) {
-                (LayerKind::Path(params), LayerPointKind::Path) => {
-                    let Some(node) = params.nodes.get_mut(drag.index) else {
-                        return;
-                    };
-                    node.u = u;
-                    node.v = v;
+                (LayerKind::Path(_), LayerPointKind::Path) => {
+                    self.apply_actions(vec![PanelAction::MovePathNode {
+                        layer: drag.layer,
+                        index: drag.index,
+                        position,
+                    }]);
+                    return;
                 }
                 (LayerKind::PolygonHeight(params), LayerPointKind::Polygon) => {
+                    let Some(uv) = position.bounded_uv() else {
+                        self.ui_state.status =
+                            "Polygon storage is unavailable for Infinite projects in this slice."
+                                .into();
+                        return;
+                    };
                     let Some(point) = params.points.get_mut(drag.index) else {
                         return;
                     };
-                    *point = [u, v];
+                    *point = [uv.u(), uv.v()];
                 }
                 _ => return,
             }

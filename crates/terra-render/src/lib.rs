@@ -1710,6 +1710,7 @@ impl TerrainRenderer {
         }
         let depth = create_depth(&self.device, self.config.width, self.config.height);
         self.depth = depth;
+        self.height_binding_revision = self.height_binding_revision.wrapping_add(1).max(1);
         self.adaptive.resize(self.config.width, self.config.height);
         let mask = self.adaptive.prepare_all_active_mask();
         if let Some(bundle) = self.progressive.ready_mut() {

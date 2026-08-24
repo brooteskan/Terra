@@ -1299,7 +1299,7 @@ fn draw_tool_inspector(ui: &mut GuiContext<'_>, doc: &TerrainDocument, ui_state:
         ui,
         "Drag to author Base heights or semantic world-space strokes.",
     );
-    slider_f32(ui, "Radius", &mut ui_state.sculpt_radius, 0.01, 0.2);
+    draw_authoring_radius_slider(ui, doc, ui_state);
     if matches!(ui_state.editor_tool, EditorTool::Smooth | EditorTool::Pinch) {
         let mut s = (ui_state.sculpt_strength / 10.0).clamp(0.05, 1.0);
         if slider_f32(ui, "Strength", &mut s, 0.05, 1.0) {
@@ -1357,7 +1357,7 @@ fn draw_mask_tool_inspector(
             ui_state.mask_paint_tool = *tool;
         }
     }
-    slider_f32(ui, "Radius", &mut ui_state.sculpt_radius, 0.01, 0.2);
+    draw_authoring_radius_slider(ui, doc, ui_state);
     slider_f32(ui, "Strength", &mut ui_state.sculpt_strength, 0.05, 1.0);
     slider_f32(ui, "Falloff", &mut ui_state.brush_falloff, 0.0, 1.0);
 
@@ -1394,6 +1394,26 @@ fn draw_mask_tool_inspector(
     label_dim(ui, "Views → Mask opens the full mask editor.");
     if button_id(ui, Id::new("insp_open_mask_view"), "Open full Mask editor") {
         ui_state.enter_mask_view();
+    }
+}
+
+fn draw_authoring_radius_slider(
+    ui: &mut GuiContext<'_>,
+    doc: &TerrainDocument,
+    ui_state: &mut UiState,
+) {
+    if let Some(infinite) = doc.infinite_settings() {
+        let min = infinite.finest_spacing_m.clamp(0.01, f64::from(f32::MAX)) as f32;
+        let max = (min * infinite.tile_size_samples as f32 * 2.0).max(min * 16.0);
+        slider_f32(
+            ui,
+            "Radius (m)",
+            &mut ui_state.infinite_brush_radius_m,
+            min,
+            max,
+        );
+    } else {
+        slider_f32(ui, "Radius", &mut ui_state.sculpt_radius, 0.01, 0.2);
     }
 }
 

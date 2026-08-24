@@ -186,7 +186,7 @@ pub struct CreateContext {
     pub workspace: CreateWorkspace,
     pub selected_layer: Option<LayerId>,
     pub active_biome: Option<LayerId>,
-    pub cursor_uv: Option<(f32, f32)>,
+    pub cursor: Option<crate::AuthoringPoint>,
     pub has_terrain: bool,
     pub empty_project: bool,
     /// When true, UI may switch to the entity's home workspace after create.
@@ -211,15 +211,15 @@ impl CreateContext {
             workspace,
             selected_layer: doc.selected,
             active_biome: doc.active_biome,
-            cursor_uv: None,
+            cursor: None,
             has_terrain,
             empty_project,
             auto_switch_workspace,
         }
     }
 
-    pub fn with_cursor(mut self, uv: Option<(f32, f32)>) -> Self {
-        self.cursor_uv = uv;
+    pub fn with_cursor(mut self, cursor: Option<crate::AuthoringPoint>) -> Self {
+        self.cursor = cursor;
         self
     }
 }

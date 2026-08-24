@@ -227,13 +227,22 @@ pub(crate) fn try_apply(
         }
         PanelAction::PaintMaskStamp {
             mask_id,
-            u,
-            v,
-            radius,
+            stamp,
             strength,
             hardness,
             tool,
         } => {
+            let terra_core::AuthoringBrushStamp::Bounded {
+                uv,
+                radius_uv: radius,
+                ..
+            } = stamp
+            else {
+                app.ui_state.status =
+                    "Sparse mask storage is not available until issue #209.".into();
+                return Ok(());
+            };
+            let (u, v) = uv.tuple();
             // Snapshot paint buffer once per stroke for undo.
             if app.mask_paint_stroke_before.is_none() {
                 if let Some(asset) = app.session.document.masks.iter().find(|a| a.id == mask_id) {
@@ -289,15 +298,24 @@ pub(crate) fn try_apply(
         }
         PanelAction::PaintSculptStamp {
             layer,
-            u,
-            v,
-            radius,
+            stamp,
             strength,
             stroke_kind,
             target_height,
         } => {
             use terra_core::layer::{BrushDab, BrushEditable, EditSupport};
 
+            let terra_core::AuthoringBrushStamp::Bounded {
+                uv,
+                radius_uv: radius,
+                ..
+            } = stamp
+            else {
+                app.ui_state.status =
+                    "World-space sculpt storage is not available until issue #203.".into();
+                return Ok(());
+            };
+            let (u, v) = uv.tuple();
             let Some(metrics) = app
                 .session
                 .document
@@ -310,7 +328,7 @@ pub(crate) fn try_apply(
             };
 
             let falloff = app.ui_state.sculpt_falloff_exponent();
-            let continuing = app.last_paint_uv.is_some();
+            let continuing = app.last_paint_point.is_some();
             let world_radius = radius * 0.5 * (metrics.world_size_x + metrics.world_size_z);
             if let Some(target) = app.session.document.stack.find_mut(layer) {
                 let support = target.brush_support(stroke_kind);
@@ -353,10 +371,12 @@ pub(crate) fn try_apply(
             if ctx.dirty_from == Some(layer) {
                 // Retain the same footprint in resolution-free UV for the CPU
                 // worker. A continuing stroke's appended segment sweeps from the
-                // previous point, so cover both endpoints ± radius; `last_paint_uv`
+                // previous point, so cover both endpoints ± radius; the typed
+                // previous point is advanced only after the action batch.
                 // still holds the prior point (it is advanced only after apply).
                 let mut stamp_uv = terra_core::tiling::UvRect::from_center_radius(u, v, radius);
-                if let Some((pu, pv)) = app.last_paint_uv {
+                if let Some(terra_core::AuthoringPoint::Bounded { uv, .. }) = app.last_paint_point {
+                    let (pu, pv) = uv.tuple();
                     stamp_uv = stamp_uv.union(terra_core::tiling::UvRect::from_center_radius(
                         pu, pv, radius,
                     ));
@@ -421,6 +441,20 @@ mod tests {
     use terra_core::layer::LayerStack;
     use terra_core::shape_history::create_shape_layer;
 
+    fn bounded_stamp(u: f32, v: f32, radius: f32) -> terra_core::AuthoringBrushStamp {
+        terra_core::AuthoringBrushStamp::bounded(
+            terra_core::BoundedUv::try_new(u, v).unwrap(),
+            radius,
+            0.0,
+        )
+        .unwrap()
+    }
+
+    fn bounded_point(u: f32, v: f32) -> terra_core::AuthoringPoint {
+        terra_core::AuthoringPoint::bounded(terra_core::BoundedUv::try_new(u, v).unwrap(), 0.0)
+            .unwrap()
+    }
+
     #[test]
     fn infinite_action_gate_rejects_bounded_painted_masks() {
         let mut app = TerraApp::default();
@@ -460,14 +494,12 @@ mod tests {
         app.worker_mark_all_dirty = false;
         app.worker_dirty_from = None;
         app.worker_dirty_region = None;
-        app.last_paint_uv = None; // fresh stroke, no previous point
+        app.last_paint_point = None; // fresh stroke, no previous point
 
         let (u, v, radius) = (0.5f32, 0.5f32, 0.05f32);
         app.apply_actions(vec![PanelAction::PaintSculptStamp {
             layer: id,
-            u,
-            v,
-            radius,
+            stamp: bounded_stamp(u, v, radius),
             strength: 1.0,
             stroke_kind: SculptStrokeKind::Raise,
             target_height: 0.0,
@@ -500,16 +532,14 @@ mod tests {
         app.session.document.stack = LayerStack::new();
         app.session.document.stack.push(layer);
         app.session.document.selected = Some(id);
-        app.last_paint_uv = None;
+        app.last_paint_point = None;
 
         // Soft brush, first dab: creates the stroke.
         app.ui_state.brush_falloff = 0.2;
         let soft_falloff = app.ui_state.sculpt_falloff_exponent();
         app.apply_actions(vec![PanelAction::PaintSculptStamp {
             layer: id,
-            u: 0.5,
-            v: 0.5,
-            radius: 0.05,
+            stamp: bounded_stamp(0.5, 0.5, 0.05),
             strength: 7.0,
             stroke_kind: SculptStrokeKind::Raise,
             target_height: 0.0,
@@ -524,7 +554,7 @@ mod tests {
 
         // Continue the same drag with a harder brush and higher strength: the active
         // stroke must pick up both, not stay frozen at the first dab's values.
-        app.last_paint_uv = Some((0.5, 0.5));
+        app.last_paint_point = Some(bounded_point(0.5, 0.5));
         app.ui_state.brush_falloff = 0.9;
         let hard_falloff = app.ui_state.sculpt_falloff_exponent();
         assert!(
@@ -533,9 +563,7 @@ mod tests {
         );
         app.apply_actions(vec![PanelAction::PaintSculptStamp {
             layer: id,
-            u: 0.52,
-            v: 0.5,
-            radius: 0.05,
+            stamp: bounded_stamp(0.52, 0.5, 0.05),
             strength: 30.0,
             stroke_kind: SculptStrokeKind::Raise,
             target_height: 0.0,
@@ -576,14 +604,12 @@ mod tests {
         app.worker_mark_all_dirty = false;
         app.worker_dirty_from = None;
         app.worker_dirty_region = None;
-        app.last_paint_uv = None;
+        app.last_paint_point = None;
 
         // Terrace has no foundation mode — it must be refused, not raised.
         app.apply_actions(vec![PanelAction::PaintSculptStamp {
             layer: id,
-            u: 0.5,
-            v: 0.5,
-            radius: 0.2,
+            stamp: bounded_stamp(0.5, 0.5, 0.2),
             strength: 30.0,
             stroke_kind: SculptStrokeKind::Terrace,
             target_height: 0.0,
@@ -608,9 +634,7 @@ mod tests {
         // Positive control: a supported brush (Lower) still edits the foundation.
         app.apply_actions(vec![PanelAction::PaintSculptStamp {
             layer: id,
-            u: 0.5,
-            v: 0.5,
-            radius: 0.2,
+            stamp: bounded_stamp(0.5, 0.5, 0.2),
             strength: 30.0,
             stroke_kind: SculptStrokeKind::Lower,
             target_height: 0.0,
@@ -641,9 +665,7 @@ mod tests {
 
         app.apply_actions(vec![PanelAction::PaintSculptStamp {
             layer: id,
-            u: 0.5,
-            v: 0.5,
-            radius: 0.05,
+            stamp: bounded_stamp(0.5, 0.5, 0.05),
             strength: 0.7,
             stroke_kind: SculptStrokeKind::Hardness,
             target_height: 0.0,
@@ -677,9 +699,7 @@ mod tests {
 
         app.apply_actions(vec![PanelAction::PaintSculptStamp {
             layer: id,
-            u: 0.5,
-            v: 0.5,
-            radius: 0.05,
+            stamp: bounded_stamp(0.5, 0.5, 0.05),
             strength: 1.0,
             stroke_kind: SculptStrokeKind::Raise,
             target_height: 0.0,

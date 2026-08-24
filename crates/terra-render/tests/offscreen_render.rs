@@ -11,10 +11,11 @@
 //! terra-render must therefore stay inside this single `#[test]`; extend this
 //! test rather than adding another that pushes error scopes.
 
+use glam::DVec2;
 use terra_core::heightfield::{Heightfield, HeightfieldMetrics};
 use terra_render::{
     BrushOverlay, GpuContext, PresentationBackendId, PresentationPipelineFeature, TerrainRenderer,
-    ViewportRendererMode,
+    TerrainTraversalMode, ViewportRendererMode,
 };
 
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
@@ -96,6 +97,7 @@ fn raster_frame_covers_offscreen_target() {
     // test-only so the asynchronous result can be asserted deterministically.
     let mut brush = BrushOverlay::new(&gpu.device, ctx.pipeline_registry(), FORMAT);
     brush.rebind_height(&gpu.device, renderer.heights.display_height_view());
+    brush.rebind_depth(&gpu.device, &renderer.depth);
     let aspect = W as f32 / H as f32;
     brush.request_surface_pick(
         &gpu.device,
@@ -108,6 +110,10 @@ fn raster_frame_covers_offscreen_target() {
         renderer.heights.height_range,
         0.05,
         [1.0, 1.0, 1.0, 1.0],
+        true,
+        TerrainTraversalMode::Bounded,
+        DVec2::ZERO,
+        renderer.height_binding_revision(),
     );
     let _ = gpu.device.poll(wgpu::Maintain::Wait);
     brush.poll(&gpu.device);
@@ -119,11 +125,29 @@ fn raster_frame_covers_offscreen_target() {
             aspect,
             (W as f32 * 0.5, H as f32 * 0.5),
             (W as f32, H as f32),
+            TerrainTraversalMode::Bounded,
+            DVec2::ZERO,
+            renderer.height_binding_revision(),
         )
         .expect("center cursor should hit the uploaded GPU terrain");
-    assert!((pick.uv.0 - 0.5).abs() < 1.0e-3, "pick={pick:?}");
-    assert!((pick.uv.1 - 0.5).abs() < 1.0e-3, "pick={pick:?}");
-    assert!((pick.height - 25.0).abs() < 1.0e-3, "pick={pick:?}");
+    let uv = pick.hit.bounded_uv.expect("bounded pick carries UV");
+    assert!((uv.u() - 0.5).abs() < 1.0e-3, "pick={pick:?}");
+    assert!((uv.v() - 0.5).abs() < 1.0e-3, "pick={pick:?}");
+    assert!((pick.hit.height_m - 25.0).abs() < 1.0e-3, "pick={pick:?}");
+    assert!(
+        brush
+            .latest_pick_for(
+                &renderer.camera,
+                aspect,
+                (W as f32 * 0.5, H as f32 * 0.5),
+                (W as f32, H as f32),
+                TerrainTraversalMode::Bounded,
+                DVec2::ZERO,
+                renderer.height_binding_revision().wrapping_add(1),
+            )
+            .is_none(),
+        "a pick from an older surface revision must be rejected"
+    );
 
     // Frame 3: enable raster cast shadows (dormant until wired to shadow_strength)
     // so the directional depth pass actually runs — guard it against validation

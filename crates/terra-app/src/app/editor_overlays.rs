@@ -72,6 +72,7 @@ impl EditorOverlays {
             }
             PresentationPipelineBundle::Brush(mut brush) => {
                 brush.rebind_height(&gpu.device, renderer.heights.display_height_view());
+                brush.rebind_depth(&gpu.device, &renderer.depth);
                 self.bound_height_revision = renderer.height_binding_revision();
                 self.brush
                     .install(request_id, brush)
@@ -103,6 +104,7 @@ impl EditorOverlays {
         if revision != self.bound_height_revision {
             if let Some(brush) = self.brush.ready_mut() {
                 brush.rebind_height(&gpu.device, renderer.heights.display_height_view());
+                brush.rebind_depth(&gpu.device, &renderer.depth);
             }
             self.bound_height_revision = revision;
         }
@@ -115,18 +117,11 @@ impl EditorOverlays {
         renderer: &TerrainRenderer,
         cursor: (f32, f32),
         screen: (f32, f32),
-        radius_uv: f32,
+        radius: f32,
         color: [f32; 4],
+        visible: bool,
     ) {
         self.sync_height(gpu, renderer);
-        if renderer.traversal_mode() == terra_render::TerrainTraversalMode::Infinite {
-            // Sparse authored editing is a later slice. Do not run the bounded
-            // monolithic picker in an incorrect coordinate frame.
-            if let Some(brush) = self.brush.ready_mut() {
-                brush.hide(&gpu.queue);
-            }
-            return;
-        }
         let (width, height) = renderer.size();
         let aspect = width as f32 / height.max(1) as f32;
         let Some(brush) = self.brush.ready_mut() else {
@@ -141,8 +136,12 @@ impl EditorOverlays {
             screen,
             renderer.heights.world_size,
             renderer.heights.height_range,
-            radius_uv,
+            radius,
             color,
+            visible,
+            renderer.traversal_mode(),
+            renderer.render_origin_xz(),
+            renderer.height_binding_revision(),
         );
     }
 
@@ -152,14 +151,19 @@ impl EditorOverlays {
         cursor: (f32, f32),
         screen: (f32, f32),
     ) -> Option<SurfacePick> {
-        if renderer.traversal_mode() == terra_render::TerrainTraversalMode::Infinite {
-            return None;
-        }
         let (width, height) = renderer.size();
         let aspect = width as f32 / height.max(1) as f32;
-        self.brush
-            .ready()
-            .and_then(|brush| brush.latest_pick_for(&renderer.camera, aspect, cursor, screen))
+        self.brush.ready().and_then(|brush| {
+            brush.latest_pick_for(
+                &renderer.camera,
+                aspect,
+                cursor,
+                screen,
+                renderer.traversal_mode(),
+                renderer.render_origin_xz(),
+                renderer.height_binding_revision(),
+            )
+        })
     }
 
     pub(crate) fn poll_brush(&mut self, device: &wgpu::Device) {

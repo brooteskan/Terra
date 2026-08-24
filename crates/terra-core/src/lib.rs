@@ -8,6 +8,7 @@
 
 pub mod analyze;
 pub mod authoring;
+pub mod authoring_coordinate;
 pub mod biome_definition;
 pub mod biome_paint;
 pub mod climate;
@@ -85,6 +86,9 @@ pub use terrain_recipe::{
     RecipeRebuildStatus,
 };
 
+pub use authoring_coordinate::{
+    AuthoringBrushStamp, AuthoringCoordinateError, AuthoringPoint, BoundedUv, TerrainSurfaceHit,
+};
 pub use biome_definition::{
     blend_height_deltas, normalize_weights, BiomeDefinition, BiomeDefinitionId, BiomeLibrary,
     BiomeOverlapPolicy, BiomePlacementRules, PlacementCombineMode,

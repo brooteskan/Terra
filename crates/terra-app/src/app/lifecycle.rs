@@ -437,11 +437,13 @@ impl TerraApp {
             && self.screen != AppScreen::Home
         {
             let (sx, sy) = self.cursor_logical().unwrap_or((0.0, 0.0));
-            let uv = self.pick_paint_uv();
+            let position = self.pick_terrain_surface().map(|hit| {
+                hit.authoring_point(self.session.document.infinite_settings().is_some())
+            });
             self.ui_state.viewport_context_menu = Some(crate::ui::ViewportContextMenu {
                 x: sx,
                 y: sy,
-                uv,
+                position,
                 locked_owner: None,
                 picking_owner_for: None,
                 owner_override: None,
@@ -454,8 +456,8 @@ impl TerraApp {
         self.end_shape_point_drag();
         self.end_layer_point_drag();
         let was_biome_paint = self.ui_state.editor_tool == crate::ui::EditorTool::PaintBiome
-            && self.last_paint_uv.is_some();
-        self.last_paint_uv = None;
+            && self.last_paint_point.is_some();
+        self.last_paint_point = None;
         if was_biome_paint {
             self.apply_actions(vec![PanelAction::EndBiomePaintStroke]);
         }
@@ -572,12 +574,21 @@ impl TerraApp {
         }
         if self.viewport_paint_tool_armed() && !self.modifiers_alt {
             self.ui_state.ensure_sculpt_defaults();
-            let step = if delta.abs() >= 1.0 {
-                delta.signum() * 0.008
+            let wheel = if delta.abs() >= 1.0 {
+                delta.signum()
             } else {
-                delta * 0.008
+                delta
             };
-            self.ui_state.sculpt_radius = (self.ui_state.sculpt_radius + step).clamp(0.005, 0.25);
+            if let Some(infinite) = self.session.document.infinite_settings() {
+                let min = infinite.finest_spacing_m.clamp(0.01, f64::from(f32::MAX)) as f32;
+                let max = (min * infinite.tile_size_samples as f32 * 2.0).max(min * 16.0);
+                let step = (self.ui_state.infinite_brush_radius_m * 0.1).max(min);
+                self.ui_state.infinite_brush_radius_m =
+                    (self.ui_state.infinite_brush_radius_m + wheel * step).clamp(min, max);
+            } else {
+                self.ui_state.sculpt_radius =
+                    (self.ui_state.sculpt_radius + wheel * 0.008).clamp(0.005, 0.25);
+            }
             return true;
         }
         if self.viewport_camera_active() {

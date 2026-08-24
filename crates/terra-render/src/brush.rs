@@ -3,10 +3,10 @@
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use bytemuck::{Pod, Zeroable};
-use glam::{Mat4, Vec3};
-use terra_core::heightfield::Heightfield;
+use glam::{DVec2, Mat4, Vec3};
+use terra_core::{heightfield::Heightfield, BoundedUv, TerrainSurfaceHit, WorldPosition};
 
-use crate::camera::OrbitCamera;
+use crate::{camera::OrbitCamera, TerrainTraversalMode};
 
 const RING_SEGMENTS: u32 = 64;
 const RING_VERTEX_COUNT: u32 = RING_SEGMENTS + 1;
@@ -20,7 +20,7 @@ struct BrushUniforms {
     inv_view_proj: [[f32; 4]; 4],
     /// xy = world size, zw = displayed minimum/maximum height.
     world_height: [f32; 4],
-    /// xy = cursor NDC, z = radius UV, w = visible flag.
+    /// xy = cursor NDC, z = radius in the active frame (UV or metres), w = visible flag.
     cursor_radius: [f32; 4],
     color: [f32; 4],
 }
@@ -30,7 +30,7 @@ struct BrushUniforms {
 struct RawSurfacePick {
     /// x = hit flag, yz = UV, w = surface height.
     hit_uv_height: [f32; 4],
-    /// xyz = world position. The fourth lane is reserved.
+    /// xyz = bounded world position or camera-relative Infinite position.
     world_pos_request: [f32; 4],
 }
 
@@ -40,7 +40,11 @@ struct PickContext {
     cursor: (f32, f32),
     screen: (f32, f32),
     view_proj: [f32; 16],
-    height_revision: u64,
+    camera_target: [f64; 3],
+    render_origin: [f64; 2],
+    traversal: TerrainTraversalMode,
+    binding_revision: u64,
+    surface_revision: u64,
 }
 
 enum ReadbackState {
@@ -60,9 +64,8 @@ struct ReadbackSlot {
 /// Completed non-blocking hit against the exact height texture used by the viewport.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SurfacePick {
-    pub uv: (f32, f32),
-    pub world_position: [f32; 3],
-    pub height: f32,
+    pub hit: TerrainSurfaceHit,
+    pub local_position: [f32; 3],
     context: PickContext,
 }
 
@@ -70,17 +73,22 @@ pub struct BrushOverlay {
     depth_pipeline: wgpu::RenderPipeline,
     overlay_pipeline: wgpu::RenderPipeline,
     compute_pipeline: wgpu::ComputePipeline,
+    infinite_compute_pipeline: wgpu::ComputePipeline,
+    infinite_overlay_pipeline: wgpu::RenderPipeline,
     render_bgl: wgpu::BindGroupLayout,
     compute_bgl: wgpu::BindGroupLayout,
+    infinite_compute_bgl: wgpu::BindGroupLayout,
     render_bind_group: Option<wgpu::BindGroup>,
     compute_bind_group: Option<wgpu::BindGroup>,
+    infinite_compute_bind_group: Option<wgpu::BindGroup>,
     uniform_buf: wgpu::Buffer,
     result_buf: wgpu::Buffer,
     uniforms: BrushUniforms,
     readback: Vec<ReadbackSlot>,
     next_readback: usize,
     next_serial: u64,
-    height_revision: u64,
+    binding_revision: u64,
+    traversal: TerrainTraversalMode,
     latest_pick: Option<SurfacePick>,
 }
 
@@ -97,6 +105,16 @@ impl BrushOverlay {
         let compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("brush-pick-shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/brush_pick.wgsl").into()),
+        });
+        let infinite_compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("brush-pick-infinite-shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("shaders/brush_pick_infinite.wgsl").into(),
+            ),
+        });
+        let infinite_render_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("brush-gizmo-infinite-shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/brush_infinite.wgsl").into()),
         });
 
         let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -156,6 +174,42 @@ impl BrushOverlay {
             label: Some("brush-compute-bgl"),
             entries: &entries(false, wgpu::ShaderStages::COMPUTE),
         });
+        let infinite_compute_bgl =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("brush-infinite-compute-bgl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Depth,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
 
         let render_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("brush-render-layout"),
@@ -212,6 +266,37 @@ impl BrushOverlay {
         // raster Depth32 attachment. Its cursor is composited after post and must
         // not be tested against the unrelated, stale raster attachment.
         let overlay_pipeline = make_render_pipeline("brush-overlay-pipeline", None);
+        let infinite_overlay_pipeline =
+            pipelines.render_pipeline("brush-infinite-overlay-pipeline", format, || {
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("brush-infinite-overlay-pipeline"),
+                    layout: Some(&render_layout),
+                    vertex: wgpu::VertexState {
+                        module: &infinite_render_shader,
+                        entry_point: Some("vs_main"),
+                        buffers: &[],
+                        compilation_options: Default::default(),
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &infinite_render_shader,
+                        entry_point: Some("fs_main"),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format,
+                            blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                        compilation_options: Default::default(),
+                    }),
+                    primitive: wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::LineStrip,
+                        ..Default::default()
+                    },
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview: None,
+                    cache: pipelines.driver_cache(),
+                })
+            });
 
         let compute_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("brush-compute-layout"),
@@ -228,6 +313,23 @@ impl BrushOverlay {
                 cache: pipelines.driver_cache(),
             })
         });
+        let infinite_compute_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("brush-infinite-compute-layout"),
+                bind_group_layouts: &[&infinite_compute_bgl],
+                push_constant_ranges: &[],
+            });
+        let infinite_compute_pipeline =
+            pipelines.compute_pipeline("brush-pick-infinite-pipeline", || {
+                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("brush-pick-infinite-pipeline"),
+                    layout: Some(&infinite_compute_layout),
+                    module: &infinite_compute_shader,
+                    entry_point: Some("main"),
+                    compilation_options: Default::default(),
+                    cache: pipelines.driver_cache(),
+                })
+            });
 
         let readback = (0..READBACK_SLOTS)
             .map(|index| ReadbackSlot {
@@ -245,17 +347,22 @@ impl BrushOverlay {
             depth_pipeline,
             overlay_pipeline,
             compute_pipeline,
+            infinite_compute_pipeline,
+            infinite_overlay_pipeline,
             render_bgl,
             compute_bgl,
+            infinite_compute_bgl,
             render_bind_group: None,
             compute_bind_group: None,
+            infinite_compute_bind_group: None,
             uniform_buf,
             result_buf,
             uniforms: BrushUniforms::zeroed(),
             readback,
             next_readback: 0,
             next_serial: 1,
-            height_revision: 0,
+            binding_revision: 0,
+            traversal: TerrainTraversalMode::Bounded,
             latest_pick: None,
         }
     }
@@ -285,7 +392,31 @@ impl BrushOverlay {
             layout: &self.compute_bgl,
             entries: &entries,
         }));
-        self.height_revision = self.height_revision.wrapping_add(1);
+        self.binding_revision = self.binding_revision.wrapping_add(1).max(1);
+        self.latest_pick = None;
+    }
+
+    pub fn rebind_depth(&mut self, device: &wgpu::Device, depth_view: &wgpu::TextureView) {
+        self.infinite_compute_bind_group =
+            Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("brush-infinite-compute-bind"),
+                layout: &self.infinite_compute_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.uniform_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(depth_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: self.result_buf.as_entire_binding(),
+                    },
+                ],
+            }));
+        self.binding_revision = self.binding_revision.wrapping_add(1).max(1);
         self.latest_pick = None;
     }
 
@@ -300,17 +431,33 @@ impl BrushOverlay {
         screen: (f32, f32),
         world_size: (f32, f32),
         height_range: (f32, f32),
-        radius_uv: f32,
+        radius: f32,
         color: [f32; 4],
+        visible: bool,
+        traversal: TerrainTraversalMode,
+        render_origin: DVec2,
+        surface_revision: u64,
     ) {
-        if screen.0 < 1.0 || screen.1 < 1.0 || self.compute_bind_group.is_none() {
+        let ready = match traversal {
+            TerrainTraversalMode::Bounded => self.compute_bind_group.is_some(),
+            TerrainTraversalMode::Infinite => self.infinite_compute_bind_group.is_some(),
+        };
+        if screen.0 < 1.0 || screen.1 < 1.0 || !ready {
             self.hide(queue);
             return;
         }
         self.poll(device);
+        self.traversal = traversal;
         let ndc_x = (cursor.0 / screen.0) * 2.0 - 1.0;
         let ndc_y = 1.0 - (cursor.1 / screen.1) * 2.0;
-        let view_proj = camera.view_proj(aspect);
+        let view_proj = match traversal {
+            TerrainTraversalMode::Bounded => camera.view_proj(aspect),
+            TerrainTraversalMode::Infinite => camera.view_proj_relative_to(aspect, render_origin),
+        };
+        let mut color = color;
+        if !visible {
+            color[3] = 0.0;
+        }
         self.uniforms = BrushUniforms {
             view_proj: view_proj.to_cols_array_2d(),
             inv_view_proj: view_proj.inverse().to_cols_array_2d(),
@@ -320,7 +467,7 @@ impl BrushOverlay {
                 height_range.0,
                 height_range.1,
             ],
-            cursor_radius: [ndc_x, ndc_y, radius_uv, 1.0],
+            cursor_radius: [ndc_x, ndc_y, radius, 1.0],
             color,
         };
         queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&self.uniforms));
@@ -332,7 +479,11 @@ impl BrushOverlay {
             cursor,
             screen,
             view_proj: view_proj.to_cols_array(),
-            height_revision: self.height_revision,
+            camera_target: camera.target.to_array(),
+            render_origin: render_origin.to_array(),
+            traversal,
+            binding_revision: self.binding_revision,
+            surface_revision,
         };
         let available = (0..self.readback.len())
             .map(|offset| (self.next_readback + offset) % self.readback.len())
@@ -347,12 +498,26 @@ impl BrushOverlay {
                 label: Some("brush-surface-pick"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.compute_pipeline);
-            pass.set_bind_group(
-                0,
-                self.compute_bind_group.as_ref().expect("checked above"),
-                &[],
-            );
+            match traversal {
+                TerrainTraversalMode::Bounded => {
+                    pass.set_pipeline(&self.compute_pipeline);
+                    pass.set_bind_group(
+                        0,
+                        self.compute_bind_group.as_ref().expect("checked above"),
+                        &[],
+                    );
+                }
+                TerrainTraversalMode::Infinite => {
+                    pass.set_pipeline(&self.infinite_compute_pipeline);
+                    pass.set_bind_group(
+                        0,
+                        self.infinite_compute_bind_group
+                            .as_ref()
+                            .expect("checked above"),
+                        &[],
+                    );
+                }
+            }
             pass.dispatch_workgroups(1, 1, 1);
         }
         if let Some(index) = available {
@@ -396,21 +561,38 @@ impl BrushOverlay {
                         drop(bytes);
                         slot.buffer.unmap();
                         if raw.hit_uv_height[0] > 0.5
-                            && context.height_revision == self.height_revision
+                            && context.binding_revision == self.binding_revision
                             && self
                                 .latest_pick
                                 .is_none_or(|pick| context.serial >= pick.context.serial)
                         {
-                            self.latest_pick = Some(SurfacePick {
-                                uv: (raw.hit_uv_height[1], raw.hit_uv_height[2]),
-                                height: raw.hit_uv_height[3],
-                                world_position: [
-                                    raw.world_pos_request[0],
-                                    raw.world_pos_request[1],
-                                    raw.world_pos_request[2],
-                                ],
-                                context,
-                            });
+                            let local_position = [
+                                raw.world_pos_request[0],
+                                raw.world_pos_request[1],
+                                raw.world_pos_request[2],
+                            ];
+                            let world =
+                                world_from_render_local(context.render_origin, local_position);
+                            let bounded_uv = match context.traversal {
+                                TerrainTraversalMode::Bounded => {
+                                    BoundedUv::try_new(raw.hit_uv_height[1], raw.hit_uv_height[2])
+                                        .map(Some)
+                                }
+                                TerrainTraversalMode::Infinite => Ok(None),
+                            };
+                            if let (Ok(world), Ok(bounded_uv)) = (world, bounded_uv) {
+                                if let Ok(hit) = TerrainSurfaceHit::try_new(
+                                    world,
+                                    raw.hit_uv_height[3],
+                                    bounded_uv,
+                                ) {
+                                    self.latest_pick = Some(SurfacePick {
+                                        hit,
+                                        local_position,
+                                        context,
+                                    });
+                                }
+                            }
                         }
                         ReadbackState::Idle
                     }
@@ -427,9 +609,16 @@ impl BrushOverlay {
         aspect: f32,
         cursor: (f32, f32),
         screen: (f32, f32),
+        traversal: TerrainTraversalMode,
+        render_origin: DVec2,
+        surface_revision: u64,
     ) -> Option<SurfacePick> {
         let pick = self.latest_pick?;
-        if pick.context.height_revision != self.height_revision
+        if pick.context.binding_revision != self.binding_revision
+            || pick.context.surface_revision != surface_revision
+            || pick.context.traversal != traversal
+            || pick.context.render_origin != render_origin.to_array()
+            || pick.context.camera_target != camera.target.to_array()
             || (pick.context.cursor.0 - cursor.0).abs() > 0.75
             || (pick.context.cursor.1 - cursor.1).abs() > 0.75
             || (pick.context.screen.0 - screen.0).abs() > 0.5
@@ -437,7 +626,11 @@ impl BrushOverlay {
         {
             return None;
         }
-        let current = camera.view_proj(aspect).to_cols_array();
+        let current = match traversal {
+            TerrainTraversalMode::Bounded => camera.view_proj(aspect),
+            TerrainTraversalMode::Infinite => camera.view_proj_relative_to(aspect, render_origin),
+        }
+        .to_cols_array();
         current
             .iter()
             .zip(pick.context.view_proj)
@@ -449,10 +642,10 @@ impl BrushOverlay {
         let Some(bind_group) = &self.render_bind_group else {
             return;
         };
-        pass.set_pipeline(if depth_tested {
-            &self.depth_pipeline
-        } else {
-            &self.overlay_pipeline
+        pass.set_pipeline(match self.traversal {
+            TerrainTraversalMode::Infinite => &self.infinite_overlay_pipeline,
+            TerrainTraversalMode::Bounded if depth_tested => &self.depth_pipeline,
+            TerrainTraversalMode::Bounded => &self.overlay_pipeline,
         });
         pass.set_bind_group(0, bind_group, &[]);
         pass.draw(0..RING_VERTEX_COUNT, 0..1);
@@ -620,6 +813,16 @@ fn sample_height_bilinear(heights: &Heightfield, u: f32, v: f32) -> f32 {
     h0 * (1.0 - ty) + h1 * ty
 }
 
+fn world_from_render_local(
+    render_origin: [f64; 2],
+    local_position: [f32; 3],
+) -> Result<WorldPosition, terra_core::WorldError> {
+    WorldPosition::try_new(
+        render_origin[0] + f64::from(local_position[0]),
+        render_origin[1] + f64::from(local_position[2]),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -697,5 +900,17 @@ mod tests {
         .expect("surface traversal must retain the visible edge hit");
         assert!((actual.0 - expected.x / 4096.0).abs() < 1.0e-3);
         assert!((actual.1 - 0.5).abs() < 1.0e-3);
+    }
+
+    #[test]
+    fn render_origin_reconstruction_preserves_large_absolute_coordinates() {
+        let expected = WorldPosition::try_new(5_000_000.25, -5_000_000.5).unwrap();
+        let before_shift =
+            world_from_render_local([4_999_936.0, -5_000_064.0], [64.25, 12.0, 63.5]).unwrap();
+        let after_shift =
+            world_from_render_local([5_000_000.0, -5_000_000.0], [0.25, 12.0, -0.5]).unwrap();
+
+        assert_eq!(before_shift, expected);
+        assert_eq!(after_shift, expected);
     }
 }

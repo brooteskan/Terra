@@ -212,7 +212,7 @@ pub fn draw_viewport_overlays(
     draw_viewport_tool_mode_bar(ui, ui_state, doc, vp, &mut actions);
 
     if brush_active {
-        draw_brush_bar(ui, ui_state, vp);
+        draw_brush_bar(ui, ui_state, doc, vp);
     }
 
     if let Some(label) = format_scale_label(world_size_m) {
@@ -1441,7 +1441,7 @@ fn draw_camera_speed_menu(ui: &mut GuiContext<'_>, state: &mut UiState, anchor: 
     ui.end_overlay();
 }
 
-fn draw_brush_bar(ui: &mut GuiContext<'_>, state: &mut UiState, vp: Rect) {
+fn draw_brush_bar(ui: &mut GuiContext<'_>, state: &mut UiState, doc: &TerrainDocument, vp: Rect) {
     let bar_w = (vp.width() - PAD * 2.0).clamp(280.0, 560.0);
     let bar = Rect::from_pos_size(
         vp.min_x + (vp.width() - bar_w) * 0.5,
@@ -1473,15 +1473,28 @@ fn draw_brush_bar(ui: &mut GuiContext<'_>, state: &mut UiState, vp: Rect) {
     let mut x = bar.min_x + 50.0;
     let stop = bar.max_x - 160.0;
     if x + 100.0 <= stop {
+        let (radius_label, radius, radius_min, radius_max) =
+            if let Some(infinite) = doc.infinite_settings() {
+                let min = infinite.finest_spacing_m.clamp(0.01, f64::from(f32::MAX)) as f32;
+                let tile_span = min * infinite.tile_size_samples as f32;
+                (
+                    "Radius m",
+                    &mut state.infinite_brush_radius_m,
+                    min,
+                    (tile_span * 2.0).max(min * 16.0),
+                )
+            } else {
+                ("Radius", &mut state.sculpt_radius, 0.005, 0.25)
+            };
         x = compact_slider(
             ui,
             Id::new("brush_radius"),
             x,
             bar,
-            "Radius",
-            &mut state.sculpt_radius,
-            0.005,
-            0.25,
+            radius_label,
+            radius,
+            radius_min,
+            radius_max,
         );
     }
     if x + 100.0 <= stop {

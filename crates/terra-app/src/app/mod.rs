@@ -375,8 +375,8 @@ pub struct TerraApp {
     gui_interacting: bool,
     /// A sculpt gesture changed the base buffer; represented in History as an annotation.
     sculpt_stroke_active: bool,
-    /// Last terrain UV stamped this stroke â€” used to fill gaps on fast brush moves.
-    last_paint_uv: Option<(f32, f32)>,
+    /// Last explicitly framed terrain point stamped during this stroke.
+    last_paint_point: Option<terra_core::AuthoringPoint>,
     /// App-owned 3D viewport in logical pixels.
     viewport_rect: Rect,
     /// Rebuild live 2D preview only when height/mode changes (not every frame).
@@ -559,7 +559,7 @@ impl Default for TerraApp {
             failure_presented: false,
             gui_interacting: false,
             sculpt_stroke_active: false,
-            last_paint_uv: None,
+            last_paint_point: None,
             viewport_rect: Rect::from_min_max(88.0, 44.0, 1300.0, 690.0),
             preview_dirty: true,
             ui_history_fp: (usize::MAX, usize::MAX),

@@ -86,13 +86,22 @@ pub(crate) fn try_apply(
         }
         PanelAction::PaintBiomeStamp {
             biome,
-            u,
-            v,
-            radius,
+            stamp,
             strength,
             erase,
             mode,
         } => {
+            let terra_core::AuthoringBrushStamp::Bounded {
+                uv,
+                radius_uv: radius,
+                ..
+            } = stamp
+            else {
+                app.ui_state.status =
+                    "Sparse biome storage is not available until issue #210.".into();
+                return Ok(());
+            };
+            let (u, v) = uv.tuple();
             let Some(bounded) = app.session.document.bounded_settings().cloned() else {
                 app.ui_state.status =
                     "Biome painting is unavailable for Infinite projects in this slice.".into();

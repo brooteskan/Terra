@@ -115,9 +115,7 @@ pub enum PanelAction {
     },
     PaintMaskStamp {
         mask_id: MaskId,
-        u: f32,
-        v: f32,
-        radius: f32,
+        stamp: terra_core::AuthoringBrushStamp,
         strength: f32,
         hardness: f32,
         tool: MaskPaintTool,
@@ -129,14 +127,23 @@ pub enum PanelAction {
     /// Stamp onto a brush-editable layer.
     PaintSculptStamp {
         layer: LayerId,
-        u: f32,
-        v: f32,
-        radius: f32,
+        stamp: terra_core::AuthoringBrushStamp,
         strength: f32,
         /// Non-destructive stroke kind stored on the Shape Layer.
         stroke_kind: terra_core::authoring::SculptStrokeKind,
         /// Absolute height for Flatten / HeightStamp (metres).
         target_height: f32,
+    },
+    /// Add a Path node using the active project's explicit coordinate frame.
+    AddPathNode {
+        layer: LayerId,
+        position: terra_core::AuthoringPoint,
+    },
+    /// Move an existing Path node without conflating UV and world metres.
+    MovePathNode {
+        layer: LayerId,
+        index: usize,
+        position: terra_core::AuthoringPoint,
     },
     /// Merge selected Shape history layers (SculptStrokes) into the first.
     MergeShapeLayers {
@@ -307,9 +314,7 @@ pub enum PanelAction {
     /// Stamp into the selected biome paint / placement layer for `active_biome`.
     PaintBiomeStamp {
         biome: LayerId,
-        u: f32,
-        v: f32,
-        radius: f32,
+        stamp: terra_core::AuthoringBrushStamp,
         strength: f32,
         erase: bool,
         /// Optional mode override (smooth / replace / add). None = paint/erase.
@@ -463,13 +468,13 @@ pub enum PanelAction {
         kind: terra_core::contextual_create::CreateKind,
         /// Explicit owner override; `None` uses inference (must resolve).
         owner: Option<terra_core::contextual_create::CreateOwner>,
-        uv: Option<(f32, f32)>,
+        position: Option<terra_core::AuthoringPoint>,
     },
     /// Open the viewport Create-here menu at a screen position.
     OpenViewportContextMenu {
         x: f32,
         y: f32,
-        uv: Option<(f32, f32)>,
+        position: Option<terra_core::AuthoringPoint>,
         locked_owner: Option<terra_core::contextual_create::CreateOwner>,
     },
     /// Focus an inspector section after create (string key: general/noise/â€¦).

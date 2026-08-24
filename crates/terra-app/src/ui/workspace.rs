@@ -742,7 +742,10 @@ impl AppWorkspace {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BrushWorkspaceState {
+    /// Normalized radius used only by bounded projects.
     pub radius: f32,
+    /// Absolute metre radius used only by Infinite projects.
+    pub infinite_radius_m: f32,
     pub strength: f32,
     pub falloff: f32,
     pub spacing: f32,
@@ -755,6 +758,7 @@ impl Default for BrushWorkspaceState {
     fn default() -> Self {
         Self {
             radius: 0.04,
+            infinite_radius_m: 32.0,
             strength: 4.0,
             falloff: 0.5,
             spacing: 0.1,

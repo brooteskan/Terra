@@ -107,6 +107,45 @@ fn panel_action_variants_have_exactly_one_production_handler() {
     );
 }
 
+#[test]
+fn viewport_authoring_actions_use_explicit_coordinate_frames() {
+    let action_path = manifest_dir().join("src/ui/actions/mod.rs");
+    let action_source = production_source(
+        &fs::read_to_string(&action_path).expect("PanelAction source is readable"),
+    );
+    let tokens = tokenize(&action_source);
+
+    for variant in ["PaintMaskStamp", "PaintSculptStamp", "PaintBiomeStamp"] {
+        let fields = panel_action_variant_fields(&tokens, variant);
+        assert!(
+            fields.contains("stamp"),
+            "{variant} must carry a framed stamp"
+        );
+        for legacy in ["u", "v", "radius"] {
+            assert!(
+                !fields.contains(legacy),
+                "{variant} exposes legacy unframed field `{legacy}`"
+            );
+        }
+    }
+    for variant in [
+        "ContextualCreate",
+        "OpenViewportContextMenu",
+        "AddPathNode",
+        "MovePathNode",
+    ] {
+        let fields = panel_action_variant_fields(&tokens, variant);
+        assert!(
+            fields.contains("position"),
+            "{variant} must carry a framed authoring position"
+        );
+        assert!(
+            !fields.contains("uv"),
+            "{variant} exposes a legacy unframed UV field"
+        );
+    }
+}
+
 fn manifest_dir() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
 }
@@ -505,6 +544,46 @@ fn panel_action_variants(tokens: &[Token]) -> BTreeSet<String> {
         }
     }
     variants
+}
+
+fn panel_action_variant_fields(tokens: &[Token], name: &str) -> BTreeSet<String> {
+    let enum_index = tokens
+        .windows(2)
+        .position(|pair| pair[0].text == "enum" && pair[1].text == "PanelAction")
+        .expect("PanelAction enum exists");
+    let open = tokens[enum_index..]
+        .iter()
+        .position(|token| token.text == "{")
+        .map(|offset| enum_index + offset)
+        .expect("PanelAction enum has a body");
+
+    let mut depth = 1_i32;
+    let mut in_variant = false;
+    let mut fields = BTreeSet::new();
+    for (index, token) in tokens.iter().enumerate().skip(open + 1) {
+        if depth == 1 && token.text == name {
+            in_variant = true;
+            continue;
+        }
+        if in_variant && depth == 2 && is_identifier(&token.text) {
+            if tokens.get(index + 1).is_some_and(|next| next.text == ":") {
+                fields.insert(token.text.clone());
+            }
+        }
+        match token.text.as_str() {
+            "{" | "(" | "[" => depth += 1,
+            "}" | ")" | "]" => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            "," if depth == 1 && in_variant => break,
+            _ => {}
+        }
+    }
+    assert!(in_variant, "PanelAction::{name} exists");
+    fields
 }
 
 fn panel_action_handlers(tokens: &[Token]) -> Vec<(String, usize)> {

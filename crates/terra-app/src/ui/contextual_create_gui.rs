@@ -15,7 +15,7 @@ use crate::ui::{UiState, WorkspaceId};
 pub struct ViewportContextMenu {
     pub x: f32,
     pub y: f32,
-    pub uv: Option<(f32, f32)>,
+    pub position: Option<terra_core::AuthoringPoint>,
     /// Forced owner when opened from hierarchy with a known scope.
     pub locked_owner: Option<CreateOwner>,
     /// When set, show owner picker for this kind instead of the kind list.
@@ -28,7 +28,7 @@ impl Default for ViewportContextMenu {
         Self {
             x: 0.0,
             y: 0.0,
-            uv: None,
+            position: None,
             locked_owner: None,
             picking_owner_for: None,
             owner_override: None,
@@ -74,7 +74,7 @@ pub fn build_create_context(
         workspace_to_create(ui.active_workspace),
         ui.auto_switch_workspace_on_create,
     )
-    .with_cursor(menu.uv)
+    .with_cursor(menu.position)
 }
 
 /// Draw the viewport / hierarchy Create-here overlay. Returns actions to apply.
@@ -197,7 +197,7 @@ fn draw_kind_list(
                 actions.push(PanelAction::ContextualCreate {
                     kind: *kind,
                     owner: Some(prop.owner),
-                    uv: menu.uv,
+                    position: menu.position,
                 });
                 ui_state.viewport_context_menu = None;
             }
@@ -266,7 +266,7 @@ fn draw_owner_picker(
             actions.push(PanelAction::ContextualCreate {
                 kind,
                 owner: Some(*owner),
-                uv: menu.uv,
+                position: menu.position,
             });
             ui_state.viewport_context_menu = None;
         }
