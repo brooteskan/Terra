@@ -80,6 +80,8 @@ pub struct TerrainTileWorkLease {
 pub struct TerrainTileWorkStats {
     pub queued: usize,
     pub in_flight: usize,
+    pub capacity: usize,
+    pub peak_live: usize,
     pub enqueued: u64,
     pub deduplicated: u64,
     pub reprioritized: u64,
@@ -128,20 +130,29 @@ impl TerrainTileWorkScheduler {
     const FORCE_RUN_AFTER_EPOCHS: u64 = 60;
 
     pub fn new(capacity: usize) -> Self {
+        let capacity = capacity.max(1);
         Self {
             queued: HashMap::new(),
             in_flight: HashMap::new(),
             live_content: None,
-            capacity: capacity.max(1),
+            capacity,
             epoch: 0,
             next_id: 0,
-            stats: TerrainTileWorkStats::default(),
+            stats: TerrainTileWorkStats {
+                capacity,
+                ..TerrainTileWorkStats::default()
+            },
         }
     }
 
     pub fn set_capacity(&mut self, capacity: usize) {
-        self.capacity = capacity.max(1);
+        let capacity = capacity.max(1);
+        let capacity_changed = self.capacity != capacity;
+        self.capacity = capacity;
         self.trim_to_capacity();
+        if capacity_changed {
+            self.stats.peak_live = self.queued.len().saturating_add(self.in_flight.len());
+        }
         self.refresh_counts();
     }
 
@@ -396,6 +407,11 @@ impl TerrainTileWorkScheduler {
     fn refresh_counts(&mut self) {
         self.stats.queued = self.queued.len();
         self.stats.in_flight = self.in_flight.len();
+        self.stats.capacity = self.capacity;
+        self.stats.peak_live = self
+            .stats
+            .peak_live
+            .max(self.stats.queued.saturating_add(self.stats.in_flight));
     }
 }
 
@@ -640,8 +656,60 @@ mod tests {
             let _ = scheduler.dequeue_budgeted(TerrainTileWorkBudget::new(10, 1, 4));
             let stats = scheduler.stats();
             assert_eq!(stats.queued + stats.in_flight, 4);
+            assert_eq!(stats.capacity, 4);
+            assert!(stats.peak_live <= stats.capacity);
         }
         assert!(scheduler.stats().cancelled > 900);
+
+        scheduler.set_capacity(2);
+        let stats = scheduler.stats();
+        assert_eq!(stats.capacity, 2);
+        assert_eq!(stats.queued + stats.in_flight, 2);
+        assert_eq!(stats.peak_live, 2);
+    }
+
+    #[test]
+    fn every_content_identity_revision_rejects_an_old_completion() {
+        let original = stamp(11);
+        let revisions = [
+            TerrainContentStamp {
+                document_revision: original.document_revision + 1,
+                ..original
+            },
+            TerrainContentStamp {
+                plan_revision: original.plan_revision + 1,
+                ..original
+            },
+            TerrainContentStamp {
+                output_revision: original.output_revision + 1,
+                ..original
+            },
+            TerrainContentStamp {
+                content_revision: original.content_revision + 1,
+                ..original
+            },
+        ];
+
+        for revised in revisions {
+            let mut scheduler = TerrainTileWorkScheduler::new(2);
+            scheduler.reconcile(
+                original,
+                [request(2, 1, TerrainDemandClass::Refinement, true, 3.0, 10)],
+            );
+            let lease = scheduler
+                .dequeue_budgeted(TerrainTileWorkBudget::new(10, 1, 2))
+                .pop()
+                .unwrap();
+            let mut replacement = request(2, 1, TerrainDemandClass::Refinement, true, 3.0, 10);
+            replacement.content = revised;
+            replacement.key.plan_revision = revised.plan_revision;
+            replacement.key.output_revision = revised.output_revision;
+            scheduler.reconcile(revised, [replacement]);
+
+            assert!(!scheduler.lease_is_live(lease.id, revised));
+            assert!(!scheduler.complete(lease, revised));
+            assert!(scheduler.stats().cancelled >= 1);
+        }
     }
 
     #[test]

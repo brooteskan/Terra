@@ -635,6 +635,63 @@ fn profiler_panel(ui: &mut GuiContext<'_>, ui_state: &UiState) {
         label(ui, "Terrain tiles: complete-field fallback");
         label(ui, &format!("Reason: {reason}"));
     }
+    if p.infinite_streaming.active {
+        let s = &p.infinite_streaming;
+        label(
+            ui,
+            &format!(
+                "Infinite demand {}/{} tiles  |  nodes {}/{}  |  hysteresis {}",
+                s.demand_tiles,
+                s.demand_tile_limit,
+                s.visited_nodes,
+                s.visited_node_limit,
+                s.planner_hysteresis
+            ),
+        );
+        label(
+            ui,
+            &format!(
+                "Tile work queued/in-flight {}/{} (cap {}, peak {})  |  GPU jobs {}",
+                p.terrain_tile_work.queued,
+                p.terrain_tile_work.in_flight,
+                p.terrain_tile_work.capacity,
+                p.terrain_tile_work.peak_live,
+                s.compiled_jobs
+            ),
+        );
+        label(
+            ui,
+            &format!(
+                "Residency {}/{} pages (pinned {})  |  directory {}  |  {:.1}/{:.1} MiB",
+                p.tile_cache_resident,
+                s.atlas_max_pages,
+                p.tile_cache_pinned,
+                s.sparse_directory_capacity,
+                p.tile_cache_used_mb,
+                p.tile_cache_budget_mb
+            ),
+        );
+        label(
+            ui,
+            &format!(
+                "CPU tile payload {:.2}/{:.2} MiB (peak {:.2})  |  budget flags node={} tile={}",
+                s.cpu_tile_payload_bytes as f64 / (1024.0 * 1024.0),
+                s.cpu_budget_bytes as f64 / (1024.0 * 1024.0),
+                s.cpu_tile_payload_peak_bytes as f64 / (1024.0 * 1024.0),
+                s.node_budget_exhausted,
+                s.tile_budget_exhausted
+            ),
+        );
+        label(
+            ui,
+            &format!(
+                "Cancelled/stale/evicted {}/{}/{}",
+                p.terrain_tile_work.cancelled,
+                p.terrain_tile_work.stale_dropped,
+                p.tile_cache_evictions
+            ),
+        );
+    }
     label(
         ui,
         &format!(

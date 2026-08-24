@@ -1274,6 +1274,26 @@ impl EditorTool {
     }
 }
 
+/// Infinite streaming live-state counters used by the profiler and acceptance
+/// harness. Cumulative scheduler/cache counters remain on [`FrameProfile`].
+#[derive(Debug, Clone, Default)]
+pub struct InfiniteStreamingProfile {
+    pub active: bool,
+    pub demand_tiles: usize,
+    pub demand_tile_limit: usize,
+    pub visited_nodes: usize,
+    pub visited_node_limit: usize,
+    pub planner_hysteresis: usize,
+    pub node_budget_exhausted: bool,
+    pub tile_budget_exhausted: bool,
+    pub atlas_max_pages: usize,
+    pub sparse_directory_capacity: usize,
+    pub compiled_jobs: usize,
+    pub cpu_tile_payload_bytes: u64,
+    pub cpu_tile_payload_peak_bytes: u64,
+    pub cpu_budget_bytes: u64,
+}
+
 /// Per-frame timings in microseconds for the profiler overlay.
 #[derive(Debug, Clone, Default)]
 pub struct FrameProfile {
@@ -1332,6 +1352,7 @@ pub struct FrameProfile {
     pub tile_cache_evictions: u64,
     pub tile_uploads_pending: usize,
     pub terrain_tile_work: terra_core::TerrainTileWorkStats,
+    pub infinite_streaming: InfiniteStreamingProfile,
     /// GPU terrain pass microseconds (0 if TIMESTAMP_QUERY unsupported).
     pub gpu_terrain_us: u64,
     /// Compiled terrain evaluation GPU microseconds (delayed timestamp readback).
@@ -1367,6 +1388,30 @@ pub struct FrameProfile {
 }
 
 impl FrameProfile {
+    pub fn update_infinite_demand(
+        &mut self,
+        plan: &terra_core::TerrainDemandPlan,
+        config: terra_core::TerrainDemandConfig,
+        planner: terra_core::TerrainDemandPlannerStats,
+    ) {
+        let streaming = &mut self.infinite_streaming;
+        streaming.active = true;
+        streaming.demand_tiles = plan.tiles.len();
+        streaming.demand_tile_limit = config.max_demand_tiles;
+        streaming.visited_nodes = plan.visited_nodes;
+        streaming.visited_node_limit = config.max_visited_nodes;
+        streaming.planner_hysteresis = planner.infinite_refined;
+        streaming.node_budget_exhausted = plan.node_budget_exhausted;
+        streaming.tile_budget_exhausted = plan.tile_budget_exhausted;
+    }
+
+    pub fn update_infinite_cpu_payload(&mut self, bytes: u64, budget_bytes: u64) {
+        let streaming = &mut self.infinite_streaming;
+        streaming.cpu_tile_payload_bytes = bytes;
+        streaming.cpu_tile_payload_peak_bytes = streaming.cpu_tile_payload_peak_bytes.max(bytes);
+        streaming.cpu_budget_bytes = budget_bytes;
+    }
+
     pub fn update_layer_timings(&mut self, timings: &[terra_cpu_eval::LayerEvalTiming]) {
         use terra_cpu_eval::LayerEvalStatus;
 

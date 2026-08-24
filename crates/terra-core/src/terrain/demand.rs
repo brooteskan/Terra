@@ -267,10 +267,28 @@ pub struct TerrainDemandPlanner {
     previously_refined_infinite: BTreeSet<TileAddress>,
 }
 
+/// Live hysteresis state retained between demand-planning epochs.
+///
+/// The planner owns no residency and must never retain history proportional to
+/// distance travelled. These counts make that invariant observable without
+/// exposing the implementation's address sets.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TerrainDemandPlannerStats {
+    pub bounded_refined: usize,
+    pub infinite_refined: usize,
+}
+
 impl TerrainDemandPlanner {
     pub fn reset(&mut self) {
         self.previously_refined.clear();
         self.previously_refined_infinite.clear();
+    }
+
+    pub fn stats(&self) -> TerrainDemandPlannerStats {
+        TerrainDemandPlannerStats {
+            bounded_refined: self.previously_refined.len(),
+            infinite_refined: self.previously_refined_infinite.len(),
+        }
     }
 
     pub fn plan(
@@ -1405,6 +1423,37 @@ mod tests {
             .iter()
             .all(|demand| !second_addresses.contains(&demand.key.address)));
         assert!(planner.previously_refined_infinite.len() <= second.visited_nodes);
+    }
+
+    #[test]
+    fn infinite_repeated_long_traversal_keeps_planner_state_within_the_current_epoch() {
+        let topology = infinite_topology();
+        let errors = infinite_errors(&topology);
+        let config = TerrainDemandConfig::default();
+        let mut planner = TerrainDemandPlanner::default();
+
+        for step in 0..512_i64 {
+            let x = ((step % 17) - 8) as f64 * 1_000_000.0;
+            let z = (((step * 7) % 19) - 9) as f64 * 1_000_000.0;
+            let plan = planner
+                .plan_infinite(
+                    &topology,
+                    &errors,
+                    infinite_view(x, z),
+                    config,
+                    infinite_config(),
+                )
+                .unwrap();
+            let stats = planner.stats();
+
+            assert!(plan.tiles.len() <= config.max_demand_tiles);
+            assert!(plan.visited_nodes <= config.max_visited_nodes);
+            assert!(stats.infinite_refined <= plan.visited_nodes);
+            assert_eq!(stats.bounded_refined, 0);
+        }
+
+        planner.reset();
+        assert_eq!(planner.stats(), TerrainDemandPlannerStats::default());
     }
 
     #[test]

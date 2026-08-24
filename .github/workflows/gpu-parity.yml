@@ -30,3 +30,11 @@ jobs:
         run: cargo test -p terra-gpu --test support_matrix
       - name: Required GPU parity matrix
         run: cargo test -p terra-gpu-eval --features gpu-parity --test parity_matrix
+      - name: Infinite sparse residency and evaluation
+        run: |
+          cargo test -p terra-gpu --test sparse_residency
+          cargo test -p terra-gpu-eval --test infinite_tile_domain
+      - name: Infinite tile-stream rendering and app integration
+        run: |
+          cargo test -p terra-render --test gpu_tests tile_stream_residency::
+          cargo test -p terra-app --lib infinite_

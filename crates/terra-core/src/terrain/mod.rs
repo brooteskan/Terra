@@ -18,7 +18,8 @@ pub use cache::{
 pub use demand::{
     conservative_geometric_errors, InfiniteTerrainDemandConfig, InfiniteTerrainDemandView,
     InfiniteTerrainErrorModel, TerrainDemandClass, TerrainDemandConfig, TerrainDemandError,
-    TerrainDemandPlan, TerrainDemandPlanner, TerrainDemandView, TerrainTileDemand,
+    TerrainDemandPlan, TerrainDemandPlanner, TerrainDemandPlannerStats, TerrainDemandView,
+    TerrainTileDemand,
 };
 pub use domain::{
     TerrainDomainError, TerrainEvaluationDomain, TerrainEvaluationSpace, TerrainSampleExtent,

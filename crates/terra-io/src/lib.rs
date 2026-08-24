@@ -608,7 +608,37 @@ mod worker_tests {
 
         assert_eq!(loaded.infinite_settings(), Some(&settings));
         let persisted = std::fs::read_to_string(&path).unwrap();
-        assert!(!persisted.contains("\"samples\""));
+        let json: serde_json::Value = serde_json::from_str(&persisted).unwrap();
+        assert_eq!(json["world"]["type"], "infinite_procedural_world");
+        assert_eq!(json["world"]["settings"]["seed"], settings.seed);
+
+        fn reject_generated_payload(value: &serde_json::Value) {
+            match value {
+                serde_json::Value::Object(object) => {
+                    for (key, child) in object {
+                        assert!(
+                            !matches!(
+                                key.as_str(),
+                                "samples"
+                                    | "resident_pages"
+                                    | "page_table"
+                                    | "tile_cache"
+                                    | "generated_tiles"
+                            ),
+                            "generated runtime payload `{key}` leaked into the project recipe"
+                        );
+                        reject_generated_payload(child);
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for item in items {
+                        reject_generated_payload(item);
+                    }
+                }
+                _ => {}
+            }
+        }
+        reject_generated_payload(&json);
         let _ = std::fs::remove_file(&path);
     }
 

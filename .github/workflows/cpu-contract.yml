@@ -16,6 +16,13 @@ jobs:
         run: cargo test -p terra-cpu-eval --test cpu_determinism_contract
       - name: Run simulation numerical contract
         run: cargo test -p terra-cpu-eval --test simulation_numerical_contract
+      - name: Run Infinite traversal, evaluation, and persistence contracts
+        run: |
+          cargo test -p terra-core --lib terrain::demand::tests::infinite
+          cargo test -p terra-core --lib terrain::work::tests
+          cargo test -p terra-cpu-eval --test infinite_tile_evaluation
+          cargo test -p terra-io --lib infinite_project_save_close_and_reopen_preserves_identity_without_tiles
+          cargo test -p terra-core --lib document::tests
       - name: Run debris-flow numerical regressions
         run: |
           cargo test -p terra-core --lib pick_receiver

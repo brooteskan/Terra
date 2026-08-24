@@ -424,6 +424,7 @@ impl TerraApp {
         project_world: &terra_core::document::ProjectWorld,
         ocean_level: Option<f32>,
     ) {
+        self.ui_state.profile.infinite_streaming = Default::default();
         self.supersede_gpu_refinement();
         self.last_height = None;
         self.scheduler.last_good = None;

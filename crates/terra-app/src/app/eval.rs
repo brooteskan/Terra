@@ -1302,6 +1302,11 @@ impl TerraApp {
                 return false;
             }
         };
+        self.ui_state.profile.update_infinite_demand(
+            &plan,
+            config,
+            self.terrain_demand_planner.stats(),
+        );
         let Some(atlas) = self.tile_atlas.as_mut().filter(|atlas| atlas.is_infinite()) else {
             return false;
         };
@@ -1371,6 +1376,12 @@ impl TerraApp {
         self.ui_state
             .profile
             .update_terrain_tile_work(self.terrain_tile_scheduler.stats());
+        self.ui_state.profile.infinite_streaming.atlas_max_pages = atlas.max_pages() as usize;
+        self.ui_state
+            .profile
+            .infinite_streaming
+            .sparse_directory_capacity = atlas.virtual_page_count() as usize;
+        self.ui_state.profile.infinite_streaming.compiled_jobs = self.compiled_tile_jobs.len();
         let changed = self.latest_terrain_demand.as_ref() != Some(&plan);
         self.latest_terrain_demand = Some(plan);
         changed || !self.terrain_tile_scheduler.is_empty()
@@ -1573,7 +1584,14 @@ impl TerraApp {
                         self.terrain_tile_scheduler.fail(lease);
                         continue;
                     };
-                    let Some(settings) = self.session.document.infinite_settings() else {
+                    let Some((seed, cpu_payload_budget_bytes)) =
+                        self.session.document.infinite_settings().map(|settings| {
+                            (
+                                settings.seed,
+                                u64::from(settings.cpu_residency_budget_mib) * 1024 * 1024,
+                            )
+                        })
+                    else {
                         self.terrain_tile_scheduler.fail(lease);
                         continue;
                     };
@@ -1605,7 +1623,7 @@ impl TerraApp {
                     let domain = match terra_core::TerrainEvaluationDomain::for_infinite_tile(
                         &topology,
                         key.clone(),
-                        settings.seed,
+                        seed,
                         self.tile_atlas.as_ref().unwrap().halo(),
                         slice.operation_halo,
                         live_stamp,
@@ -1630,6 +1648,10 @@ impl TerraApp {
                             continue;
                         }
                     };
+                    self.ui_state.profile.update_infinite_cpu_payload(
+                        (tile.samples.len() as u64).saturating_mul(4),
+                        cpu_payload_budget_bytes,
+                    );
                     self.tile_atlas
                         .as_mut()
                         .unwrap()
@@ -1703,6 +1725,7 @@ impl TerraApp {
         self.ui_state
             .profile
             .update_terrain_tile_work(self.terrain_tile_scheduler.stats());
+        self.ui_state.profile.infinite_streaming.compiled_jobs = self.compiled_tile_jobs.len();
         uploaded
     }
 
@@ -1768,6 +1791,7 @@ impl TerraApp {
             }
         }
         self.compiled_tile_jobs = retained;
+        self.ui_state.profile.infinite_streaming.compiled_jobs = self.compiled_tile_jobs.len();
         uploaded
     }
 
@@ -1776,6 +1800,7 @@ impl TerraApp {
             self.compiled_tile_producer.cancel(work.engine);
         }
         self.terrain_tile_scheduler.clear();
+        self.ui_state.profile.infinite_streaming.compiled_jobs = 0;
     }
 
     pub(crate) fn sync_tile_stream_to_renderer(&mut self) {
@@ -3187,6 +3212,21 @@ mod tests {
             .terrain_tile_scheduler
             .queued_requests()
             .all(|request| request.source == terra_core::TerrainTileWorkSource::GpuCompiledPlan));
+        let streaming = &app.ui_state.profile.infinite_streaming;
+        assert!(streaming.active);
+        assert_eq!(streaming.demand_tiles, demand.tiles.len());
+        assert!(streaming.demand_tiles <= streaming.demand_tile_limit);
+        assert!(streaming.visited_nodes <= streaming.visited_node_limit);
+        assert!(streaming.planner_hysteresis <= streaming.visited_nodes);
+        assert_eq!(streaming.atlas_max_pages, atlas_pages as usize);
+        assert_eq!(
+            app.ui_state.profile.terrain_tile_work.capacity,
+            atlas_pages as usize
+        );
+        assert!(
+            app.ui_state.profile.terrain_tile_work.peak_live
+                <= app.ui_state.profile.terrain_tile_work.capacity
+        );
 
         let content = terra_core::TerrainContentStamp {
             document_revision: 1,
@@ -3260,6 +3300,11 @@ mod tests {
             .queued_requests()
             .all(|request| request.source == terra_core::TerrainTileWorkSource::CpuInfinitePlan));
         assert!(app.terrain_tile_scheduler.len() <= atlas_pages as usize);
+        assert_eq!(app.upload_pending_terrain_tiles(), 1);
+        let streaming = &app.ui_state.profile.infinite_streaming;
+        assert!(streaming.cpu_tile_payload_bytes > 0);
+        assert!(streaming.cpu_tile_payload_bytes <= streaming.cpu_budget_bytes);
+        assert!(streaming.cpu_tile_payload_peak_bytes <= streaming.cpu_budget_bytes);
     }
 
     #[test]

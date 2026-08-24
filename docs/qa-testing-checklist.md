@@ -223,6 +223,23 @@ Run each; watch bottom-dock status (Ready / Outdated / Running) and cancel behav
 
 ---
 
+## 13. Infinite Procedural World — *experimental Slice 1*
+
+- [ ] Create an **Infinite Procedural World** from Project Home; the project chip says `Infinite`
+- [ ] Save, close, and reopen it; seed, origin, spacing, tile size, LOD, radii, and budgets match
+- [ ] Inspect the saved JSON; it contains the recipe/settings and no generated samples or pages
+- [ ] Travel through positive and negative coordinates and at least 1,000 km from the origin; terrain remains stable
+- [ ] Return to the origin; regenerated terrain matches the earlier view
+- [ ] During rapid travel, **View → Profiler** counters remain within the displayed demand, work, residency, and CPU payload limits
+- [ ] Observe a fine tile refining; valid coarse terrain remains visible until the finer page is current
+- [ ] Add a supported bounded Blur after a supported generator; shared tile edges remain visually seamless
+- [ ] Try a disabled full-field/basin/global operation; the UI names why it is unavailable and schedules no new terrain work
+- [ ] Open a legacy/bounded project afterward; creation, evaluation, rendering, save/load, and residency still behave normally
+
+See [Infinite Procedural World — Slice 1](infinite-procedural-world.md) for the supported operation set and troubleshooting signals.
+
+---
+
 ### Notes for the tester
 
 - The authoritative list of clickable tools is `all_tools()` in `crates/terra-app/src/ui/tool_catalog.rs`; if something above isn't in the UI, note it — a few core variants are intentionally hidden.

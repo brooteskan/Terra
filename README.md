@@ -90,6 +90,7 @@ Terra uses a **layer stack** (World Creator–style), not a node graph. Workspac
 | [Workflow structure](docs/workflow.md) | Layer stack, biomes, masks, workspaces, and how pieces fit together |
 | [Creating terrain](docs/creating-terrain.md) | New project → sculpt → biomes → filters → save |
 | [Editor overview](docs/editor.md) | Shell layout, panels, and common actions |
+| [Infinite Procedural World](docs/infinite-procedural-world.md) | Slice 1 settings, supported operations, limits, and troubleshooting |
 
 ## Contributing
 
