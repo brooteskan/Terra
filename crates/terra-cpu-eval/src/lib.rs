@@ -491,6 +491,7 @@ impl StackEvaluator {
     ) -> Result<Heightfield, EvalError> {
         profiling::scope!("rebuild_all");
         self.cache.clear();
+        self.cache.ensure_quality(ctx.quality);
         // A cold rebuild re-stamps from scratch; the whole-field SculptStrokes arm
         // repopulates the prefix store as it goes.
         self.sculpt_prefix.clear();
@@ -508,6 +509,7 @@ impl StackEvaluator {
         ctx: &mut EvalContext,
     ) -> Result<Heightfield, EvalError> {
         profiling::scope!("rebuild_incremental");
+        self.cache.ensure_quality(ctx.quality);
         if stack.requires_tree_evaluation() {
             let seed = Heightfield::zeros(ctx.metrics);
             return self.evaluate_nodes(&stack.nodes, ctx, &seed);
@@ -673,6 +675,7 @@ impl StackEvaluator {
         ctx: &mut EvalContext,
         input: &Heightfield,
     ) -> Result<Heightfield, EvalError> {
+        self.cache.ensure_quality(ctx.quality);
         let mut current = input.clone();
         let soloing = nodes.iter().any(StackNode::contains_solo);
         for node in nodes {
@@ -783,6 +786,7 @@ impl StackEvaluator {
         start_index: usize,
         mut current: Heightfield,
     ) -> Result<Heightfield, EvalError> {
+        self.cache.ensure_quality(ctx.quality);
         let layers = stack.flatten_layers();
         for layer in layers.into_iter().skip(start_index) {
             ctx.check_cancelled()?;
@@ -1869,7 +1873,120 @@ fn gate_aux_by_mask(ctx: &mut EvalContext, mask: &MaskField) {
 mod tests {
     use super::*;
     use std::collections::HashSet;
-    use terra_core::layer::{BlendMode, FlatParams, LayerKind, NoiseParams};
+    use terra_core::layer::{
+        BlendMode, FbmParams, FlatParams, LayerKind, MultiScaleAmplifyParams, NoiseParams,
+    };
+
+    fn quality_sensitive_stack() -> LayerStack {
+        let mut stack = LayerStack::new();
+        stack.push(Layer::new(
+            "Noise",
+            LayerKind::Fbm(FbmParams {
+                base: NoiseParams {
+                    amplitude: 80.0,
+                    frequency: 0.025,
+                    octaves: 5,
+                    ..NoiseParams::default()
+                },
+                ..FbmParams::default()
+            }),
+        ));
+        stack.push(Layer::new(
+            "Amplify",
+            LayerKind::MultiScaleAmplify(MultiScaleAmplifyParams {
+                thermal_iters: 14,
+                spe_iters: 7,
+                ..MultiScaleAmplifyParams::default()
+            }),
+        ));
+        stack
+    }
+
+    fn max_abs_difference(a: &Heightfield, b: &Heightfield) -> f32 {
+        let mut max = 0.0f32;
+        for y in 0..a.metrics.height {
+            for x in 0..a.metrics.width {
+                max = max.max((a.get(x, y) - b.get(x, y)).abs());
+            }
+        }
+        max
+    }
+
+    #[test]
+    fn quality_transition_recomputes_and_matches_cold_target_quality() {
+        let stack = quality_sensitive_stack();
+        let metrics = HeightfieldMetrics::new(48, 48, 480.0, 480.0);
+
+        let mut warm = StackEvaluator::new();
+        let mut medium_ctx = EvalContext::new(metrics);
+        medium_ctx.quality = PreviewQuality::Medium;
+        let medium = warm.rebuild_all(&stack, &mut medium_ctx).unwrap();
+
+        let mut full_ctx = EvalContext::new(metrics);
+        full_ctx.quality = PreviewQuality::Full;
+        let transitioned = warm.rebuild_incremental(&stack, &mut full_ctx).unwrap();
+
+        let mut cold = StackEvaluator::new();
+        let mut cold_ctx = EvalContext::new(metrics);
+        cold_ctx.quality = PreviewQuality::Full;
+        let cold_full = cold.rebuild_all(&stack, &mut cold_ctx).unwrap();
+
+        assert!(
+            max_abs_difference(&medium, &cold_full) > 1e-5,
+            "fixture must distinguish Medium from Full"
+        );
+        assert!(
+            max_abs_difference(&transitioned, &cold_full) <= 1e-6,
+            "a transitioned Full evaluation must equal a cold Full evaluation"
+        );
+        assert!(
+            full_ctx
+                .layer_timings
+                .iter()
+                .all(|timing| timing.status != LayerEvalStatus::CacheHit),
+            "Full must not consume Medium checkpoints"
+        );
+
+        let mut export_ctx = EvalContext::new(metrics);
+        export_ctx.quality = PreviewQuality::Export;
+        warm.rebuild_incremental(&stack, &mut export_ctx).unwrap();
+        assert_eq!(warm.cache.quality(), Some(PreviewQuality::Export));
+        assert!(export_ctx
+            .layer_timings
+            .iter()
+            .all(|timing| timing.status != LayerEvalStatus::CacheHit));
+        assert!(PreviewQuality::Draft.resolution(512, 2048) <= 512);
+    }
+
+    #[test]
+    fn same_1024_metrics_medium_to_full_cannot_hit_medium_cache() {
+        let mut stack = LayerStack::new();
+        stack.push(Layer::new(
+            "Base",
+            LayerKind::Flat(FlatParams { height: 12.0 }),
+        ));
+        let metrics = HeightfieldMetrics::new(1024, 1024, 1_024.0, 1_024.0);
+
+        let mut transitioned = StackEvaluator::new();
+        let mut medium_ctx = EvalContext::new(metrics);
+        medium_ctx.quality = PreviewQuality::Medium;
+        transitioned.rebuild_all(&stack, &mut medium_ctx).unwrap();
+        let mut full_ctx = EvalContext::new(metrics);
+        full_ctx.quality = PreviewQuality::Full;
+        let full = transitioned
+            .rebuild_incremental(&stack, &mut full_ctx)
+            .unwrap();
+
+        let mut cold = StackEvaluator::new();
+        let mut cold_ctx = EvalContext::new(metrics);
+        cold_ctx.quality = PreviewQuality::Full;
+        let cold_full = cold.rebuild_all(&stack, &mut cold_ctx).unwrap();
+        assert_eq!(max_abs_difference(&full, &cold_full), 0.0);
+        assert!(full_ctx
+            .layer_timings
+            .iter()
+            .all(|timing| timing.status != LayerEvalStatus::CacheHit));
+    }
 
     /// Layer ids from `from` to the top of the stack (inclusive). Test-only
     /// mirror of the dirty suffix `mark_dirty_from` propagates over.

@@ -119,5 +119,7 @@ mod execution_resources;
 mod masks_composition;
 #[path = "tests/output_identity.rs"]
 mod output_identity;
+#[path = "tests/quality_cache.rs"]
+mod quality_cache;
 #[path = "tests/refinement_performance.rs"]
 mod refinement_performance;

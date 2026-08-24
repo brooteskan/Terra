@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use terra_core::heightfield::{Heightfield, HeightfieldMetrics, TileId};
 use terra_core::layer::LayerId;
 use terra_core::mask::MaskField;
+use terra_core::quality::PreviewQuality;
 
 #[derive(Debug, Clone)]
 pub struct CachedOutput {
@@ -75,6 +76,11 @@ impl CacheEntry {
 pub struct LayerCache {
     entries: HashMap<LayerId, CacheEntry>,
     pub generation: u64,
+    /// Quality rung shared by every current entry.
+    ///
+    /// Processor semantics can change with quality even when two rungs resolve
+    /// to identical dimensions, so a cache generation never mixes rungs.
+    quality: Option<PreviewQuality>,
     /// Optional on-disk spill for baked (`cached`) layer checkpoints.
     disk: Option<DiskSmartCache>,
     /// Seed (pre-reach-expansion) dirty tiles for entries that were dirtied over a
@@ -96,6 +102,7 @@ impl LayerCache {
         Self {
             entries: HashMap::new(),
             generation: 0,
+            quality: None,
             disk: Some(DiskSmartCache::owned_instance()),
             seed_dirty: HashMap::new(),
         }
@@ -105,6 +112,7 @@ impl LayerCache {
         Self {
             entries: HashMap::new(),
             generation: 0,
+            quality: None,
             disk: Some(DiskSmartCache::new(root)),
             seed_dirty: HashMap::new(),
         }
@@ -114,6 +122,7 @@ impl LayerCache {
         Self {
             entries: HashMap::new(),
             generation: 0,
+            quality: None,
             disk: None,
             seed_dirty: HashMap::new(),
         }
@@ -144,6 +153,27 @@ impl LayerCache {
         self.generation = self.generation.wrapping_add(1);
     }
 
+    /// Establish the quality rung for subsequent lookups and stores.
+    ///
+    /// A rung change invalidates all resident/spilled descriptors. The backing
+    /// files remain in the private spill root, but their headers are checked
+    /// against this quality before either a probe or load can succeed.
+    pub fn ensure_quality(&mut self, quality: PreviewQuality) {
+        if self.quality == Some(quality) {
+            return;
+        }
+        if self.quality.is_some() {
+            self.entries.clear();
+            self.seed_dirty.clear();
+            self.generation = self.generation.wrapping_add(1);
+        }
+        self.quality = Some(quality);
+    }
+
+    pub fn quality(&self) -> Option<PreviewQuality> {
+        self.quality
+    }
+
     pub fn insert(&mut self, id: LayerId, output: CachedOutput) {
         // A freshly stored output is clean over the whole field.
         self.seed_dirty.remove(&id);
@@ -157,7 +187,7 @@ impl LayerCache {
         // A freshly baked output is clean over the whole field.
         self.seed_dirty.remove(&id);
         if let Some(disk) = &self.disk {
-            if disk.spill(id, &output).is_ok() {
+            if disk.spill_for_quality(id, &output, self.quality).is_ok() {
                 self.entries.insert(
                     id,
                     CacheEntry::Spilled {
@@ -229,10 +259,11 @@ impl LayerCache {
             Plan::UseResident => {}
             Plan::GiveUp => return None,
             Plan::LoadDisk { spilled_claim } => {
-                let loaded = self
-                    .disk
-                    .as_ref()
-                    .and_then(|disk| disk.load(id, metrics).ok().flatten());
+                let loaded = self.disk.as_ref().and_then(|disk| {
+                    disk.load_for_quality(id, metrics, self.quality)
+                        .ok()
+                        .flatten()
+                });
                 if let Some(loaded) = loaded {
                     self.entries.insert(id, CacheEntry::Resident(loaded));
                 } else if spilled_claim {
@@ -269,7 +300,7 @@ impl LayerCache {
         // worker restart adopting the previous thread's bakes). Probe the header
         // only and adopt a lightweight descriptor.
         if let Some(disk) = &self.disk {
-            if disk.probe(id, metrics) {
+            if disk.probe_for_quality(id, metrics, self.quality) {
                 self.entries.insert(
                     id,
                     CacheEntry::Spilled {
@@ -417,6 +448,40 @@ mod tests {
         }
     }
 
+    #[test]
+    fn quality_change_invalidates_same_resolution_resident_entry() {
+        let metrics = HeightfieldMetrics::new(1024, 1024, 1_024.0, 1_024.0);
+        let id = LayerId::new();
+        let mut cache = LayerCache::without_disk();
+        cache.ensure_quality(PreviewQuality::Medium);
+        cache.insert(id, output(metrics, 4.0));
+        assert!(cache.has_clean(id, metrics));
+
+        cache.ensure_quality(PreviewQuality::Full);
+
+        assert_eq!(cache.quality(), Some(PreviewQuality::Full));
+        assert!(cache.get(id).is_none());
+        assert!(!cache.has_clean(id, metrics));
+    }
+
+    #[test]
+    fn quality_change_rejects_same_resolution_surviving_spill() {
+        let dir = scratch_dir("quality_mismatch");
+        let metrics = HeightfieldMetrics::new(16, 16, 160.0, 160.0);
+        let id = LayerId::new();
+        {
+            let mut writer = LayerCache::with_disk(&dir);
+            writer.ensure_quality(PreviewQuality::Draft);
+            writer.insert_baked(id, output(metrics, 7.0));
+        }
+
+        let mut reader = LayerCache::with_disk(&dir);
+        reader.ensure_quality(PreviewQuality::Full);
+        assert!(!reader.has_clean(id, metrics));
+        assert!(reader.get_or_load(id, metrics).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// B1-D8 revert check: `insert_baked` spills and reclaims memory, and the
     /// entry reloads on demand. If eviction is reverted the entry stays resident
     /// and `is_spilled` fails.
@@ -454,9 +519,11 @@ mod tests {
         let id = LayerId::new();
         {
             let mut writer = LayerCache::with_disk(&dir);
+            writer.ensure_quality(PreviewQuality::Full);
             writer.insert_baked(id, output(metrics, 4.0));
         }
         let mut reader = LayerCache::with_disk(&dir);
+        reader.ensure_quality(PreviewQuality::Full);
         assert!(reader.has_clean(id, metrics), "surviving spill is clean");
         assert!(reader.is_spilled(id), "adopted as a reclaimed descriptor");
         let loaded = reader.get_or_load(id, metrics).expect("reload");

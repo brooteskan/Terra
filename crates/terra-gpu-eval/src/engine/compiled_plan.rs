@@ -547,7 +547,10 @@ impl GpuTerrainEngine {
         self.uniform_pool.reset();
         self.plan_operations.begin_evaluation();
         self.last_plan_operation_trace.clear();
-        let quality_changed = self.last_quality.replace(quality) != Some(quality);
+        // Quality is part of the realized plan-resource identity. Do not publish
+        // it until the candidate itself commits: a preflight/encoding failure
+        // must leave the previous quality visible so retrying stays cold.
+        let quality_changed = self.last_quality != Some(quality);
         #[cfg(test)]
         {
             self.executed_plan_operations.clear();
@@ -1268,6 +1271,7 @@ impl GpuTerrainEngine {
             self.plan_resources.commit_candidate(candidate);
         }
         self.active_plan_revision = Some(expected_revision);
+        self.last_quality = Some(quality);
         self.deferred_plan_resume = deferred_at.map(|operation| (expected_revision, operation));
         if present_scope.is_full() {
             self.mark_all_tiles_dirty();

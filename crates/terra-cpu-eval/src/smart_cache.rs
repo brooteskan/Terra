@@ -27,6 +27,7 @@ use std::time::{Duration, SystemTime};
 use terra_core::heightfield::{Heightfield, HeightfieldMetrics};
 use terra_core::layer::LayerId;
 use terra_core::mask::MaskField;
+use terra_core::quality::PreviewQuality;
 
 /// Magic for the single-file bake format introduced by B1-D8. The prior format
 /// used separate `.meta.json` / `.height.bin` / `.aux.*.bin` files; those are
@@ -39,7 +40,9 @@ const MAGIC: &[u8; 4] = b"TCB1";
 // while sediment_depth held the actual fine-sediment inventory.
 // Version 5 moved to the single-file atomic bake layout (B1-D8); older multi-file
 // spills use a different on-disk shape and are swept, not loaded.
-const VERSION: u32 = 5;
+// Version 6 records the quality rung so same-resolution refinement rungs cannot
+// satisfy one another.
+const VERSION: u32 = 6;
 
 /// Age past which an orphaned per-instance root (whose `RootGuard` never ran,
 /// e.g. a crashed session) is swept. Live instances keep a recent mtime.
@@ -53,6 +56,8 @@ struct BakeHeader {
     metrics: HeightfieldMetrics,
     generation: u64,
     aux_names: Vec<String>,
+    #[serde(default)]
+    quality: Option<PreviewQuality>,
     #[serde(default)]
     strata: Option<Vec<terra_core::layer::Stratum>>,
 }
@@ -134,8 +139,20 @@ impl DiskSmartCache {
         let _ = fs::create_dir_all(&self.root);
     }
 
-    /// Write `output` as one atomic `<id>.bake` file (temp + rename).
+    /// Write a quality-neutral bake. Retained for callers that use the disk
+    /// store independently of [`LayerCache`].
     pub fn spill(&self, id: LayerId, output: &CachedOutput) -> Result<(), EvalError> {
+        self.spill_for_quality(id, output, None)
+    }
+
+    /// Write `output` as one atomic `<id>.bake` file (temp + rename), carrying
+    /// the evaluator quality identity used by [`LayerCache`].
+    pub fn spill_for_quality(
+        &self,
+        id: LayerId,
+        output: &CachedOutput,
+        quality: Option<PreviewQuality>,
+    ) -> Result<(), EvalError> {
         fs::create_dir_all(&self.root).map_err(io_err)?;
 
         let mut aux_names: Vec<String> = output.aux.keys().cloned().collect();
@@ -146,6 +163,7 @@ impl DiskSmartCache {
             metrics: output.height.metrics,
             generation: output.generation,
             aux_names: aux_names.clone(),
+            quality,
             strata: output.strata.clone(),
         };
         let header_json = serde_json::to_vec(&header).map_err(io_err)?;
@@ -182,17 +200,27 @@ impl DiskSmartCache {
     /// Load a baked checkpoint if present, metrics match, and the payload length
     /// is exactly what the header implies. A truncated / torn / mismatched file
     /// returns `Ok(None)` (a miss), never partial data as a clean hit.
+    /// Load a quality-neutral bake. Retained for independent disk-store users.
     pub fn load(
         &self,
         id: LayerId,
         expected: HeightfieldMetrics,
+    ) -> Result<Option<CachedOutput>, EvalError> {
+        self.load_for_quality(id, expected, None)
+    }
+
+    pub fn load_for_quality(
+        &self,
+        id: LayerId,
+        expected: HeightfieldMetrics,
+        expected_quality: Option<PreviewQuality>,
     ) -> Result<Option<CachedOutput>, EvalError> {
         let bytes = match fs::read(self.bake_path(id)) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(io_err(e)),
         };
-        let Some((header, payload)) = parse_validated(&bytes, expected) else {
+        let Some((header, payload)) = parse_validated(&bytes, expected, expected_quality) else {
             return Ok(None);
         };
 
@@ -222,11 +250,21 @@ impl DiskSmartCache {
     /// Whether a valid bake for `id` at `expected` exists — no blob load. Used to
     /// adopt a surviving spill (worker restart) as a reclaimed entry. Applies the
     /// same validation as [`Self::load`], so a torn file is not claimed clean.
+    /// Probe a quality-neutral bake. Retained for independent disk-store users.
     pub fn probe(&self, id: LayerId, expected: HeightfieldMetrics) -> bool {
+        self.probe_for_quality(id, expected, None)
+    }
+
+    pub fn probe_for_quality(
+        &self,
+        id: LayerId,
+        expected: HeightfieldMetrics,
+        expected_quality: Option<PreviewQuality>,
+    ) -> bool {
         let Ok(bytes) = fs::read(self.bake_path(id)) else {
             return false;
         };
-        parse_validated(&bytes, expected).is_some()
+        parse_validated(&bytes, expected, expected_quality).is_some()
     }
 }
 
@@ -237,7 +275,11 @@ fn io_err<E: ToString>(e: E) -> EvalError {
 /// Parse and validate a `.bake` buffer. Returns the header and the payload slice
 /// only when magic, version, metrics, and — critically — the exact payload length
 /// all check out. Any shortfall or mismatch yields `None`, i.e. a cache miss.
-fn parse_validated(bytes: &[u8], expected: HeightfieldMetrics) -> Option<(BakeHeader, &[u8])> {
+fn parse_validated(
+    bytes: &[u8],
+    expected: HeightfieldMetrics,
+    expected_quality: Option<PreviewQuality>,
+) -> Option<(BakeHeader, &[u8])> {
     if bytes.len() < 8 || &bytes[0..4] != MAGIC {
         return None;
     }
@@ -246,6 +288,9 @@ fn parse_validated(bytes: &[u8], expected: HeightfieldMetrics) -> Option<(BakeHe
     let header_bytes = bytes.get(8..header_end)?;
     let header: BakeHeader = serde_json::from_slice(header_bytes).ok()?;
     if header.version != VERSION {
+        return None;
+    }
+    if header.quality != expected_quality {
         return None;
     }
     if header.metrics.width != expected.width
@@ -361,13 +406,77 @@ mod tests {
             aux,
             strata: None,
         };
-        cache.spill(id, &output).unwrap();
-        let loaded = cache.load(id, metrics).unwrap().expect("disk hit");
+        cache
+            .spill_for_quality(id, &output, Some(PreviewQuality::Full))
+            .unwrap();
+        let loaded = cache
+            .load_for_quality(id, metrics, Some(PreviewQuality::Full))
+            .unwrap()
+            .expect("disk hit");
         assert!((loaded.height.get(3, 4) - 12.5).abs() < 1e-5);
         assert!((loaded.aux["flow_acc"].get(1, 1) - 0.75).abs() < 1e-5);
         assert!(!loaded.dirty);
         assert_eq!(loaded.generation, 7);
         cache.clear_all();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn quality_mismatch_is_a_cache_miss() {
+        let dir = scratch_dir("quality");
+        let cache = DiskSmartCache::new(&dir);
+        let metrics = HeightfieldMetrics::new(8, 8, 80.0, 80.0);
+        let id = LayerId::new();
+        let output = CachedOutput {
+            height: Heightfield::filled(metrics, 3.0),
+            generation: 1,
+            dirty: false,
+            aux: HashMap::new(),
+            strata: None,
+        };
+        cache
+            .spill_for_quality(id, &output, Some(PreviewQuality::Medium))
+            .unwrap();
+
+        assert!(!cache.probe_for_quality(id, metrics, Some(PreviewQuality::Full)));
+        assert!(cache
+            .load_for_quality(id, metrics, Some(PreviewQuality::Full))
+            .unwrap()
+            .is_none());
+        assert!(cache
+            .load_for_quality(id, metrics, Some(PreviewQuality::Medium))
+            .unwrap()
+            .is_some());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn previous_format_version_is_a_cache_miss() {
+        let dir = scratch_dir("v5");
+        let cache = DiskSmartCache::new(&dir);
+        let metrics = HeightfieldMetrics::new(4, 4, 40.0, 40.0);
+        let id = LayerId::new();
+        let header = BakeHeader {
+            version: VERSION - 1,
+            metrics,
+            generation: 1,
+            aux_names: Vec::new(),
+            quality: None,
+            strata: None,
+        };
+        let header_json = serde_json::to_vec(&header).unwrap();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(MAGIC);
+        buf.extend_from_slice(&(header_json.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&header_json);
+        buf.extend_from_slice(&[0u8; 4 * 4 * 4]);
+        fs::write(cache.bake_path(id), &buf).unwrap();
+
+        assert!(cache
+            .load_for_quality(id, metrics, Some(PreviewQuality::Full))
+            .unwrap()
+            .is_none());
+        assert!(!cache.probe_for_quality(id, metrics, Some(PreviewQuality::Full)));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -393,7 +502,7 @@ mod tests {
 
         let id = LayerId::new();
         cache
-            .spill(
+            .spill_for_quality(
                 id,
                 &CachedOutput {
                     height: Heightfield::filled(metrics, 11.0),
@@ -402,9 +511,13 @@ mod tests {
                     aux,
                     strata: None,
                 },
+                Some(PreviewQuality::Full),
             )
             .unwrap();
-        let loaded = cache.load(id, metrics).unwrap().expect("disk hit");
+        let loaded = cache
+            .load_for_quality(id, metrics, Some(PreviewQuality::Full))
+            .unwrap()
+            .expect("disk hit");
         let restored = AuxMaps::from_hashmap(&loaded.aux);
         assert_eq!(restored.bedrock_height.as_ref().unwrap().get(0, 0), 6.0);
         assert_eq!(restored.get(keys::DEBRIS_DEPTH).unwrap().get(0, 0), 2.0);
@@ -428,6 +541,7 @@ mod tests {
             metrics,
             generation: 1,
             aux_names: Vec::new(),
+            quality: Some(PreviewQuality::Full),
             strata: None,
         };
         let header_json = serde_json::to_vec(&header).unwrap();
@@ -440,11 +554,14 @@ mod tests {
         fs::write(cache.bake_path(id), &buf).unwrap();
 
         assert!(
-            cache.load(id, metrics).unwrap().is_none(),
+            cache
+                .load_for_quality(id, metrics, Some(PreviewQuality::Full))
+                .unwrap()
+                .is_none(),
             "a short payload must be a miss"
         );
         assert!(
-            !cache.probe(id, metrics),
+            !cache.probe_for_quality(id, metrics, Some(PreviewQuality::Full)),
             "probe must reject the torn file too"
         );
         let _ = fs::remove_dir_all(&dir);
@@ -460,7 +577,7 @@ mod tests {
 
         let metrics = HeightfieldMetrics::new(4, 4, 40.0, 40.0);
         let id = LayerId::new();
-        a.spill(
+        a.spill_for_quality(
             id,
             &CachedOutput {
                 height: Heightfield::filled(metrics, 5.0),
@@ -469,12 +586,18 @@ mod tests {
                 aux: HashMap::new(),
                 strata: None,
             },
+            Some(PreviewQuality::Full),
         )
         .unwrap();
 
-        assert!(a.load(id, metrics).unwrap().is_some());
+        assert!(a
+            .load_for_quality(id, metrics, Some(PreviewQuality::Full))
+            .unwrap()
+            .is_some());
         assert!(
-            b.load(id, metrics).unwrap().is_none(),
+            b.load_for_quality(id, metrics, Some(PreviewQuality::Full))
+                .unwrap()
+                .is_none(),
             "a sibling instance must not see another instance's bake"
         );
     }
@@ -489,7 +612,7 @@ mod tests {
             let cache = DiskSmartCache::owned_instance();
             root = cache.root().to_path_buf();
             cache
-                .spill(
+                .spill_for_quality(
                     id,
                     &CachedOutput {
                         height: Heightfield::filled(metrics, 5.0),
@@ -498,6 +621,7 @@ mod tests {
                         aux: HashMap::new(),
                         strata: None,
                     },
+                    Some(PreviewQuality::Full),
                 )
                 .unwrap();
             assert!(root.exists());
