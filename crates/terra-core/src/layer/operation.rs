@@ -490,6 +490,9 @@ impl LayerKind {
             LayerKind::Blur(p) => Reach::Localized {
                 halo_samples: p.radius.saturating_mul(p.iterations.max(1)),
             },
+            LayerKind::SculptStrokes(p) if p.strokes.iter().all(|stroke| !stroke.enabled) => {
+                Reach::LOCAL
+            }
             LayerKind::SculptStrokes(p) => Reach::Localized {
                 // Floor of 1 for the reconcile 3x3 (also covers a base-neighborhood
                 // stroke's own stamp read). Reach is 2 only when such a stroke feeds a
@@ -526,6 +529,15 @@ impl LayerKind {
         use crate::invalidation::{InfiniteOperationCapability as Capability, SpatialRejectReason};
 
         match self {
+            // A freshly-created Shape history layer carries bounded-project stroke
+            // semantics, but until it contains an enabled stroke its kernel and
+            // published auxiliary fields are coordinate-independent no-ops. Infinite
+            // project templates include this empty layer so the sculpt tool is ready.
+            LayerKind::SculptStrokes(params)
+                if params.strokes.iter().all(|stroke| !stroke.enabled) =>
+            {
+                Capability::Direct
+            }
             LayerKind::Flat(_)
             | LayerKind::NoiseValue(_)
             | LayerKind::NoisePerlin(_)
@@ -946,11 +958,10 @@ mod tests {
             LayerKind::VoronoiRegions(Default::default()).intrinsic_reach(),
             Reach::LOCAL
         );
-        // SculptStrokes: one-sample reconcile-halo floor for the default (empty,
-        // reconcile 0.15) params.
+        // An empty SculptStrokes history is a coordinate-independent no-op.
         assert_eq!(
             LayerKind::SculptStrokes(Default::default()).intrinsic_reach(),
-            Reach::Localized { halo_samples: 1 }
+            Reach::LOCAL
         );
         // Grows to two when a base-neighborhood stroke (Smooth, Pinch, or Coastline)
         // feeds a non-zero reconcile: the base 3x3 shifts the stamped field, then
@@ -1012,6 +1023,24 @@ mod tests {
         assert_eq!(
             LayerKind::EffectFilter(strata).intrinsic_reach(),
             Reach::Full
+        );
+    }
+
+    #[test]
+    fn empty_sculpt_history_is_an_infinite_safe_no_op() {
+        use crate::invalidation::{InfiniteOperationCapability, SpatialRejectReason};
+
+        assert_eq!(
+            LayerKind::SculptStrokes(Default::default()).infinite_capability(),
+            InfiniteOperationCapability::Direct
+        );
+        let mut params = crate::authoring::SculptStrokeParams::default();
+        params
+            .strokes
+            .push(crate::authoring::SculptStroke::default());
+        assert_eq!(
+            LayerKind::SculptStrokes(params).infinite_capability(),
+            InfiniteOperationCapability::Unsupported(SpatialRejectReason::BoundedAuthoredData)
         );
     }
 

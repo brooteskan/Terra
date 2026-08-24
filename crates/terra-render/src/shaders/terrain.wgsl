@@ -36,7 +36,8 @@ struct FrameUniforms {
     stream6: vec4<u32>,
     // Signed finest-tile render anchor: x low/high, z low/high
     stream7: vec4<u32>,
-    // x=finest spacing metres, y=finest tile span metres
+    // x=finest spacing metres, y=finest tile span metres,
+    // z/w=camera-relative X/Z centre of this draw's exclusion hole
     stream8: vec4<f32>,
 };
 
@@ -414,6 +415,13 @@ fn sample_page_infinite(page: u32, local_xz: vec2<f32>, lod: u32) -> f32 {
 
 fn resolve_height_infinite_from(local_xz: vec2<f32>, start_lod: u32) -> ResolvedHeightSample {
     let max_lod = u.stream6.z;
+    // Infinite presentation has no bounded monolithic fallback. Until the
+    // current coarse-coverage set is complete, resolve to terminal so the
+    // fragment stage leaves the viewport clear instead of drawing a local square
+    // or exposing a partially resident page set.
+    if (u.stream.x <= 0.5 || u.stream6.y == 0u) {
+        return ResolvedHeightSample(u.world.z, STREAM_TERMINAL, max_lod);
+    }
     for (var lod = start_lod; lod <= max_lod; lod = lod + 1u) {
         let address = infinite_address(local_xz, lod);
         let page = lookup_tile_page_sparse(lod, address);
@@ -806,11 +814,7 @@ fn fs_wireframe(i: VsOut) -> @location(0) vec4<f32> {
 fn fs_main(i: VsOut) -> @location(0) vec4<f32> {
     // Coarse clipmap rings / fallback leave a hole so finer coverage is never overdrawn.
     if (u.viz.w > 0.5) {
-        let cells = max(u.clipmap.w - 1.0, 1.0);
-        let center = vec2<f32>(
-            u.clipmap.x + u.clipmap.z * cells * 0.5,
-            u.clipmap.y + u.clipmap.z * cells * 0.5,
-        );
+        let center = u.stream8.zw;
         let d = max(abs(i.world_pos.x - center.x), abs(i.world_pos.z - center.y));
         if (d < u.viz.w) {
             discard;

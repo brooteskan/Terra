@@ -126,6 +126,14 @@ impl TerrainTraversalMode {
     }
 }
 
+fn terrain_patch_index_count(grid: &TerrainGrid, traversal: TerrainTraversalMode) -> u32 {
+    if traversal == TerrainTraversalMode::Infinite {
+        grid.surface_index_count
+    } else {
+        grid.index_count
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct FrameUniforms {
@@ -164,7 +172,8 @@ struct FrameUniforms {
     stream6: [u32; 4],
     /// Signed finest-tile render anchor: x low/high, z low/high.
     stream7: [u32; 4],
-    /// x=finest spacing metres, y=finest tile span metres.
+    /// x=finest spacing metres, y=finest tile span metres,
+    /// z/w=camera-relative X/Z centre of this draw's exclusion hole.
     stream8: [f32; 4],
 }
 
@@ -1866,48 +1875,58 @@ impl TerrainRenderer {
     fn finish_height_present(&mut self, t0: std::time::Instant) {
         self.recreate_bind_group();
         let extent = self.heights.world_size.0.max(self.heights.world_size.1);
-        // Match mesh density to the height texture as closely as device buffer
-        // limits allow (256 MiB default). Height/normal textures still carry Full
-        // 1 m detail; mesh is capped so create_buffer does not exceed max_buffer_size.
-        let tex = self
-            .heights
-            .tex_size
-            .0
-            .max(self.heights.tex_size.1)
-            .max(256);
-        let max_grid = TerrainGrid::max_resolution_for_device_limits();
-        let target_grid = WorldGridConfig::for_world(tex.min(max_grid).max(513)).grid_size;
-        let next = ClipmapConfig::for_world_with_height(extent, target_grid, tex);
-        let rings_changed = self.clipmap.rings.len() != next.rings.len()
-            || self
-                .clipmap
-                .rings
-                .iter()
-                .zip(next.rings.iter())
-                .any(|(a, b)| a.grid_size != b.grid_size)
-            || self.clipmap.fallback.grid_size != next.fallback.grid_size;
-        if rings_changed {
-            self.clipmap = next;
-            self.world_grid = self.clipmap.fallback.clone();
-            if self.grid.resolution != self.world_grid.grid_size {
-                self.grid = TerrainGrid::new(&self.device, self.world_grid.grid_size);
+        if self.traversal_mode == TerrainTraversalMode::Bounded {
+            // Match mesh density to the height texture as closely as device buffer
+            // limits allow (256 MiB default). Infinite presentation is derived from
+            // its topology and must not be replaced by this bounded-world heuristic.
+            let tex = self
+                .heights
+                .tex_size
+                .0
+                .max(self.heights.tex_size.1)
+                .max(256);
+            let max_grid = TerrainGrid::max_resolution_for_device_limits();
+            let target_grid = WorldGridConfig::for_world(tex.min(max_grid).max(513)).grid_size;
+            let next = ClipmapConfig::for_world_with_height(extent, target_grid, tex);
+            let rings_changed = self.clipmap.rings.len() != next.rings.len()
+                || self
+                    .clipmap
+                    .rings
+                    .iter()
+                    .zip(next.rings.iter())
+                    .any(|(a, b)| a.grid_size != b.grid_size)
+                || self.clipmap.fallback.grid_size != next.fallback.grid_size;
+            if rings_changed {
+                self.clipmap = next;
+                self.world_grid = self.clipmap.fallback.clone();
+                if self.grid.resolution != self.world_grid.grid_size {
+                    self.grid = TerrainGrid::new(&self.device, self.world_grid.grid_size);
+                }
+                self.ring_grids = self
+                    .clipmap
+                    .rings
+                    .iter()
+                    .map(|ring| TerrainGrid::new(&self.device, ring.grid_size))
+                    .collect();
+                self.ensure_ring_uniform_bufs();
+                self.recreate_bind_group();
+            } else {
+                // Keep ring spacings in sync with extent without reallocating meshes.
+                self.clipmap = next;
+                self.world_grid = self.clipmap.fallback.clone();
             }
-            self.ring_grids = self
-                .clipmap
-                .rings
-                .iter()
-                .map(|ring| TerrainGrid::new(&self.device, ring.grid_size))
-                .collect();
-            self.ensure_ring_uniform_bufs();
-            self.recreate_bind_group();
-        } else {
-            // Keep ring spacings in sync with extent without reallocating meshes.
-            self.clipmap = next;
-            self.world_grid = self.clipmap.fallback.clone();
         }
         // Frame once (or after explicit reset). Continuous retargeting fights orbit/pan.
         if !self.camera_framed {
-            self.frame_camera_to_terrain();
+            if let Some(config) = self.infinite_presentation {
+                self.frame_camera_to_infinite(
+                    config.topology.origin.x_m(),
+                    config.topology.origin.z_m(),
+                    config.horizon_m.clamp(10.0, f64::from(f32::MAX)) as f32,
+                );
+            } else {
+                self.frame_camera_to_terrain();
+            }
         } else if self.camera.distance < 10.0 || self.camera.distance > extent * 4.0 {
             self.camera.distance = extent * 1.1;
         }
@@ -2447,8 +2466,11 @@ impl TerrainRenderer {
             absolute_eye.y as f32,
             (absolute_eye.z - render_origin.y) as f32,
         );
-        let (stream6, stream7, stream8) = if let Some(topology) = self.tile_stream_infinite_topology
-        {
+        let infinite_topology = self.tile_stream_infinite_topology.or_else(|| {
+            self.infinite_presentation
+                .map(|presentation| presentation.topology)
+        });
+        let (stream6, stream7, stream8) = if let Some(topology) = infinite_topology {
             let tile_span = topology.finest_spacing_m * f64::from(topology.tile_size);
             let anchor_x = ((render_origin.x - topology.origin.x_m()) / tile_span).floor() as i64;
             let anchor_z = ((render_origin.y - topology.origin.z_m()) / tile_span).floor() as i64;
@@ -2457,7 +2479,11 @@ impl TerrainRenderer {
             (
                 [
                     1,
-                    self.tile_stream_virtual_page_count,
+                    if self.use_tile_stream {
+                        self.tile_stream_virtual_page_count
+                    } else {
+                        0
+                    },
                     u32::from(topology.max_lod.get()),
                     0,
                 ],
@@ -2662,8 +2688,8 @@ impl TerrainRenderer {
                 let present = backends::raster_lit::plan_raster_present(
                     &self.clipmap,
                     ClipmapPresentInput {
-                        camera_x: self.camera.target.x,
-                        camera_z: self.camera.target.z,
+                        camera_x: absolute_eye.x,
+                        camera_z: absolute_eye.z,
                         world_x,
                         world_z,
                         height_tex_w: tw,
@@ -2695,6 +2721,10 @@ impl TerrainRenderer {
                             self.grid.resolution as f32,
                         ];
                         uniforms.viz[3] = present.fallback_exclude_half_extent;
+                        uniforms.stream8[2] =
+                            (present.fallback_exclude_center_x - render_origin.x) as f32;
+                        uniforms.stream8[3] =
+                            (present.fallback_exclude_center_z - render_origin.y) as f32;
                         self.queue.write_buffer(
                             &self.uniform_buf,
                             0,
@@ -2713,6 +2743,8 @@ impl TerrainRenderer {
                             draw.grid_size as f32,
                         ];
                         uniforms.viz[3] = draw.exclude_half_extent;
+                        uniforms.stream8[2] = (draw.exclude_center_x - render_origin.x) as f32;
+                        uniforms.stream8[3] = (draw.exclude_center_z - render_origin.y) as f32;
                         self.queue
                             .write_buffer(ring_u, 0, bytemuck::bytes_of(&uniforms));
                     }
@@ -2752,7 +2784,9 @@ impl TerrainRenderer {
                         occlusion_query_set: None,
                     });
                     pass.set_pipeline(&self.pipeline);
-
+                    // Infinite clipmaps are transient surface patches, not solid terrain
+                    // blocks. Drawing each grid's skirt and underside creates one nested
+                    // wall set per LOD; the clipmap holes then leave only repeated corners.
                     if present.use_single_grid {
                         pass.set_bind_group(0, &self.bind_group, &[]);
                         pass.set_vertex_buffer(0, self.grid.vertex_buf.slice(..));
@@ -2760,7 +2794,9 @@ impl TerrainRenderer {
                             self.grid.index_buf.slice(..),
                             wgpu::IndexFormat::Uint32,
                         );
-                        pass.draw_indexed(0..self.grid.index_count, 0, 0..1);
+                        let index_count =
+                            terrain_patch_index_count(&self.grid, self.traversal_mode);
+                        pass.draw_indexed(0..index_count, 0, 0..1);
                     } else {
                         if present.draw_fallback {
                             pass.set_bind_group(0, &self.bind_group, &[]);
@@ -2769,7 +2805,9 @@ impl TerrainRenderer {
                                 self.grid.index_buf.slice(..),
                                 wgpu::IndexFormat::Uint32,
                             );
-                            pass.draw_indexed(0..self.grid.index_count, 0, 0..1);
+                            let index_count =
+                                terrain_patch_index_count(&self.grid, self.traversal_mode);
+                            pass.draw_indexed(0..index_count, 0, 0..1);
                         }
                         for draw in &present.rings {
                             let Some(ring_grid) = self.ring_grids.get(draw.ring_index) else {
@@ -2784,7 +2822,9 @@ impl TerrainRenderer {
                                 ring_grid.index_buf.slice(..),
                                 wgpu::IndexFormat::Uint32,
                             );
-                            pass.draw_indexed(0..ring_grid.index_count, 0, 0..1);
+                            let index_count =
+                                terrain_patch_index_count(ring_grid, self.traversal_mode);
+                            pass.draw_indexed(0..index_count, 0, 0..1);
                         }
                     }
                 }
@@ -3247,6 +3287,10 @@ mod shader_tests {
         assert!(address.contains("signed64_add_i32") && address.contains("signed64_shift_right"));
         let resolve = fn_body(source, "resolve_height_infinite_from");
         assert!(resolve.contains("lookup_tile_page_sparse"));
+        assert!(
+            resolve.contains("u.stream.x <= 0.5") && resolve.contains("STREAM_TERMINAL"),
+            "unready Infinite presentation must be empty, never monolithic or partially resident"
+        );
         assert!(
             !resolve.contains("sample_height_monolithic"),
             "Infinite page misses must not expose the finite monolithic heightfield"

@@ -70,8 +70,10 @@ impl ClipmapRingLevel {
     ) -> (f64, f64) {
         let half = f64::from(self.coverage()) * 0.5;
         let snap = f64::from(self.spacing.max(1e-6));
-        let mut ox = ((camera_x - half) / snap).floor() * snap;
-        let mut oz = ((camera_z - half) / snap).floor() * snap;
+        // Snap the grid centre to the nearest lattice point. Snapping the
+        // minimum corner with floor() biases coverage behind the camera.
+        let mut ox = (camera_x / snap).round() * snap - half;
+        let mut oz = (camera_z / snap).round() * snap - half;
         if let ClipmapTraversalBounds::Bounded { world_x, world_z } = bounds {
             let max_x = f64::from((world_x - self.coverage()).max(0.0));
             let max_z = f64::from((world_z - self.coverage()).max(0.0));
@@ -194,6 +196,10 @@ pub struct ClipmapRingDraw {
     /// Discard fragments whose Chebyshev distance from ring centre is below this
     /// (half-extent of the next-finer coverage). Zero = no hole.
     pub exclude_half_extent: f32,
+    /// Exact centre of the next-finer grid. Dyadic grids can have different
+    /// snapped centres, so the current grid's centre is not interchangeable.
+    pub exclude_center_x: f64,
+    pub exclude_center_z: f64,
     /// Soft morph band outside the exclude hole (metres).
     pub morph_width: f32,
 }
@@ -210,6 +216,8 @@ pub struct ClipmapPresentPlan {
     pub fallback_origin_x: f64,
     pub fallback_origin_z: f64,
     pub fallback_exclude_half_extent: f32,
+    pub fallback_exclude_center_x: f64,
+    pub fallback_exclude_center_z: f64,
     /// Coarse → fine rings (fine wins depth; coarse holes prevent overdraw).
     pub rings: Vec<ClipmapRingDraw>,
 }
@@ -251,6 +259,8 @@ impl ClipmapPresentPlan {
                 fallback_origin_x: 0.0,
                 fallback_origin_z: 0.0,
                 fallback_exclude_half_extent: 0.0,
+                fallback_exclude_center_x: 0.0,
+                fallback_exclude_center_z: 0.0,
                 rings: Vec::new(),
             };
         }
@@ -265,6 +275,16 @@ impl ClipmapPresentPlan {
             } else {
                 0.0
             };
+            let (exclude_center_x, exclude_center_z) = if rev_i > 0 {
+                let (finer_x, finer_z) = origins[rev_i - 1];
+                (
+                    finer_x + f64::from(finer_half),
+                    finer_z + f64::from(finer_half),
+                )
+            } else {
+                let half = f64::from(ring.coverage()) * 0.5;
+                (ox + half, oz + half)
+            };
             let morph = (ring.spacing * 2.0).max(tex_spacing);
             draws.push(ClipmapRingDraw {
                 ring_index: rev_i,
@@ -273,6 +293,8 @@ impl ClipmapPresentPlan {
                 spacing: ring.spacing,
                 grid_size: ring.grid_size,
                 exclude_half_extent: finer_half,
+                exclude_center_x,
+                exclude_center_z,
                 morph_width: morph,
             });
         }
@@ -289,21 +311,34 @@ impl ClipmapPresentPlan {
             == ClipmapTraversalBounds::Infinite
         {
             (
-                ((input.camera_x - fallback_extent * 0.5) / fallback_snap).floor() * fallback_snap,
-                ((input.camera_z - fallback_extent * 0.5) / fallback_snap).floor() * fallback_snap,
+                (input.camera_x / fallback_snap).round() * fallback_snap - fallback_extent * 0.5,
+                (input.camera_z / fallback_snap).round() * fallback_snap - fallback_extent * 0.5,
             )
         } else {
             (0.0, 0.0)
         };
 
+        let (fallback_exclude_center_x, fallback_exclude_center_z) = clipmap
+            .rings
+            .last()
+            .zip(origins.last())
+            .map_or((input.camera_x, input.camera_z), |(ring, &(x, z))| {
+                let half = f64::from(ring.coverage()) * 0.5;
+                (x + half, z + half)
+            });
+        let draw_fallback = input.traversal_bounds != ClipmapTraversalBounds::Infinite
+            || f64::from(outer_half) + f64::from(fallback_spacing) * 0.5 < fallback_extent * 0.5;
+
         Self {
             use_single_grid: false,
-            draw_fallback: true,
+            draw_fallback,
             fallback_spacing,
             fallback_grid_size: clipmap.fallback.grid_size,
             fallback_origin_x,
             fallback_origin_z,
             fallback_exclude_half_extent: outer_half,
+            fallback_exclude_center_x,
+            fallback_exclude_center_z,
             rings: draws,
         }
     }
@@ -465,5 +500,80 @@ mod tests {
         assert!(cfg.rings.last().unwrap().coverage() * 0.5 >= 16_384.0);
         assert_eq!(cfg.fallback.grid_size, 9);
         assert_eq!(cfg.fallback.spacing_for_extent(32_768.0), 4096.0);
+    }
+
+    #[test]
+    fn infinite_plan_is_camera_centered_with_aligned_holes() {
+        let topology = terra_core::InfiniteTopologyConfig {
+            origin: terra_core::WorldPosition::ORIGIN,
+            tile_size: 256,
+            finest_spacing_m: 1.0,
+            max_lod: terra_core::Lod::try_new(12).unwrap(),
+        };
+        let horizon = 16_384.0;
+        let cfg = ClipmapConfig::for_infinite(topology, horizon);
+        let camera_x = 1_234.25;
+        let camera_z = -5_678.75;
+        let plan = ClipmapPresentPlan::build(
+            &cfg,
+            ClipmapPresentInput {
+                camera_x,
+                camera_z,
+                world_x: (horizon * 2.0) as f32,
+                world_z: (horizon * 2.0) as f32,
+                height_tex_w: 8,
+                height_tex_h: 8,
+                traversal_bounds: ClipmapTraversalBounds::Infinite,
+            },
+        );
+
+        assert!(
+            !plan.draw_fallback,
+            "the outer ring already spans the complete horizon"
+        );
+        for draw in &plan.rings {
+            let half = f64::from(draw.spacing) * f64::from(draw.grid_size - 1) * 0.5;
+            let center_x = draw.origin_x + half;
+            let center_z = draw.origin_z + half;
+            let tolerance = f64::from(draw.spacing) * 0.5 + 1.0e-6;
+            assert!((center_x - camera_x).abs() <= tolerance);
+            assert!((center_z - camera_z).abs() <= tolerance);
+        }
+        for pair in plan.rings.windows(2) {
+            let coarse = pair[0];
+            let finer = pair[1];
+            let finer_half = f64::from(finer.spacing) * f64::from(finer.grid_size - 1) * 0.5;
+            assert_eq!(coarse.exclude_center_x, finer.origin_x + finer_half);
+            assert_eq!(coarse.exclude_center_z, finer.origin_z + finer_half);
+        }
+    }
+
+    #[test]
+    fn infinite_plan_keeps_fallback_when_max_lod_cannot_reach_horizon() {
+        let topology = terra_core::InfiniteTopologyConfig {
+            origin: terra_core::WorldPosition::ORIGIN,
+            tile_size: 64,
+            finest_spacing_m: 1.0,
+            max_lod: terra_core::Lod::try_new(2).unwrap(),
+        };
+        let horizon = 1_000.0;
+        let cfg = ClipmapConfig::for_infinite(topology, horizon);
+        let plan = ClipmapPresentPlan::build(
+            &cfg,
+            ClipmapPresentInput {
+                camera_x: 100.0,
+                camera_z: -200.0,
+                world_x: (horizon * 2.0) as f32,
+                world_z: (horizon * 2.0) as f32,
+                height_tex_w: 8,
+                height_tex_h: 8,
+                traversal_bounds: ClipmapTraversalBounds::Infinite,
+            },
+        );
+        assert!(plan.draw_fallback);
+        let outer = plan.rings.first().unwrap();
+        let half = f64::from(outer.spacing) * f64::from(outer.grid_size - 1) * 0.5;
+        assert_eq!(plan.fallback_exclude_center_x, outer.origin_x + half);
+        assert_eq!(plan.fallback_exclude_center_z, outer.origin_z + half);
     }
 }

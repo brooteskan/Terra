@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use terra_core::layer::{
     BlendMode, BlurParams, FlatParams, Layer, LayerKind, LayerStack, NoiseParams,
+    SculptStrokeParams,
 };
 use terra_core::quality::PreviewQuality;
 use terra_core::terrain_plan::{
@@ -256,4 +257,18 @@ fn infinite_gpu_rejects_unsupported_work_before_dispatch() {
     ));
     assert_eq!(producer.stats().submitted, 0);
     assert_eq!(producer.stats().engine_allocations, 0);
+}
+
+#[test]
+fn infinite_gpu_admits_empty_sculpt_history_without_a_device() {
+    let mut stack = stack(false);
+    stack.push(Layer::new(
+        "empty sculpt history",
+        LayerKind::SculptStrokes(SculptStrokeParams::default()),
+    ));
+    let plan = compile(&stack, 188);
+
+    let slice = GpuCompiledTileProducer::analyze_infinite(&stack, &[], &plan)
+        .expect("empty sculpt history is a domain-coordinate-independent no-op");
+    assert_eq!(slice.operation_halo, 0);
 }

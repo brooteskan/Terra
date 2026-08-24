@@ -760,16 +760,21 @@ fn preflight_tile_operations(
                     owner: plan.provenance().owner_of(id),
                     detail: "authored layer is missing".into(),
                 })?;
-        if !matches!(
-            authored.kind,
+        let domain_coordinate_safe = match &authored.kind {
             LayerKind::Flat(_)
-                | LayerKind::Blur(_)
-                | LayerKind::SculptBase(_)
-                | LayerKind::NoiseValue(_)
-                | LayerKind::NoisePerlin(_)
-                | LayerKind::Fbm(_)
-                | LayerKind::Ridged(_)
-        ) {
+            | LayerKind::Blur(_)
+            | LayerKind::SculptBase(_)
+            | LayerKind::NoiseValue(_)
+            | LayerKind::NoisePerlin(_)
+            | LayerKind::Fbm(_)
+            | LayerKind::Ridged(_) => true,
+            // Empty shape history is emitted by Infinite project templates. With
+            // no enabled stroke the shader only forwards height and clears its
+            // auxiliary outputs, so it has no bounded-coordinate dependency.
+            LayerKind::SculptStrokes(params) => params.strokes.iter().all(|stroke| !stroke.enabled),
+            _ => false,
+        };
+        if !domain_coordinate_safe {
             return Err(GpuTileEvaluationError::UnsupportedOperation {
                 operation: id,
                 owner: plan.provenance().owner_of(id),

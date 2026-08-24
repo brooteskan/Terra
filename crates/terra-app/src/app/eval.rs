@@ -1244,7 +1244,6 @@ impl TerraApp {
         let (width, height) = renderer.size();
         let aspect = width as f32 / height.max(1) as f32;
         let eye = renderer.camera.eye();
-        let target = renderer.camera.target;
         let eye_world = match terra_world::WorldPosition::try_new(eye.x, eye.z) {
             Ok(position) => position,
             Err(error) => {
@@ -1252,7 +1251,7 @@ impl TerraApp {
                 return false;
             }
         };
-        let coverage_center_world = match terra_world::WorldPosition::try_new(target.x, target.z) {
+        let coverage_center_world = match terra_world::WorldPosition::try_new(eye.x, eye.z) {
             Ok(position) => position,
             Err(error) => {
                 log::warn!(target: "terra_app::evaluation", "Infinite demand centre rejected: {error}");
@@ -1396,10 +1395,19 @@ impl TerraApp {
             self.clear_terrain_tile_work();
             return 0;
         }
-        let budget = terrain_tile_work_budget(
+        let mut budget = terrain_tile_work_budget(
             self.terrain_runtime.refinement.state(),
             self.tile_atlas.as_ref().unwrap().max_pages() as usize,
         );
+        if infinite_topology.is_some() {
+            // `GpuCompiledTileProducer` recycles tile-sized engines. Dispatching
+            // several Infinite pages concurrently defeats that pool and compiles
+            // one full evaluator pipeline set per page (minutes on downlevel
+            // adapters). Keep one job in flight so coarse coverage and later
+            // refinement reuse the same compiled engine.
+            budget.max_items = 1;
+            budget.max_in_flight = 1;
+        }
         let published_frame = self
             .renderer
             .as_ref()
@@ -3027,7 +3035,8 @@ mod tests {
 
     use terra_core::heightfield::{Heightfield, HeightfieldMetrics};
     use terra_core::layer::{
-        FlatParams, Layer, LayerKind, LayerStack, SculptStrokeKind, StreamPowerParams,
+        BlendMode, FlatParams, Layer, LayerKind, LayerStack, NoiseParams, SculptStrokeKind,
+        SculptStrokeParams, StreamPowerParams,
     };
     use terra_core::quality::PreviewQuality;
     use terra_core::shape_history::{create_shape_layer, ShapeTool};
@@ -3059,11 +3068,35 @@ mod tests {
             terra_core::document::InfiniteProceduralWorldSettings::default(),
         )
         .unwrap();
+        app.session.document.stack.push(Layer::new(
+            "empty sculpt history",
+            LayerKind::SculptStrokes(SculptStrokeParams::default()),
+        ));
 
-        assert!(app.refresh_infinite_spatial_status());
+        assert!(
+            app.refresh_infinite_spatial_status(),
+            "empty sculpt history rejected: {:?}; status={}",
+            app.ui_state.infinite_spatial_status,
+            app.ui_state.status
+        );
         let status = app.ui_state.infinite_spatial_status.unwrap();
         assert_eq!(status.operation_halo, Some(0));
         assert!(status.reason.is_none());
+        let stack = app.session.document.preview_eval_stack();
+        let plan = app
+            .terrain_plan_cache
+            .acquire(&stack, &app.session.document.masks)
+            .unwrap()
+            .clone();
+        let gpu_analysis = terra_gpu_eval::GpuCompiledTileProducer::analyze_infinite(
+            &stack,
+            &app.session.document.masks,
+            &plan,
+        );
+        assert!(
+            gpu_analysis.is_ok(),
+            "empty sculpt history must remain executable by the GPU tile adapter: {gpu_analysis:?}"
+        );
     }
 
     #[test]
@@ -3081,6 +3114,24 @@ mod tests {
         let mut app = TerraApp::default();
         app.session.document =
             terra_core::document::TerrainDocument::new_infinite(settings.clone()).unwrap();
+        let mut noise = Layer::new(
+            "Procedural Terrain",
+            LayerKind::NoiseValue(NoiseParams {
+                seed: 1,
+                frequency: 0.0015,
+                amplitude: 80.0,
+                octaves: 4,
+                lacunarity: 2.0,
+                persistence: 0.5,
+                ..NoiseParams::default()
+            }),
+        );
+        noise.common.blend = BlendMode::Add;
+        app.session.document.stack.push(noise);
+        app.session.document.stack.push(Layer::new(
+            "Uplift",
+            LayerKind::SculptStrokes(SculptStrokeParams::default()),
+        ));
         app.terrain_runtime
             .try_reconfigure(terra_core::TerrainRuntimeConfig::Infinite(
                 topology.config(),
@@ -3112,7 +3163,12 @@ mod tests {
         .expect("Infinite test atlas");
         atlas.configure_infinite(&gpu.device, &gpu.queue, topology);
         app.tile_atlas = Some(atlas);
-        assert!(app.refresh_infinite_spatial_status());
+        assert!(
+            app.refresh_infinite_spatial_status(),
+            "exact Infinite project graph rejected: {:?}; status={}",
+            app.ui_state.infinite_spatial_status,
+            app.ui_state.status
+        );
         assert!(app.refresh_terrain_demand());
 
         let demand = app
@@ -3150,34 +3206,45 @@ mod tests {
             .expect("planned signed key must satisfy the #185 tile-domain contract");
         }
 
-        let live_content = app.terrain_tile_scheduler.live_content().unwrap();
-        let coarse_keys: Vec<_> = demand
-            .tiles
-            .iter()
-            .filter(|tile| tile.class == terra_core::TerrainDemandClass::CoarseCoverage)
-            .map(|tile| tile.key.clone())
-            .collect();
-        let page_extent = settings.tile_size_samples + settings.publication_halo_samples * 2;
-        let samples = vec![12.0; (page_extent * page_extent) as usize];
-        for key in coarse_keys {
-            app.tile_atlas
-                .as_mut()
-                .unwrap()
-                .upload_packed_height_tile_current_at_frame(
-                    &gpu.queue,
-                    key,
-                    &samples,
-                    page_extent,
-                    page_extent,
-                    settings.publication_halo_samples,
-                    live_content,
-                    live_content,
-                    0,
-                )
-                .unwrap();
+        let sky_target = gpu.target(128, 128, wgpu::TextureFormat::Rgba8Unorm);
+        app.renderer
+            .as_mut()
+            .unwrap()
+            .render_to_view(&sky_target.view, 128, 128);
+        let sky = gpu.read_rgba8(&sky_target);
+
+        for _ in 0..16 {
+            app.upload_pending_terrain_tiles();
+            if app.renderer.as_ref().unwrap().tile_stream_enabled() {
+                break;
+            }
+            gpu.device.poll(wgpu::Maintain::Wait);
         }
-        app.sync_tile_stream_to_renderer();
-        assert!(app.renderer.as_ref().unwrap().tile_stream_enabled());
+        assert!(
+            app.renderer.as_ref().unwrap().tile_stream_enabled(),
+            "the production Infinite path must publish required coarse pages and enable rendering"
+        );
+        assert_eq!(
+            app.compiled_tile_producer.stats().engine_allocations,
+            1,
+            "Infinite bootstrap must compile one GPU evaluator and recycle it across pages"
+        );
+        let terrain_target = gpu.target(128, 128, wgpu::TextureFormat::Rgba8Unorm);
+        app.renderer
+            .as_mut()
+            .unwrap()
+            .render_to_view(&terrain_target.view, 128, 128);
+        let terrain = gpu.read_rgba8(&terrain_target);
+        let mut changed = 0usize;
+        for y in 0..128 {
+            for x in 0..128 {
+                changed += usize::from(sky.get(x, y) != terrain.get(x, y));
+            }
+        }
+        assert!(
+            changed > 128 * 128 / 4,
+            "production Infinite publication must replace sky with terrain, changed={changed}"
+        );
 
         app.session.document.stack.push(Layer::new(
             "CPU Infinite noise",

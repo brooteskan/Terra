@@ -270,11 +270,14 @@ fn infinite_sparse_page_renders_at_large_signed_coordinates() {
     ));
     let mut atlas = GpuTileAtlas::new(&gpu.device, 8, 1, 8).unwrap();
     atlas.configure_infinite(&gpu.device, &gpu.queue, topology);
+    let coarse_samples: Vec<f32> = (0..100)
+        .map(|index| 25.0 + (index % 10) as f32 * 4.0)
+        .collect();
     atlas
         .upload_packed_height_tile_current_at_frame(
             &gpu.queue,
             key,
-            &vec![45.0; 100],
+            &coarse_samples,
             10,
             10,
             1,
@@ -291,6 +294,26 @@ fn infinite_sparse_page_renders_at_large_signed_coordinates() {
         topology: topology.config(),
         horizon_m: 32.0,
     });
+    let expected_ring_spacings: Vec<_> = renderer
+        .clipmap
+        .rings
+        .iter()
+        .map(|ring| ring.spacing)
+        .collect();
+    renderer.upload_heightfield(&Heightfield::filled(
+        HeightfieldMetrics::new(64, 64, 64.0, 64.0),
+        0.0,
+    ));
+    assert_eq!(
+        renderer
+            .clipmap
+            .rings
+            .iter()
+            .map(|ring| ring.spacing)
+            .collect::<Vec<_>>(),
+        expected_ring_spacings,
+        "a height presentation must not replace the topology-derived Infinite clipmap",
+    );
     renderer.frame_camera_to_infinite(5_000_000.0, -5_000_000.0, 24.0);
     renderer.camera.target.y = 45.0;
 
@@ -324,6 +347,21 @@ fn infinite_sparse_page_renders_at_large_signed_coordinates() {
         differing_pixels(&before, &after) > 0,
         "a resident signed sparse page must affect camera-relative presentation"
     );
+
+    renderer.set_tile_stream_debug_mode(0);
+    let motion_before_target = gpu.target(W, H, FORMAT);
+    renderer.render_to_view(&motion_before_target.view, W, H);
+    let motion_before = gpu.read_rgba8(&motion_before_target);
+    renderer.camera.target.x += 2.0;
+    let motion_after_target = gpu.target(W, H, FORMAT);
+    renderer.render_to_view(&motion_after_target.view, W, H);
+    let motion_after = gpu.read_rgba8(&motion_after_target);
+    assert!(
+        differing_pixels(&motion_before, &motion_after) > 0,
+        "moving the Infinite camera must move streamed terrain detail in the local frame"
+    );
+    renderer.camera.target.x -= 2.0;
+    renderer.set_tile_stream_debug_mode(1);
 
     let fine_keys: Vec<_> = [624_999, 625_000]
         .into_iter()
@@ -366,5 +404,130 @@ fn infinite_sparse_page_renders_at_large_signed_coordinates() {
         differing_pixels(&after, &restored),
         0,
         "evicting Infinite detail must restore the same resident coarse ancestor"
+    );
+}
+
+#[test]
+fn infinite_default_horizon_draws_complete_multiring_coverage() {
+    let Some(gpu) = terra_test_gpu::headless() else {
+        return;
+    };
+    let ctx = GpuContext::new(gpu.device.clone(), gpu.queue.clone(), FORMAT);
+    let topology = InfiniteTopology::try_new(InfiniteTopologyConfig {
+        origin: WorldPosition::ORIGIN,
+        tile_size: 256,
+        finest_spacing_m: 1.0,
+        max_lod: Lod::try_new(12).unwrap(),
+    })
+    .unwrap();
+    let content = TerrainContentStamp {
+        document_revision: 211,
+        plan_revision: 223,
+        output_revision: 227,
+        content_revision: 229,
+    };
+    let mut atlas = GpuTileAtlas::new(&gpu.device, 256, 2, 8).unwrap();
+    atlas.configure_infinite(&gpu.device, &gpu.queue, topology);
+    let page_extent = 260;
+    for x in [-1, 0] {
+        for z in [-1, 0] {
+            let key = TerrainTileKey::height(TileAddress::new(
+                Lod::try_new(12).unwrap(),
+                TileCoord { x, z },
+            ));
+            let height = 20.0 + (x + 1) as f32 * 8.0 + (z + 1) as f32 * 4.0;
+            atlas
+                .upload_packed_height_tile_current_at_frame(
+                    &gpu.queue,
+                    key,
+                    &vec![height; (page_extent * page_extent) as usize],
+                    page_extent,
+                    page_extent,
+                    2,
+                    content,
+                    content,
+                    0,
+                )
+                .unwrap();
+        }
+    }
+
+    let mut renderer = TerrainRenderer::new_headless(&ctx, W, H);
+    renderer.set_renderer_mode(ViewportRendererMode::Raster);
+    renderer.reset_project_state((32_768.0, 32_768.0), None, TerrainTraversalMode::Infinite);
+    renderer.configure_infinite_presentation(InfinitePresentationConfig {
+        topology: topology.config(),
+        horizon_m: 16_384.0,
+    });
+    renderer.frame_camera_to_infinite(0.0, 0.0, 4_096.0);
+    renderer.camera.target.y = 20.0;
+    let unready_target = gpu.target(W, H, FORMAT);
+    renderer.render_to_view(&unready_target.view, W, H);
+    let unready = gpu.read_rgba8(&unready_target);
+    let mut empty_atlas = GpuTileAtlas::new(&gpu.device, 256, 2, 8).unwrap();
+    empty_atlas.configure_infinite(&gpu.device, &gpu.queue, topology);
+    renderer.set_tile_stream_resources(TerrainTileStreamResources {
+        atlas_view: empty_atlas.create_texture_view(),
+        physical_page_table: empty_atlas.page_table_buffer_cloned(),
+        virtual_page_table: empty_atlas.virtual_page_table_buffer_cloned(),
+        level_table: empty_atlas.level_table_buffer_cloned(),
+        tile_size: empty_atlas.tile_size(),
+        halo: empty_atlas.halo(),
+        max_pages: empty_atlas.max_pages(),
+        level_count: empty_atlas.level_count(),
+        target_level: 0,
+        target_resolution: 257,
+        content,
+        transition_frames: 0,
+        terminal_fallback: TerrainTerminalFallback::RootRequired,
+        virtual_page_count: empty_atlas.virtual_page_count(),
+        infinite_topology: Some(topology.config()),
+        enable: true,
+    });
+    let clear_target = gpu.target(W, H, FORMAT);
+    renderer.render_to_view(&clear_target.view, W, H);
+    let clear = gpu.read_rgba8(&clear_target);
+    assert_eq!(
+        differing_pixels(&unready, &clear),
+        0,
+        "unready Infinite presentation must not draw the bounded monolithic placeholder"
+    );
+
+    renderer.set_tile_stream_resources(TerrainTileStreamResources {
+        atlas_view: atlas.create_texture_view(),
+        physical_page_table: atlas.page_table_buffer_cloned(),
+        virtual_page_table: atlas.virtual_page_table_buffer_cloned(),
+        level_table: atlas.level_table_buffer_cloned(),
+        tile_size: atlas.tile_size(),
+        halo: atlas.halo(),
+        max_pages: atlas.max_pages(),
+        level_count: atlas.level_count(),
+        target_level: 0,
+        target_resolution: 257,
+        content,
+        transition_frames: 0,
+        terminal_fallback: TerrainTerminalFallback::RootRequired,
+        virtual_page_count: atlas.virtual_page_count(),
+        infinite_topology: Some(topology.config()),
+        enable: true,
+    });
+
+    let target = gpu.target(W, H, FORMAT);
+    renderer.render_to_view(&target.view, W, H);
+    let pixels = gpu.read_rgba8(&target);
+    let changed = differing_pixels(&pixels, &clear);
+    assert!(
+        changed > (W * H / 3) as usize,
+        "default multiring Infinite coverage should occupy the viewport, changed={changed}"
+    );
+
+    renderer.set_use_tile_stream(false);
+    let disabled_target = gpu.target(W, H, FORMAT);
+    renderer.render_to_view(&disabled_target.view, W, H);
+    let disabled = gpu.read_rgba8(&disabled_target);
+    assert_eq!(
+        differing_pixels(&disabled, &clear),
+        0,
+        "disabled Infinite streaming must not expose a monolithic square or partial pages"
     );
 }
