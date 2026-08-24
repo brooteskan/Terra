@@ -112,7 +112,11 @@ mod tests {
     fn per_texel_aux_stays_localizable() {
         // SculptStrokes publishes only per-texel stamp aux, so it keeps its
         // one-sample reconcile halo.
-        let l = layer(LayerKind::SculptStrokes(Default::default()));
+        use crate::authoring::{SculptStroke, SculptStrokeParams};
+        let l = layer(LayerKind::SculptStrokes(SculptStrokeParams {
+            strokes: vec![SculptStroke::default()],
+            ..SculptStrokeParams::default()
+        }));
         assert_eq!(
             effective_reach(&l, &[]),
             Reach::Localized { halo_samples: 1 }
