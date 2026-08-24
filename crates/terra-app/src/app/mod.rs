@@ -65,6 +65,7 @@ pub enum RuntimeEvent {
         reason: wgpu::DeviceLostReason,
         message: String,
     },
+    PipelineCompileCompleted,
 }
 
 /// GPU objects built off the main thread during startup, handed back through
@@ -219,7 +220,7 @@ pub struct TerraApp {
     /// engine, GUI) shares clones of this instead of sourcing device/queue
     /// through the renderer.
     gpu: Option<terra_render::GpuContext>,
-    pipeline_compile: pipeline_compile::TerrainPipelineCompileCoordinator,
+    pipeline_compile: pipeline_compile::PresentationPipelineCompileCoordinator,
     project_generation: u64,
     device_generation: u64,
     session: EditorSession,
@@ -466,7 +467,7 @@ impl Default for TerraApp {
             renderer: None,
             editor_overlays: None,
             gpu: None,
-            pipeline_compile: pipeline_compile::TerrainPipelineCompileCoordinator::default(),
+            pipeline_compile: pipeline_compile::PresentationPipelineCompileCoordinator::default(),
             project_generation: 0,
             device_generation: 0,
             session,
@@ -592,6 +593,11 @@ impl Default for TerraApp {
 
 impl TerraApp {
     pub fn set_runtime_event_proxy(&mut self, proxy: EventLoopProxy<RuntimeEvent>) {
+        let pipeline_proxy = proxy.clone();
+        self.pipeline_compile
+            .set_completion_waker(Arc::new(move || {
+                let _ = pipeline_proxy.send_event(RuntimeEvent::PipelineCompileCompleted);
+            }));
         self.runtime_event_proxy = Some(proxy);
     }
 }

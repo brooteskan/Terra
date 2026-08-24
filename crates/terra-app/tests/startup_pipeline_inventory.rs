@@ -115,7 +115,7 @@ fn every_production_pipeline_creation_is_labeled_and_tracked() {
         (
             "crates/terra-render/src/lib.rs".into(),
             Counts {
-                render: 3,
+                render: 1,
                 compute: 0,
             },
         ),

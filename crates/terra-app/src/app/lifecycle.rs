@@ -67,11 +67,22 @@ impl TerraApp {
             {
                 log::error!("GPU device lost ({reason:?}): {message}");
                 self.ui_state.status = format!("GPU device lost: {message}");
+                self.device_generation = self.device_generation.wrapping_add(1);
+                self.pipeline_compile.cancel_all();
+                if let Some(renderer) = self.renderer.as_mut() {
+                    renderer.invalidate_optional_pipelines();
+                }
+                if let Some(overlays) = self.editor_overlays.as_mut() {
+                    overlays.invalidate();
+                }
                 self.logical_frames
                     .request_shutdown(EditGeneration::new(self.eval_token));
                 self.record_frame_event(FrameTraceEventKind::DeviceLost);
             }
             RuntimeEvent::DeviceLost { .. } => {}
+            RuntimeEvent::PipelineCompileCompleted => {
+                self.request_app_frame(FrameRequestReason::Completion);
+            }
         }
     }
 
@@ -2014,6 +2025,14 @@ mod tests {
         });
         assert!(app.logical_frames.shutdown_requested());
         assert!(app.ui_state.status.contains("injected"));
+    }
+
+    #[test]
+    fn pipeline_completion_requests_a_logical_frame() {
+        let mut app = TerraApp::default();
+        assert!(!app.logical_frames.has_pending());
+        app.handle_runtime_event(RuntimeEvent::PipelineCompileCompleted);
+        assert!(app.logical_frames.has_pending());
     }
 
     #[test]

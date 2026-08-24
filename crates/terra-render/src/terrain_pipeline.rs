@@ -5,8 +5,20 @@ use crate::{terrain_shader, TerrainGrid, TerrainShaderVariant};
 /// Complete set of pipelines that must switch together for one terrain variant.
 pub struct TerrainPipelineBundle {
     pub(crate) terrain: wgpu::RenderPipeline,
-    pub(crate) ocean: wgpu::RenderPipeline,
-    pub(crate) wireframe: wgpu::RenderPipeline,
+    pub(crate) variant: TerrainShaderVariant,
+    pub(crate) format: wgpu::TextureFormat,
+    pub(crate) family: Arc<()>,
+}
+
+pub struct OceanPipelineBundle {
+    pub(crate) pipeline: wgpu::RenderPipeline,
+    pub(crate) variant: TerrainShaderVariant,
+    pub(crate) format: wgpu::TextureFormat,
+    pub(crate) family: Arc<()>,
+}
+
+pub struct WireframePipelineBundle {
+    pub(crate) pipeline: wgpu::RenderPipeline,
     pub(crate) variant: TerrainShaderVariant,
     pub(crate) format: wgpu::TextureFormat,
     pub(crate) family: Arc<()>,
@@ -141,7 +153,20 @@ impl TerrainPipelineCompiler {
                             cache: self.pipelines.driver_cache(),
                         })
                 });
-        let ocean =
+        Ok(TerrainPipelineBundle {
+            terrain,
+            variant,
+            format: self.format,
+            family: Arc::clone(&self.family),
+        })
+    }
+
+    pub fn compile_ocean(
+        &self,
+        variant: TerrainShaderVariant,
+    ) -> Result<OceanPipelineBundle, TerrainPipelineCompileError> {
+        let (shader, layout) = self.shader_and_layout(variant)?;
+        let pipeline =
             self.pipelines
                 .render_pipeline(variant.ocean_pipeline_label(), self.format, || {
                     self.device
@@ -181,7 +206,20 @@ impl TerrainPipelineCompiler {
                             cache: self.pipelines.driver_cache(),
                         })
                 });
-        let wireframe =
+        Ok(OceanPipelineBundle {
+            pipeline,
+            variant,
+            format: self.format,
+            family: Arc::clone(&self.family),
+        })
+    }
+
+    pub fn compile_wireframe(
+        &self,
+        variant: TerrainShaderVariant,
+    ) -> Result<WireframePipelineBundle, TerrainPipelineCompileError> {
+        let (shader, layout) = self.shader_and_layout(variant)?;
+        let pipeline =
             self.pipelines
                 .render_pipeline(variant.wireframe_pipeline_label(), self.format, || {
                     self.device
@@ -225,14 +263,50 @@ impl TerrainPipelineCompiler {
                             cache: self.pipelines.driver_cache(),
                         })
                 });
-
-        Ok(TerrainPipelineBundle {
-            terrain,
-            ocean,
-            wireframe,
+        Ok(WireframePipelineBundle {
+            pipeline,
             variant,
             format: self.format,
             family: Arc::clone(&self.family),
         })
+    }
+
+    fn shader_and_layout(
+        &self,
+        variant: TerrainShaderVariant,
+    ) -> Result<(wgpu::ShaderModule, wgpu::PipelineLayout), TerrainPipelineCompileError> {
+        let source = terrain_shader::compose(variant);
+        let module = naga::front::wgsl::parse_str(&source).map_err(|error| {
+            TerrainPipelineCompileError::ShaderParse {
+                variant: variant.name(),
+                message: error.to_string(),
+            }
+        })?;
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .map_err(|error| TerrainPipelineCompileError::ShaderValidation {
+            variant: variant.name(),
+            message: error.to_string(),
+        })?;
+        let shader = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(variant.shader_label()),
+                source: wgpu::ShaderSource::Wgsl(source.into()),
+            });
+        let layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some(match variant {
+                    TerrainShaderVariant::Bounded => "terrain-bounded-optional-pl",
+                    TerrainShaderVariant::Infinite => "terrain-infinite-optional-pl",
+                }),
+                bind_group_layouts: &[&self.bind_group_layout],
+                push_constant_ranges: &[],
+            });
+        Ok((shader, layout))
     }
 }

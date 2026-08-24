@@ -1,35 +1,109 @@
 use terra_render::{
-    BrushOverlay, GpuContext, GuideOverlay, GuideState, PresentationBackendId, SurfacePick,
+    BrushOverlay, GpuContext, GuideOverlay, GuideState, OptionalResource, OptionalResourceState,
+    PresentationBackendId, PresentationPipelineBundle, PresentationPipelineFeature, SurfacePick,
     TerrainRenderer,
 };
 
 /// Editor-only viewport visuals owned and scheduled by the application shell.
 pub(crate) struct EditorOverlays {
-    pub(crate) brush: BrushOverlay,
-    guides: GuideOverlay,
+    brush: OptionalResource<BrushOverlay>,
+    guides: OptionalResource<GuideOverlay>,
+    guide_state: GuideState,
     bound_height_revision: u64,
 }
 
 impl EditorOverlays {
     pub(crate) fn new(gpu: &GpuContext, renderer: &TerrainRenderer) -> Self {
-        let mut brush = BrushOverlay::new(&gpu.device, gpu.pipeline_registry(), gpu.surface_format);
-        brush.rebind_height(&gpu.device, renderer.heights.display_height_view());
+        let _ = gpu;
         Self {
-            brush,
-            guides: GuideOverlay::new(&gpu.device, gpu.pipeline_registry(), gpu.surface_format),
+            brush: OptionalResource::default(),
+            guides: OptionalResource::default(),
+            guide_state: GuideState::default(),
             bound_height_revision: renderer.height_binding_revision(),
         }
     }
 
+    pub(crate) fn state(&self, feature: PresentationPipelineFeature) -> &OptionalResourceState {
+        match feature {
+            PresentationPipelineFeature::Guides => self.guides.state(),
+            PresentationPipelineFeature::Brush => self.brush.state(),
+            _ => panic!("renderer-owned feature queried through EditorOverlays"),
+        }
+    }
+
+    pub(crate) fn begin_compile(
+        &mut self,
+        feature: PresentationPipelineFeature,
+        request_id: u64,
+    ) -> bool {
+        match feature {
+            PresentationPipelineFeature::Guides => self.guides.begin(request_id),
+            PresentationPipelineFeature::Brush => self.brush.begin(request_id),
+            _ => false,
+        }
+    }
+
+    pub(crate) fn fail_compile(
+        &mut self,
+        feature: PresentationPipelineFeature,
+        request_id: u64,
+        message: String,
+    ) -> bool {
+        match feature {
+            PresentationPipelineFeature::Guides => self.guides.fail(request_id, message),
+            PresentationPipelineFeature::Brush => self.brush.fail(request_id, message),
+            _ => false,
+        }
+    }
+
+    pub(crate) fn install(
+        &mut self,
+        gpu: &GpuContext,
+        renderer: &TerrainRenderer,
+        request_id: u64,
+        bundle: PresentationPipelineBundle,
+    ) -> Result<(), String> {
+        match bundle {
+            PresentationPipelineBundle::Guides(mut guides) => {
+                guides.set_state(self.guide_state);
+                self.guides
+                    .install(request_id, guides)
+                    .map_err(|_| "stale guide pipeline bundle".to_string())
+            }
+            PresentationPipelineBundle::Brush(mut brush) => {
+                brush.rebind_height(&gpu.device, renderer.heights.display_height_view());
+                self.bound_height_revision = renderer.height_binding_revision();
+                self.brush
+                    .install(request_id, brush)
+                    .map_err(|_| "stale brush pipeline bundle".to_string())
+            }
+            _ => Err("renderer bundle cannot be installed in EditorOverlays".into()),
+        }
+    }
+
+    pub(crate) fn cancel_compiles(&mut self) {
+        self.guides.reset_unready();
+        self.brush.reset_unready();
+    }
+
+    pub(crate) fn invalidate(&mut self) {
+        self.guides.reset();
+        self.brush.reset();
+    }
+
     pub(crate) fn set_guides(&mut self, grid: bool, bounds: bool) {
-        self.guides.set_state(GuideState { grid, bounds });
+        self.guide_state = GuideState { grid, bounds };
+        if let Some(guides) = self.guides.ready_mut() {
+            guides.set_state(self.guide_state);
+        }
     }
 
     pub(crate) fn sync_height(&mut self, gpu: &GpuContext, renderer: &TerrainRenderer) {
         let revision = renderer.height_binding_revision();
         if revision != self.bound_height_revision {
-            self.brush
-                .rebind_height(&gpu.device, renderer.heights.display_height_view());
+            if let Some(brush) = self.brush.ready_mut() {
+                brush.rebind_height(&gpu.device, renderer.heights.display_height_view());
+            }
             self.bound_height_revision = revision;
         }
     }
@@ -48,12 +122,17 @@ impl EditorOverlays {
         if renderer.traversal_mode() == terra_render::TerrainTraversalMode::Infinite {
             // Sparse authored editing is a later slice. Do not run the bounded
             // monolithic picker in an incorrect coordinate frame.
-            self.brush.hide(&gpu.queue);
+            if let Some(brush) = self.brush.ready_mut() {
+                brush.hide(&gpu.queue);
+            }
             return;
         }
         let (width, height) = renderer.size();
         let aspect = width as f32 / height.max(1) as f32;
-        self.brush.request_surface_pick(
+        let Some(brush) = self.brush.ready_mut() else {
+            return;
+        };
+        brush.request_surface_pick(
             &gpu.device,
             &gpu.queue,
             &renderer.camera,
@@ -79,7 +158,20 @@ impl EditorOverlays {
         let (width, height) = renderer.size();
         let aspect = width as f32 / height.max(1) as f32;
         self.brush
-            .latest_pick_for(&renderer.camera, aspect, cursor, screen)
+            .ready()
+            .and_then(|brush| brush.latest_pick_for(&renderer.camera, aspect, cursor, screen))
+    }
+
+    pub(crate) fn poll_brush(&mut self, device: &wgpu::Device) {
+        if let Some(brush) = self.brush.ready_mut() {
+            brush.poll(device);
+        }
+    }
+
+    pub(crate) fn hide_brush(&mut self, queue: &wgpu::Queue) {
+        if let Some(brush) = self.brush.ready_mut() {
+            brush.hide(queue);
+        }
     }
 
     pub(crate) fn render(
@@ -91,18 +183,24 @@ impl EditorOverlays {
         self.sync_height(gpu, renderer);
         let (width, height) = renderer.size();
         let view_proj = renderer.camera_view_proj(width as f32 / height.max(1) as f32);
-        self.brush.upload_view_proj(&gpu.queue, view_proj);
-        self.guides.upload_view_proj(&gpu.queue, view_proj);
+        if let Some(brush) = self.brush.ready_mut() {
+            brush.upload_view_proj(&gpu.queue, view_proj);
+        }
+        if let Some(guides) = self.guides.ready_mut() {
+            guides.upload_view_proj(&gpu.queue, view_proj);
+        }
         let render_origin = renderer.render_origin_xz();
-        self.guides.sync_geometry(
-            &gpu.queue,
-            renderer.heights.world_size,
-            renderer.heights.height_range,
-            (
-                (renderer.camera.target.x - render_origin.x) as f32,
-                (renderer.camera.target.z - render_origin.y) as f32,
-            ),
-        );
+        if let Some(guides) = self.guides.ready_mut() {
+            guides.sync_geometry(
+                &gpu.queue,
+                renderer.heights.world_size,
+                renderer.heights.height_range,
+                (
+                    (renderer.camera.target.x - render_origin.x) as f32,
+                    (renderer.camera.target.z - render_origin.y) as f32,
+                ),
+            );
+        }
 
         let mut encoder = gpu
             .device
@@ -131,7 +229,9 @@ impl EditorOverlays {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            self.guides.draw(&mut pass);
+            if let Some(guides) = self.guides.ready() {
+                guides.draw(&mut pass);
+            }
         }
         {
             let depth_tested = renderer.presentation_backend() == PresentationBackendId::RasterLit;
@@ -157,7 +257,9 @@ impl EditorOverlays {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            self.brush.draw(&mut pass, depth_tested);
+            if let Some(brush) = self.brush.ready() {
+                brush.draw(&mut pass, depth_tested);
+            }
         }
         gpu.queue.submit(Some(encoder.finish()));
     }

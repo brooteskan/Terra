@@ -41,8 +41,10 @@ pub mod grid;
 pub mod guides;
 pub mod height_gpu;
 mod integrity_probe;
+mod optional_resource;
 pub mod overhang;
 pub mod path_tracer;
+mod presentation_pipeline;
 pub mod presentation_transition;
 pub mod progressive;
 pub mod render_quality;
@@ -71,8 +73,13 @@ pub use grid::TerrainGrid;
 pub use guides::{GuideOverlay, GuideState};
 pub use height_gpu::{AuxMaps, HeightGpu, HeightPresentGeom};
 pub use integrity_probe::TerrainIntegrityProbeResult;
+pub use optional_resource::{OptionalResource, OptionalResourceState};
 pub use overhang::OverhangOverlay;
 pub use path_tracer::{PathTraceUniforms, PathTracer};
+pub use presentation_pipeline::{
+    PresentationPipelineBundle, PresentationPipelineCompiler, PresentationPipelineFeature,
+    ProgressivePresentationBundle,
+};
 pub use presentation_transition::{
     PresentedTerrainBaseline, TerrainPresentationDecisionCode, TerrainPresentationExpectations,
     TerrainPresentationMode, TerrainPresentationRecord, TerrainTransitionDiagnosticCode,
@@ -85,7 +92,8 @@ pub use scene_versions::{
 };
 pub use terra_core::EditorRefinementState;
 pub use terrain_pipeline::{
-    TerrainPipelineBundle, TerrainPipelineCompileError, TerrainPipelineCompiler,
+    OceanPipelineBundle, TerrainPipelineBundle, TerrainPipelineCompileError,
+    TerrainPipelineCompiler, WireframePipelineBundle,
 };
 pub use terrain_shader::TerrainShaderVariant;
 pub use vegetation::VegetationOverlay;
@@ -317,7 +325,11 @@ pub struct TerrainRenderer {
     pipelines: std::sync::Arc<terra_gpu::PipelineCacheRegistry>,
     config: wgpu::SurfaceConfiguration,
     bounded_pipeline_bundle: TerrainPipelineBundle,
-    infinite_pipeline_bundle: Option<TerrainPipelineBundle>,
+    infinite_pipeline_bundle: OptionalResource<TerrainPipelineBundle>,
+    bounded_ocean_pipeline: OptionalResource<OceanPipelineBundle>,
+    infinite_ocean_pipeline: OptionalResource<OceanPipelineBundle>,
+    bounded_wireframe_pipeline: OptionalResource<WireframePipelineBundle>,
+    infinite_wireframe_pipeline: OptionalResource<WireframePipelineBundle>,
     active_pipeline_variant: TerrainShaderVariant,
     pipeline_family: std::sync::Arc<()>,
     /// Single frame-uniform buffer for the world-fixed terrain grid.
@@ -366,9 +378,9 @@ pub struct TerrainRenderer {
     /// editor overlays to refresh their bind groups without reaching into internals.
     height_binding_revision: u64,
     /// Phase J dual-height overhang / cave roof proxy (opt-in layers).
-    pub overhang: OverhangOverlay,
+    overhang: OptionalResource<OverhangOverlay>,
     /// Instanced vegetation driven by the evaluated vegetation-density field.
-    pub vegetation: VegetationOverlay,
+    vegetation: OptionalResource<VegetationOverlay>,
     /// Presentation lighting (does not affect height data).
     pub lighting: EnvironmentLighting,
     /// Active ocean height; None disables the water surface.
@@ -378,9 +390,7 @@ pub struct TerrainRenderer {
     /// Display aids / analysis shading from the viewport chrome.
     display_aids: ViewportDisplayAids,
     /// Progressive stochastic lighting, temporal reprojection, and denoising.
-    progressive: progressive::ProgressiveRenderer,
-    /// GPU heightfield path tracer (progressive ray-traced modes).
-    path_tracer: PathTracer,
+    progressive: OptionalResource<ProgressivePresentationBundle>,
     /// Scene generation counters and invalidation tracking.
     scene_versions: SceneVersionRegistry,
     /// Adaptive quality / resolution budgeting.
@@ -814,10 +824,23 @@ impl TerrainRenderer {
         )
     }
 
+    pub fn presentation_pipeline_compiler(&self) -> PresentationPipelineCompiler {
+        PresentationPipelineCompiler::new(
+            self.device.clone(),
+            self.queue.clone(),
+            self.pipelines.clone(),
+            self.terrain_pipeline_compiler(),
+            self.config.format,
+            self.config.width,
+            self.config.height,
+            self.quality.internal_scale,
+        )
+    }
+
     pub fn has_pipeline_variant(&self, variant: TerrainShaderVariant) -> bool {
         match variant {
             TerrainShaderVariant::Bounded => true,
-            TerrainShaderVariant::Infinite => self.infinite_pipeline_bundle.is_some(),
+            TerrainShaderVariant::Infinite => self.infinite_pipeline_bundle.is_ready(),
         }
     }
 
@@ -834,7 +857,7 @@ impl TerrainRenderer {
         }
         match bundle.variant {
             TerrainShaderVariant::Bounded => self.bounded_pipeline_bundle = bundle,
-            TerrainShaderVariant::Infinite => self.infinite_pipeline_bundle = Some(bundle),
+            TerrainShaderVariant::Infinite => self.infinite_pipeline_bundle.set_ready(bundle),
         }
         Ok(())
     }
@@ -862,9 +885,203 @@ impl TerrainRenderer {
             TerrainShaderVariant::Bounded => &self.bounded_pipeline_bundle,
             TerrainShaderVariant::Infinite => self
                 .infinite_pipeline_bundle
-                .as_ref()
+                .ready()
                 .expect("active Infinite terrain pipeline is installed"),
         }
+    }
+
+    fn ocean_slot(&self, variant: TerrainShaderVariant) -> &OptionalResource<OceanPipelineBundle> {
+        match variant {
+            TerrainShaderVariant::Bounded => &self.bounded_ocean_pipeline,
+            TerrainShaderVariant::Infinite => &self.infinite_ocean_pipeline,
+        }
+    }
+
+    fn ocean_slot_mut(
+        &mut self,
+        variant: TerrainShaderVariant,
+    ) -> &mut OptionalResource<OceanPipelineBundle> {
+        match variant {
+            TerrainShaderVariant::Bounded => &mut self.bounded_ocean_pipeline,
+            TerrainShaderVariant::Infinite => &mut self.infinite_ocean_pipeline,
+        }
+    }
+
+    fn wireframe_slot(
+        &self,
+        variant: TerrainShaderVariant,
+    ) -> &OptionalResource<WireframePipelineBundle> {
+        match variant {
+            TerrainShaderVariant::Bounded => &self.bounded_wireframe_pipeline,
+            TerrainShaderVariant::Infinite => &self.infinite_wireframe_pipeline,
+        }
+    }
+
+    fn wireframe_slot_mut(
+        &mut self,
+        variant: TerrainShaderVariant,
+    ) -> &mut OptionalResource<WireframePipelineBundle> {
+        match variant {
+            TerrainShaderVariant::Bounded => &mut self.bounded_wireframe_pipeline,
+            TerrainShaderVariant::Infinite => &mut self.infinite_wireframe_pipeline,
+        }
+    }
+
+    pub fn optional_pipeline_state(
+        &self,
+        feature: PresentationPipelineFeature,
+    ) -> &OptionalResourceState {
+        match feature {
+            PresentationPipelineFeature::InfiniteTerrain => self.infinite_pipeline_bundle.state(),
+            PresentationPipelineFeature::Ocean(variant) => self.ocean_slot(variant).state(),
+            PresentationPipelineFeature::Wireframe(variant) => self.wireframe_slot(variant).state(),
+            PresentationPipelineFeature::Progressive => self.progressive.state(),
+            PresentationPipelineFeature::Overhang => self.overhang.state(),
+            PresentationPipelineFeature::Vegetation => self.vegetation.state(),
+            PresentationPipelineFeature::Guides | PresentationPipelineFeature::Brush => {
+                panic!("editor overlay state is application-owned")
+            }
+        }
+    }
+
+    pub fn begin_optional_pipeline_compile(
+        &mut self,
+        feature: PresentationPipelineFeature,
+        request_id: u64,
+    ) -> bool {
+        match feature {
+            PresentationPipelineFeature::InfiniteTerrain => {
+                self.infinite_pipeline_bundle.begin(request_id)
+            }
+            PresentationPipelineFeature::Ocean(variant) => {
+                self.ocean_slot_mut(variant).begin(request_id)
+            }
+            PresentationPipelineFeature::Wireframe(variant) => {
+                self.wireframe_slot_mut(variant).begin(request_id)
+            }
+            PresentationPipelineFeature::Progressive => self.progressive.begin(request_id),
+            PresentationPipelineFeature::Overhang => self.overhang.begin(request_id),
+            PresentationPipelineFeature::Vegetation => self.vegetation.begin(request_id),
+            PresentationPipelineFeature::Guides | PresentationPipelineFeature::Brush => false,
+        }
+    }
+
+    pub fn fail_optional_pipeline_compile(
+        &mut self,
+        feature: PresentationPipelineFeature,
+        request_id: u64,
+        message: String,
+    ) -> bool {
+        match feature {
+            PresentationPipelineFeature::InfiniteTerrain => {
+                self.infinite_pipeline_bundle.fail(request_id, message)
+            }
+            PresentationPipelineFeature::Ocean(variant) => {
+                self.ocean_slot_mut(variant).fail(request_id, message)
+            }
+            PresentationPipelineFeature::Wireframe(variant) => {
+                self.wireframe_slot_mut(variant).fail(request_id, message)
+            }
+            PresentationPipelineFeature::Progressive => self.progressive.fail(request_id, message),
+            PresentationPipelineFeature::Overhang => self.overhang.fail(request_id, message),
+            PresentationPipelineFeature::Vegetation => self.vegetation.fail(request_id, message),
+            PresentationPipelineFeature::Guides | PresentationPipelineFeature::Brush => false,
+        }
+    }
+
+    pub fn install_optional_pipeline_bundle(
+        &mut self,
+        request_id: u64,
+        bundle: PresentationPipelineBundle,
+    ) -> Result<(), String> {
+        match bundle {
+            PresentationPipelineBundle::Terrain(bundle) => {
+                if bundle.format != self.config.format
+                    || !std::sync::Arc::ptr_eq(&bundle.family, &self.pipeline_family)
+                    || bundle.variant != TerrainShaderVariant::Infinite
+                {
+                    return Err("incompatible Infinite terrain pipeline bundle".into());
+                }
+                self.infinite_pipeline_bundle
+                    .install(request_id, bundle)
+                    .map_err(|_| "stale Infinite terrain pipeline bundle".to_string())
+            }
+            PresentationPipelineBundle::Ocean(bundle) => {
+                if bundle.format != self.config.format
+                    || !std::sync::Arc::ptr_eq(&bundle.family, &self.pipeline_family)
+                {
+                    return Err("incompatible ocean pipeline bundle".into());
+                }
+                self.ocean_slot_mut(bundle.variant)
+                    .install(request_id, bundle)
+                    .map_err(|_| "stale ocean pipeline bundle".to_string())
+            }
+            PresentationPipelineBundle::Wireframe(bundle) => {
+                if bundle.format != self.config.format
+                    || !std::sync::Arc::ptr_eq(&bundle.family, &self.pipeline_family)
+                {
+                    return Err("incompatible wireframe pipeline bundle".into());
+                }
+                self.wireframe_slot_mut(bundle.variant)
+                    .install(request_id, bundle)
+                    .map_err(|_| "stale wireframe pipeline bundle".to_string())
+            }
+            PresentationPipelineBundle::Progressive(mut bundle) => {
+                bundle.progressive.resize(
+                    &self.device,
+                    &self.pipelines,
+                    self.config.width,
+                    self.config.height,
+                );
+                bundle.path_tracer.resize(
+                    &self.device,
+                    &self.queue,
+                    &self.pipelines,
+                    self.config.width,
+                    self.config.height,
+                    self.quality.internal_scale,
+                );
+                let mask = self.adaptive.prepare_all_active_mask();
+                bundle.path_tracer.upload_sample_mask(&self.queue, &mask);
+                self.progressive
+                    .install(request_id, bundle)
+                    .map_err(|_| "stale progressive pipeline bundle".to_string())
+            }
+            PresentationPipelineBundle::Overhang(bundle) => self
+                .overhang
+                .install(request_id, bundle)
+                .map_err(|_| "stale overhang pipeline bundle".to_string()),
+            PresentationPipelineBundle::Vegetation(bundle) => self
+                .vegetation
+                .install(request_id, bundle)
+                .map_err(|_| "stale vegetation pipeline bundle".to_string()),
+            PresentationPipelineBundle::Guides(_) | PresentationPipelineBundle::Brush(_) => {
+                Err("editor overlay bundle cannot be installed in TerrainRenderer".into())
+            }
+        }
+    }
+
+    pub fn cancel_optional_pipeline_compiles(&mut self) {
+        self.infinite_pipeline_bundle.reset_unready();
+        self.bounded_ocean_pipeline.reset_unready();
+        self.infinite_ocean_pipeline.reset_unready();
+        self.bounded_wireframe_pipeline.reset_unready();
+        self.infinite_wireframe_pipeline.reset_unready();
+        self.progressive.reset_unready();
+        self.overhang.reset_unready();
+        self.vegetation.reset_unready();
+    }
+
+    pub fn invalidate_optional_pipelines(&mut self) {
+        self.infinite_pipeline_bundle.reset();
+        self.bounded_ocean_pipeline.reset();
+        self.infinite_ocean_pipeline.reset();
+        self.bounded_wireframe_pipeline.reset();
+        self.infinite_wireframe_pipeline.reset();
+        self.progressive.reset();
+        self.overhang.reset();
+        self.vegetation.reset();
+        self.active_pipeline_variant = TerrainShaderVariant::Bounded;
     }
 
     /// Construct a renderer with no window or surface, for offscreen rendering.
@@ -1234,98 +1451,9 @@ impl TerrainRenderer {
             },
         );
 
-        let ocean_pipeline = pipelines.render_pipeline(
-            TerrainShaderVariant::Bounded.ocean_pipeline_label(),
-            format,
-            || {
-                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                    label: Some(TerrainShaderVariant::Bounded.ocean_pipeline_label()),
-                    layout: Some(&pipeline_layout),
-                    vertex: wgpu::VertexState {
-                        module: &shader,
-                        entry_point: Some("vs_ocean"),
-                        buffers: &[TerrainGrid::vertex_layout()],
-                        compilation_options: Default::default(),
-                    },
-                    fragment: Some(wgpu::FragmentState {
-                        module: &shader,
-                        entry_point: Some("fs_ocean"),
-                        targets: &[Some(wgpu::ColorTargetState {
-                            format,
-                            blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                            write_mask: wgpu::ColorWrites::ALL,
-                        })],
-                        compilation_options: Default::default(),
-                    }),
-                    primitive: wgpu::PrimitiveState {
-                        topology: wgpu::PrimitiveTopology::TriangleList,
-                        cull_mode: None,
-                        ..Default::default()
-                    },
-                    depth_stencil: Some(wgpu::DepthStencilState {
-                        format: wgpu::TextureFormat::Depth32Float,
-                        depth_write_enabled: true,
-                        depth_compare: wgpu::CompareFunction::Less,
-                        stencil: Default::default(),
-                        bias: Default::default(),
-                    }),
-                    multisample: wgpu::MultisampleState::default(),
-                    multiview: None,
-                    cache: pipelines.driver_cache(),
-                })
-            },
-        );
-
-        let wireframe_pipeline = pipelines.render_pipeline(
-            TerrainShaderVariant::Bounded.wireframe_pipeline_label(),
-            format,
-            || {
-                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                    label: Some(TerrainShaderVariant::Bounded.wireframe_pipeline_label()),
-                    layout: Some(&pipeline_layout),
-                    vertex: wgpu::VertexState {
-                        module: &shader,
-                        entry_point: Some("vs_main"),
-                        buffers: &[TerrainGrid::vertex_layout()],
-                        compilation_options: Default::default(),
-                    },
-                    fragment: Some(wgpu::FragmentState {
-                        module: &shader,
-                        entry_point: Some("fs_wireframe"),
-                        targets: &[Some(wgpu::ColorTargetState {
-                            format,
-                            blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                            write_mask: wgpu::ColorWrites::ALL,
-                        })],
-                        compilation_options: Default::default(),
-                    }),
-                    primitive: wgpu::PrimitiveState {
-                        topology: wgpu::PrimitiveTopology::LineList,
-                        cull_mode: None,
-                        ..Default::default()
-                    },
-                    depth_stencil: Some(wgpu::DepthStencilState {
-                        format: wgpu::TextureFormat::Depth32Float,
-                        depth_write_enabled: false,
-                        depth_compare: wgpu::CompareFunction::LessEqual,
-                        stencil: Default::default(),
-                        bias: wgpu::DepthBiasState {
-                            constant: -4,
-                            slope_scale: -2.0,
-                            clamp: 0.0,
-                        },
-                    }),
-                    multisample: wgpu::MultisampleState::default(),
-                    multiview: None,
-                    cache: pipelines.driver_cache(),
-                })
-            },
-        );
         let pipeline_family = std::sync::Arc::new(());
         let bounded_pipeline_bundle = TerrainPipelineBundle {
             terrain: pipeline,
-            ocean: ocean_pipeline,
-            wireframe: wireframe_pipeline,
             variant: TerrainShaderVariant::Bounded,
             format,
             family: std::sync::Arc::clone(&pipeline_family),
@@ -1370,27 +1498,9 @@ impl TerrainRenderer {
             })
             .collect();
         let camera = OrbitCamera::default();
-        let overhang = OverhangOverlay::new(&device, &pipelines, format);
-        let vegetation = VegetationOverlay::new(&device, &pipelines, format);
-        let progressive = progressive::ProgressiveRenderer::new(
-            &device,
-            &pipelines,
-            config.width,
-            config.height,
-            format,
-        );
         let quality = ViewportQualityManager::default();
         let initial_internal_scale = quality.internal_scale;
-        let mut path_tracer = PathTracer::new(
-            &device,
-            &queue,
-            &pipelines,
-            config.width,
-            config.height,
-            initial_internal_scale,
-        );
         let adaptive = AdaptiveSamplingState::new(config.width, config.height);
-        path_tracer.upload_sample_mask(&queue, &adaptive.prepare_all_active_mask());
 
         Self {
             surface,
@@ -1399,7 +1509,11 @@ impl TerrainRenderer {
             pipelines,
             config,
             bounded_pipeline_bundle,
-            infinite_pipeline_bundle: None,
+            infinite_pipeline_bundle: OptionalResource::default(),
+            bounded_ocean_pipeline: OptionalResource::default(),
+            infinite_ocean_pipeline: OptionalResource::default(),
+            bounded_wireframe_pipeline: OptionalResource::default(),
+            infinite_wireframe_pipeline: OptionalResource::default(),
             active_pipeline_variant: TerrainShaderVariant::Bounded,
             pipeline_family,
             uniform_buf,
@@ -1432,14 +1546,13 @@ impl TerrainRenderer {
             last_grid_resolution: 0,
             camera_framed: false,
             height_binding_revision: 1,
-            overhang,
-            vegetation,
+            overhang: OptionalResource::default(),
+            vegetation: OptionalResource::default(),
             lighting: EnvironmentLighting::default(),
             ocean_level: None,
             biome_tint_strength: 0.0,
             display_aids: ViewportDisplayAids::default(),
-            progressive,
-            path_tracer,
+            progressive: OptionalResource::default(),
             scene_versions: SceneVersionRegistry::default(),
             quality,
             adaptive,
@@ -1597,23 +1710,25 @@ impl TerrainRenderer {
         }
         let depth = create_depth(&self.device, self.config.width, self.config.height);
         self.depth = depth;
-        self.progressive.resize(
-            &self.device,
-            &self.pipelines,
-            self.config.width,
-            self.config.height,
-        );
-        self.path_tracer.resize(
-            &self.device,
-            &self.queue,
-            &self.pipelines,
-            self.config.width,
-            self.config.height,
-            self.quality.internal_scale,
-        );
         self.adaptive.resize(self.config.width, self.config.height);
         let mask = self.adaptive.prepare_all_active_mask();
-        self.path_tracer.upload_sample_mask(&self.queue, &mask);
+        if let Some(bundle) = self.progressive.ready_mut() {
+            bundle.progressive.resize(
+                &self.device,
+                &self.pipelines,
+                self.config.width,
+                self.config.height,
+            );
+            bundle.path_tracer.resize(
+                &self.device,
+                &self.queue,
+                &self.pipelines,
+                self.config.width,
+                self.config.height,
+                self.quality.internal_scale,
+            );
+            bundle.path_tracer.upload_sample_mask(&self.queue, &mask);
+        }
         self.notify_invalidation(InvalidationReason::ViewportResized);
     }
 
@@ -1670,11 +1785,17 @@ impl TerrainRenderer {
     }
 
     pub fn progressive_accumulation_frame(&self) -> u32 {
-        self.progressive.accumulation_frame_index()
+        self.progressive
+            .ready()
+            .map_or(0, |bundle| bundle.progressive.accumulation_frame_index())
     }
 
     pub fn progressive_last_invalidation(&self) -> InvalidationReason {
-        self.progressive.last_invalidation_reason()
+        self.progressive
+            .ready()
+            .map_or(InvalidationReason::TerrainChanged, |bundle| {
+                bundle.progressive.last_invalidation_reason()
+            })
     }
 
     pub fn scene_versions_snapshot(&self) -> SceneVersions {
@@ -1684,11 +1805,13 @@ impl TerrainRenderer {
     pub fn notify_invalidation(&mut self, reason: InvalidationReason) {
         self.scene_versions.notify(reason);
         if reason.resets_accumulation() {
-            self.progressive.invalidate_with_reason(reason);
-            self.path_tracer.invalidate(&self.queue);
             self.adaptive.reactivate_all();
             let mask = self.adaptive.prepare_all_active_mask();
-            self.path_tracer.upload_sample_mask(&self.queue, &mask);
+            if let Some(bundle) = self.progressive.ready_mut() {
+                bundle.progressive.invalidate_with_reason(reason);
+                bundle.path_tracer.invalidate(&self.queue);
+                bundle.path_tracer.upload_sample_mask(&self.queue, &mask);
+            }
         }
     }
 
@@ -1700,14 +1823,20 @@ impl TerrainRenderer {
         self.quality.config.mode = mode;
         let backend = PresentationBackendId::from_mode(mode);
         // Progressive post stack is only armed for the PT backend.
-        self.progressive
-            .set_enabled(matches!(backend, PresentationBackendId::ProgressivePt));
+        if let Some(bundle) = self.progressive.ready_mut() {
+            bundle
+                .progressive
+                .set_enabled(matches!(backend, PresentationBackendId::ProgressivePt));
+        }
         self.notify_invalidation(InvalidationReason::RenderModeChanged);
     }
 
     /// Active presentation backend for the current mode.
     pub fn presentation_backend(&self) -> PresentationBackendId {
-        if self.traversal_mode == TerrainTraversalMode::Infinite {
+        if self.traversal_mode == TerrainTraversalMode::Infinite
+            || (self.quality.config.mode.uses_progressive_path_tracer()
+                && !self.progressive.is_ready())
+        {
             PresentationBackendId::RasterLit
         } else {
             PresentationBackendId::from_mode(self.quality.config.mode)
@@ -2251,9 +2380,11 @@ impl TerrainRenderer {
 
     /// Upload or clear the Phase J overhang / cave roof proxy mesh.
     pub fn sync_overhang_mesh(&mut self, mesh: Option<&terra_core::volumetric::OverhangMesh>) {
-        match mesh {
-            Some(m) if !m.is_empty() => self.overhang.upload_mesh(&self.device, m),
-            _ => self.overhang.clear(),
+        if let Some(overhang) = self.overhang.ready_mut() {
+            match mesh {
+                Some(m) if !m.is_empty() => overhang.upload_mesh(&self.device, m),
+                _ => overhang.clear(),
+            }
         }
         self.notify_invalidation(InvalidationReason::GeometryChanged);
     }
@@ -2267,14 +2398,16 @@ impl TerrainRenderer {
         scale_max: f32,
         yaw_variation_deg: f32,
     ) {
-        self.vegetation.sync(
-            &self.device,
-            height,
-            density,
-            scale_min,
-            scale_max,
-            yaw_variation_deg,
-        );
+        if let Some(vegetation) = self.vegetation.ready_mut() {
+            vegetation.sync(
+                &self.device,
+                height,
+                density,
+                scale_min,
+                scale_max,
+                yaw_variation_deg,
+            );
+        }
         self.notify_invalidation(InvalidationReason::GeometryChanged);
     }
 
@@ -2284,6 +2417,10 @@ impl TerrainRenderer {
             self.ocean_level = level;
             self.notify_invalidation(InvalidationReason::GeometryChanged);
         }
+    }
+
+    pub fn ocean_enabled(&self) -> bool {
+        self.ocean_level.is_some()
     }
 
     /// Clear viewport GPU state that belongs to the previous document.
@@ -2302,20 +2439,22 @@ impl TerrainRenderer {
         self.last_presentation_record = None;
         self.heights
             .reset_project_state(&self.device, &self.queue, world_size);
-        // Empty vegetation overlay (no density → clear instances).
-        let blank = terra_core::heightfield::Heightfield::zeros(
-            terra_core::heightfield::HeightfieldMetrics {
-                width: 8,
-                height: 8,
-                world_size_x: world_size.0.max(1.0),
-                world_size_z: world_size.1.max(1.0),
-                tile_size: 8,
-                halo: 0,
-            },
-        );
-        self.vegetation
-            .sync(&self.device, &blank, None, 1.0, 1.0, 0.0);
-        self.overhang.clear();
+        if let Some(vegetation) = self.vegetation.ready_mut() {
+            let blank = terra_core::heightfield::Heightfield::zeros(
+                terra_core::heightfield::HeightfieldMetrics {
+                    width: 8,
+                    height: 8,
+                    world_size_x: world_size.0.max(1.0),
+                    world_size_z: world_size.1.max(1.0),
+                    tile_size: 8,
+                    halo: 0,
+                },
+            );
+            vegetation.sync(&self.device, &blank, None, 1.0, 1.0, 0.0);
+        }
+        if let Some(overhang) = self.overhang.ready_mut() {
+            overhang.clear();
+        }
         self.ocean_level = ocean_level.filter(|v| v.is_finite());
         self.notify_invalidation(InvalidationReason::TerrainChanged);
         self.request_camera_reframe();
@@ -2429,15 +2568,17 @@ impl TerrainRenderer {
     /// Deprecated: prefer [`Self::set_renderer_mode`]. Only applies when mode is ProgressivePt.
     pub fn set_progressive_enabled(&mut self, enabled: bool) {
         let backend = self.presentation_backend();
-        if matches!(backend, PresentationBackendId::ProgressivePt) {
-            self.progressive.set_enabled(enabled);
-        } else {
-            self.progressive.set_enabled(false);
+        if let Some(bundle) = self.progressive.ready_mut() {
+            bundle
+                .progressive
+                .set_enabled(enabled && matches!(backend, PresentationBackendId::ProgressivePt));
         }
     }
 
     pub fn progressive_samples(&self) -> u32 {
-        self.progressive.samples()
+        self.progressive
+            .ready()
+            .map_or(0, |bundle| bundle.progressive.samples())
     }
 
     /// Acquire the swapchain frame, render terrain into it, and return it
@@ -2501,27 +2642,32 @@ impl TerrainRenderer {
         }
 
         self.quality.update_for_state(self.last_interaction_state);
-        self.progressive
-            .set_max_samples(self.quality.config.max_accumulated_spp);
-        self.progressive.set_history_cap(self.quality.history_cap);
+        if let Some(bundle) = self.progressive.ready_mut() {
+            bundle
+                .progressive
+                .set_max_samples(self.quality.config.max_accumulated_spp);
+            bundle.progressive.set_history_cap(self.quality.history_cap);
+        }
 
         let internal_scale = self.quality.internal_scale;
         if (self.last_internal_scale - internal_scale).abs() > 1e-4 {
-            self.path_tracer.resize(
-                &self.device,
-                &self.queue,
-                &self.pipelines,
-                width,
-                height,
-                internal_scale,
-            );
             let mask = self.adaptive.prepare_all_active_mask();
-            self.path_tracer.upload_sample_mask(&self.queue, &mask);
+            if let Some(bundle) = self.progressive.ready_mut() {
+                bundle.path_tracer.resize(
+                    &self.device,
+                    &self.queue,
+                    &self.pipelines,
+                    width,
+                    height,
+                    internal_scale,
+                );
+                bundle.path_tracer.upload_sample_mask(&self.queue, &mask);
+            }
             self.notify_invalidation(InvalidationReason::ViewportResized);
             self.last_internal_scale = internal_scale;
         }
 
-        let backend = PresentationBackendId::from_mode(self.quality.config.mode);
+        let backend = self.presentation_backend();
         // Raster cast shadows are driven by the lighting shadow-strength control;
         // 0 keeps the depth pass off, matching the historical "no shadows" look.
         self.shadow_map
@@ -2545,10 +2691,12 @@ impl TerrainRenderer {
             .expect("frame schedule always records a backend");
         let path_trace_mode = matches!(backend, PresentationBackendId::ProgressivePt);
         // Keep progressive post armed whenever the schedule expects it.
-        if self.frame_graph.schedule.progressive_post && !self.progressive.enabled() {
-            self.progressive.set_enabled(true);
-        } else if !self.frame_graph.schedule.progressive_post && self.progressive.enabled() {
-            self.progressive.set_enabled(false);
+        if let Some(bundle) = self.progressive.ready_mut() {
+            if self.frame_graph.schedule.progressive_post && !bundle.progressive.enabled() {
+                bundle.progressive.set_enabled(true);
+            } else if !self.frame_graph.schedule.progressive_post && bundle.progressive.enabled() {
+                bundle.progressive.set_enabled(false);
+            }
         }
 
         self.constrain_camera();
@@ -2568,10 +2716,16 @@ impl TerrainRenderer {
             self.lighting.clear[1],
             self.lighting.clear[2],
         ];
-        if self.progressive.signature_changed(lighting_signature) {
+        if self
+            .progressive
+            .ready()
+            .is_some_and(|bundle| bundle.progressive.signature_changed(lighting_signature))
+        {
             self.notify_invalidation(InvalidationReason::LightingChanged);
         }
-        self.progressive.prepare_signature(lighting_signature);
+        if let Some(bundle) = self.progressive.ready_mut() {
+            bundle.progressive.prepare_signature(lighting_signature);
+        }
 
         let progressive_seed = self.global_frame_index as u32;
         let contour_interval = {
@@ -2655,7 +2809,9 @@ impl TerrainRenderer {
             render: [
                 progressive_seed as f32,
                 if path_trace_mode { 1.0 } else { 0.0 },
-                self.progressive.samples() as f32,
+                self.progressive
+                    .ready()
+                    .map_or(0, |bundle| bundle.progressive.samples()) as f32,
                 self.biome_tint_strength,
             ],
             viz: [
@@ -2737,10 +2893,12 @@ impl TerrainRenderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("terrain-enc"),
             });
-        self.overhang
-            .upload_view_proj(&self.queue, view_proj, self.lighting.light_dir);
-        self.vegetation
-            .upload_view_proj(&self.queue, view_proj, self.lighting.light_dir);
+        if let Some(overhang) = self.overhang.ready_mut() {
+            overhang.upload_view_proj(&self.queue, view_proj, self.lighting.light_dir);
+        }
+        if let Some(vegetation) = self.vegetation.ready_mut() {
+            vegetation.upload_view_proj(&self.queue, view_proj, self.lighting.light_dir);
+        }
 
         // Depth-only directional shadow pass (RasterLit only).
         if self.frame_graph.schedule.shadow {
@@ -2778,7 +2936,11 @@ impl TerrainRenderer {
                 if self.frame_graph.schedule.pt_dispatch {
                     self.frame_graph.mark(PassKind::ProgressivePt);
                     let mask = self.adaptive.prepare_all_active_mask();
-                    self.path_tracer.upload_sample_mask(&self.queue, &mask);
+                    self.progressive
+                        .ready_mut()
+                        .expect("progressive backend requires installed bundle")
+                        .path_tracer
+                        .upload_sample_mask(&self.queue, &mask);
 
                     let target = glam::Vec3::new(
                         (self.camera.target.x - render_origin.x) as f32,
@@ -2813,17 +2975,21 @@ impl TerrainRenderer {
                         .gpu_timer
                         .as_mut()
                         .and_then(|t| t.path_trace_timestamp_writes());
-                    self.path_tracer.dispatch(
-                        &self.device,
-                        &self.queue,
-                        &mut encoder,
-                        self.heights.display_height_view(),
-                        self.heights.display_normal_view(),
-                        self.heights.materials_view(),
-                        pt_uniforms,
-                        self.quality.spp_this_frame,
-                        path_ts,
-                    );
+                    self.progressive
+                        .ready_mut()
+                        .expect("progressive backend requires installed bundle")
+                        .path_tracer
+                        .dispatch(
+                            &self.device,
+                            &self.queue,
+                            &mut encoder,
+                            self.heights.display_height_view(),
+                            self.heights.display_normal_view(),
+                            self.heights.materials_view(),
+                            pt_uniforms,
+                            self.quality.spp_this_frame,
+                            path_ts,
+                        );
                 }
             }
             PresentationBackendId::RasterLit => {
@@ -3016,28 +3182,40 @@ impl TerrainRenderer {
                         if self.traversal_mode == TerrainTraversalMode::Bounded
                             && self.ocean_level.is_some()
                         {
-                            pass.set_pipeline(&self.active_pipeline_bundle().ocean);
-                            pass.set_bind_group(0, &self.bind_group, &[]);
-                            pass.set_vertex_buffer(0, self.grid.vertex_buf.slice(..));
-                            pass.set_index_buffer(
-                                self.grid.index_buf.slice(..),
-                                wgpu::IndexFormat::Uint32,
-                            );
-                            pass.draw_indexed(0..self.grid.surface_index_count, 0, 0..1);
+                            if let Some(ocean) =
+                                self.ocean_slot(self.active_pipeline_variant).ready()
+                            {
+                                pass.set_pipeline(&ocean.pipeline);
+                                pass.set_bind_group(0, &self.bind_group, &[]);
+                                pass.set_vertex_buffer(0, self.grid.vertex_buf.slice(..));
+                                pass.set_index_buffer(
+                                    self.grid.index_buf.slice(..),
+                                    wgpu::IndexFormat::Uint32,
+                                );
+                                pass.draw_indexed(0..self.grid.surface_index_count, 0, 0..1);
+                            }
                         }
                         if self.display_aids.wireframe {
-                            pass.set_pipeline(&self.active_pipeline_bundle().wireframe);
-                            pass.set_bind_group(0, &self.bind_group, &[]);
-                            pass.set_vertex_buffer(0, self.grid.vertex_buf.slice(..));
-                            pass.set_index_buffer(
-                                self.grid.edge_index_buf.slice(..),
-                                wgpu::IndexFormat::Uint32,
-                            );
-                            pass.draw_indexed(0..self.grid.edge_index_count, 0, 0..1);
+                            if let Some(wireframe) =
+                                self.wireframe_slot(self.active_pipeline_variant).ready()
+                            {
+                                pass.set_pipeline(&wireframe.pipeline);
+                                pass.set_bind_group(0, &self.bind_group, &[]);
+                                pass.set_vertex_buffer(0, self.grid.vertex_buf.slice(..));
+                                pass.set_index_buffer(
+                                    self.grid.edge_index_buf.slice(..),
+                                    wgpu::IndexFormat::Uint32,
+                                );
+                                pass.draw_indexed(0..self.grid.edge_index_count, 0, 0..1);
+                            }
                         }
                         if self.traversal_mode == TerrainTraversalMode::Bounded {
-                            self.vegetation.draw(&mut pass);
-                            self.overhang.draw(&mut pass);
+                            if let Some(vegetation) = self.vegetation.ready() {
+                                vegetation.draw(&mut pass);
+                            }
+                            if let Some(overhang) = self.overhang.ready() {
+                                overhang.draw(&mut pass);
+                            }
                         }
                     }
                 }
@@ -3051,19 +3229,27 @@ impl TerrainRenderer {
                 .as_mut()
                 .map(|t| t.progressive_timestamp_writes())
                 .unwrap_or((None, None));
+            let bundle = self
+                .progressive
+                .ready_mut()
+                .expect("progressive post requires installed bundle");
+            let ProgressivePresentationBundle {
+                progressive,
+                path_tracer,
+            } = bundle;
             ProgressivePostPipeline::resolve_hdr(
-                &mut self.progressive,
+                progressive,
                 &self.device,
                 &self.queue,
                 &mut encoder,
                 HdrFrame {
-                    color: self.path_tracer.radiance_view(),
+                    color: path_tracer.radiance_view(),
                     width,
                     height,
                 },
                 GBufferViews {
-                    depth: self.path_tracer.depth_view(),
-                    normal: Some(self.path_tracer.normal_view()),
+                    depth: path_tracer.depth_view(),
+                    normal: Some(path_tracer.normal_view()),
                 },
                 view,
                 view_proj,
@@ -3112,7 +3298,10 @@ impl TerrainRenderer {
     /// Bootstrap adaptive tile states from accumulated sample count (debug / offline only).
     #[allow(dead_code)]
     fn update_adaptive_from_progressive(&mut self) {
-        let samples = self.progressive.samples() as f32;
+        let samples = self
+            .progressive
+            .ready()
+            .map_or(0, |bundle| bundle.progressive.samples()) as f32;
         if samples <= 0.0 {
             return;
         }

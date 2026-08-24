@@ -270,8 +270,11 @@ impl TerraApp {
         quality.config.history_clamp_k = vr.history_clamp_k.max(0.1);
         quality.config.converge_fraction = vr.converge_fraction.clamp(0.0, 1.0);
         renderer.set_debug_viz_mode(vr.debug_viz_mode);
-        self.ui_state.progressive_renderer_active =
-            self.screen == AppScreen::Editor && vr.mode.uses_progressive_path_tracer();
+        let bounded = renderer.traversal_mode() == terra_render::TerrainTraversalMode::Bounded;
+        let wants_progressive = bounded && vr.mode.uses_progressive_path_tracer();
+        self.ui_state.progressive_renderer_active = self.screen == AppScreen::Editor
+            && renderer.presentation_backend()
+                == terra_render::PresentationBackendId::ProgressivePt;
 
         let shading = if self.ui_state.is_mask_view() {
             terra_render::ViewportShadingMode::Lit
@@ -291,8 +294,58 @@ impl TerraApp {
             contours: ov.contours,
             shading,
         });
+        let active_variant = renderer.active_pipeline_variant();
+        let ocean_enabled = renderer.ocean_enabled();
+        let wants_wireframe = ov.wireframe;
+        let wants_guides = ov.grid || ov.world_bounds;
         if let Some(editor_overlays) = self.editor_overlays.as_mut() {
             editor_overlays.set_guides(ov.grid, ov.world_bounds);
+        }
+        if ocean_enabled && bounded {
+            self.request_presentation_pipeline(
+                terra_render::PresentationPipelineFeature::Ocean(active_variant),
+                false,
+            );
+        }
+        if wants_wireframe {
+            self.request_presentation_pipeline(
+                terra_render::PresentationPipelineFeature::Wireframe(active_variant),
+                false,
+            );
+        }
+        if wants_progressive {
+            self.request_presentation_pipeline(
+                terra_render::PresentationPipelineFeature::Progressive,
+                false,
+            );
+        }
+        if wants_guides {
+            self.request_presentation_pipeline(
+                terra_render::PresentationPipelineFeature::Guides,
+                false,
+            );
+        }
+        let vegetation_non_empty = self
+            .scheduler
+            .last_aux
+            .get("vegetation")
+            .is_some_and(|mask| mask.data().iter().any(|value| *value > 0.0));
+        if vegetation_non_empty {
+            self.request_presentation_pipeline(
+                terra_render::PresentationPipelineFeature::Vegetation,
+                false,
+            );
+        }
+        let overhang_non_empty = self
+            .scheduler
+            .last_aux
+            .get("overhang_mask")
+            .is_some_and(|mask| mask.data().iter().any(|value| *value > 0.0));
+        if overhang_non_empty {
+            self.request_presentation_pipeline(
+                terra_render::PresentationPipelineFeature::Overhang,
+                false,
+            );
         }
     }
 
@@ -739,7 +792,7 @@ impl TerraApp {
                     self.request_rebuild();
                 }
                 if ui_out.request_retry_terrain_pipeline {
-                    self.retry_infinite_pipeline_compile();
+                    self.retry_failed_pipeline_compile();
                 }
                 if ui_out.request_save_bookmark {
                     let slot = self

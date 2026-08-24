@@ -402,13 +402,68 @@ impl ProgressiveRenderer {
     pub fn resize(
         &mut self,
         device: &wgpu::Device,
-        pipelines: &terra_gpu::PipelineCacheRegistry,
+        _pipelines: &terra_gpu::PipelineCacheRegistry,
         width: u32,
         height: u32,
     ) {
-        let enabled = self.enabled;
-        *self = Self::new(device, pipelines, width, height, self.surface_format);
-        self.enabled = enabled;
+        let render_sampled =
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
+        self.width = width.max(1);
+        self.height = height.max(1);
+        self.scene = make_view(
+            device,
+            "progressive-scene",
+            self.width,
+            self.height,
+            self.surface_format,
+            render_sampled,
+        );
+        self.history_color = std::array::from_fn(|i| {
+            make_view(
+                device,
+                &format!("progressive-history-color-{i}"),
+                self.width,
+                self.height,
+                wgpu::TextureFormat::Rgba16Float,
+                render_sampled,
+            )
+        });
+        self.history_moments = std::array::from_fn(|i| {
+            make_view(
+                device,
+                &format!("progressive-history-moments-{i}"),
+                self.width,
+                self.height,
+                wgpu::TextureFormat::Rgba16Float,
+                render_sampled,
+            )
+        });
+        self.history_depth = std::array::from_fn(|i| {
+            make_view(
+                device,
+                &format!("progressive-history-depth-{i}"),
+                self.width,
+                self.height,
+                wgpu::TextureFormat::R32Float,
+                render_sampled,
+            )
+        });
+        self.denoise = std::array::from_fn(|i| {
+            make_view(
+                device,
+                &format!("progressive-denoise-{i}"),
+                self.width,
+                self.height,
+                wgpu::TextureFormat::Rgba16Float,
+                render_sampled,
+            )
+        });
+        self.history_index = 0;
+        self.history_valid = false;
+        self.samples = 0;
+        self.accumulation_frame_index = 0;
+        self.last_signature = None;
+        self.previous_view_proj = Mat4::IDENTITY;
     }
 
     pub fn set_enabled(&mut self, enabled: bool) {

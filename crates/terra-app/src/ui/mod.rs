@@ -1623,7 +1623,7 @@ pub struct FrameUiOutput {
     pub request_cancel_build: bool,
     /// Retry after a persistent evaluation failure.
     pub request_retry_evaluation: bool,
-    /// Retry a failed Infinite renderer pipeline compilation.
+    /// Retry the failed optional presentation pipeline compilation.
     pub request_retry_terrain_pipeline: bool,
     /// Force a full-quality rebuild (EXPORT button).
     pub request_full_build: bool,

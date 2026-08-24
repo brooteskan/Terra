@@ -306,16 +306,21 @@ impl PathTracer {
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        pipelines: &terra_gpu::PipelineCacheRegistry,
+        _pipelines: &terra_gpu::PipelineCacheRegistry,
         width: u32,
         height: u32,
         internal_scale: f32,
     ) {
-        let accum = self.accum_index;
-        let seed = self.frame_seed;
-        *self = Self::new(device, queue, pipelines, width, height, internal_scale);
-        self.accum_index = accum;
-        self.frame_seed = seed;
+        let internal_scale = internal_scale.clamp(0.25, 1.0);
+        self.width = width.max(1);
+        self.height = height.max(1);
+        self.internal_width = ((self.width as f32) * internal_scale).round().max(1.0) as u32;
+        self.internal_height = ((self.height as f32) * internal_scale).round().max(1.0) as u32;
+        self.outputs = create_outputs(device, queue, self.width, self.height);
+        (self.sample_mask_tex, self.sample_mask_view) =
+            create_sample_mask(device, self.width, self.height);
+        self.accum_index = 0;
+        self.frame_seed = 0;
     }
 
     pub fn destroy(&mut self) {

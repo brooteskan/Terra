@@ -380,6 +380,12 @@ impl TerraApp {
 
         self.project_generation = self.project_generation.wrapping_add(1);
         self.pipeline_compile.cancel_all();
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.cancel_optional_pipeline_compiles();
+        }
+        if let Some(overlays) = self.editor_overlays.as_mut() {
+            overlays.cancel_compiles();
+        }
         self.ui_state.terrain_pipeline_status = crate::ui::TerrainPipelineStatus::Idle;
 
         // Cancel any in-flight eval for the previous document before swapping state.
@@ -567,7 +573,7 @@ impl TerraApp {
                 engine.reset_project_state(&gpu.device, &gpu.queue);
             }
         }
-        let mut compile_request = None;
+        let mut compile_infinite = false;
         let mut presentation_ready = true;
         if let Some(renderer) = self.renderer.as_mut() {
             let requested_variant = if infinite_frame.is_some() {
@@ -604,19 +610,14 @@ impl TerraApp {
                     None,
                     terra_render::TerrainTraversalMode::Bounded,
                 );
-                compile_request = Some(renderer.terrain_pipeline_compiler());
+                compile_infinite = true;
             }
         }
-        if let Some(compiler) = compile_request {
-            let request = super::pipeline_compile::TerrainPipelineRequest {
-                variant: terra_render::TerrainShaderVariant::Infinite,
-                project_generation: self.project_generation,
-                device_generation: self.device_generation,
-            };
-            self.pipeline_compile.request(request, compiler);
-            self.ui_state.terrain_pipeline_status = crate::ui::TerrainPipelineStatus::Pending {
-                label: terra_render::TerrainShaderVariant::Infinite.shader_label(),
-            };
+        if compile_infinite {
+            self.request_presentation_pipeline(
+                terra_render::PresentationPipelineFeature::InfiniteTerrain,
+                false,
+            );
         }
         // Preserve the GPU allocation, but make all previous-document pages
         // unreachable and stop streaming until the new document re-syncs.
@@ -624,72 +625,199 @@ impl TerraApp {
         presentation_ready
     }
 
-    pub(crate) fn drain_pipeline_compile(&mut self) {
-        use super::pipeline_compile::TerrainPipelineCompileStatus;
-
-        let status = self.pipeline_compile.status().clone();
-        match status {
-            TerrainPipelineCompileStatus::Idle => {}
-            TerrainPipelineCompileStatus::Pending(request) => {
-                self.ui_state.terrain_pipeline_status = crate::ui::TerrainPipelineStatus::Pending {
-                    label: request.variant.shader_label(),
-                };
-            }
-            TerrainPipelineCompileStatus::Failed { message, .. } => {
-                self.ui_state.terrain_pipeline_status =
-                    crate::ui::TerrainPipelineStatus::Failed { message };
-            }
+    pub(crate) fn request_presentation_pipeline(
+        &mut self,
+        feature: terra_render::PresentationPipelineFeature,
+        retry: bool,
+    ) {
+        let state = match feature {
+            terra_render::PresentationPipelineFeature::Guides
+            | terra_render::PresentationPipelineFeature::Brush => self
+                .editor_overlays
+                .as_ref()
+                .map(|overlays| overlays.state(feature).clone()),
+            _ => self
+                .renderer
+                .as_ref()
+                .map(|renderer| renderer.optional_pipeline_state(feature).clone()),
+        };
+        let should_request = state.is_some_and(|state| {
+            matches!(state, terra_render::OptionalResourceState::Absent)
+                || (retry && matches!(state, terra_render::OptionalResourceState::Failed { .. }))
+        });
+        if !should_request {
+            return;
         }
-
-        let Some(completion) = self.pipeline_compile.take_completion() else {
+        let Some(compiler) = self
+            .renderer
+            .as_ref()
+            .map(|renderer| renderer.presentation_pipeline_compiler())
+        else {
             return;
         };
-        if !completion.request.matches_live(
-            terra_render::TerrainShaderVariant::Infinite,
+        let submission = self.pipeline_compile.request(
+            feature,
             self.project_generation,
             self.device_generation,
-        ) {
-            log::info!("discarding stale Infinite terrain pipeline completion");
-            return;
+            compiler,
+        );
+        if submission.new_request {
+            match feature {
+                terra_render::PresentationPipelineFeature::Guides
+                | terra_render::PresentationPipelineFeature::Brush => {
+                    if let Some(overlays) = self.editor_overlays.as_mut() {
+                        overlays.begin_compile(feature, submission.request.id);
+                    }
+                }
+                _ => {
+                    if let Some(renderer) = self.renderer.as_mut() {
+                        renderer.begin_optional_pipeline_compile(feature, submission.request.id);
+                    }
+                }
+            }
         }
-        let Some(settings) = self.session.document.infinite_settings().cloned() else {
-            log::info!("discarding Infinite pipeline completion for a bounded project");
-            return;
+        self.ui_state.terrain_pipeline_status = crate::ui::TerrainPipelineStatus::Pending {
+            label: feature.label(),
         };
-        let bundle = match completion.result {
-            Ok(bundle) => bundle,
-            Err(message) => {
-                log::error!("Infinite terrain pipeline compilation failed: {message}");
+    }
+
+    pub(crate) fn drain_pipeline_compile(&mut self) {
+        use super::pipeline_compile::PipelineCompileStatus;
+
+        if let Some((_, message)) = self.pipeline_compile.retained_failure() {
+            self.ui_state.terrain_pipeline_status =
+                crate::ui::TerrainPipelineStatus::Failed { message };
+        } else {
+            match self.pipeline_compile.status().clone() {
+                PipelineCompileStatus::Idle => {}
+                PipelineCompileStatus::Pending(request) => {
+                    self.ui_state.terrain_pipeline_status =
+                        crate::ui::TerrainPipelineStatus::Pending {
+                            label: request.feature.label(),
+                        };
+                }
+                PipelineCompileStatus::Failed { message, .. } => {
+                    self.ui_state.terrain_pipeline_status =
+                        crate::ui::TerrainPipelineStatus::Failed { message };
+                }
+            }
+        }
+
+        while let Some(completion) = self.pipeline_compile.take_completion() {
+            let request = completion.request;
+            if !request.matches_live(self.project_generation, self.device_generation) {
+                log::info!("discarding stale {:?} pipeline completion", request.feature);
+                continue;
+            }
+            let bundle = match completion.result {
+                Ok(bundle) => bundle,
+                Err(message) => {
+                    match request.feature {
+                        terra_render::PresentationPipelineFeature::Guides
+                        | terra_render::PresentationPipelineFeature::Brush => {
+                            if let Some(overlays) = self.editor_overlays.as_mut() {
+                                overlays.fail_compile(request.feature, request.id, message.clone());
+                            }
+                        }
+                        _ => {
+                            if let Some(renderer) = self.renderer.as_mut() {
+                                renderer.fail_optional_pipeline_compile(
+                                    request.feature,
+                                    request.id,
+                                    message.clone(),
+                                );
+                            }
+                        }
+                    }
+                    log::error!("{} compilation failed: {message}", request.feature.label());
+                    self.ui_state.terrain_pipeline_status =
+                        crate::ui::TerrainPipelineStatus::Failed { message };
+                    self.request_app_frame(FrameRequestReason::Completion);
+                    continue;
+                }
+            };
+
+            let install = match request.feature {
+                terra_render::PresentationPipelineFeature::Guides
+                | terra_render::PresentationPipelineFeature::Brush => {
+                    match (
+                        self.editor_overlays.as_mut(),
+                        self.gpu.as_ref(),
+                        self.renderer.as_ref(),
+                    ) {
+                        (Some(overlays), Some(gpu), Some(renderer)) => {
+                            overlays.install(gpu, renderer, request.id, bundle)
+                        }
+                        _ => Err("editor overlay owner is unavailable".into()),
+                    }
+                }
+                _ => self
+                    .renderer
+                    .as_mut()
+                    .ok_or_else(|| "renderer is unavailable".to_string())
+                    .and_then(|renderer| {
+                        renderer.install_optional_pipeline_bundle(request.id, bundle)
+                    }),
+            };
+            if let Err(message) = install {
+                match request.feature {
+                    terra_render::PresentationPipelineFeature::Guides
+                    | terra_render::PresentationPipelineFeature::Brush => {
+                        if let Some(overlays) = self.editor_overlays.as_mut() {
+                            overlays.fail_compile(request.feature, request.id, message.clone());
+                        }
+                    }
+                    _ => {
+                        if let Some(renderer) = self.renderer.as_mut() {
+                            renderer.fail_optional_pipeline_compile(
+                                request.feature,
+                                request.id,
+                                message.clone(),
+                            );
+                        }
+                    }
+                }
+                self.pipeline_compile
+                    .record_install_failure(request, message.clone());
                 self.ui_state.terrain_pipeline_status =
                     crate::ui::TerrainPipelineStatus::Failed { message };
                 self.request_app_frame(FrameRequestReason::Completion);
-                return;
+                continue;
             }
+
+            if request.feature == terra_render::PresentationPipelineFeature::InfiniteTerrain {
+                self.finish_infinite_pipeline_install();
+            } else {
+                if matches!(
+                    request.feature,
+                    terra_render::PresentationPipelineFeature::Overhang
+                        | terra_render::PresentationPipelineFeature::Vegetation
+                ) {
+                    self.needs_height_upload = true;
+                }
+                self.ui_state.terrain_pipeline_status = crate::ui::TerrainPipelineStatus::Idle;
+                self.ui_state.status = format!("{} ready", request.feature.label());
+                self.request_app_frame(FrameRequestReason::Completion);
+            }
+        }
+    }
+
+    fn finish_infinite_pipeline_install(&mut self) {
+        let Some(settings) = self.session.document.infinite_settings().cloned() else {
+            return;
         };
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
-        if let Err(error) = renderer.install_pipeline_bundle(bundle) {
-            log::error!("Infinite terrain pipeline installation failed: {error}");
-            self.ui_state.terrain_pipeline_status =
-                crate::ui::TerrainPipelineStatus::Failed { message: error };
-            return;
-        }
-        if let Err(error) =
+        if let Err(message) =
             renderer.activate_pipeline_variant(terra_render::TerrainShaderVariant::Infinite)
         {
             self.ui_state.terrain_pipeline_status =
-                crate::ui::TerrainPipelineStatus::Failed { message: error };
+                crate::ui::TerrainPipelineStatus::Failed { message };
             return;
         }
-        let topology = match settings.topology() {
-            Ok(topology) => topology.config(),
-            Err(error) => {
-                self.ui_state.terrain_pipeline_status = crate::ui::TerrainPipelineStatus::Failed {
-                    message: error.to_string(),
-                };
-                return;
-            }
+        let Ok(topology) = settings.topology().map(|topology| topology.config()) else {
+            return;
         };
         let local_span = (settings.horizon_m * 2.0).clamp(1.0, f64::from(f32::MAX)) as f32;
         let ocean =
@@ -715,24 +843,16 @@ impl TerraApp {
         self.request_app_frame(FrameRequestReason::Completion);
     }
 
-    pub(crate) fn retry_infinite_pipeline_compile(&mut self) {
-        if self.session.document.infinite_settings().is_none() {
+    pub(crate) fn retry_failed_pipeline_compile(&mut self) {
+        let Some(feature) = self
+            .pipeline_compile
+            .failed_request()
+            .map(|request| request.feature)
+        else {
             return;
-        }
-        let Some(renderer) = self.renderer.as_ref() else {
-            return;
         };
-        let request = super::pipeline_compile::TerrainPipelineRequest {
-            variant: terra_render::TerrainShaderVariant::Infinite,
-            project_generation: self.project_generation,
-            device_generation: self.device_generation,
-        };
-        self.pipeline_compile
-            .request(request, renderer.terrain_pipeline_compiler());
-        self.ui_state.terrain_pipeline_status = crate::ui::TerrainPipelineStatus::Pending {
-            label: terra_render::TerrainShaderVariant::Infinite.shader_label(),
-        };
-        self.ui_state.status = "Retrying Infinite terrain renderer…".into();
+        self.request_presentation_pipeline(feature, true);
+        self.ui_state.status = format!("Retrying {}…", feature.label());
         self.request_app_frame(FrameRequestReason::UiActions);
     }
 
@@ -747,6 +867,12 @@ impl TerraApp {
         self.force_draft = false;
         self.project_generation = self.project_generation.wrapping_add(1);
         self.pipeline_compile.cancel_all();
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.cancel_optional_pipeline_compiles();
+        }
+        if let Some(overlays) = self.editor_overlays.as_mut() {
+            overlays.cancel_compiles();
+        }
         self.ui_state.terrain_pipeline_status = crate::ui::TerrainPipelineStatus::Idle;
         self.session = EditorSession::new();
         self.session.history = CommandHistory::default();

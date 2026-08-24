@@ -147,6 +147,30 @@ where
     T: Send + 'static,
     F: FnOnce(&JobCtx) -> T + Send + 'static,
 {
+    spawn_one_shot_impl(name, f, || {})
+}
+
+/// Spawn a one-shot job and invoke `notify` after its result has been published.
+///
+/// This is intended for event-loop integrations that can sleep while work is in
+/// flight. The notification observes the same Release/Acquire ordering as
+/// [`JobHandle::try_take`], so a consumer woken by it can immediately drain the
+/// completed result without periodic polling.
+pub fn spawn_one_shot_with_notify<T, F, N>(name: &str, f: F, notify: N) -> JobHandle<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&JobCtx) -> T + Send + 'static,
+    N: FnOnce() + Send + 'static,
+{
+    spawn_one_shot_impl(name, f, notify)
+}
+
+fn spawn_one_shot_impl<T, F, N>(name: &str, f: F, notify: N) -> JobHandle<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&JobCtx) -> T + Send + 'static,
+    N: FnOnce() + Send + 'static,
+{
     let (token, flag) = CancelToken::flag();
     // 0 bits is 0.0f32 — the correct starting progress.
     let progress = Arc::new(AtomicU32::new(0));
@@ -183,6 +207,7 @@ where
             // Publish the slot before flipping `finished`: the handle reads
             // `finished` with Acquire, so this Release orders the store before it.
             worker_completion.finished.store(true, Ordering::Release);
+            notify();
         })
         .expect("spawn one-shot job thread");
 
@@ -222,6 +247,19 @@ mod tests {
         // Single consumer: the result is gone, but the job stays finished.
         assert_eq!(handle.try_take(), None);
         assert!(handle.is_finished());
+    }
+
+    #[test]
+    fn completion_notification_observes_published_result() {
+        let notified = Arc::new(AtomicBool::new(false));
+        let worker_notified = Arc::clone(&notified);
+        let handle = spawn_one_shot_with_notify(
+            "test-notify",
+            |_| 7u32,
+            move || worker_notified.store(true, Ordering::Release),
+        );
+        wait_until(|| notified.load(Ordering::Acquire));
+        assert_eq!(handle.try_take(), Some(Ok(7)));
     }
 
     #[test]

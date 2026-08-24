@@ -75,7 +75,7 @@ pub fn draw_bottom_dock(
     let (status_text, show_progress, progress, show_retry) =
         if let TerrainPipelineStatus::Pending { label } = &ui_state.terrain_pipeline_status {
             (
-                format!("Compiling Infinite terrain renderer - {label}"),
+                format!("Compiling presentation feature - {label}"),
                 true,
                 0.5,
                 false,
@@ -83,7 +83,7 @@ pub fn draw_bottom_dock(
         } else if let TerrainPipelineStatus::Failed { message } = &ui_state.terrain_pipeline_status
         {
             (
-                format!("Infinite renderer compile failed - {message}"),
+                format!("Presentation compile failed - {message}"),
                 false,
                 0.0,
                 true,

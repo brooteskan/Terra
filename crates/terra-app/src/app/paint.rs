@@ -525,7 +525,7 @@ impl TerraApp {
         let screen_w = surface_w as f32 / ppp;
         let screen_h = surface_h as f32 / ppp;
         let aspect = surface_w as f32 / surface_h.max(1) as f32;
-        editor_overlays.brush.poll(&gpu.device);
+        editor_overlays.poll_brush(&gpu.device);
         if let Some(pick) =
             editor_overlays.latest_surface_pick(renderer, (x, y), (screen_w, screen_h))
         {
@@ -575,9 +575,17 @@ impl TerraApp {
             if let (Some(editor_overlays), Some(gpu)) =
                 (self.editor_overlays.as_mut(), self.gpu.as_ref())
             {
-                editor_overlays.brush.hide(&gpu.queue);
+                editor_overlays.hide_brush(&gpu.queue);
             }
             return;
+        }
+        if self.renderer.as_ref().is_some_and(|renderer| {
+            renderer.traversal_mode() == terra_render::TerrainTraversalMode::Bounded
+        }) {
+            self.request_presentation_pipeline(
+                terra_render::PresentationPipelineFeature::Brush,
+                false,
+            );
         }
         self.ui_state.ensure_sculpt_defaults();
         let radius = if self.ui_state.editor_tool.is_place_point() {

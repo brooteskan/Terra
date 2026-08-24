@@ -90,6 +90,7 @@ pub fn write_requested_report(
         .filter(|record| record.kind.is_pipeline())
         .map(pipeline_report)
         .collect();
+    validate_default_bounded_labels(&pipelines)?;
     let dominant_pipeline = telemetry.dominant_pipeline().map(pipeline_report);
     let report = StartupBenchmarkReport {
         schema_version: 1,
@@ -117,6 +118,76 @@ pub fn write_requested_report(
     std::fs::write(&path, json)
         .map_err(|error| format!("write benchmark report {}: {error}", path.display()))?;
     Ok(true)
+}
+
+fn validate_default_bounded_labels(pipelines: &[PipelineReport]) -> Result<(), String> {
+    const OPTIONAL: &[&str] = &[
+        "terrain-infinite",
+        "ocean",
+        "wireframe",
+        "path-trace",
+        "progressive-",
+        "overhang",
+        "vegetation",
+        "guides",
+        "brush-",
+    ];
+    let unexpected: Vec<_> = pipelines
+        .iter()
+        .filter(|pipeline| {
+            let label = pipeline.label.to_ascii_lowercase();
+            OPTIONAL.iter().any(|needle| label.contains(needle))
+        })
+        .map(|pipeline| pipeline.label.as_str())
+        .collect();
+    if unexpected.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "default bounded boot compiled optional pipelines: {}",
+            unexpected.join(", ")
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pipeline(label: &str) -> PipelineReport {
+        PipelineReport {
+            kind: "render_pipeline".into(),
+            label: label.into(),
+            status: "completed".into(),
+            started_ms: 0,
+            duration_ms: 1,
+        }
+    }
+
+    #[test]
+    fn bounded_boot_rejects_every_optional_presentation_family() {
+        assert!(validate_default_bounded_labels(&[
+            pipeline("terrain-bounded-pipeline"),
+            pipeline("shadow-pipeline"),
+        ])
+        .is_ok());
+        for label in [
+            "terrain-infinite-pipeline",
+            "terrain-bounded-ocean",
+            "terrain-bounded-wireframe",
+            "path-trace-pipe",
+            "progressive-composite-pipeline",
+            "overhang-pipe",
+            "vegetation-pipe",
+            "guides-pipe",
+            "brush-pick-pipeline",
+        ] {
+            assert!(
+                validate_default_bounded_labels(&[pipeline(label)]).is_err(),
+                "{label}"
+            );
+        }
+    }
 }
 
 fn pipeline_report(record: &terra_telemetry::CompilationRecord) -> PipelineReport {

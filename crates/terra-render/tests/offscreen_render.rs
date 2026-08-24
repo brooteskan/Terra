@@ -12,7 +12,10 @@
 //! test rather than adding another that pushes error scopes.
 
 use terra_core::heightfield::{Heightfield, HeightfieldMetrics};
-use terra_render::{BrushOverlay, GpuContext, TerrainRenderer, ViewportRendererMode};
+use terra_render::{
+    BrushOverlay, GpuContext, PresentationBackendId, PresentationPipelineFeature, TerrainRenderer,
+    ViewportRendererMode,
+};
 
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const W: u32 = 64;
@@ -136,13 +139,21 @@ fn raster_frame_covers_offscreen_target() {
     );
     assert_fully_overwritten(&gpu.read_rgba8(&target), "shadowed frame");
 
-    // Frame 4: switch to the progressive path tracer so the frame graph takes
+    // Frame 4: request progressive while its atomic bundle is still compiling.
+    // RasterLit must remain the actual backend, including across resize.
+    let compiler = renderer.presentation_pipeline_compiler();
+    assert!(renderer.begin_optional_pipeline_compile(PresentationPipelineFeature::Progressive, 77,));
     // the ProgressivePt branch. This exercises the schedule's pt_dispatch gating
     // and runs the end-of-frame debug_assert that the recorded passes match the
     // plan for a non-raster backend. Pixel coverage is not asserted — only the
     // RasterLit backend clears every pixel with the opaque atmosphere colour —
     // but the frame must still record without validation errors.
     renderer.set_renderer_mode(ViewportRendererMode::ProgressiveRayTraced);
+    assert_eq!(
+        renderer.presentation_backend(),
+        PresentationBackendId::RasterLit
+    );
+    renderer.resize(winit::dpi::PhysicalSize::new(W, H));
     gpu.fill(&target, MAGENTA);
     gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
     renderer.render_to_view(&target.view, W, H);
@@ -150,5 +161,23 @@ fn raster_frame_covers_offscreen_target() {
     assert!(
         err.is_none(),
         "validation error in path-traced frame: {err:?}"
+    );
+
+    let bundle = compiler
+        .compile(PresentationPipelineFeature::Progressive)
+        .expect("compile progressive bundle");
+    renderer
+        .install_optional_pipeline_bundle(77, bundle)
+        .expect("install progressive bundle");
+    assert_eq!(
+        renderer.presentation_backend(),
+        PresentationBackendId::ProgressivePt
+    );
+    gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
+    renderer.render_to_view(&target.view, W, H);
+    let err = pollster::block_on(gpu.device.pop_error_scope());
+    assert!(
+        err.is_none(),
+        "validation error after progressive install: {err:?}"
     );
 }
