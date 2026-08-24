@@ -9,7 +9,7 @@ design was reached, but they do not override this document.
 | Crate | Responsibility |
 |-------|----------------|
 | `terra-telemetry` | Backend-neutral startup-stage and pipeline-compilation tracking shared by GPU-facing crates |
-| `terra-world` | Fixed-origin coordinates, signed tile addresses, LODs, sample/world transforms, and bounded/infinite topology contracts |
+| `terra-world` | Fixed-origin coordinates, closed authored bounds/indexes, signed tile addresses, LODs, sample/world transforms, and bounded/infinite topology contracts |
 | `terra-core` | Backend-neutral domain model: heightfields, layer stack, masks, biomes, and editor commands |
 | `terra-cpu-eval` | Stateful CPU terrain evaluation, caches, scheduling, workers, timing, and output lifecycle |
 | `terra-jobs` | Cancellation primitive (`CancelToken`) and cancellable parallel-fill helpers shared by core algorithms and CPU evaluation |
@@ -22,8 +22,9 @@ design was reached, but they do not override this document.
 | `terra-test-gpu` | Non-published headless GPU harness used by render and UI tests |
 
 `terra-telemetry` is `wgpu`-free and depends only on the standard library.
-`terra-world` depends only on backend-independent serialization support and must
-stay free of domain content, evaluators, GPU, renderer, IO, and app crates.
+`terra-world` depends only on backend-independent serialization and stable-identity
+support and must stay free of domain content, evaluators, GPU, renderer, IO, and app
+crates.
 `terra-core` must stay free of evaluator, `wgpu`, and UI crates. `terra-cpu-eval`
 depends on `terra-core`, never the reverse. `terra-gpu-eval` depends on
 `terra-gpu`, never the reverse. `terra-gui` must stay free
@@ -238,10 +239,20 @@ derived from this path and are tested against valid page-table rows.
 
 `terra-world` owns the fixed-origin `f64` CPU coordinate system, signed `i64` tile
 addresses, validated finest-first LODs, sample/world transforms, and both bounded and
-infinite topology contracts. The infinite topology exposes only direct addressing and
-finite rectangle queries: it has no total dimensions, root tile, dense metadata index,
-or complete-world iterator. Content identity remains in `terra-core` and composes a
-world tile address with layer and field identity.
+infinite topology contracts. Half-open `WorldRect` values define traversal and planning
+windows; closed, possibly degenerate `WorldBounds` values define sparse authored
+footprints so features on tile seams are visible to both adjacent evaluation domains.
+The Infinite topology exposes only direct addressing and finite rectangle/bounds
+queries: it has no total dimensions, root tile, dense metadata index, or complete-world
+iterator. Terrain-content identity remains in `terra-core` and composes a world tile
+address with layer and field identity.
+
+`terra-world::AuthoredFeatureIndex` is the backend-independent runtime lookup for stable
+authored-feature identities and their finite bounds. It stores only occupied signed
+cells, filters cell candidates against exact bounds, and supports bounded tile,
+tile-plus-halo, and rectangle queries. Serialized feature-family records own the stable
+identity and bounds; loading rebuilds the index. Index buckets, generated terrain,
+residency state, and any complete-world enumeration are never persisted.
 
 `TerrainPyramid` is the bounded adapter over `terra-world::BoundedTopology` for a complete
 ceil-halving resolution hierarchy. It preserves the legacy coarse-first bounded level

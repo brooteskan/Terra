@@ -3,16 +3,17 @@
 //! `terra-world` owns fixed-origin CPU coordinates, signed tile addresses, LOD
 //! conventions, sample/world transforms, and topology math. It deliberately
 //! knows nothing about terrain fields, layers, evaluation, residency, GPU
-//! publication, rendering, IO, or application state. Its only external
-//! dependency is `serde`, used so a spatial address can be embedded in a
-//! persisted content key without making serialization a topology concern.
+//! publication, rendering, IO, or application state. Its external dependencies
+//! are limited to `serde` for validated wire primitives and `uuid` for stable
+//! authored-feature identity.
 //!
 //! # Conventions and invariants
 //!
 //! - Authoritative CPU world positions are `f64` metres from one fixed origin.
 //! - Tile and global-sample coordinates are signed `i64` values.
 //! - LOD 0 is finest; increasing LOD values are coarser.
-//! - Rectangles are half-open on their maximum edge.
+//! - Planning rectangles are half-open on their maximum edge.
+//! - Sparse authored bounds are closed and may be degenerate.
 //! - A sample represents the centre of its cell.
 //! - Negative coordinate conversion uses floor/Euclidean behavior, never
 //!   truncation toward zero.
@@ -23,14 +24,18 @@
 //! directly or request the finite tile range intersecting an explicit rectangle.
 
 mod address;
+mod authored_index;
 mod bounded;
+mod bounds;
 mod coordinate;
 mod extent;
 mod infinite;
 mod transform;
 
 pub use address::{Lod, TileAddress, TileAddressRange, TileCoord, MAX_LOD};
+pub use authored_index::{AuthoredFeatureId, AuthoredFeatureIndex, FeatureIndexError};
 pub use bounded::{BoundedLevel, BoundedTopology, BoundedTopologyConfig};
+pub use bounds::WorldBounds;
 pub use coordinate::{WorldPosition, WorldRect};
 pub use extent::{SampleCoord, SampleExtent, SpatialDomain, TileExtent};
 pub use infinite::{InfiniteTopology, InfiniteTopologyConfig};
@@ -48,6 +53,8 @@ pub enum WorldError {
     InvalidResolution(u32),
     InvalidWorldCoordinate,
     InvalidWorldRect,
+    InvalidWorldBounds,
+    InvalidWorldExpansion,
     InvalidSpacing,
     InvalidWorldExtent,
     AddressOutsideTopology(TileAddress),
@@ -67,6 +74,12 @@ impl fmt::Display for WorldError {
             }
             Self::InvalidWorldCoordinate => write!(f, "world coordinate must be finite"),
             Self::InvalidWorldRect => write!(f, "world rectangle must be finite and non-empty"),
+            Self::InvalidWorldBounds => {
+                write!(f, "world bounds must be finite and ordered on both axes")
+            }
+            Self::InvalidWorldExpansion => {
+                write!(f, "world-bounds expansion must be finite and non-negative")
+            }
             Self::InvalidSpacing => write!(f, "sample spacing must be finite and positive"),
             Self::InvalidWorldExtent => write!(f, "world extent must be finite and positive"),
             Self::AddressOutsideTopology(address) => {
@@ -234,6 +247,51 @@ mod tests {
         assert_eq!(range.min.coord, TileCoord { x: -1, z: -1 });
         assert_eq!(range.max.coord, TileCoord { x: 1, z: 0 });
         assert_eq!(range.iter().count(), 6);
+    }
+
+    #[test]
+    fn closed_authored_bounds_include_both_sides_of_tile_seams() {
+        let topology = InfiniteTopology::try_new(InfiniteTopologyConfig {
+            origin: WorldPosition::ORIGIN,
+            tile_size: 4,
+            finest_spacing_m: 1.0,
+            max_lod: Lod::try_new(2).unwrap(),
+        })
+        .unwrap();
+        let seam = WorldBounds::from_point(WorldPosition::ORIGIN);
+        let range = topology.addresses_touching(seam, Lod::FINEST).unwrap();
+        assert_eq!(range.min.coord, TileCoord { x: -1, z: -1 });
+        assert_eq!(range.max.coord, TileCoord { x: 0, z: 0 });
+        assert_eq!(range.iter().count(), 4);
+
+        let negative_seams = WorldBounds::try_new(
+            WorldPosition::try_new(-8.0, -4.0).unwrap(),
+            WorldPosition::try_new(-4.0, 0.0).unwrap(),
+        )
+        .unwrap();
+        let range = topology
+            .addresses_touching(negative_seams, Lod::FINEST)
+            .unwrap();
+        assert_eq!(range.min.coord, TileCoord { x: -3, z: -2 });
+        assert_eq!(range.max.coord, TileCoord { x: -1, z: 0 });
+    }
+
+    #[test]
+    fn closed_bounds_mapping_is_checked_at_address_limits() {
+        let topology = InfiniteTopology::try_new(InfiniteTopologyConfig {
+            origin: WorldPosition::ORIGIN,
+            tile_size: 1,
+            finest_spacing_m: 1.0,
+            max_lod: Lod::FINEST,
+        })
+        .unwrap();
+        let lower_limit = WorldBounds::from_point(
+            WorldPosition::try_new(-9_223_372_036_854_775_808.0, 0.5).unwrap(),
+        );
+        assert_eq!(
+            topology.addresses_touching(lower_limit, Lod::FINEST),
+            Err(WorldError::ArithmeticOverflow)
+        );
     }
 
     #[test]

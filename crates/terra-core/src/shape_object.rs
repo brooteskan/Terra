@@ -5,6 +5,7 @@ use crate::authoring::{
 };
 use crate::ids::LayerId;
 use serde::{Deserialize, Serialize};
+use terra_world::{WorldBounds, WorldError, WorldPosition};
 use uuid::Uuid;
 
 /// Stable identity for a shape object.
@@ -66,63 +67,6 @@ impl ShapeKind {
             Self::PlateauPolygon => TerrainConstraintKind::Plateau,
             Self::LakeBasin => TerrainConstraintKind::MinElevation,
             Self::Volcano | Self::UpliftCentre | Self::HeightStamp => TerrainConstraintKind::Ridge,
-        }
-    }
-}
-
-/// World-space axis-aligned bounds in metres.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
-pub struct WorldBounds {
-    pub min_x: f32,
-    pub min_z: f32,
-    pub max_x: f32,
-    pub max_z: f32,
-}
-
-impl WorldBounds {
-    pub fn from_points(points: &[(f32, f32)], pad: f32) -> Self {
-        if points.is_empty() {
-            return Self::default();
-        }
-        let mut min_x = f32::MAX;
-        let mut min_z = f32::MAX;
-        let mut max_x = f32::MIN;
-        let mut max_z = f32::MIN;
-        for &(x, z) in points {
-            min_x = min_x.min(x);
-            min_z = min_z.min(z);
-            max_x = max_x.max(x);
-            max_z = max_z.max(z);
-        }
-        Self {
-            min_x: min_x - pad,
-            min_z: min_z - pad,
-            max_x: max_x + pad,
-            max_z: max_z + pad,
-        }
-    }
-
-    pub fn intersects_page(&self, origin_x: f32, origin_z: f32, extent: f32) -> bool {
-        let max_x = origin_x + extent;
-        let max_z = origin_z + extent;
-        self.min_x <= max_x
-            && self.max_x >= origin_x
-            && self.min_z <= max_z
-            && self.max_z >= origin_z
-    }
-
-    pub fn expand(&self, other: &WorldBounds) -> WorldBounds {
-        if self.max_x < self.min_x {
-            return *other;
-        }
-        if other.max_x < other.min_x {
-            return *self;
-        }
-        WorldBounds {
-            min_x: self.min_x.min(other.min_x),
-            min_z: self.min_z.min(other.min_z),
-            max_x: self.max_x.max(other.max_x),
-            max_z: self.max_z.max(other.max_z),
         }
     }
 }
@@ -218,13 +162,26 @@ impl ShapeObject {
             .collect()
     }
 
-    pub fn world_bounds(&self, world_size_x: f32, world_size_z: f32) -> WorldBounds {
-        let pts: Vec<(f32, f32)> = self
+    pub fn world_bounds(
+        &self,
+        world_size_x: f32,
+        world_size_z: f32,
+    ) -> Result<Option<WorldBounds>, WorldError> {
+        let points = self
             .transformed_points()
-            .iter()
-            .map(|p| (p.u * world_size_x, p.v * world_size_z))
-            .collect();
-        WorldBounds::from_points(&pts, self.width_m)
+            .into_iter()
+            .map(|point| {
+                WorldPosition::try_new(
+                    f64::from(point.u) * f64::from(world_size_x),
+                    f64::from(point.v) * f64::from(world_size_z),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let Some(bounds) = WorldBounds::try_from_points(points)? else {
+            return Ok(None);
+        };
+        let padding = f64::from(self.width_m);
+        bounds.checked_expand(padding, padding).map(Some)
     }
 
     pub fn to_constraint(&self) -> TerrainConstraint {
@@ -321,14 +278,24 @@ impl ShapeObjectStore {
         }
     }
 
-    pub fn dirty_bounds(&self, world_size_x: f32, world_size_z: f32) -> WorldBounds {
-        let mut b = WorldBounds::default();
+    pub fn dirty_bounds(
+        &self,
+        world_size_x: f32,
+        world_size_z: f32,
+    ) -> Result<Option<WorldBounds>, WorldError> {
+        let mut aggregate: Option<WorldBounds> = None;
         for s in &self.shapes {
             if s.enabled {
-                b = b.expand(&s.world_bounds(world_size_x, world_size_z));
+                let Some(bounds) = s.world_bounds(world_size_x, world_size_z)? else {
+                    continue;
+                };
+                aggregate = Some(match aggregate {
+                    Some(current) => current.checked_union(bounds)?,
+                    None => bounds,
+                });
             }
         }
-        b
+        Ok(aggregate)
     }
 
     /// Tropical Island starter shapes (UV space).
@@ -586,8 +553,11 @@ mod tests {
         let store = ShapeObjectStore::tropical_island_shapes();
         let params = store.compile_constraints();
         assert_eq!(params.constraints.len(), 3);
-        let b = store.dirty_bounds(8192.0, 8192.0);
-        assert!(b.max_x > b.min_x);
+        let b = store
+            .dirty_bounds(8192.0, 8192.0)
+            .unwrap()
+            .expect("enabled shapes have bounds");
+        assert!(b.max().x_m() > b.min().x_m());
     }
 
     #[test]

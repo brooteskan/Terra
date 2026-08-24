@@ -1,6 +1,7 @@
 use crate::{
     Lod, SampleCoord, SampleExtent, SampleSpacing, SampleWorldTransform, SpatialDomain,
-    TileAddress, TileAddressRange, TileCoord, TileExtent, WorldError, WorldPosition, WorldRect,
+    TileAddress, TileAddressRange, TileCoord, TileExtent, WorldBounds, WorldError, WorldPosition,
+    WorldRect,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -149,6 +150,36 @@ impl InfiniteTopology {
         TileAddressRange::try_new(min, max)
     }
 
+    /// Return every tile whose closed world extent touches closed authored bounds.
+    ///
+    /// A bound exactly on a tile seam belongs to both adjacent tiles. This is
+    /// intentionally different from [`Self::addresses_intersecting`], whose
+    /// planning rectangle is half-open on its maximum edge.
+    pub fn addresses_touching(
+        &self,
+        bounds: WorldBounds,
+        lod: Lod,
+    ) -> Result<TileAddressRange, WorldError> {
+        let spacing = self.spacing(lod)?;
+        let span_x = spacing.x_m() * f64::from(self.config.tile_size);
+        let span_z = spacing.z_m() * f64::from(self.config.tile_size);
+        let min = TileAddress::new(
+            lod,
+            TileCoord {
+                x: inclusive_lower_tile(bounds.min().x_m(), self.config.origin.x_m(), span_x)?,
+                z: inclusive_lower_tile(bounds.min().z_m(), self.config.origin.z_m(), span_z)?,
+            },
+        );
+        let max = TileAddress::new(
+            lod,
+            TileCoord {
+                x: inclusive_upper_tile(bounds.max().x_m(), self.config.origin.x_m(), span_x)?,
+                z: inclusive_upper_tile(bounds.max().z_m(), self.config.origin.z_m(), span_z)?,
+            },
+        );
+        TileAddressRange::try_new(min, max)
+    }
+
     fn validate_lod(&self, lod: Lod) -> Result<(), WorldError> {
         if lod > self.config.max_lod {
             return Err(WorldError::AddressOutsideTopology(TileAddress::new(
@@ -171,6 +202,24 @@ fn f64_to_i64(value: f64) -> Result<i64, WorldError> {
         return Err(WorldError::ArithmeticOverflow);
     }
     Ok(value as i64)
+}
+
+fn normalized_tile_coordinate(value: f64, origin: f64, span: f64) -> Result<f64, WorldError> {
+    let normalized = (value - origin) / span;
+    if !normalized.is_finite() {
+        return Err(WorldError::ArithmeticOverflow);
+    }
+    Ok(normalized)
+}
+
+fn inclusive_lower_tile(value: f64, origin: f64, span: f64) -> Result<i64, WorldError> {
+    f64_to_i64(normalized_tile_coordinate(value, origin, span)?.ceil())?
+        .checked_sub(1)
+        .ok_or(WorldError::ArithmeticOverflow)
+}
+
+fn inclusive_upper_tile(value: f64, origin: f64, span: f64) -> Result<i64, WorldError> {
+    f64_to_i64(normalized_tile_coordinate(value, origin, span)?.floor())
 }
 
 fn next_down(value: f64) -> f64 {

@@ -77,7 +77,8 @@ pub use terra_jobs::CancelToken;
 pub use terra_world::{
     BoundedLevel, BoundedTopology, BoundedTopologyConfig, InfiniteTopology, InfiniteTopologyConfig,
     Lod, SampleCoord, SampleExtent, SampleSpacing, SampleWorldTransform, SpatialDomain,
-    TileAddress, TileAddressRange, TileCoord, TileExtent, WorldError, WorldPosition, WorldRect,
+    TileAddress, TileAddressRange, TileCoord, TileExtent, WorldBounds, WorldError, WorldPosition,
+    WorldRect,
 };
 pub use terrain_recipe::{
     build_terrain_recipe_from_stack, recipe_matches_stack, RecipeItem, RecipeItemKind,
@@ -122,7 +123,7 @@ pub use matter_sim::{
 pub use realism_benchmark::{
     validate_benchmark_structure, BenchmarkExpectations, RealismBenchmark,
 };
-pub use shape_object::{ShapeKind, ShapeObject, ShapeObjectId, ShapeObjectStore, WorldBounds};
+pub use shape_object::{ShapeKind, ShapeObject, ShapeObjectId, ShapeObjectStore};
 pub use simulation_scenario::{
     diagnose_scenario, layer_kind_is_scenario_compatible, MatterSource, MatterSourceKind,
     OutputApplicationSettings, OutputInfluence, ScenarioPass, ScenarioPassKind, ScenarioQuality,
