@@ -107,11 +107,11 @@ pub enum TerrainOpKind {
         output: FieldSlot,
         mode: GroupCompositeMode,
     },
-    /// Publish one private auxiliary field across an isolated group boundary.
-    /// Keeping this separate from the height composite lets liveness discard
-    /// unobserved private fields independently.
+    /// Composite one layer/group auxiliary candidate under its authored mask.
+    /// Keeping this separate from height composition lets liveness discard
+    /// unobserved auxiliary fields independently.
     CompositeAuxField {
-        group: LayerId,
+        owner: NodeRef,
         mask: FieldSlot,
         composite: GroupAuxComposite,
     },
@@ -582,12 +582,12 @@ fn hash_operation_kind(kind: &TerrainOpKind, hasher: &mut impl Hasher) {
             mode.hash(hasher);
         }
         TerrainOpKind::CompositeAuxField {
-            group,
+            owner,
             mask,
             composite,
         } => {
             5_u8.hash(hasher);
-            group.hash(hasher);
+            owner.hash(hasher);
             mask.hash(hasher);
             composite.field.hash(hasher);
             composite.parent.hash(hasher);

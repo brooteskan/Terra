@@ -60,6 +60,8 @@ struct AuxUniform {
     region_y: u32,
     region_w: u32,
     region_h: u32,
+    channel_class: u32,
+    _pad: [u32; 3],
 }
 
 #[repr(C)]
@@ -681,9 +683,19 @@ impl GpuPlanOperations {
         mask: FieldSlot,
         output: FieldSlot,
         opacity: f32,
+        channel_class: terra_core::field_data::ChannelClass,
     ) -> Result<(), GpuPlanOperationError> {
         self.composite_aux_region(
-            device, encoder, resources, parent, child, mask, output, opacity, None,
+            device,
+            encoder,
+            resources,
+            parent,
+            child,
+            mask,
+            output,
+            opacity,
+            channel_class,
+            None,
         )
     }
 
@@ -698,6 +710,7 @@ impl GpuPlanOperations {
         mask: FieldSlot,
         output: FieldSlot,
         opacity: f32,
+        channel_class: terra_core::field_data::ChannelClass,
         region: Option<(u32, u32, u32, u32)>,
     ) -> Result<(), GpuPlanOperationError> {
         if !opacity.is_finite() {
@@ -723,6 +736,12 @@ impl GpuPlanOperations {
                 region_y: region.1,
                 region_w: region.2,
                 region_h: region.3,
+                channel_class: match channel_class {
+                    terra_core::field_data::ChannelClass::Weight => 0,
+                    terra_core::field_data::ChannelClass::Metric => 1,
+                    terra_core::field_data::ChannelClass::Categorical => 2,
+                },
+                _pad: [0; 3],
             },
         );
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {

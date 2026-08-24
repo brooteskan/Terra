@@ -131,6 +131,57 @@ pub mod keys {
     }
 }
 
+/// Compositing semantics for one auxiliary raster channel.
+///
+/// Weight channels are normalized coverage/intensity values, metric channels
+/// carry physical or otherwise unbounded quantities, and categorical channels
+/// carry identities for which interpolation would create invalid values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelClass {
+    Weight,
+    Metric,
+    Categorical,
+}
+
+/// Return the compositing class for a canonical auxiliary key.
+///
+/// Legacy aliases are canonicalized first. Unknown/free-form channels default
+/// to [`ChannelClass::Weight`], the conservative behavior for the normalized
+/// mask-like values produced by most ad-hoc processors.
+pub fn channel_class(key: &str) -> ChannelClass {
+    match keys::canonical(key) {
+        keys::MATERIALS | keys::LITHOLOGY | keys::FLOW_DIRECTION | keys::BIOMES => {
+            ChannelClass::Categorical
+        }
+        keys::STRATA_REFERENCE
+        | keys::CONSTRAINT_TARGET
+        | keys::CONSTRAINT_ERROR
+        | keys::UPLIFT_RATE
+        | keys::TECTONIC_BASE
+        | keys::WATER_DISCHARGE
+        | keys::TEMPERATURE
+        | keys::RAINFALL
+        | keys::WIND_DIRECTION
+        | keys::OVERHANG_CEILING
+        | keys::WATER_DEPTH
+        | keys::SNOW_DEPTH
+        | keys::SAND_DEPTH
+        | keys::DEBRIS_DEPTH
+        | keys::MELTWATER
+        | keys::DRIFT
+        | keys::BEDROCK_HEIGHT
+        | keys::SEDIMENT_THICKNESS
+        | keys::SOIL_DEPTH
+        | keys::WATER_VELOCITY
+        | keys::FLOW_ACCUMULATION
+        | keys::STREAM_ORDER
+        | keys::SPE_INCISION
+        | keys::SHORE_DISTANCE
+        | keys::BATHYMETRY => ChannelClass::Metric,
+        _ => ChannelClass::Weight,
+    }
+}
+
 /// Typed auxiliary fields produced by sims and analysis.
 #[derive(Debug, Clone, Default)]
 pub struct AuxMaps {
@@ -379,5 +430,35 @@ impl AuxMaps {
         self.hardness
             .clone()
             .unwrap_or_else(|| MaskField::filled(metrics, k.clamp(0.0, 1.0)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{channel_class, keys, ChannelClass};
+
+    #[test]
+    fn channel_classes_cover_weight_metric_categorical_and_unknown() {
+        assert_eq!(channel_class(keys::WETNESS), ChannelClass::Weight);
+        assert_eq!(channel_class(keys::BEDROCK_HEIGHT), ChannelClass::Metric);
+        assert_eq!(channel_class(keys::MATERIALS), ChannelClass::Categorical);
+        assert_eq!(channel_class(keys::LITHOLOGY), ChannelClass::Categorical);
+        assert_eq!(
+            channel_class(keys::FLOW_DIRECTION),
+            ChannelClass::Categorical
+        );
+        assert_eq!(channel_class(keys::BIOMES), ChannelClass::Categorical);
+        assert_eq!(channel_class("custom_coverage"), ChannelClass::Weight);
+    }
+
+    #[test]
+    fn legacy_sediment_aliases_receive_metric_semantics() {
+        for key in [
+            keys::SEDIMENT_THICKNESS,
+            keys::SEDIMENT_DEPTH,
+            keys::LOOSE_SEDIMENT,
+        ] {
+            assert_eq!(channel_class(key), ChannelClass::Metric, "key {key}");
+        }
     }
 }

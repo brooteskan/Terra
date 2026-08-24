@@ -38,6 +38,49 @@ fn kernel_runs_in_place(kernel: GpuKernel) -> bool {
     )
 }
 
+fn aux_composite_opacity(stack: &LayerStack, owner: NodeRef) -> f32 {
+    match owner {
+        NodeRef::Layer(layer) => {
+            stack
+                .find(layer)
+                .expect("compiled aux owner layer")
+                .common
+                .opacity
+        }
+        NodeRef::Group(group) => {
+            let authored = stack.find_group(group).expect("compiled aux owner group");
+            if authored.group_kind == terra_core::layer::GroupKind::Biome {
+                authored.opacity * authored.filter_blending
+            } else {
+                authored.opacity
+            }
+        }
+        NodeRef::Mask(_) | NodeRef::Output(_) => 1.0,
+    }
+}
+
+/// Whether an auxiliary value eventually feeds executable GPU work rather than
+/// terminating at named-output publication. The legacy kernels do not copy
+/// their auxiliary scratch textures into plan resources yet, so only terminal
+/// publication chains may remain GPU-only.
+pub(super) fn auxiliary_value_is_observed(
+    plan: &CompiledTerrainPlan,
+    field: terra_core::terrain_plan::FieldSlot,
+) -> bool {
+    plan.analysis().consumers(field).iter().any(|consumer| {
+        let Some(operation) = plan.operation(*consumer) else {
+            return true;
+        };
+        match &operation.kind {
+            TerrainOpKind::PublishOutput { .. } => false,
+            TerrainOpKind::CompositeAuxField { composite, .. } => {
+                auxiliary_value_is_observed(plan, composite.output)
+            }
+            _ => true,
+        }
+    })
+}
+
 fn plan_scope_region(
     scope: PropagatedDirtyScope,
     metrics: HeightfieldMetrics,
@@ -453,16 +496,12 @@ impl GpuTerrainEngine {
                 )?;
             }
             TerrainOpKind::CompositeAuxField {
-                group,
+                owner,
                 mask,
                 composite,
             } => {
-                let authored = stack.find_group(*group).expect("compiled group owner");
-                let opacity = if authored.group_kind == terra_core::layer::GroupKind::Biome {
-                    authored.opacity * authored.filter_blending
-                } else {
-                    authored.opacity
-                };
+                let opacity = aux_composite_opacity(stack, *owner);
+                let class = terra_core::field_data::channel_class(&composite.field.cache_key());
                 self.plan_operations.composite_aux_region(
                     device,
                     encoder,
@@ -472,6 +511,7 @@ impl GpuTerrainEngine {
                     *mask,
                     composite.output,
                     opacity,
+                    class,
                     Some(region),
                 )?;
             }
@@ -776,11 +816,7 @@ impl GpuTerrainEngine {
                 };
                 if output_fields.iter().any(|field| {
                     plan.analysis().field_is_live(*field)
-                        && plan.analysis().consumers(*field).iter().any(|consumer| {
-                            !plan.operation(*consumer).is_some_and(|operation| {
-                                matches!(operation.kind, TerrainOpKind::PublishOutput { .. })
-                            })
-                        })
+                        && auxiliary_value_is_observed(plan, *field)
                 }) {
                     let diagnostic = plan_fallback_diagnostic(
                         plan,
@@ -1127,17 +1163,13 @@ impl GpuTerrainEngine {
                         Ok(())
                     }
                     TerrainOpKind::CompositeAuxField {
-                        group,
+                        owner,
                         mask,
                         composite,
                     } => {
-                        let authored = stack.find_group(*group).expect("compiled group owner");
-                        let opacity = if authored.group_kind == terra_core::layer::GroupKind::Biome
-                        {
-                            authored.opacity * authored.filter_blending
-                        } else {
-                            authored.opacity
-                        };
+                        let opacity = aux_composite_opacity(stack, *owner);
+                        let class =
+                            terra_core::field_data::channel_class(&composite.field.cache_key());
                         self.plan_operations.composite_aux_region(
                             device,
                             &mut encoder,
@@ -1147,6 +1179,7 @@ impl GpuTerrainEngine {
                             *mask,
                             composite.output,
                             opacity,
+                            class,
                             Some(region),
                         )?;
                         Ok(())

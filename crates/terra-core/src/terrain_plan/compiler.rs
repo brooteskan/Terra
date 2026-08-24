@@ -224,10 +224,6 @@ impl Compiler<'_> {
                 _ => {}
             }
         }
-        for (field, slot) in produced {
-            state.set_aux(field, slot);
-        }
-
         let mask = self.builder.add_field(LogicalFieldKind::Mask, origin);
         let mask_inputs =
             self.resolve_distribution_inputs(owner_ref, &layer.common.masks, state)?;
@@ -256,6 +252,28 @@ impl Compiler<'_> {
             },
         });
         state.height = output;
+        for (field, child) in produced {
+            let parent = state.field(&field);
+            let output = self
+                .builder
+                .add_field(LogicalFieldKind::Auxiliary(field.clone()), origin);
+            self.builder.add_operation(TerrainOp {
+                origin,
+                reach: Reach::LOCAL,
+                aux_reach: AuxReach::PerTexel,
+                kind: TerrainOpKind::CompositeAuxField {
+                    owner: owner_ref,
+                    mask,
+                    composite: GroupAuxComposite {
+                        field: field.clone(),
+                        parent,
+                        child,
+                        output,
+                    },
+                },
+            });
+            state.set_aux(field, output);
+        }
         self.publish_outputs(owner_ref, &layer.common.outputs, state)?;
         for field in state.output_slots() {
             self.builder.record_owner_field(owner_ref, field);
@@ -396,7 +414,7 @@ impl Compiler<'_> {
                 reach: Reach::LOCAL,
                 aux_reach: AuxReach::PerTexel,
                 kind: TerrainOpKind::CompositeAuxField {
-                    group: group.id,
+                    owner: owner_ref,
                     mask,
                     composite: composite.clone(),
                 },

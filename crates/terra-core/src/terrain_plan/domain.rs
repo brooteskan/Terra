@@ -76,7 +76,8 @@ pub fn resolve_plan_execution_strategy(
     plan: &CompiledTerrainPlan,
     output: FieldSlot,
 ) -> TerrainPlanExecutionStrategy {
-    let live = dependency_operations(plan, output);
+    let roots = execution_roots(plan, output);
+    let live = dependency_operations(plan, &roots);
     let mut blockers = live
         .iter()
         .copied()
@@ -85,9 +86,9 @@ pub fn resolve_plan_execution_strategy(
     blockers.sort_by_key(|blocker| blocker.operation.index());
 
     if blockers.is_empty() {
-        return TerrainPlanExecutionStrategy::Local(
-            resolve_plan_domain(plan, output).expect("local strategy passed domain analysis"),
-        );
+        return TerrainPlanExecutionStrategy::Local(resolve_local_suffix(
+            plan, output, &roots, &live, 0,
+        ));
     }
 
     let boundary = blockers.iter().fold(0usize, |current, blocker| {
@@ -140,7 +141,7 @@ pub fn resolve_plan_execution_strategy(
     let mut frontier_fields = frontier.into_iter().collect::<Vec<_>>();
     frontier_fields.sort_by_key(|field| field.index());
 
-    let suffix = resolve_local_suffix(plan, output, &suffix_set, boundary);
+    let suffix = resolve_local_suffix(plan, output, &roots, &suffix_set, boundary);
     TerrainPlanExecutionStrategy::Checkpointed {
         checkpoint: TerrainPlanCheckpoint {
             boundary,
@@ -188,10 +189,23 @@ fn checkpoint_blocker(
     })
 }
 
-fn dependency_operations(plan: &CompiledTerrainPlan, output: FieldSlot) -> HashSet<PlanOpId> {
+fn execution_roots(plan: &CompiledTerrainPlan, output: FieldSlot) -> Vec<FieldSlot> {
+    let mut roots = vec![output];
+    for operation in plan.operations() {
+        let super::TerrainOpKind::PublishOutput { source, .. } = operation.kind else {
+            continue;
+        };
+        if !roots.contains(&source) {
+            roots.push(source);
+        }
+    }
+    roots
+}
+
+fn dependency_operations(plan: &CompiledTerrainPlan, roots: &[FieldSlot]) -> HashSet<PlanOpId> {
     let mut fields = HashSet::new();
     let mut operations = HashSet::new();
-    let mut pending = VecDeque::from([output]);
+    let mut pending = VecDeque::from_iter(roots.iter().copied());
     while let Some(field) = pending.pop_front() {
         if !fields.insert(field) {
             continue;
@@ -210,11 +224,12 @@ fn dependency_operations(plan: &CompiledTerrainPlan, output: FieldSlot) -> HashS
 fn resolve_local_suffix(
     plan: &CompiledTerrainPlan,
     output: FieldSlot,
+    roots: &[FieldSlot],
     selected: &HashSet<PlanOpId>,
     boundary: usize,
 ) -> TerrainPlanDomainSlice {
     let mut required = HashMap::<FieldSlot, u32>::new();
-    let mut pending = VecDeque::from([(output, 0u32)]);
+    let mut pending = VecDeque::from_iter(roots.iter().copied().map(|root| (root, 0u32)));
     let mut maximum = 0u32;
     while let Some((field, downstream_halo)) = pending.pop_front() {
         if required
@@ -265,7 +280,7 @@ pub fn resolve_plan_domain(
     plan: &CompiledTerrainPlan,
     output: FieldSlot,
 ) -> Result<TerrainPlanDomainSlice, TerrainPlanDomainRejection> {
-    resolve_plan_domain_with(plan, output, |plan, producer, field| {
+    resolve_plan_domain_with(plan, output, &[output], |plan, producer, field| {
         let operation = plan.operation(producer).expect("validated plan operation");
         if matches!(
             plan.field(field).map(|field| &field.kind),
@@ -292,7 +307,8 @@ pub fn resolve_infinite_plan_domain(
     plan: &CompiledTerrainPlan,
     output: FieldSlot,
 ) -> Result<TerrainPlanDomainSlice, TerrainPlanDomainRejection> {
-    resolve_plan_domain_with(plan, output, |plan, producer, field| {
+    let roots = execution_roots(plan, output);
+    resolve_plan_domain_with(plan, output, &roots, |plan, producer, field| {
         let operation = plan.operation(producer).expect("validated plan operation");
         if matches!(
             plan.field(field).map(|field| &field.kind),
@@ -324,10 +340,11 @@ pub fn resolve_infinite_plan_domain(
 fn resolve_plan_domain_with(
     plan: &CompiledTerrainPlan,
     output: FieldSlot,
+    roots: &[FieldSlot],
     reject: impl Fn(&CompiledTerrainPlan, PlanOpId, FieldSlot) -> Option<TerrainPlanDomainRejectReason>,
 ) -> Result<TerrainPlanDomainSlice, TerrainPlanDomainRejection> {
     let mut required = HashMap::<FieldSlot, u32>::new();
-    let mut pending = VecDeque::from([(output, 0u32)]);
+    let mut pending = VecDeque::from_iter(roots.iter().copied().map(|root| (root, 0u32)));
     let mut selected = HashSet::new();
     let mut maximum = 0u32;
 
@@ -384,10 +401,10 @@ fn resolve_plan_domain_with(
 mod tests {
     use super::*;
     use crate::field_data::FieldId;
-    use crate::ids::LayerId;
+    use crate::ids::{LayerId, OutputId};
     use crate::terrain_plan::{
-        LogicalFieldKind, PlanOrigin, PlanStructureRevision, SeedSource, TerrainOp, TerrainOpKind,
-        TerrainPlanBuilder, TerrainPlanStamp,
+        GroupAuxComposite, LogicalFieldKind, PlanOrigin, PlanStructureRevision, SeedSource,
+        TerrainOp, TerrainOpKind, TerrainPlanBuilder, TerrainPlanStamp,
     };
 
     fn infinite_fixture_stack() -> crate::layer::LayerStack {
@@ -469,6 +486,92 @@ mod tests {
         let slice = resolve_plan_domain(&plan, plan.final_height()).unwrap();
         assert_eq!(slice.operation_halo, 8);
         assert_eq!(slice.operations.len(), 3);
+    }
+
+    #[test]
+    fn execution_strategy_includes_published_auxiliary_dependencies() {
+        let owner = LayerId::from_u128(3);
+        let origin = PlanOrigin::Authored(NodeRef::Layer(owner));
+        let mut builder =
+            TerrainPlanBuilder::new(TerrainPlanStamp::new(PlanStructureRevision::new(10)));
+        let height = builder.add_field(LogicalFieldKind::Height, PlanOrigin::Root);
+        let candidate = builder.add_field(LogicalFieldKind::Height, origin);
+        let child = builder.add_field(LogicalFieldKind::Auxiliary(FieldId::Hardness), origin);
+        let mask = builder.add_field(LogicalFieldKind::Mask, origin);
+        let composite = builder.add_field(LogicalFieldKind::Auxiliary(FieldId::Hardness), origin);
+        builder.add_operation(TerrainOp {
+            origin: PlanOrigin::Root,
+            reach: Reach::LOCAL,
+            aux_reach: AuxReach::HeightOnly,
+            kind: TerrainOpKind::Seed {
+                source: SeedSource::Zero,
+                output: height,
+            },
+        });
+        builder.add_operation(TerrainOp {
+            origin,
+            reach: Reach::Localized { halo_samples: 2 },
+            aux_reach: AuxReach::PerTexel,
+            kind: TerrainOpKind::RunLayerKernel {
+                layer: owner,
+                type_id: "published-aux".into(),
+                input_height: height,
+                input_fields: Vec::new(),
+                output_candidate: candidate,
+                output_fields: vec![child],
+            },
+        });
+        builder.add_operation(TerrainOp {
+            origin,
+            reach: Reach::LOCAL,
+            aux_reach: AuxReach::HeightOnly,
+            kind: TerrainOpKind::EvaluateMask {
+                input_height: height,
+                input_fields: Vec::new(),
+                output_mask: mask,
+            },
+        });
+        builder.add_operation(TerrainOp {
+            origin,
+            reach: Reach::LOCAL,
+            aux_reach: AuxReach::PerTexel,
+            kind: TerrainOpKind::CompositeAuxField {
+                owner: NodeRef::Layer(owner),
+                mask,
+                composite: GroupAuxComposite {
+                    field: FieldId::Hardness,
+                    parent: None,
+                    child,
+                    output: composite,
+                },
+            },
+        });
+        builder.add_operation(TerrainOp {
+            origin: PlanOrigin::Authored(NodeRef::Output(OutputId::new())),
+            reach: Reach::LOCAL,
+            aux_reach: AuxReach::HeightOnly,
+            kind: TerrainOpKind::PublishOutput {
+                output: OutputId::new(),
+                source: composite,
+            },
+        });
+        let plan = builder.finish(height).unwrap();
+
+        let TerrainPlanExecutionStrategy::Local(slice) =
+            resolve_plan_execution_strategy(&plan, height)
+        else {
+            panic!("published per-texel auxiliary should remain local");
+        };
+        assert_eq!(
+            slice.operations,
+            vec![
+                PlanOpId::from_index(0),
+                PlanOpId::from_index(1),
+                PlanOpId::from_index(2),
+                PlanOpId::from_index(3),
+            ]
+        );
+        assert_eq!(slice.operation_halo, 2);
     }
 
     #[test]

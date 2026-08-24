@@ -141,6 +141,10 @@ pub struct EvalContext {
     /// re-stamped position count, set during that layer's generate and drained by
     /// the next `record_*_timing` into [`LayerEvalTiming::strokes_restamped`].
     pub(crate) pending_strokes_restamped: Option<u32>,
+    /// Pre-write values captured while a scoped layer processor runs. Capturing
+    /// at `aux_insert` records only channels the processor actually writes and
+    /// avoids cloning the complete aux store merely to composite a few outputs.
+    aux_write_capture: Option<HashMap<String, Option<MaskField>>>,
 }
 
 impl EvalContext {
@@ -160,6 +164,7 @@ impl EvalContext {
             layer_timings: Vec::new(),
             initial_scope: None,
             pending_strokes_restamped: None,
+            aux_write_capture: None,
         }
     }
 
@@ -214,6 +219,11 @@ impl EvalContext {
     pub fn aux_insert(&mut self, key: impl Into<String>, field: MaskField) {
         let key = key.into();
         let canonical = terra_core::field_data::keys::canonical(&key).to_string();
+        if let Some(capture) = self.aux_write_capture.as_mut() {
+            if !capture.contains_key(&canonical) {
+                capture.insert(canonical.clone(), self.aux_maps.get(&canonical).cloned());
+            }
+        }
         self.aux_maps.insert(canonical.clone(), field.clone());
         if canonical == terra_core::field_data::keys::SEDIMENT_THICKNESS {
             self.aux
@@ -222,6 +232,14 @@ impl EvalContext {
                 .remove(terra_core::field_data::keys::LOOSE_SEDIMENT);
         }
         self.aux.insert(canonical, field);
+    }
+
+    fn begin_aux_write_capture(&mut self) {
+        self.aux_write_capture = Some(HashMap::new());
+    }
+
+    fn take_aux_write_capture(&mut self) -> HashMap<String, Option<MaskField>> {
+        self.aux_write_capture.take().unwrap_or_default()
     }
 
     /// Replace string aux and rebuild typed maps (worker / scheduler ingest).
@@ -886,25 +904,33 @@ impl StackEvaluator {
 
         let scaled_layer = layer_with_world_scale(layer, ctx.level_steps.world_scale);
         let mut bound_layer = apply_param_bindings(ctx, &scaled_layer);
+        let scope_aux = !bound_layer.common.masks.is_empty() || bound_layer.common.opacity < 1.0;
+        if scope_aux {
+            ctx.begin_aux_write_capture();
+        }
         // SculptStrokes takes the prefix-cached whole-field path (#123): an edit
         // resumes an earlier stamp instead of re-stamping the whole stroke set.
         // Every other kind dispatches through the stateless registry as before.
-        let generated = match &bound_layer.kind {
+        let generated_result = match &bound_layer.kind {
             terra_core::layer::LayerKind::SculptStrokes(p) => {
-                self.eval_sculpt_strokes_cached(ctx, input, p, layer.id())?
+                self.eval_sculpt_strokes_cached(ctx, input, p, layer.id())
             }
-            _ => self.registry.evaluate(ctx, input, &bound_layer)?,
+            _ => self.registry.evaluate(ctx, input, &bound_layer),
         };
+        let aux_writes = scope_aux.then(|| ctx.take_aux_write_capture());
+        let generated = generated_result?;
         // Avoid unused-mut warning if future passes mutate further.
         let _ = &mut bound_layer;
         let mask = effective_layer_mask(ctx, &bound_layer, input);
-        // Gate materials / vegetation aux by local placement (Biome × Local at group+layer).
-        if matches!(
-            layer.kind,
-            terra_core::layer::LayerKind::Materials(_)
-                | terra_core::layer::LayerKind::Vegetation(_)
-        ) {
-            gate_aux_by_mask(ctx, &mask);
+        if let Some(aux_writes) = aux_writes {
+            scope_aux_writes(
+                ctx,
+                &aux_writes,
+                &mask,
+                bound_layer.common.opacity,
+                None,
+                None,
+            );
         }
         let mut out = input.clone();
         let w = input.metrics.width;
@@ -914,7 +940,13 @@ impl StackEvaluator {
                 let hin = input.get(i, j);
                 let hlayer = generated.get(i, j);
                 let m = mask.get(i, j);
-                let v = blend_heights(layer.common.blend, hin, hlayer, layer.common.opacity, m);
+                let v = blend_heights(
+                    layer.common.blend,
+                    hin,
+                    hlayer,
+                    bound_layer.common.opacity,
+                    m,
+                );
                 out.set(i, j, v);
             }
         }
@@ -996,8 +1028,23 @@ impl StackEvaluator {
 
         let scaled_layer = layer_with_world_scale(layer, ctx.level_steps.world_scale);
         let bound_layer = apply_param_bindings(ctx, &scaled_layer);
-        let generated = self.generate_scoped(ctx, input, &bound_layer, scope)?;
+        // Even an unmasked layer needs write capture here: a tile-scoped rebuild
+        // must preserve the cached composite on clean tiles while replacing only
+        // dirty tile interiors.
+        ctx.begin_aux_write_capture();
+        let generated_result = self.generate_scoped(ctx, input, &bound_layer, scope);
+        let aux_writes = ctx.take_aux_write_capture();
+        let generated = generated_result?;
         let mask = effective_layer_mask(ctx, &bound_layer, input);
+        let cached_aux = self.cache.get(layer.id()).map(|cached| &cached.aux);
+        scope_aux_writes(
+            ctx,
+            &aux_writes,
+            &mask,
+            bound_layer.common.opacity,
+            Some(scope),
+            cached_aux,
+        );
 
         let mut out = prev;
         for &id in scope {
@@ -1015,7 +1062,13 @@ impl StackEvaluator {
                     let hin = input.get(i, j);
                     let hlayer = generated.get(i, j);
                     let m = mask.get(i, j);
-                    let v = blend_heights(layer.common.blend, hin, hlayer, layer.common.opacity, m);
+                    let v = blend_heights(
+                        layer.common.blend,
+                        hin,
+                        hlayer,
+                        bound_layer.common.opacity,
+                        m,
+                    );
                     out.set(i, j, v);
                 }
             }
@@ -1718,6 +1771,92 @@ fn mask_at(mask: &MaskField, target: HeightfieldMetrics) -> std::borrow::Cow<'_,
     }
 }
 
+#[inline]
+fn composite_aux_sample(
+    class: terra_core::field_data::ChannelClass,
+    parent: f32,
+    child: f32,
+    weight: f32,
+) -> f32 {
+    use terra_core::field_data::ChannelClass;
+    match class {
+        ChannelClass::Weight => (parent * (1.0 - weight) + child * weight).clamp(0.0, 1.0),
+        ChannelClass::Metric => parent * (1.0 - weight) + child * weight,
+        ChannelClass::Categorical => {
+            if weight >= 0.5 {
+                child
+            } else {
+                parent
+            }
+        }
+    }
+}
+
+/// Composite the aux channels written by one layer under its effective weight.
+///
+/// `scope == None` updates the whole field. A tile scope seeds clean texels from
+/// `cached`, then replaces only dirty tile interiors so incremental evaluation
+/// remains equivalent to a cold whole-field pass.
+fn scope_aux_writes(
+    ctx: &mut EvalContext,
+    before: &HashMap<String, Option<MaskField>>,
+    mask: &MaskField,
+    opacity: f32,
+    scope: Option<&[TileId]>,
+    cached: Option<&HashMap<String, MaskField>>,
+) {
+    use terra_core::field_data::{channel_class, keys};
+
+    let metrics = ctx.metrics;
+    let mask = mask_at(mask, metrics);
+    for (key, prior) in before {
+        if key == keys::SLOPE || key == keys::CURVATURE {
+            continue;
+        }
+        let Some(after) = ctx.aux_maps.get(key).cloned() else {
+            continue;
+        };
+        let after = after.into_resampled_nearest(metrics);
+        let prior = prior
+            .clone()
+            .map(|field| field.into_resampled_nearest(metrics));
+        let mut out = scope
+            .and_then(|_| cached.and_then(|maps| maps.get(key)).cloned())
+            .map(|field| field.into_resampled_nearest(metrics))
+            .unwrap_or_else(|| after.clone());
+        let class = channel_class(key);
+
+        let mut composite_at = |i: u32, j: u32| {
+            let weight = (mask.get(i, j) * opacity).clamp(0.0, 1.0);
+            let parent = prior.as_ref().map_or(0.0, |field| field.get(i, j));
+            let value = composite_aux_sample(class, parent, after.get(i, j), weight);
+            let index = (j * metrics.width + i) as usize;
+            out.data_mut()[index] = value;
+        };
+
+        if let Some(tiles) = scope {
+            for &tile in tiles {
+                let x0 = tile.tx.saturating_mul(metrics.tile_size);
+                let y0 = tile.tz.saturating_mul(metrics.tile_size);
+                let x1 = x0.saturating_add(metrics.tile_size).min(metrics.width);
+                let y1 = y0.saturating_add(metrics.tile_size).min(metrics.height);
+                for j in y0..y1 {
+                    for i in x0..x1 {
+                        composite_at(i, j);
+                    }
+                }
+            }
+        } else {
+            for j in 0..metrics.height {
+                for i in 0..metrics.width {
+                    composite_at(i, j);
+                }
+            }
+        }
+        ctx.aux_insert(key, out);
+    }
+}
+
 /// Merge child aux maps into the parent context, weighted by the group mask.
 fn merge_aux_masked(
     ctx: &mut EvalContext,
@@ -1730,6 +1869,7 @@ fn merge_aux_masked(
     let mask = mask_at(mask, ctx.metrics);
     let child_map = child.to_hashmap();
     for (key, child_field) in child_map {
+        let class = terra_core::field_data::channel_class(&key);
         let child_field = child_field.into_resampled_nearest(ctx.metrics);
         let mut out = ctx
             .aux_maps
@@ -1740,8 +1880,9 @@ fn merge_aux_masked(
         for j in 0..ctx.metrics.height {
             for i in 0..ctx.metrics.width {
                 let w = (mask.get(i, j) * opacity).clamp(0.0, 1.0);
-                let v = out.get(i, j) * (1.0 - w) + child_field.get(i, j) * w;
-                out.set(i, j, v);
+                let v = composite_aux_sample(class, out.get(i, j), child_field.get(i, j), w);
+                let index = (j * ctx.metrics.width + i) as usize;
+                out.data_mut()[index] = v;
             }
         }
         ctx.aux_insert(key, out);
@@ -1835,38 +1976,6 @@ fn height_fingerprint(h: &Heightfield) -> u64 {
         j += step_j;
     }
     state
-}
-
-/// Multiply recent materials / vegetation aux fields by a placement mask.
-fn gate_aux_by_mask(ctx: &mut EvalContext, mask: &MaskField) {
-    use terra_core::field_data::keys;
-    let mul = |field: &mut MaskField| {
-        // Match the mask to this field's grid so `get` stays in-range by local
-        // construction rather than depending on the producer's metrics (#94).
-        let mask = mask_at(mask, field.metrics);
-        let w = field.metrics.width;
-        let h = field.metrics.height;
-        for j in 0..h {
-            for i in 0..w {
-                let v = field.get(i, j) * mask.get(i, j);
-                field.set(i, j, v);
-            }
-        }
-    };
-    for slot in [
-        &mut ctx.aux_maps.materials,
-        &mut ctx.aux_maps.hardness,
-        &mut ctx.aux_maps.vegetation,
-    ] {
-        if let Some(field) = slot.as_mut() {
-            mul(field);
-        }
-    }
-    for key in [keys::MATERIALS, keys::HARDNESS, keys::VEGETATION] {
-        if let Some(field) = ctx.aux.get_mut(key) {
-            mul(field);
-        }
-    }
 }
 
 #[cfg(test)]
@@ -2001,30 +2110,123 @@ mod tests {
         set
     }
 
-    /// #94: gating an 8x8 aux field with a 4x4 mask must not panic (raw
-    /// `mask.get(4, 3)` indexed 16 == len before the clamp/resample) and must
-    /// keep the mask world-aligned. Reverting the `mask_at` guard fails this.
+    fn raw_field(metrics: HeightfieldMetrics, value: f32) -> MaskField {
+        MaskField::from_raw(
+            metrics,
+            &vec![value; (metrics.width * metrics.height) as usize],
+        )
+    }
+
     #[test]
-    fn gate_aux_by_mask_survives_smaller_mask() {
+    fn scoped_aux_writes_respect_channel_classes_at_thresholds() {
+        use terra_core::field_data::keys;
+        let metrics = HeightfieldMetrics::new(3, 1, 30.0, 10.0);
+        let mut ctx = EvalContext::new(metrics);
+        let mut before = HashMap::new();
+        for (key, parent, child) in [
+            (keys::BEDROCK_HEIGHT, 100.0, 250.0),
+            (keys::MATERIALS, 2.0, 3.0),
+            (keys::WETNESS, 0.2, 0.8),
+        ] {
+            before.insert(key.to_string(), Some(raw_field(metrics, parent)));
+            ctx.aux_insert(key, raw_field(metrics, child));
+        }
+        let mask = MaskField::from_raw(metrics, &[1.0, 0.4, 0.6]);
+
+        scope_aux_writes(&mut ctx, &before, &mask, 1.0, None, None);
+
+        let bedrock = ctx.aux_maps.get(keys::BEDROCK_HEIGHT).unwrap();
+        assert_eq!(bedrock.data(), &[250.0, 160.0, 190.0]);
+        let materials = ctx.aux_maps.get(keys::MATERIALS).unwrap();
+        assert_eq!(materials.data(), &[3.0, 2.0, 3.0]);
+        let wetness = ctx.aux_maps.get(keys::WETNESS).unwrap();
+        for (actual, expected) in wetness.data().iter().zip([0.8, 0.44, 0.56]) {
+            assert!((actual - expected).abs() < 1.0e-6, "{actual} != {expected}");
+        }
+    }
+
+    #[test]
+    fn scoped_aux_writes_resample_foreign_grids_without_clamping_metrics() {
         use terra_core::field_data::keys;
         let metrics = HeightfieldMetrics::new(8, 8, 80.0, 80.0);
+        let small = HeightfieldMetrics::new(4, 4, 80.0, 80.0);
         let mut ctx = EvalContext::new(metrics);
-        ctx.aux_insert(keys::MATERIALS, MaskField::ones(metrics));
+        ctx.aux_insert(keys::BEDROCK_HEIGHT, raw_field(small, 250.0));
+        let mut before = HashMap::new();
+        before.insert(
+            keys::BEDROCK_HEIGHT.to_string(),
+            Some(raw_field(small, 100.0)),
+        );
+        let mask = MaskField::ones(small);
 
-        // Half-resolution mask: left half 0, right half 1.
-        let mut mask = MaskField::zeros(HeightfieldMetrics::new(4, 4, 80.0, 80.0));
-        for j in 0..4 {
-            for i in 2..4 {
-                mask.set(i, j, 1.0);
-            }
+        scope_aux_writes(&mut ctx, &before, &mask, 1.0, None, None);
+
+        let field = ctx.aux_maps.get(keys::BEDROCK_HEIGHT).unwrap();
+        assert_eq!(field.metrics.width, 8);
+        assert!(field.data().iter().all(|&value| value == 250.0));
+    }
+
+    #[test]
+    fn group_aux_merge_respects_channel_classes_at_thresholds() {
+        use terra_core::field_data::keys;
+        let metrics = HeightfieldMetrics::new(3, 1, 30.0, 10.0);
+        let mut ctx = EvalContext::new(metrics);
+        ctx.aux_insert(keys::BEDROCK_HEIGHT, raw_field(metrics, 100.0));
+        ctx.aux_insert(keys::MATERIALS, raw_field(metrics, 2.0));
+        ctx.aux_insert(keys::WETNESS, raw_field(metrics, 0.2));
+        let mut child = AuxMaps::new();
+        child.insert(keys::BEDROCK_HEIGHT, raw_field(metrics, 250.0));
+        child.insert(keys::MATERIALS, raw_field(metrics, 3.0));
+        child.insert(keys::WETNESS, raw_field(metrics, 0.8));
+        let mask = MaskField::from_raw(metrics, &[1.0, 0.4, 0.6]);
+
+        merge_aux_masked(&mut ctx, &child, &mask, 1.0);
+
+        assert_eq!(
+            ctx.aux_maps.get(keys::BEDROCK_HEIGHT).unwrap().data(),
+            &[250.0, 160.0, 190.0]
+        );
+        assert_eq!(
+            ctx.aux_maps.get(keys::MATERIALS).unwrap().data(),
+            &[3.0, 2.0, 3.0]
+        );
+        let wetness = ctx.aux_maps.get(keys::WETNESS).unwrap();
+        for (actual, expected) in wetness.data().iter().zip([0.8, 0.44, 0.56]) {
+            assert!((actual - expected).abs() < 1.0e-6, "{actual} != {expected}");
         }
+    }
 
-        gate_aux_by_mask(&mut ctx, &mask);
+    #[test]
+    fn masked_layer_runtime_uses_categorical_winner_take_all() {
+        use terra_core::field_data::keys;
+        use terra_core::layer::BiomesParams;
 
-        let gated = ctx.aux.get(keys::MATERIALS).expect("materials aux present");
-        assert_eq!(gated.metrics.width, 8);
-        assert_eq!(gated.get(0, 0), 0.0, "left half gated off");
-        assert_eq!(gated.get(7, 7), 1.0, "right half kept, world-aligned");
+        let evaluate = |opacity: f32| {
+            let mut lower_params = BiomesParams::height_bands();
+            for band in &mut lower_params.bands {
+                band.id = 2;
+            }
+            let mut upper_params = BiomesParams::height_bands();
+            for band in &mut upper_params.bands {
+                band.id = 3;
+            }
+            let mut upper = Layer::new("Upper biomes", LayerKind::Biomes(upper_params));
+            upper.common.opacity = opacity;
+            let mut stack = LayerStack::new();
+            stack.push(Layer::new(
+                "Base",
+                LayerKind::Flat(FlatParams { height: 50.0 }),
+            ));
+            stack.push(Layer::new("Lower biomes", LayerKind::Biomes(lower_params)));
+            stack.push(upper);
+            let metrics = HeightfieldMetrics::new(4, 4, 40.0, 40.0);
+            let mut ctx = EvalContext::new(metrics);
+            StackEvaluator::new().rebuild_all(&stack, &mut ctx).unwrap();
+            ctx.aux_maps.get(keys::BIOMES).unwrap().get(0, 0)
+        };
+
+        assert_eq!(evaluate(0.4), 2.0 / 16.0);
+        assert_eq!(evaluate(0.6), 3.0 / 16.0);
     }
 
     /// #94: `merge_aux_masked` raw-indexes three cross-context fields (mask,

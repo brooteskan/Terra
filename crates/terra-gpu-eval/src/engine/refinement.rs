@@ -78,11 +78,7 @@ impl GpuTerrainEngine {
             {
                 if output_fields.iter().any(|field| {
                     plan.analysis().field_is_live(*field)
-                        && plan.analysis().consumers(*field).iter().any(|consumer| {
-                            !plan.operation(*consumer).is_some_and(|operation| {
-                                matches!(operation.kind, TerrainOpKind::PublishOutput { .. })
-                            })
-                        })
+                        && super::compiled_plan::auxiliary_value_is_observed(plan, *field)
                 }) {
                     return Err(cpu_required(
                         GpuFallbackCode::AuxiliaryDependency,

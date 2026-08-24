@@ -865,10 +865,12 @@ fn group_aux_composite_merges_only_declared_fields() {
         .iter()
         .find_map(|operation| match &operation.kind {
             TerrainOpKind::CompositeAuxField {
-                group,
+                owner,
                 mask,
                 composite,
-            } if *group == group_id && plan.analysis().field_is_live(composite.output) => {
+            } if *owner == terra_core::deps::NodeRef::Group(group_id)
+                && plan.analysis().field_is_live(composite.output) =>
+            {
                 Some((composite.parent, composite.child, *mask, composite.output))
             }
             _ => None,
@@ -880,35 +882,45 @@ fn group_aux_composite_merges_only_declared_fields() {
         .realize(&gpu.device, &plan, GpuPlanResourceKey::new(64, 4, 1))
         .expect("resources");
     let operations = GpuPlanOperations::new(&gpu.device);
-    let mut encoder = gpu
-        .device
-        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("compiled-plan-aux-test"),
-        });
-    operations
-        .fill_field(&gpu.device, &mut encoder, resources, parent, 2.0)
-        .unwrap();
-    operations
-        .fill_field(&gpu.device, &mut encoder, resources, child, 10.0)
-        .unwrap();
-    operations
-        .fill_field(&gpu.device, &mut encoder, resources, mask, 0.25)
-        .unwrap();
-    operations
-        .composite_aux(
-            &gpu.device,
-            &mut encoder,
-            resources,
-            Some(parent),
-            child,
-            mask,
-            output,
-            0.5,
-        )
-        .unwrap();
-    gpu.queue.submit(Some(encoder.finish()));
-    let values = read_field(gpu, resources, output);
-    assert!(values.iter().all(|value| (*value - 3.0).abs() <= 1.0e-5));
+    let run = |parent_value, child_value, mask_value, channel_class| {
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("compiled-plan-aux-test"),
+            });
+        operations
+            .fill_field(&gpu.device, &mut encoder, resources, parent, parent_value)
+            .unwrap();
+        operations
+            .fill_field(&gpu.device, &mut encoder, resources, child, child_value)
+            .unwrap();
+        operations
+            .fill_field(&gpu.device, &mut encoder, resources, mask, mask_value)
+            .unwrap();
+        operations
+            .composite_aux(
+                &gpu.device,
+                &mut encoder,
+                resources,
+                Some(parent),
+                child,
+                mask,
+                output,
+                1.0,
+                channel_class,
+            )
+            .unwrap();
+        gpu.queue.submit(Some(encoder.finish()));
+        read_field(gpu, resources, output)[0]
+    };
+
+    use terra_core::field_data::ChannelClass;
+    assert!((run(100.0, 250.0, 1.0, ChannelClass::Metric) - 250.0).abs() <= 1.0e-5);
+    assert!((run(100.0, 250.0, 0.4, ChannelClass::Metric) - 160.0).abs() <= 1.0e-5);
+    assert_eq!(run(2.0, 3.0, 0.4, ChannelClass::Categorical), 2.0);
+    assert_eq!(run(2.0, 3.0, 0.6, ChannelClass::Categorical), 3.0);
+    assert!((run(0.2, 0.8, 0.4, ChannelClass::Weight) - 0.44).abs() <= 1.0e-5);
+    assert_eq!(run(0.8, 2.0, 1.0, ChannelClass::Weight), 1.0);
 }
 
 fn read_field(

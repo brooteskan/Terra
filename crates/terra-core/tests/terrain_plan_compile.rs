@@ -243,13 +243,49 @@ fn isolated_auxiliary_outputs_cross_the_group_only_through_explicit_merges() {
         .operations()
         .iter()
         .find_map(|operation| match &operation.kind {
-            TerrainOpKind::CompositeAuxField { composite, .. } => Some(composite),
+            TerrainOpKind::CompositeAuxField {
+                owner: NodeRef::Group(group),
+                composite,
+                ..
+            } if *group == LayerId::from_u128(64) => Some(composite),
             _ => None,
         })
         .expect("isolated group composite");
     assert!(aux.parent.is_none());
     assert!(plan.provenance().producer_of(aux.output).is_some());
     assert!(!plan.analysis().field_is_live(aux.output));
+}
+
+#[test]
+fn layer_auxiliary_outputs_are_composited_before_publication() {
+    let mut lower = Layer::new("Lower biomes", LayerKind::Biomes(BiomesParams::default()));
+    lower.common.id = LayerId::from_u128(66);
+    let mut upper = Layer::new("Upper biomes", LayerKind::Biomes(BiomesParams::default()));
+    upper.common.id = LayerId::from_u128(67);
+    upper.common.opacity = 0.4;
+    let mut stack = LayerStack::new();
+    stack.push(lower);
+    stack.push(upper);
+
+    let plan = compile_terrain_plan(&stack, &[], stamp()).expect("layer aux plan");
+    let composite = plan
+        .operations()
+        .iter()
+        .find_map(|operation| match &operation.kind {
+            TerrainOpKind::CompositeAuxField {
+                owner: NodeRef::Layer(layer),
+                composite,
+                ..
+            } if *layer == LayerId::from_u128(67) && composite.field == FieldId::Biomes => {
+                Some(composite)
+            }
+            _ => None,
+        })
+        .expect("upper layer biome composite");
+
+    assert!(composite.parent.is_some());
+    assert_ne!(composite.child, composite.output);
+    assert!(plan.provenance().producer_of(composite.output).is_some());
 }
 
 #[test]
