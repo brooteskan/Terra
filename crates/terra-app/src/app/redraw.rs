@@ -44,6 +44,7 @@ impl PendingUiEffects {
             || out.camera_frame_selection
             || out.request_cancel_build
             || out.request_retry_evaluation
+            || out.request_retry_terrain_pipeline
             || out.request_full_build
             || out.request_save_bookmark
             || out.request_save_bookmark_slot.is_some()
@@ -736,6 +737,9 @@ impl TerraApp {
                     self.worker_dirty_from = None;
                     self.worker_dirty_region = None;
                     self.request_rebuild();
+                }
+                if ui_out.request_retry_terrain_pipeline {
+                    self.retry_infinite_pipeline_compile();
                 }
                 if ui_out.request_save_bookmark {
                     let slot = self

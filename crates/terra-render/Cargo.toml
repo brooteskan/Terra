@@ -17,9 +17,9 @@ thiserror = { workspace = true }
 image = { workspace = true }
 log = { workspace = true }
 profiling = { workspace = true }
+naga = { version = "24.0.0", features = ["wgsl-in"] }
 
 [dev-dependencies]
-naga = { version = "24.0.0", features = ["wgsl-in"] }
 pollster = { workspace = true }
 terra-test-gpu = { workspace = true }
 

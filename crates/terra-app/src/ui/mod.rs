@@ -107,6 +107,18 @@ pub struct EvaluationFailureStatus {
     pub worker_restarted: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum TerrainPipelineStatus {
+    #[default]
+    Idle,
+    Pending {
+        label: &'static str,
+    },
+    Failed {
+        message: String,
+    },
+}
+
 /// Cached compatibility of the current compiled graph with Infinite sparse
 /// evaluation. Updated at the same plan-admission boundary used by scheduling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -201,6 +213,8 @@ pub struct UiState {
     pub status: String,
     /// Persistent evaluation failure; cleared only by a successful current build or reset.
     pub evaluation_failure: Option<EvaluationFailureStatus>,
+    /// Asynchronous terrain-variant compilation, independent of terrain evaluation.
+    pub terrain_pipeline_status: TerrainPipelineStatus,
     /// Derived, non-serialized Infinite graph admission status.
     pub infinite_spatial_status: Option<InfiniteSpatialStatus>,
     /// Whether the visible terrain is the complete stack or a truthful local
@@ -1609,6 +1623,8 @@ pub struct FrameUiOutput {
     pub request_cancel_build: bool,
     /// Retry after a persistent evaluation failure.
     pub request_retry_evaluation: bool,
+    /// Retry a failed Infinite renderer pipeline compilation.
+    pub request_retry_terrain_pipeline: bool,
     /// Force a full-quality rebuild (EXPORT button).
     pub request_full_build: bool,
     /// Save the current camera into the next free bookmark slot.

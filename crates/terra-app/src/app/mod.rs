@@ -10,6 +10,7 @@ mod input;
 mod lifecycle;
 mod logical_frame;
 mod paint;
+mod pipeline_compile;
 pub mod prefs;
 mod project;
 mod redraw;
@@ -215,6 +216,9 @@ pub struct TerraApp {
     /// engine, GUI) shares clones of this instead of sourcing device/queue
     /// through the renderer.
     gpu: Option<terra_render::GpuContext>,
+    pipeline_compile: pipeline_compile::TerrainPipelineCompileCoordinator,
+    project_generation: u64,
+    device_generation: u64,
     session: EditorSession,
     ui_state: UiState,
     scheduler: EvalScheduler,
@@ -451,6 +455,7 @@ impl Default for TerraApp {
         jobs.register(|app| &mut app.exporter);
         jobs.register(|app| &mut app.project_io);
         jobs.register(|app| &mut app.tool_thumbs);
+        jobs.register(|app| &mut app.pipeline_compile);
         Self {
             runtime_event_proxy: None,
             window: None,
@@ -458,6 +463,9 @@ impl Default for TerraApp {
             renderer: None,
             editor_overlays: None,
             gpu: None,
+            pipeline_compile: pipeline_compile::TerrainPipelineCompileCoordinator::default(),
+            project_generation: 0,
+            device_generation: 0,
             session,
             ui_state,
             scheduler: EvalScheduler::new(),

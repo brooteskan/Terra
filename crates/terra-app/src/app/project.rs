@@ -378,6 +378,10 @@ impl TerraApp {
         use terra_core::command::CommandHistory;
         document.normalize_wc_tree();
 
+        self.project_generation = self.project_generation.wrapping_add(1);
+        self.pipeline_compile.cancel_all();
+        self.ui_state.terrain_pipeline_status = crate::ui::TerrainPipelineStatus::Idle;
+
         // Cancel any in-flight eval for the previous document before swapping state.
         self.eval_token = self.eval_token.wrapping_add(1);
         self.eval_worker.set_token(self.eval_token);
@@ -399,7 +403,7 @@ impl TerraApp {
         self.screen = AppScreen::Editor;
         self.pending_project_action = None;
 
-        self.reset_runtime_for_document(&project_world, ocean);
+        let presentation_ready = self.reset_runtime_for_document(&project_world, ocean);
         self.apply_document_lighting();
 
         // Editor chrome starts minimized on create/open.
@@ -412,7 +416,13 @@ impl TerraApp {
         self.inspector_gui.reset_expand_for_project();
 
         self.mark_all_layers_dirty();
-        self.request_rebuild_immediate();
+        if presentation_ready {
+            self.request_rebuild_immediate();
+        } else {
+            self.pending_eval = false;
+            self.pending_eval_immediate = false;
+            self.ui_state.status = "Compiling Infinite terrain renderer…".into();
+        }
         self.refresh_window_title();
         self.request_app_frame(FrameRequestReason::RequiredEvaluation);
     }
@@ -423,7 +433,7 @@ impl TerraApp {
         &mut self,
         project_world: &terra_core::document::ProjectWorld,
         ocean_level: Option<f32>,
-    ) {
+    ) -> bool {
         self.ui_state.profile.infinite_streaming = Default::default();
         self.supersede_gpu_refinement();
         self.last_height = None;
@@ -557,25 +567,173 @@ impl TerraApp {
                 engine.reset_project_state(&gpu.device, &gpu.queue);
             }
         }
+        let mut compile_request = None;
+        let mut presentation_ready = true;
         if let Some(renderer) = self.renderer.as_mut() {
-            renderer.reset_project_state(world_size, ocean_level, traversal_mode);
-            if let Some((topology, horizon_m, preview_radius)) = infinite_frame {
-                renderer.configure_infinite_presentation(
-                    terra_render::InfinitePresentationConfig {
-                        topology,
-                        horizon_m,
-                    },
+            let requested_variant = if infinite_frame.is_some() {
+                terra_render::TerrainShaderVariant::Infinite
+            } else {
+                terra_render::TerrainShaderVariant::Bounded
+            };
+            if renderer.has_pipeline_variant(requested_variant) {
+                if let Err(error) = renderer.activate_pipeline_variant(requested_variant) {
+                    self.ui_state.status = error;
+                }
+                renderer.reset_project_state(world_size, ocean_level, traversal_mode);
+                if let Some((topology, horizon_m, preview_radius)) = infinite_frame {
+                    renderer.configure_infinite_presentation(
+                        terra_render::InfinitePresentationConfig {
+                            topology,
+                            horizon_m,
+                        },
+                    );
+                    renderer.frame_camera_to_infinite(
+                        topology.origin.x_m(),
+                        topology.origin.z_m(),
+                        preview_radius,
+                    );
+                }
+            } else {
+                presentation_ready = false;
+                let _ =
+                    renderer.activate_pipeline_variant(terra_render::TerrainShaderVariant::Bounded);
+                // Keep a neutral, bounded placeholder until the matching bundle
+                // is installed. Infinite traversal must not become active early.
+                renderer.reset_project_state(
+                    world_size,
+                    None,
+                    terra_render::TerrainTraversalMode::Bounded,
                 );
-                renderer.frame_camera_to_infinite(
-                    topology.origin.x_m(),
-                    topology.origin.z_m(),
-                    preview_radius,
-                );
+                compile_request = Some(renderer.terrain_pipeline_compiler());
             }
+        }
+        if let Some(compiler) = compile_request {
+            let request = super::pipeline_compile::TerrainPipelineRequest {
+                variant: terra_render::TerrainShaderVariant::Infinite,
+                project_generation: self.project_generation,
+                device_generation: self.device_generation,
+            };
+            self.pipeline_compile.request(request, compiler);
+            self.ui_state.terrain_pipeline_status = crate::ui::TerrainPipelineStatus::Pending {
+                label: terra_render::TerrainShaderVariant::Infinite.shader_label(),
+            };
         }
         // Preserve the GPU allocation, but make all previous-document pages
         // unreachable and stop streaming until the new document re-syncs.
         self.retire_streamed_residency();
+        presentation_ready
+    }
+
+    pub(crate) fn drain_pipeline_compile(&mut self) {
+        use super::pipeline_compile::TerrainPipelineCompileStatus;
+
+        let status = self.pipeline_compile.status().clone();
+        match status {
+            TerrainPipelineCompileStatus::Idle => {}
+            TerrainPipelineCompileStatus::Pending(request) => {
+                self.ui_state.terrain_pipeline_status = crate::ui::TerrainPipelineStatus::Pending {
+                    label: request.variant.shader_label(),
+                };
+            }
+            TerrainPipelineCompileStatus::Failed { message, .. } => {
+                self.ui_state.terrain_pipeline_status =
+                    crate::ui::TerrainPipelineStatus::Failed { message };
+            }
+        }
+
+        let Some(completion) = self.pipeline_compile.take_completion() else {
+            return;
+        };
+        if !completion.request.matches_live(
+            terra_render::TerrainShaderVariant::Infinite,
+            self.project_generation,
+            self.device_generation,
+        ) {
+            log::info!("discarding stale Infinite terrain pipeline completion");
+            return;
+        }
+        let Some(settings) = self.session.document.infinite_settings().cloned() else {
+            log::info!("discarding Infinite pipeline completion for a bounded project");
+            return;
+        };
+        let bundle = match completion.result {
+            Ok(bundle) => bundle,
+            Err(message) => {
+                log::error!("Infinite terrain pipeline compilation failed: {message}");
+                self.ui_state.terrain_pipeline_status =
+                    crate::ui::TerrainPipelineStatus::Failed { message };
+                self.request_app_frame(FrameRequestReason::Completion);
+                return;
+            }
+        };
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        if let Err(error) = renderer.install_pipeline_bundle(bundle) {
+            log::error!("Infinite terrain pipeline installation failed: {error}");
+            self.ui_state.terrain_pipeline_status =
+                crate::ui::TerrainPipelineStatus::Failed { message: error };
+            return;
+        }
+        if let Err(error) =
+            renderer.activate_pipeline_variant(terra_render::TerrainShaderVariant::Infinite)
+        {
+            self.ui_state.terrain_pipeline_status =
+                crate::ui::TerrainPipelineStatus::Failed { message: error };
+            return;
+        }
+        let topology = match settings.topology() {
+            Ok(topology) => topology.config(),
+            Err(error) => {
+                self.ui_state.terrain_pipeline_status = crate::ui::TerrainPipelineStatus::Failed {
+                    message: error.to_string(),
+                };
+                return;
+            }
+        };
+        let local_span = (settings.horizon_m * 2.0).clamp(1.0, f64::from(f32::MAX)) as f32;
+        let ocean =
+            Some(self.session.document.blueprint.sea_level).filter(|value| value.is_finite());
+        renderer.reset_project_state(
+            (local_span, local_span),
+            ocean,
+            terra_render::TerrainTraversalMode::Infinite,
+        );
+        renderer.configure_infinite_presentation(terra_render::InfinitePresentationConfig {
+            topology,
+            horizon_m: settings.horizon_m,
+        });
+        renderer.frame_camera_to_infinite(
+            topology.origin.x_m(),
+            topology.origin.z_m(),
+            settings.preview_radius_m as f32,
+        );
+        self.ui_state.terrain_pipeline_status = crate::ui::TerrainPipelineStatus::Idle;
+        self.ui_state.status = "Infinite terrain renderer ready".into();
+        self.mark_all_layers_dirty();
+        self.request_rebuild_immediate();
+        self.request_app_frame(FrameRequestReason::Completion);
+    }
+
+    pub(crate) fn retry_infinite_pipeline_compile(&mut self) {
+        if self.session.document.infinite_settings().is_none() {
+            return;
+        }
+        let Some(renderer) = self.renderer.as_ref() else {
+            return;
+        };
+        let request = super::pipeline_compile::TerrainPipelineRequest {
+            variant: terra_render::TerrainShaderVariant::Infinite,
+            project_generation: self.project_generation,
+            device_generation: self.device_generation,
+        };
+        self.pipeline_compile
+            .request(request, renderer.terrain_pipeline_compiler());
+        self.ui_state.terrain_pipeline_status = crate::ui::TerrainPipelineStatus::Pending {
+            label: terra_render::TerrainShaderVariant::Infinite.shader_label(),
+        };
+        self.ui_state.status = "Retrying Infinite terrain renderer…".into();
+        self.request_app_frame(FrameRequestReason::UiActions);
     }
 
     pub(crate) fn close_project(&mut self) {
@@ -587,12 +745,15 @@ impl TerraApp {
         self.pending_eval_immediate = false;
         self.worker_refine_pending = false;
         self.force_draft = false;
+        self.project_generation = self.project_generation.wrapping_add(1);
+        self.pipeline_compile.cancel_all();
+        self.ui_state.terrain_pipeline_status = crate::ui::TerrainPipelineStatus::Idle;
         self.session = EditorSession::new();
         self.session.history = CommandHistory::default();
         self.project_path = None;
         self.document_dirty = false;
         let project_world = self.session.document.world.clone();
-        self.reset_runtime_for_document(&project_world, None);
+        let _ = self.reset_runtime_for_document(&project_world, None);
         self.pending_project_action = None;
         self.screen = AppScreen::Home;
         self.ui_state.status = String::new();

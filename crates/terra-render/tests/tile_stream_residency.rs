@@ -8,8 +8,9 @@ use terra_core::{
 };
 use terra_gpu::GpuTileAtlas;
 use terra_render::{
-    GpuContext, InfinitePresentationConfig, TerrainRenderer, TerrainTerminalFallback,
-    TerrainTileStreamResources, TerrainTraversalMode, ViewportRendererMode,
+    GpuContext, InfinitePresentationConfig, TerrainRenderer, TerrainShaderVariant,
+    TerrainTerminalFallback, TerrainTileStreamResources, TerrainTraversalMode,
+    ViewportRendererMode,
 };
 
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
@@ -21,6 +22,25 @@ fn renderer(ctx: &GpuContext, height: &Heightfield) -> TerrainRenderer {
     renderer.set_renderer_mode(ViewportRendererMode::Raster);
     renderer.upload_heightfield(height);
     renderer
+}
+
+fn install_infinite_pipeline(renderer: &mut TerrainRenderer) {
+    let bundle = renderer
+        .terrain_pipeline_compiler()
+        .compile(TerrainShaderVariant::Infinite)
+        .expect("compile Infinite terrain bundle");
+    renderer
+        .install_pipeline_bundle(bundle)
+        .expect("install Infinite terrain bundle");
+    assert_eq!(
+        renderer.active_pipeline_variant(),
+        TerrainShaderVariant::Bounded
+    );
+    assert!(renderer.has_pipeline_variant(TerrainShaderVariant::Bounded));
+    assert!(renderer.has_pipeline_variant(TerrainShaderVariant::Infinite));
+    renderer
+        .activate_pipeline_variant(TerrainShaderVariant::Infinite)
+        .expect("activate Infinite terrain bundle");
 }
 
 fn differing_pixels(left: &terra_test_gpu::Pixels, right: &terra_test_gpu::Pixels) -> usize {
@@ -288,6 +308,7 @@ fn infinite_sparse_page_renders_at_large_signed_coordinates() {
         .unwrap();
 
     let mut renderer = TerrainRenderer::new_headless(&ctx, W, H);
+    install_infinite_pipeline(&mut renderer);
     renderer.set_renderer_mode(ViewportRendererMode::Raster);
     renderer.reset_project_state((64.0, 64.0), None, TerrainTraversalMode::Infinite);
     renderer.configure_infinite_presentation(InfinitePresentationConfig {
@@ -453,6 +474,7 @@ fn infinite_default_horizon_draws_complete_multiring_coverage() {
     }
 
     let mut renderer = TerrainRenderer::new_headless(&ctx, W, H);
+    install_infinite_pipeline(&mut renderer);
     renderer.set_renderer_mode(ViewportRendererMode::Raster);
     renderer.reset_project_state((32_768.0, 32_768.0), None, TerrainTraversalMode::Infinite);
     renderer.configure_infinite_presentation(InfinitePresentationConfig {

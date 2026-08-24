@@ -51,6 +51,8 @@ pub mod scene_versions;
 pub mod shadows;
 pub mod staging;
 pub mod terrain_mesh;
+mod terrain_pipeline;
+mod terrain_shader;
 pub mod vegetation;
 
 pub use adaptive_sampling::{AdaptiveSamplingState, TileState, VarianceTileSummary, TILE_SIZE};
@@ -82,6 +84,10 @@ pub use scene_versions::{
     CameraChangeThresholds, CameraSnapshot, InvalidationReason, SceneVersionRegistry, SceneVersions,
 };
 pub use terra_core::EditorRefinementState;
+pub use terrain_pipeline::{
+    TerrainPipelineBundle, TerrainPipelineCompileError, TerrainPipelineCompiler,
+};
+pub use terrain_shader::TerrainShaderVariant;
 pub use vegetation::VegetationOverlay;
 
 use bytemuck::{Pod, Zeroable};
@@ -310,13 +316,12 @@ pub struct TerrainRenderer {
     queue: wgpu::Queue,
     pipelines: std::sync::Arc<terra_gpu::PipelineCacheRegistry>,
     config: wgpu::SurfaceConfiguration,
-    pub pipeline: wgpu::RenderPipeline,
-    /// Grid edge LineList overlay for the Wireframe display aid.
-    pub wireframe_pipeline: wgpu::RenderPipeline,
+    bounded_pipeline_bundle: TerrainPipelineBundle,
+    infinite_pipeline_bundle: Option<TerrainPipelineBundle>,
+    active_pipeline_variant: TerrainShaderVariant,
+    pipeline_family: std::sync::Arc<()>,
     /// Single frame-uniform buffer for the world-fixed terrain grid.
     pub uniform_buf: wgpu::Buffer,
-    /// Transparent sea-level surface rendered after opaque terrain.
-    pub ocean_pipeline: wgpu::RenderPipeline,
     pub bind_group_layout: wgpu::BindGroupLayout,
     pub bind_group: wgpu::BindGroup,
     /// Authored tint/roughness/metalness indexed by the material-ID map.
@@ -752,6 +757,71 @@ impl TerrainRenderer {
         self.config.format
     }
 
+    /// Capture the immutable GPU/layout capability needed to build another
+    /// terrain variant on a worker thread.
+    pub fn terrain_pipeline_compiler(&self) -> TerrainPipelineCompiler {
+        TerrainPipelineCompiler::new(
+            self.device.clone(),
+            self.pipelines.clone(),
+            self.bind_group_layout.clone(),
+            self.config.format,
+            std::sync::Arc::clone(&self.pipeline_family),
+        )
+    }
+
+    pub fn has_pipeline_variant(&self, variant: TerrainShaderVariant) -> bool {
+        match variant {
+            TerrainShaderVariant::Bounded => true,
+            TerrainShaderVariant::Infinite => self.infinite_pipeline_bundle.is_some(),
+        }
+    }
+
+    /// Install a fully compiled bundle without changing the active presentation.
+    pub fn install_pipeline_bundle(&mut self, bundle: TerrainPipelineBundle) -> Result<(), String> {
+        if bundle.format != self.config.format {
+            return Err(format!(
+                "terrain pipeline format mismatch: bundle={:?}, renderer={:?}",
+                bundle.format, self.config.format
+            ));
+        }
+        if !std::sync::Arc::ptr_eq(&bundle.family, &self.pipeline_family) {
+            return Err("terrain pipeline bundle belongs to another renderer".into());
+        }
+        match bundle.variant {
+            TerrainShaderVariant::Bounded => self.bounded_pipeline_bundle = bundle,
+            TerrainShaderVariant::Infinite => self.infinite_pipeline_bundle = Some(bundle),
+        }
+        Ok(())
+    }
+
+    pub fn activate_pipeline_variant(
+        &mut self,
+        variant: TerrainShaderVariant,
+    ) -> Result<(), String> {
+        if !self.has_pipeline_variant(variant) {
+            return Err(format!(
+                "{} terrain pipeline is not installed",
+                variant.name()
+            ));
+        }
+        self.active_pipeline_variant = variant;
+        Ok(())
+    }
+
+    pub const fn active_pipeline_variant(&self) -> TerrainShaderVariant {
+        self.active_pipeline_variant
+    }
+
+    fn active_pipeline_bundle(&self) -> &TerrainPipelineBundle {
+        match self.active_pipeline_variant {
+            TerrainShaderVariant::Bounded => &self.bounded_pipeline_bundle,
+            TerrainShaderVariant::Infinite => self
+                .infinite_pipeline_bundle
+                .as_ref()
+                .expect("active Infinite terrain pipeline is installed"),
+        }
+    }
+
     /// Construct a renderer with no window or surface, for offscreen rendering.
     ///
     /// Takes the same app-owned [`GpuContext`] as [`Self::new`] — the device and
@@ -802,11 +872,12 @@ impl TerrainRenderer {
     ) -> Self {
         let format = config.format;
 
-        log::info!("terra-render: compiling terrain shader/pipelines…");
+        log::info!("terra-render: compiling bounded terrain shader/pipelines…");
         terra_core::shader_progress::record_shader_compiled();
+        let terrain_source = terrain_shader::compose(TerrainShaderVariant::Bounded);
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("terrain"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/terrain.wgsl").into()),
+            label: Some(TerrainShaderVariant::Bounded.shader_label()),
+            source: wgpu::ShaderSource::Wgsl(terrain_source.into()),
         });
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1077,123 +1148,144 @@ impl TerrainRenderer {
             push_constant_ranges: &[],
         });
 
-        let pipeline = pipelines.render_pipeline("terrain-pipe", format, || {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("terrain-pipe"),
-                layout: Some(&pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some("vs_main"),
-                    buffers: &[TerrainGrid::vertex_layout()],
-                    compilation_options: Default::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some("fs_main"),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format,
-                        blend: Some(wgpu::BlendState::REPLACE),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                    compilation_options: Default::default(),
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    cull_mode: Some(wgpu::Face::Back),
-                    ..Default::default()
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: wgpu::TextureFormat::Depth32Float,
-                    depth_write_enabled: true,
-                    depth_compare: wgpu::CompareFunction::Less,
-                    stencil: Default::default(),
-                    bias: Default::default(),
-                }),
-                multisample: wgpu::MultisampleState::default(),
-                multiview: None,
-                cache: pipelines.driver_cache(),
-            })
-        });
-
-        let ocean_pipeline = pipelines.render_pipeline("ocean-pipe", format, || {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("ocean-pipe"),
-                layout: Some(&pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some("vs_ocean"),
-                    buffers: &[TerrainGrid::vertex_layout()],
-                    compilation_options: Default::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some("fs_ocean"),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format,
-                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                    compilation_options: Default::default(),
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    cull_mode: None,
-                    ..Default::default()
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: wgpu::TextureFormat::Depth32Float,
-                    depth_write_enabled: true,
-                    depth_compare: wgpu::CompareFunction::Less,
-                    stencil: Default::default(),
-                    bias: Default::default(),
-                }),
-                multisample: wgpu::MultisampleState::default(),
-                multiview: None,
-                cache: pipelines.driver_cache(),
-            })
-        });
-
-        let wireframe_pipeline = pipelines.render_pipeline("wireframe-pipe", format, || {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("wireframe-pipe"),
-                layout: Some(&pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some("vs_main"),
-                    buffers: &[TerrainGrid::vertex_layout()],
-                    compilation_options: Default::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some("fs_wireframe"),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format,
-                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                    compilation_options: Default::default(),
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::LineList,
-                    cull_mode: None,
-                    ..Default::default()
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: wgpu::TextureFormat::Depth32Float,
-                    depth_write_enabled: false,
-                    depth_compare: wgpu::CompareFunction::LessEqual,
-                    stencil: Default::default(),
-                    bias: wgpu::DepthBiasState {
-                        constant: -4,
-                        slope_scale: -2.0,
-                        clamp: 0.0,
+        let pipeline = pipelines.render_pipeline(
+            TerrainShaderVariant::Bounded.terrain_pipeline_label(),
+            format,
+            || {
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some(TerrainShaderVariant::Bounded.terrain_pipeline_label()),
+                    layout: Some(&pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &shader,
+                        entry_point: Some("vs_main"),
+                        buffers: &[TerrainGrid::vertex_layout()],
+                        compilation_options: Default::default(),
                     },
-                }),
-                multisample: wgpu::MultisampleState::default(),
-                multiview: None,
-                cache: pipelines.driver_cache(),
-            })
-        });
+                    fragment: Some(wgpu::FragmentState {
+                        module: &shader,
+                        entry_point: Some("fs_main"),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format,
+                            blend: Some(wgpu::BlendState::REPLACE),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                        compilation_options: Default::default(),
+                    }),
+                    primitive: wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleList,
+                        cull_mode: Some(wgpu::Face::Back),
+                        ..Default::default()
+                    },
+                    depth_stencil: Some(wgpu::DepthStencilState {
+                        format: wgpu::TextureFormat::Depth32Float,
+                        depth_write_enabled: true,
+                        depth_compare: wgpu::CompareFunction::Less,
+                        stencil: Default::default(),
+                        bias: Default::default(),
+                    }),
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview: None,
+                    cache: pipelines.driver_cache(),
+                })
+            },
+        );
+
+        let ocean_pipeline = pipelines.render_pipeline(
+            TerrainShaderVariant::Bounded.ocean_pipeline_label(),
+            format,
+            || {
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some(TerrainShaderVariant::Bounded.ocean_pipeline_label()),
+                    layout: Some(&pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &shader,
+                        entry_point: Some("vs_ocean"),
+                        buffers: &[TerrainGrid::vertex_layout()],
+                        compilation_options: Default::default(),
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &shader,
+                        entry_point: Some("fs_ocean"),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format,
+                            blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                        compilation_options: Default::default(),
+                    }),
+                    primitive: wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleList,
+                        cull_mode: None,
+                        ..Default::default()
+                    },
+                    depth_stencil: Some(wgpu::DepthStencilState {
+                        format: wgpu::TextureFormat::Depth32Float,
+                        depth_write_enabled: true,
+                        depth_compare: wgpu::CompareFunction::Less,
+                        stencil: Default::default(),
+                        bias: Default::default(),
+                    }),
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview: None,
+                    cache: pipelines.driver_cache(),
+                })
+            },
+        );
+
+        let wireframe_pipeline = pipelines.render_pipeline(
+            TerrainShaderVariant::Bounded.wireframe_pipeline_label(),
+            format,
+            || {
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some(TerrainShaderVariant::Bounded.wireframe_pipeline_label()),
+                    layout: Some(&pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &shader,
+                        entry_point: Some("vs_main"),
+                        buffers: &[TerrainGrid::vertex_layout()],
+                        compilation_options: Default::default(),
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &shader,
+                        entry_point: Some("fs_wireframe"),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format,
+                            blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                        compilation_options: Default::default(),
+                    }),
+                    primitive: wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::LineList,
+                        cull_mode: None,
+                        ..Default::default()
+                    },
+                    depth_stencil: Some(wgpu::DepthStencilState {
+                        format: wgpu::TextureFormat::Depth32Float,
+                        depth_write_enabled: false,
+                        depth_compare: wgpu::CompareFunction::LessEqual,
+                        stencil: Default::default(),
+                        bias: wgpu::DepthBiasState {
+                            constant: -4,
+                            slope_scale: -2.0,
+                            clamp: 0.0,
+                        },
+                    }),
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview: None,
+                    cache: pipelines.driver_cache(),
+                })
+            },
+        );
+        let pipeline_family = std::sync::Arc::new(());
+        let bounded_pipeline_bundle = TerrainPipelineBundle {
+            terrain: pipeline,
+            ocean: ocean_pipeline,
+            wireframe: wireframe_pipeline,
+            variant: TerrainShaderVariant::Bounded,
+            format,
+            family: std::sync::Arc::clone(&pipeline_family),
+        };
         let depth = create_depth(&device, config.width, config.height);
         let clipmap = ClipmapConfig::for_world(4096.0, 1025);
         let world_grid = clipmap.fallback.clone();
@@ -1262,8 +1354,10 @@ impl TerrainRenderer {
             queue,
             pipelines,
             config,
-            pipeline,
-            wireframe_pipeline,
+            bounded_pipeline_bundle,
+            infinite_pipeline_bundle: None,
+            active_pipeline_variant: TerrainShaderVariant::Bounded,
+            pipeline_family,
             uniform_buf,
             bind_group_layout,
             bind_group,
@@ -1284,7 +1378,6 @@ impl TerrainRenderer {
             traversal_mode: TerrainTraversalMode::Bounded,
             infinite_presentation: None,
             size,
-            ocean_pipeline,
             last_upload_us: 0,
             last_gpu_timings: GpuTimings::default(),
             pending_presentation_trace: GpuPresentationTraceContext::default(),
@@ -2205,6 +2298,11 @@ impl TerrainRenderer {
     }
 
     pub fn configure_infinite_presentation(&mut self, config: InfinitePresentationConfig) {
+        debug_assert_eq!(
+            self.active_pipeline_variant,
+            TerrainShaderVariant::Infinite,
+            "Infinite traversal requires the Infinite terrain pipeline bundle"
+        );
         self.traversal_mode = TerrainTraversalMode::Infinite;
         self.infinite_presentation = Some(config);
         let next = ClipmapConfig::for_infinite(config.topology, config.horizon_m);
@@ -2783,7 +2881,7 @@ impl TerrainRenderer {
                         timestamp_writes: terrain_ts,
                         occlusion_query_set: None,
                     });
-                    pass.set_pipeline(&self.pipeline);
+                    pass.set_pipeline(&self.active_pipeline_bundle().terrain);
                     // Infinite clipmaps are transient surface patches, not solid terrain
                     // blocks. Drawing each grid's skirt and underside creates one nested
                     // wall set per LOD; the clipmap holes then leave only repeated corners.
@@ -2874,7 +2972,7 @@ impl TerrainRenderer {
                         if self.traversal_mode == TerrainTraversalMode::Bounded
                             && self.ocean_level.is_some()
                         {
-                            pass.set_pipeline(&self.ocean_pipeline);
+                            pass.set_pipeline(&self.active_pipeline_bundle().ocean);
                             pass.set_bind_group(0, &self.bind_group, &[]);
                             pass.set_vertex_buffer(0, self.grid.vertex_buf.slice(..));
                             pass.set_index_buffer(
@@ -2884,7 +2982,7 @@ impl TerrainRenderer {
                             pass.draw_indexed(0..self.grid.surface_index_count, 0, 0..1);
                         }
                         if self.display_aids.wireframe {
-                            pass.set_pipeline(&self.wireframe_pipeline);
+                            pass.set_pipeline(&self.active_pipeline_bundle().wireframe);
                             pass.set_bind_group(0, &self.bind_group, &[]);
                             pass.set_vertex_buffer(0, self.grid.vertex_buf.slice(..));
                             pass.set_index_buffer(
@@ -3204,8 +3302,8 @@ fn create_depth(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture
 mod shader_tests {
     #[test]
     fn terrain_and_ocean_shader_parses() {
-        let source = include_str!("shaders/terrain.wgsl");
-        let module = naga::front::wgsl::parse_str(source)
+        let source = crate::terrain_shader::compose(crate::TerrainShaderVariant::Bounded);
+        let module = naga::front::wgsl::parse_str(&source)
             .unwrap_or_else(|error| panic!("terrain WGSL parse failed: {error}"));
         assert!(module
             .entry_points
@@ -3248,9 +3346,9 @@ mod shader_tests {
     /// can return as atlas capacity grows.
     #[test]
     fn streamed_sampling_uses_page_resolution_not_monolithic_grid() {
-        let source = include_str!("shaders/terrain.wgsl");
+        let source = crate::terrain_shader::compose(crate::TerrainShaderVariant::Bounded);
 
-        let lookup = fn_body(source, "lookup_tile_page");
+        let lookup = fn_body(&source, "lookup_tile_page");
         assert!(
             lookup.contains("metadata_offset") && lookup.contains("virtual_page_table"),
             "lookup must directly index the dense virtual page table"
@@ -3260,7 +3358,7 @@ mod shader_tests {
             "lookup must not scan physical pages"
         );
 
-        let page = fn_body(source, "sample_page_bilinear");
+        let page = fn_body(&source, "sample_page_bilinear");
         assert!(
             page.contains("terrain_levels") && page.contains("resolution"),
             "page sampling must denormalize with the selected level resolution"
@@ -3270,7 +3368,7 @@ mod shader_tests {
             "streamed page sampling must not scale by the monolithic grid"
         );
 
-        let resolve = fn_body(source, "resolve_from_level");
+        let resolve = fn_body(&source, "resolve_from_level");
         assert!(
             resolve.contains("level = level - 1") && resolve.contains("sample_height_monolithic"),
             "resolution must walk resident ancestors before terminal fallback"
@@ -3279,13 +3377,13 @@ mod shader_tests {
 
     #[test]
     fn infinite_streaming_uses_signed_sparse_lookup_and_never_monolithic_fallback() {
-        let source = include_str!("shaders/terrain.wgsl");
-        let lookup = fn_body(source, "lookup_tile_page_sparse");
+        let source = crate::terrain_shader::compose(crate::TerrainShaderVariant::Infinite);
+        let lookup = fn_body(&source, "lookup_tile_page_sparse");
         assert!(lookup.contains("sparse_hash") && lookup.contains("mapping.tile_x_hi"));
         assert!(lookup.contains("mapping.tile_z_hi") && lookup.contains("probe < capacity"));
-        let address = fn_body(source, "infinite_address");
+        let address = fn_body(&source, "infinite_address");
         assert!(address.contains("signed64_add_i32") && address.contains("signed64_shift_right"));
-        let resolve = fn_body(source, "resolve_height_infinite_from");
+        let resolve = fn_body(&source, "resolve_height_infinite_from");
         assert!(resolve.contains("lookup_tile_page_sparse"));
         assert!(
             resolve.contains("u.stream.x <= 0.5") && resolve.contains("STREAM_TERMINAL"),
@@ -3299,7 +3397,7 @@ mod shader_tests {
 
     #[test]
     fn streamed_debug_distinguishes_exact_ancestor_blend_and_terminal() {
-        let source = include_str!("shaders/terrain.wgsl");
+        let source = crate::terrain_shader::compose(crate::TerrainShaderVariant::Bounded);
         for class in [
             "STREAM_EXACT",
             "STREAM_ANCESTOR",
@@ -3311,7 +3409,7 @@ mod shader_tests {
                 "missing stream sample class {class}"
             );
         }
-        let fragment = fn_body(source, "fs_main");
+        let fragment = fn_body(&source, "fs_main");
         assert!(
             fragment.contains("stream5.y")
                 && fragment.contains("STREAM_EXACT")

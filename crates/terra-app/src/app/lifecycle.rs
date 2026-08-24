@@ -985,6 +985,7 @@ impl ApplicationHandler<RuntimeEvent> for TerraApp {
         // where the concrete types are in hand.
         let jobs = Arc::clone(&self.jobs).tick(self);
         self.drain_project_io();
+        self.drain_pipeline_compile();
         let camera_flying = self.apply_camera_fly();
         if let Some(gpu) = self.gpu.as_ref() {
             self.height_pyramid_export.pump(&gpu.device, &gpu.queue);
@@ -1721,6 +1722,7 @@ impl TerraApp {
         self.tile_atlas = tile_atlas;
         self.gpu_engine = Some(gpu_engine);
         self.gpu_pyramid_materializer = Some(gpu_pyramid_materializer);
+        self.device_generation = self.device_generation.wrapping_add(1);
         self.gpu = Some(boot.gpu);
         self.refresh_window_title();
         self.refresh_viewport_rect();

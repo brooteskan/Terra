@@ -3163,6 +3163,16 @@ mod tests {
             ))
             .unwrap();
         let mut renderer = TerrainRenderer::new_headless(&context, 128, 128);
+        let infinite_bundle = renderer
+            .terrain_pipeline_compiler()
+            .compile(terra_render::TerrainShaderVariant::Infinite)
+            .expect("compile Infinite test terrain bundle");
+        renderer
+            .install_pipeline_bundle(infinite_bundle)
+            .expect("install Infinite test terrain bundle");
+        renderer
+            .activate_pipeline_variant(terra_render::TerrainShaderVariant::Infinite)
+            .expect("activate Infinite test terrain bundle");
         renderer.reset_project_state(
             (
                 settings.horizon_m as f32 * 2.0,

@@ -1,7 +1,7 @@
 //! Thin bottom status bar with mesh stats, backend, and processing feedback.
 
 use crate::ui::style::{self, FONT_SCALE, PAD, STATUS_STRIP_H, TYPE_LABEL};
-use crate::ui::{TerrainPreviewFreshness, UiState};
+use crate::ui::{TerrainPipelineStatus, TerrainPreviewFreshness, UiState};
 use terra_core::document::TerrainDocument;
 use terra_core::quality::PreviewQuality;
 use terra_gui::{DrawList, GuiContext, Id, Rect};
@@ -73,7 +73,22 @@ pub fn draw_bottom_dock(
 
     // Right: processing / failure / idle status + action (layout first for truncation).
     let (status_text, show_progress, progress, show_retry) =
-        if let Some(progress) = ui_state.export_progress {
+        if let TerrainPipelineStatus::Pending { label } = &ui_state.terrain_pipeline_status {
+            (
+                format!("Compiling Infinite terrain renderer - {label}"),
+                true,
+                0.5,
+                false,
+            )
+        } else if let TerrainPipelineStatus::Failed { message } = &ui_state.terrain_pipeline_status
+        {
+            (
+                format!("Infinite renderer compile failed - {message}"),
+                false,
+                0.0,
+                true,
+            )
+        } else if let Some(progress) = ui_state.export_progress {
             (
                 format!("Exporting height pyramid {:.0}%", progress * 100.0),
                 true,
@@ -179,7 +194,14 @@ pub fn draw_bottom_dock(
         }
         if ui.input.primary_released && ui.state.is_active(cid) && hovered {
             if show_retry {
-                out.request_retry_evaluation = true;
+                if matches!(
+                    ui_state.terrain_pipeline_status,
+                    TerrainPipelineStatus::Failed { .. }
+                ) {
+                    out.request_retry_terrain_pipeline = true;
+                } else {
+                    out.request_retry_evaluation = true;
+                }
             } else {
                 out.request_cancel_build = true;
             }

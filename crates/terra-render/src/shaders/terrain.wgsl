@@ -145,12 +145,11 @@ fn vs_main(v: VsIn) -> VsOut {
     );
     let huv = clamp(huv_raw, vec2<f32>(0.0), vec2<f32>(1.0));
 
-    var surface_h = 0.0;
-    if (u.stream6.x != 0u) {
-        surface_h = resolve_height_infinite(vec2<f32>(wx, wz)).height;
-    } else {
-        surface_h = sample_height_bilinear(huv);
-    }
+    // terra-variant:infinite
+    let surface_h = resolve_height_infinite(vec2<f32>(wx, wz)).height;
+    // terra-variant:bounded
+    let surface_h = sample_height_bilinear(huv);
+    // terra-variant:end
     // grid.w = slab base height (below terrain min).
     let base_y = u.grid.w;
     let h = select(surface_h, base_y, v.use_base > 0.5);
@@ -159,7 +158,11 @@ fn vs_main(v: VsIn) -> VsOut {
     o.position = u.view_proj * vec4<f32>(world_pos, 1.0);
     o.world_pos = world_pos;
     o.face = v.face;
-    o.terrain_uv = select(huv_raw, vec2<f32>(0.5), u.stream6.x != 0u);
+    // terra-variant:infinite
+    o.terrain_uv = vec2<f32>(0.5);
+    // terra-variant:bounded
+    o.terrain_uv = huv_raw;
+    // terra-variant:end
 
     if (v.face > 1.5) {
         o.normal = vec3<f32>(0.0, -1.0, 0.0);
@@ -176,19 +179,19 @@ fn vs_main(v: VsIn) -> VsOut {
             o.normal = vec3<f32>(0.0, 0.0, 1.0);
         }
     } else {
-        if (u.stream6.x != 0u) {
-            let d = max(u.stream8.x, 0.01);
-            let hx0 = resolve_height_infinite(vec2<f32>(wx - d, wz)).height;
-            let hx1 = resolve_height_infinite(vec2<f32>(wx + d, wz)).height;
-            let hz0 = resolve_height_infinite(vec2<f32>(wx, wz - d)).height;
-            let hz1 = resolve_height_infinite(vec2<f32>(wx, wz + d)).height;
-            o.normal = normalize(vec3<f32>(hx0 - hx1, 2.0 * d, hz0 - hz1));
-        } else {
-            let ntex = textureDimensions(normal_tex);
-            let nx = i32(clamp(huv.x * f32(ntex.x - 1u), 0.0, f32(ntex.x - 1u)));
-            let ny = i32(clamp(huv.y * f32(ntex.y - 1u), 0.0, f32(ntex.y - 1u)));
-            o.normal = textureLoad(normal_tex, vec2<i32>(nx, ny), 0).xyz;
-        }
+        // terra-variant:infinite
+        let d = max(u.stream8.x, 0.01);
+        let hx0 = resolve_height_infinite(vec2<f32>(wx - d, wz)).height;
+        let hx1 = resolve_height_infinite(vec2<f32>(wx + d, wz)).height;
+        let hz0 = resolve_height_infinite(vec2<f32>(wx, wz - d)).height;
+        let hz1 = resolve_height_infinite(vec2<f32>(wx, wz + d)).height;
+        o.normal = normalize(vec3<f32>(hx0 - hx1, 2.0 * d, hz0 - hz1));
+        // terra-variant:bounded
+        let ntex = textureDimensions(normal_tex);
+        let nx = i32(clamp(huv.x * f32(ntex.x - 1u), 0.0, f32(ntex.x - 1u)));
+        let ny = i32(clamp(huv.y * f32(ntex.y - 1u), 0.0, f32(ntex.y - 1u)));
+        o.normal = textureLoad(normal_tex, vec2<i32>(nx, ny), 0).xyz;
+        // terra-variant:end
     }
     return o;
 }
@@ -253,6 +256,7 @@ fn page_identity_current(e: PageTableEntry) -> bool {
         && e.content_revision_hi == u.stream3.w;
 }
 
+// terra-variant:infinite
 struct Signed64Words {
     lo: u32,
     hi: u32,
@@ -336,6 +340,7 @@ fn lookup_tile_page_sparse(lod: u32, address: vec4<u32>) -> i32 {
     }
     return -1;
 }
+// terra-variant:end
 
 fn lookup_tile_page(level: u32, tile_x: u32, tile_z: u32) -> i32 {
     let level_count = u.stream4.x;
@@ -377,6 +382,7 @@ fn sample_page_bilinear(page: u32, uv: vec2<f32>) -> f32 {
     return mix(mix(h00, h10, f.x), mix(h01, h11, f.x), f.y);
 }
 
+// terra-variant:infinite
 fn infinite_tile_origin_local(local_xz: vec2<f32>, lod: u32) -> vec2<f32> {
     let fine_span = max(u.stream8.y, 1.0e-6);
     let level_scale = exp2(f32(lod));
@@ -488,6 +494,7 @@ fn resolve_height_infinite(local_xz: vec2<f32>) -> ResolvedHeightSample {
         selected.level,
     );
 }
+// terra-variant:end
 
 fn resolve_from_level(uv: vec2<f32>, start_level: i32) -> ResolvedHeightSample {
     let c = clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0));
@@ -821,12 +828,11 @@ fn fs_main(i: VsOut) -> @location(0) vec4<f32> {
         }
     }
     if (u.stream.x > 0.5 && u.stream5.y > 0.5 && i.face < 0.5) {
-        var resolved: ResolvedHeightSample;
-        if (u.stream6.x != 0u) {
-            resolved = resolve_height_infinite(i.world_pos.xz);
-        } else {
-            resolved = resolve_height_streamed(clamp(i.terrain_uv, vec2<f32>(0.0), vec2<f32>(1.0)));
-        }
+        // terra-variant:infinite
+        let resolved = resolve_height_infinite(i.world_pos.xz);
+        // terra-variant:bounded
+        let resolved = resolve_height_streamed(clamp(i.terrain_uv, vec2<f32>(0.0), vec2<f32>(1.0)));
+        // terra-variant:end
         if (resolved.sample_class == STREAM_EXACT) {
             return vec4<f32>(0.10, 0.85, 0.25, 1.0);
         }
@@ -843,7 +849,7 @@ fn fs_main(i: VsOut) -> @location(0) vec4<f32> {
             u.stream5.x > 0.5,
         );
     }
-    if (u.stream6.x != 0u) {
+    // terra-variant:infinite
         let resolved = resolve_height_infinite(i.world_pos.xz);
         if (resolved.sample_class == STREAM_TERMINAL) {
             discard;
@@ -864,6 +870,7 @@ fn fs_main(i: VsOut) -> @location(0) vec4<f32> {
         color = mix(color, vec3<f32>(0.48, 0.55, 0.64), fog_amount * u.raster.z);
         return vec4<f32>(aces_tonemap(color * max(u.eye.w, 0.1)), 1.0);
     }
+    // terra-variant:bounded
     // Slab sides / underside — World Creator–style light cliff faces.
     if (i.face > 0.5) {
         var n = i.normal;
@@ -1101,6 +1108,7 @@ fn fs_main(i: VsOut) -> @location(0) vec4<f32> {
     color = apply_contours(color, i.world_pos.y);
     return vec4<f32>(color, 1.0);
 }
+// terra-variant:end
 
 @fragment
 fn fs_ocean(i: VsOut) -> @location(0) vec4<f32> {
