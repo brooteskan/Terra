@@ -348,11 +348,15 @@ pub fn write_height_png(hf: &Heightfield, path: &std::path::Path) -> Result<(), 
     for j in 0..h {
         for i in 0..w {
             let t = ((hf.get(i, j) - min_h) / span).clamp(0.0, 1.0);
-            img16.put_pixel(i, j, image::Luma([(t * 65535.0) as u16]));
+            img16.put_pixel(i, j, image::Luma([quantize_normalized_height(t)]));
         }
     }
     img16.save(path)?;
     Ok(())
+}
+
+fn quantize_normalized_height(t: f32) -> u16 {
+    (t.clamp(0.0, 1.0) * 65535.0).round() as u16
 }
 
 pub fn write_mask_png(mask: &MaskField, path: &std::path::Path) -> Result<(), IoError> {
@@ -677,6 +681,49 @@ mod tests {
         let m = HeightfieldMetrics::new(8, 8, 8.0, 8.0);
         let hf = Heightfield::filled(m, 3.5);
         assert_eq!(hash_heights(&hf), hash_heights(&hf));
+    }
+
+    #[test]
+    fn height_png_quantization_rounds_to_nearest_code() {
+        assert_eq!(quantize_normalized_height(0.0), 0);
+        assert_eq!(quantize_normalized_height(1.0), u16::MAX);
+
+        let code = 12_345.0;
+        assert_eq!(
+            quantize_normalized_height((code + 0.49) / 65535.0),
+            code as u16
+        );
+        assert_eq!(
+            quantize_normalized_height((code + 0.51) / 65535.0),
+            code as u16 + 1
+        );
+    }
+
+    #[test]
+    fn height_png_round_trip_stays_within_half_lsb_and_defines_flat_fields() {
+        let dir = std::env::temp_dir().join(format!("terra_height_png_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("height.png");
+        let metrics = HeightfieldMetrics::new(8, 1, 8.0, 1.0);
+        let samples = [0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 0.999, 1.0];
+        let hf = Heightfield::from_dense(metrics, &samples);
+
+        write_height_png(&hf, &path).unwrap();
+        let png = image::open(&path).unwrap().to_luma16();
+        for (i, expected) in samples.into_iter().enumerate() {
+            let decoded = png.get_pixel(i as u32, 0).0[0] as f32 / 65535.0;
+            assert!(
+                (decoded - expected).abs() <= 0.5 / 65535.0 + 1e-7,
+                "normalized height mismatch at {i}: {decoded} vs {expected}"
+            );
+        }
+
+        let flat = Heightfield::filled(metrics, 73.0);
+        write_height_png(&flat, &path).unwrap();
+        let flat_png = image::open(&path).unwrap().to_luma16();
+        assert!(flat_png.pixels().all(|pixel| pixel.0[0] == 0));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

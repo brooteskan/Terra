@@ -67,7 +67,11 @@ impl MaskOp {
     }
 
     pub fn apply_unary(self, a: f32) -> f32 {
-        self.apply(a, a)
+        match self {
+            MaskOp::Min { value } => a.min(value),
+            MaskOp::Max { value } => a.max(value),
+            other => other.apply(a, a),
+        }
     }
 }
 
@@ -160,5 +164,34 @@ mod tests {
         };
         assert!((op.apply_unary(0.0) - 0.0).abs() < 1e-5);
         assert!((op.apply_unary(1.0) - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn unary_min_and_max_use_configured_values() {
+        let min = MaskOp::Min { value: 0.3 };
+        let max = MaskOp::Max { value: 0.6 };
+
+        assert!((min.apply_unary(0.8) - 0.3).abs() < 1e-5);
+        assert!((min.apply_unary(0.2) - 0.2).abs() < 1e-5);
+        assert!((max.apply_unary(0.2) - 0.6).abs() < 1e-5);
+        assert!((max.apply_unary(0.8) - 0.8).abs() < 1e-5);
+    }
+
+    #[test]
+    fn mask_ops_apply_unary_min_and_max() {
+        let m = HeightfieldMetrics::new(2, 1, 2.0, 1.0);
+        let mut f = MaskField::filled(m, 0.8);
+
+        apply_mask_ops(&mut f, &[MaskOp::Min { value: 0.3 }]);
+        assert!((f.get(0, 0) - 0.3).abs() < 1e-5);
+
+        apply_mask_ops(&mut f, &[MaskOp::Max { value: 0.6 }]);
+        assert!((f.get(0, 0) - 0.6).abs() < 1e-5);
+    }
+
+    #[test]
+    fn binary_min_and_max_use_second_operand() {
+        assert!((MaskOp::Min { value: 0.1 }.apply(0.8, 0.4) - 0.4).abs() < 1e-5);
+        assert!((MaskOp::Max { value: 0.9 }.apply(0.2, 0.6) - 0.6).abs() < 1e-5);
     }
 }

@@ -124,6 +124,23 @@ mod tests {
     }
 
     #[test]
+    fn empty_and_disabled_sculpt_histories_have_zero_reach() {
+        use crate::authoring::{SculptStroke, SculptStrokeParams};
+
+        let empty = layer(LayerKind::SculptStrokes(SculptStrokeParams::default()));
+        assert_eq!(effective_reach(&empty, &[]), Reach::LOCAL);
+
+        let disabled = layer(LayerKind::SculptStrokes(SculptStrokeParams {
+            strokes: vec![SculptStroke {
+                enabled: false,
+                ..SculptStroke::default()
+            }],
+            ..SculptStrokeParams::default()
+        }));
+        assert_eq!(effective_reach(&disabled, &[]), Reach::LOCAL);
+    }
+
+    #[test]
     fn smooth_stroke_with_reconcile_reaches_two_samples() {
         // A Smooth stroke reads a 3x3 of the layer input; with reconcile on, the
         // stamped result is re-read at 3x3, so the effective reach is two samples.
