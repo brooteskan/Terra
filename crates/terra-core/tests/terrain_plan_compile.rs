@@ -1,14 +1,15 @@
+use std::collections::HashSet;
 use terra_core::deps::NodeRef;
 use terra_core::field_data::FieldId;
 use terra_core::ids::LayerId;
 use terra_core::layer::{
     BindingSource, BiomesParams, FlatParams, GroupInputMode, Layer, LayerGroup, LayerKind,
-    LayerStack, NamedOutputDecl, ParamBinding, StackNode, VolcanoParams,
+    LayerStack, LayerTypeRegistry, NamedOutputDecl, ParamBinding, StackNode, VolcanoParams,
 };
 use terra_core::mask::{DistNode, MaskAsset, MaskId, MaskRef, MaskSource};
 use terra_core::terrain_plan::{
-    compile_terrain_plan, GroupCompositeMode, PlanNodeSelection, PlanStructureRevision, SeedSource,
-    TerrainOpKind, TerrainPlanDiagnostic, TerrainPlanStamp,
+    compile_terrain_plan, GroupCompositeMode, LogicalFieldKind, PlanNodeSelection,
+    PlanStructureRevision, SeedSource, TerrainOpKind, TerrainPlanDiagnostic, TerrainPlanStamp,
 };
 
 fn stamp() -> TerrainPlanStamp {
@@ -61,6 +62,49 @@ fn flat_stack_lowers_in_explicit_bottom_to_top_order() {
             "layer-composite",
         ]
     );
+}
+
+#[test]
+fn every_registered_kernel_allocates_its_declared_aux_outputs() {
+    let registry = LayerTypeRegistry::builtin();
+    for metadata in registry.all() {
+        let layer = registry
+            .create(metadata.type_id)
+            .unwrap_or_else(|| panic!("registered kind {} must construct", metadata.type_id));
+        let layer_id = layer.id();
+        let expected: HashSet<_> = layer
+            .kind
+            .produced_fields()
+            .into_iter()
+            .filter(|field| *field != FieldId::Height)
+            .collect();
+        let mut stack = LayerStack::new();
+        stack.push(layer);
+        let plan = compile_terrain_plan(&stack, &[], stamp())
+            .unwrap_or_else(|errors| panic!("{} failed to compile: {errors:?}", metadata.type_id));
+        let output_fields = plan
+            .operations()
+            .iter()
+            .find_map(|operation| match &operation.kind {
+                TerrainOpKind::RunLayerKernel {
+                    layer,
+                    output_fields,
+                    ..
+                } if *layer == layer_id => Some(output_fields),
+                _ => None,
+            })
+            .expect("compiled layer kernel");
+        let actual: HashSet<_> = output_fields
+            .iter()
+            .map(
+                |slot| match &plan.field(*slot).expect("compiled output field").kind {
+                    LogicalFieldKind::Auxiliary(field) => field.clone(),
+                    other => panic!("{} emitted non-aux output {other:?}", metadata.type_id),
+                },
+            )
+            .collect();
+        assert_eq!(actual, expected, "{} output contract", metadata.type_id);
+    }
 }
 
 #[test]

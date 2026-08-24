@@ -1,6 +1,8 @@
 //! Stateful CPU terrain evaluation, caching, scheduling, and worker support.
 
 mod cache;
+#[cfg(test)]
+mod field_contract_tests;
 mod processors;
 pub mod realism_benchmark;
 mod scheduler;

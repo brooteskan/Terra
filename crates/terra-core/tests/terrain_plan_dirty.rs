@@ -2,9 +2,12 @@ use terra_core::deps::NodeRef;
 use terra_core::field_data::FieldId;
 use terra_core::ids::{LayerId, OutputId};
 use terra_core::invalidation::{AuxReach, Reach};
+use terra_core::layer::{
+    Layer, LayerKind, LayerStack, MaterialsParams, StreamPowerParams, VegetationParams,
+};
 use terra_core::terrain_plan::{
-    propagate_plan_edits, FullFieldReason, LogicalFieldKind, PlanDirtyScope, PlanOrigin,
-    PlanStructureRevision, SeedSource, TerrainEditClass, TerrainOp, TerrainOpKind,
+    compile_terrain_plan, propagate_plan_edits, FullFieldReason, LogicalFieldKind, PlanDirtyScope,
+    PlanOrigin, PlanStructureRevision, SeedSource, TerrainEditClass, TerrainOp, TerrainOpKind,
     TerrainPlanBuilder, TerrainPlanStamp,
 };
 use terra_core::tiling::UvRect;
@@ -102,4 +105,73 @@ fn structural_invalidation_reaches_the_live_plan_once_in_order() {
         invalidation.first_full_field_escalation.unwrap().reason,
         FullFieldReason::StructuralChange
     );
+}
+
+#[test]
+fn vegetation_hardness_edit_invalidates_downstream_stream_power() {
+    let mut stack = LayerStack::new();
+    stack.push(Layer::new(
+        "Materials",
+        LayerKind::Materials(MaterialsParams::default()),
+    ));
+    let vegetation = Layer::new(
+        "Vegetation",
+        LayerKind::Vegetation(VegetationParams {
+            root_cohesion: 0.5,
+            ..VegetationParams::default()
+        }),
+    );
+    let vegetation_id = vegetation.id();
+    stack.push(vegetation);
+    let stream_power = Layer::new(
+        "Stream Power",
+        LayerKind::StreamPowerErosion(StreamPowerParams::default()),
+    );
+    let stream_power_id = stream_power.id();
+    stack.push(stream_power);
+
+    let plan = compile_terrain_plan(
+        &stack,
+        &[],
+        TerrainPlanStamp::new(PlanStructureRevision::new(9)),
+    )
+    .expect("vegetation hardness plan");
+    let stream_power_inputs = plan
+        .operations()
+        .iter()
+        .find_map(|operation| match &operation.kind {
+            TerrainOpKind::RunLayerKernel {
+                layer,
+                input_fields,
+                ..
+            } if *layer == stream_power_id => Some(input_fields),
+            _ => None,
+        })
+        .expect("stream-power kernel");
+    let vegetation_hardness = stream_power_inputs
+        .iter()
+        .copied()
+        .find(|slot| {
+            plan.field(*slot).is_some_and(|field| {
+                matches!(&field.kind, LogicalFieldKind::Auxiliary(FieldId::Hardness))
+                    && field.origin.authored() == Some(NodeRef::Layer(vegetation_id))
+            })
+        })
+        .expect("stream power consumes vegetation hardness");
+    assert!(plan.analysis().field_is_live(vegetation_hardness));
+
+    let invalidation = propagate_plan_edits(
+        &plan,
+        &[TerrainEditClass::Parameters {
+            owner: NodeRef::Layer(vegetation_id),
+        }],
+    );
+    assert!(invalidation.operations.iter().any(|dirty| {
+        plan.operation(dirty.operation).is_some_and(|operation| {
+            matches!(
+                operation.kind,
+                TerrainOpKind::RunLayerKernel { layer, .. } if layer == stream_power_id
+            )
+        })
+    }));
 }

@@ -937,14 +937,17 @@ pub fn compile_gpu_graph(stack: &LayerStack, mask_assets: &[MaskAsset]) -> GpuCo
         }
     }
 
-    // Carved paths publish wetness on the CPU. The GPU path is deliberately a
-    // height kernel, so keep it only when no enabled suffix layer can observe that
-    // omitted field. Raise-only paths publish no auxiliary data and need no gate.
+    // Path and RiverCarve publish wetness on the CPU. Their GPU previews are
+    // deliberately height-only, so keep them only when no enabled suffix layer
+    // can observe the omitted field. Use the semantic field contract rather than
+    // parameter shortcuts: contracts are conservative across conditional writes.
     for i in 0..layers.len() {
-        let LayerKind::Path(params) = &layers[i].kind else {
-            continue;
-        };
-        if plans[i].is_none() || !params.carve {
+        let omits_declared_wetness =
+            matches!(
+                layers[i].kind,
+                LayerKind::Path(_) | LayerKind::RiverCarve(_)
+            ) && layers[i].kind.produced_fields().contains(&FieldId::Wetness);
+        if plans[i].is_none() || !omits_declared_wetness {
             continue;
         }
         if layers[i + 1..]
@@ -959,10 +962,10 @@ pub fn compile_gpu_graph(stack: &LayerStack, mask_assets: &[MaskAsset]) -> GpuCo
                 GpuFallbackCode::AuxiliaryDependency,
                 "wetness",
                 consumer.map_or_else(
-                    || "downstream layer consumes omitted Path wetness".to_string(),
+                    || "downstream layer consumes wetness omitted by the GPU preview".to_string(),
                     |layer| {
                         format!(
-                            "'{}' consumes wetness omitted by the Path preview",
+                            "'{}' consumes wetness omitted by the GPU preview",
                             layer.common.name
                         )
                     },

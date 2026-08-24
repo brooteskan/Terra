@@ -310,15 +310,6 @@ pub fn resolve_infinite_plan_domain(
     let roots = execution_roots(plan, output);
     resolve_plan_domain_with(plan, output, &roots, |plan, producer, field| {
         let operation = plan.operation(producer).expect("validated plan operation");
-        if matches!(
-            plan.field(field).map(|field| &field.kind),
-            Some(LogicalFieldKind::Auxiliary(_))
-        ) && operation.aux_reach == AuxReach::Global
-        {
-            return Some(TerrainPlanDomainRejectReason::Infinite(
-                SpatialRejectReason::GlobalAuxiliary,
-            ));
-        }
         let Some(contract) = super::operation_spatial_contract(stack, mask_assets, plan, producer)
         else {
             return Some(TerrainPlanDomainRejectReason::Infinite(
@@ -327,6 +318,15 @@ pub fn resolve_infinite_plan_domain(
         };
         if let Some(reason) = contract.infinite.rejection() {
             return Some(TerrainPlanDomainRejectReason::Infinite(reason));
+        }
+        if matches!(
+            plan.field(field).map(|field| &field.kind),
+            Some(LogicalFieldKind::Auxiliary(_))
+        ) && operation.aux_reach == AuxReach::Global
+        {
+            return Some(TerrainPlanDomainRejectReason::Infinite(
+                SpatialRejectReason::GlobalAuxiliary,
+            ));
         }
         if contract.reach == Reach::Full {
             return Some(TerrainPlanDomainRejectReason::Infinite(

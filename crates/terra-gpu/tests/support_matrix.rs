@@ -225,7 +225,7 @@ fn authored_shape_layers_have_explicit_gpu_configuration_boundaries() {
 }
 
 #[test]
-fn carved_path_is_demoted_only_when_later_wetness_is_observable() {
+fn declared_wetness_producers_are_demoted_when_later_wetness_is_observable() {
     let make_path = |carve| {
         Layer::new(
             "path",
@@ -279,8 +279,29 @@ fn carved_path_is_demoted_only_when_later_wetness_is_observable() {
         LayerKind::Biomes(BiomesParams::default()),
     ));
     let graph = compile_gpu_graph(&raise_only, &[]);
-    assert!(graph.plans[0].is_some());
-    assert_eq!(graph.cpu_from, Some(1));
+    assert!(graph.plans[0].is_none());
+    assert_eq!(graph.cpu_from, Some(0));
+    assert_eq!(
+        graph.cpu_fallback.expect("aux boundary").reason.code,
+        GpuFallbackCode::AuxiliaryDependency
+    );
+
+    let mut river_carve = LayerStack::new();
+    river_carve.push(Layer::new(
+        "river carve",
+        LayerKind::RiverCarve(RiverCarveParams::default()),
+    ));
+    river_carve.push(Layer::new(
+        "biomes",
+        LayerKind::Biomes(BiomesParams::default()),
+    ));
+    let graph = compile_gpu_graph(&river_carve, &[]);
+    assert!(graph.plans[0].is_none());
+    assert_eq!(graph.cpu_from, Some(0));
+    assert_eq!(
+        graph.cpu_fallback.expect("aux boundary").reason.code,
+        GpuFallbackCode::AuxiliaryDependency
+    );
 }
 
 #[test]

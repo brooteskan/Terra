@@ -270,6 +270,7 @@ impl LayerKind {
                 FieldId::Height,
                 FieldId::Hardness,
                 FieldId::Wetness,
+                FieldId::WaterDepth,
                 FieldId::Sediment,
                 FieldId::Erosion,
                 FieldId::Deposition,
@@ -302,6 +303,7 @@ impl LayerKind {
                     FieldId::Erosion,
                     FieldId::Deposition,
                     FieldId::Hardness,
+                    FieldId::Materials,
                     FieldId::BedrockHeight,
                     FieldId::DebrisDepth,
                     FieldId::SedimentThickness,
@@ -312,6 +314,7 @@ impl LayerKind {
             LayerKind::DebrisFlow(_) => {
                 vec![
                     FieldId::Height,
+                    FieldId::Hardness,
                     FieldId::Erosion,
                     FieldId::Deposition,
                     FieldId::BedrockHeight,
@@ -322,12 +325,23 @@ impl LayerKind {
                     FieldId::FlowAccumulation,
                 ]
             }
-            LayerKind::StreamPowerErosion(_) | LayerKind::RiverCarve(_) => vec![
+            LayerKind::StreamPowerErosion(_) => vec![
+                FieldId::Height,
+                FieldId::Hardness,
+                FieldId::Materials,
+                FieldId::FlowDirection,
+                FieldId::FlowAccumulation,
+                FieldId::StreamOrder,
+                FieldId::SpeIncision,
+                FieldId::Erosion,
+            ],
+            LayerKind::RiverCarve(_) => vec![
                 FieldId::Height,
                 FieldId::FlowDirection,
                 FieldId::FlowAccumulation,
                 FieldId::StreamOrder,
                 FieldId::SpeIncision,
+                FieldId::Wetness,
             ],
             LayerKind::MultiScaleAmplify(_) => vec![
                 FieldId::Height,
@@ -352,13 +366,22 @@ impl LayerKind {
                 FieldId::SoilMoisture,
                 FieldId::WindExposure,
             ],
-            LayerKind::Vegetation(_) => vec![FieldId::Vegetation],
+            // Root cohesion writes hardness only when enabled and an incoming
+            // hardness field exists. Contracts are static, so declare the
+            // conditional write conservatively.
+            LayerKind::Vegetation(_) => vec![FieldId::Vegetation, FieldId::Hardness],
             LayerKind::OverhangStamp(_) | LayerKind::LocalSdf(_) => {
                 vec![
                     FieldId::Height,
                     FieldId::OverhangCeiling,
                     FieldId::OverhangMask,
                 ]
+            }
+            LayerKind::FluidSimulation(_) => {
+                vec![FieldId::Height, FieldId::Wetness, FieldId::WaterDepth]
+            }
+            LayerKind::RiverNetwork(_) | LayerKind::Path(_) => {
+                vec![FieldId::Height, FieldId::Wetness]
             }
             _ if matches!(self.category(), OperationCategory::Generator) => {
                 vec![FieldId::Height]
@@ -372,6 +395,7 @@ impl LayerKind {
             .into_iter()
             .filter(|f| {
                 *f == FieldId::Height
+                    || (matches!(self, LayerKind::Vegetation(_)) && *f == FieldId::Hardness)
                     || matches!(
                         self.category(),
                         OperationCategory::Simulation | OperationCategory::Modifier
@@ -907,6 +931,59 @@ mod tests {
             FieldId::Deposition,
         ] {
             assert!(fields.contains(&field), "missing {field:?}");
+        }
+    }
+
+    #[test]
+    fn conditional_and_split_evaluator_outputs_are_declared() {
+        let cases = [
+            (
+                LayerKind::HydraulicErosion(Default::default()),
+                vec![FieldId::WaterDepth],
+            ),
+            (
+                LayerKind::ThermalErosion(Default::default()),
+                vec![FieldId::Materials],
+            ),
+            (
+                LayerKind::DebrisFlow(Default::default()),
+                vec![FieldId::Hardness],
+            ),
+            (
+                LayerKind::StreamPowerErosion(Default::default()),
+                vec![FieldId::Hardness, FieldId::Materials, FieldId::Erosion],
+            ),
+            (
+                LayerKind::RiverCarve(Default::default()),
+                vec![FieldId::Wetness],
+            ),
+            (
+                LayerKind::Vegetation(Default::default()),
+                vec![FieldId::Vegetation, FieldId::Hardness],
+            ),
+            (
+                LayerKind::FluidSimulation(Default::default()),
+                vec![FieldId::Wetness, FieldId::WaterDepth],
+            ),
+            (
+                LayerKind::RiverNetwork(Default::default()),
+                vec![FieldId::Wetness],
+            ),
+            (LayerKind::Path(Default::default()), vec![FieldId::Wetness]),
+        ];
+
+        for (kind, expected) in cases {
+            let produced = kind.produced_fields();
+            for field in expected {
+                assert!(
+                    produced.contains(&field),
+                    "{} must declare {field:?}",
+                    kind.type_id()
+                );
+            }
+            if matches!(&kind, LayerKind::Vegetation(_)) {
+                assert!(kind.modified_fields().contains(&FieldId::Hardness));
+            }
         }
     }
 

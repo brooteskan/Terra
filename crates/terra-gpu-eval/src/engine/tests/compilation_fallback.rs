@@ -29,6 +29,19 @@ fn cpu_resume_prefix_requires_a_complete_height_only_checkpoint() {
     );
     let stream_power_layers = [&stream_power];
     assert!(!cpu_resume_prefix_is_height_only(&stream_power_layers, 1));
+
+    // Simulate a persisted pre-contract layer with no generated named outputs.
+    // The canonical kind contract must still prevent an aux-losing bridge.
+    let mut raise_path = Layer::new(
+        "Raise Path",
+        LayerKind::Path(terra_core::layer::PathParams {
+            carve: false,
+            ..Default::default()
+        }),
+    );
+    raise_path.common.outputs.clear();
+    let raise_path_layers = [&raise_path];
+    assert!(!cpu_resume_prefix_is_height_only(&raise_path_layers, 1));
 }
 
 #[test]

@@ -140,12 +140,11 @@ pub(super) fn cpu_resume_prefix_is_height_only(layers: &[&Layer], resume_index: 
     layers.iter().take(resume_index).all(|layer| {
         !layer.common.enabled
             || (layer.common.outputs.is_empty()
-                && (matches!(&layer.kind, LayerKind::Path(params) if !params.carve)
-                    || layer
-                        .kind
-                        .produced_fields()
-                        .into_iter()
-                        .all(|field| field == FieldId::Height)))
+                && layer
+                    .kind
+                    .produced_fields()
+                    .into_iter()
+                    .all(|field| field == FieldId::Height))
     })
 }
 
