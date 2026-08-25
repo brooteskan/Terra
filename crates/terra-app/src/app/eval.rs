@@ -996,7 +996,10 @@ impl TerraApp {
         };
         if self.gpu_pyramid_materializer.is_none() {
             self.gpu_pyramid_materializer =
-                Some(terra_gpu::GpuHeightPyramidMaterializer::new(&gpu.device));
+                Some(terra_gpu::GpuHeightPyramidMaterializer::new_with_pipelines(
+                    &gpu.device,
+                    gpu.pipeline_registry(),
+                ));
         }
         let Some(engine) = self.gpu_engine.as_ref() else {
             return;
@@ -1487,9 +1490,10 @@ impl TerraApp {
                     })
                     .ok()?;
                     let invalidation = self.pending_plan_invalidation.clone().unwrap_or_default();
-                    match self.compiled_tile_producer.begin(
+                    match self.compiled_tile_producer.begin_with_pipelines(
                         &self.gpu.as_ref().unwrap().device,
                         &self.gpu.as_ref().unwrap().queue,
+                        self.gpu.as_ref().unwrap().pipeline_registry(),
                         &preview_stack,
                         &self.session.document.masks,
                         &plan,

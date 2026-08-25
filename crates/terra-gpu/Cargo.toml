@@ -14,6 +14,10 @@ glam = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
 profiling = { workspace = true }
+blake3 = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 terra-cpu-eval = { workspace = true }

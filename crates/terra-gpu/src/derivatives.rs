@@ -41,6 +41,18 @@ pub fn run_derivative_gpu(
     radius_m: f32,
     mode: GpuDerivativeMode,
 ) -> Result<MaskField, GpuError> {
+    let pipelines = crate::PipelineCacheRegistry::new(device);
+    run_derivative_gpu_with_pipelines(device, queue, &pipelines, height, radius_m, mode)
+}
+
+pub fn run_derivative_gpu_with_pipelines(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    pipelines: &crate::PipelineCacheRegistry,
+    height: &Heightfield,
+    radius_m: f32,
+    mode: GpuDerivativeMode,
+) -> Result<MaskField, GpuError> {
     let m = height.metrics;
     let w = m.width;
     let h = m.height;
@@ -72,7 +84,7 @@ pub fn run_derivative_gpu(
                 module: &shader,
                 entry_point: Some("main"),
                 compilation_options: Default::default(),
-                cache: None,
+                cache: pipelines.driver_cache(),
             })
         },
     );

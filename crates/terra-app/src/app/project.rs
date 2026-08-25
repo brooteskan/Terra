@@ -565,14 +565,19 @@ impl TerraApp {
                     || (infinite_topology.is_some() && atlas.max_pages() != max_pages)
             });
             if replace {
-                self.tile_atlas =
-                    match terra_gpu::GpuTileAtlas::new(&gpu.device, tile_size, halo, max_pages) {
-                        Ok(atlas) => Some(atlas),
-                        Err(error) => {
-                            self.ui_state.status = format!("GPU tile atlas disabled: {error}");
-                            None
-                        }
-                    };
+                self.tile_atlas = match terra_gpu::GpuTileAtlas::new_with_pipelines(
+                    &gpu.device,
+                    gpu.pipeline_registry(),
+                    tile_size,
+                    halo,
+                    max_pages,
+                ) {
+                    Ok(atlas) => Some(atlas),
+                    Err(error) => {
+                        self.ui_state.status = format!("GPU tile atlas disabled: {error}");
+                        None
+                    }
+                };
             }
             if let Some(atlas) = self.tile_atlas.as_mut() {
                 if let Some(topology) = infinite_topology {

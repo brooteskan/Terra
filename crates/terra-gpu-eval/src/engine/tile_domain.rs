@@ -277,6 +277,33 @@ impl GpuCompiledTileProducer {
         quality: PreviewQuality,
         domain: TerrainEvaluationDomain,
     ) -> Result<GpuTileEvaluationJob, GpuTileEvaluationError> {
+        let pipelines = terra_gpu::PipelineCacheRegistry::new(device);
+        self.begin_with_pipelines(
+            device,
+            queue,
+            &pipelines,
+            stack,
+            mask_assets,
+            plan,
+            invalidation,
+            quality,
+            domain,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin_with_pipelines(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pipelines: &terra_gpu::PipelineCacheRegistry,
+        stack: &LayerStack,
+        mask_assets: &[MaskAsset],
+        plan: &CompiledTerrainPlan,
+        invalidation: &PlanInvalidation,
+        quality: PreviewQuality,
+        domain: TerrainEvaluationDomain,
+    ) -> Result<GpuTileEvaluationJob, GpuTileEvaluationError> {
         self.reclaim_retired(device);
         let revision = plan.stamp().structure_revision;
         if revision.get() != domain.content.plan_revision {
@@ -313,6 +340,7 @@ impl GpuCompiledTileProducer {
                 self.ensure_checkpoint(
                     device,
                     queue,
+                    pipelines,
                     stack,
                     mask_assets,
                     plan,
@@ -335,8 +363,9 @@ impl GpuCompiledTileProducer {
             engine
         } else {
             self.stats.engine_allocations = self.stats.engine_allocations.saturating_add(1);
-            GpuTerrainEngine::new(
+            GpuTerrainEngine::new_with_pipelines(
                 device,
+                pipelines,
                 domain.evaluation.width.max(domain.evaluation.height),
             )
         };
@@ -588,6 +617,7 @@ impl GpuCompiledTileProducer {
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        pipelines: &terra_gpu::PipelineCacheRegistry,
         stack: &LayerStack,
         mask_assets: &[MaskAsset],
         plan: &CompiledTerrainPlan,
@@ -613,8 +643,9 @@ impl GpuCompiledTileProducer {
         // tile jobs, so cancellation can never splice two revisions together.
         self.checkpoint = None;
         let mut engine = self.checkpoint_engine.take().unwrap_or_else(|| {
-            GpuTerrainEngine::new(
+            GpuTerrainEngine::new_with_pipelines(
                 device,
+                pipelines,
                 domain.world.level_width.max(domain.world.level_height),
             )
         });

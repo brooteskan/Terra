@@ -190,7 +190,13 @@ impl PresentationPipelineCompileCoordinator {
         let waker = self.completion_waker.clone();
         let handle = terra_jobs::spawn_one_shot_with_notify(
             "terra-presentation-pipeline",
-            move |_ctx| compiler.compile(request.feature),
+            move |_ctx| {
+                let result = compiler.compile(request.feature);
+                if result.is_ok() {
+                    compiler.save_pipeline_cache();
+                }
+                result
+            },
             move || {
                 if let Some(waker) = waker {
                     waker();

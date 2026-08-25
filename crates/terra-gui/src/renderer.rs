@@ -48,6 +48,15 @@ pub struct GuiRenderer {
 
 impl GuiRenderer {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Self {
+        Self::new_with_pipeline_cache(device, queue, None, format)
+    }
+
+    pub fn new_with_pipeline_cache(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pipeline_cache: Option<&wgpu::PipelineCache>,
+        format: wgpu::TextureFormat,
+    ) -> Self {
         font::prepare(1.0);
         let (atlas, atlas_w, atlas_h, font_physical_px) = font::build_atlas_r8();
         let font_tex = device.create_texture(&wgpu::TextureDescriptor {
@@ -256,7 +265,7 @@ impl GuiRenderer {
                     depth_stencil: None,
                     multisample: wgpu::MultisampleState::default(),
                     multiview: None,
-                    cache: None,
+                    cache: pipeline_cache,
                 })
             },
         );

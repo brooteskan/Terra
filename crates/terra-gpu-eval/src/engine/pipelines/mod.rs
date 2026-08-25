@@ -571,16 +571,19 @@ pub(super) struct Pipe {
     bgl: wgpu::BindGroupLayout,
 }
 
-type PipeCache = std::collections::HashMap<&'static str, Pipe>;
+struct PipeCache<'a> {
+    pipes: std::collections::HashMap<&'static str, Pipe>,
+    pipelines: &'a terra_gpu::PipelineCacheRegistry,
+}
 
-pub(super) fn make_pipe(
-    cache: &mut PipeCache,
+fn make_pipe(
+    cache: &mut PipeCache<'_>,
     device: &wgpu::Device,
     label: &'static str,
     wgsl: &str,
     bgl: wgpu::BindGroupLayout,
 ) -> Pipe {
-    if let Some(pipe) = cache.get(label) {
+    if let Some(pipe) = cache.pipes.get(label) {
         return pipe.clone();
     }
 
@@ -603,12 +606,12 @@ pub(super) fn make_pipe(
                 module: &module,
                 entry_point: Some("main"),
                 compilation_options: Default::default(),
-                cache: None,
+                cache: cache.pipelines.driver_cache(),
             })
         },
     );
     let pipe = Pipe { pipeline, bgl };
-    cache.insert(label, pipe.clone());
+    cache.pipes.insert(label, pipe.clone());
     pipe
 }
 
@@ -692,9 +695,21 @@ pub(super) fn storage_rw_buffer_entry(binding: u32) -> wgpu::BindGroupLayoutEntr
 
 impl GpuTerrainEngine {
     pub fn new(device: &wgpu::Device, initial: u32) -> Self {
+        let pipelines = terra_gpu::PipelineCacheRegistry::new(device);
+        Self::new_with_pipelines(device, &pipelines, initial)
+    }
+
+    pub fn new_with_pipelines(
+        device: &wgpu::Device,
+        pipelines: &terra_gpu::PipelineCacheRegistry,
+        initial: u32,
+    ) -> Self {
         // Reuse duplicate pipelines only while assembling this engine. The
         // engine owns the selected handles; no global retains its device.
-        let mut pipe_cache = PipeCache::new();
+        let mut pipe_cache = PipeCache {
+            pipes: std::collections::HashMap::new(),
+            pipelines,
+        };
         let w = initial.max(PROJECT_RESET_TEXTURE_EXTENT);
         let fill_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("fill-bgl"),
@@ -1178,7 +1193,7 @@ impl GpuTerrainEngine {
         });
 
         Self {
-            plan_operations: GpuPlanOperations::new(device),
+            plan_operations: GpuPlanOperations::new_with_pipelines(device, pipelines),
             plan_resources: GpuPlanResourceCache::default(),
             device_generation: NEXT_DEVICE_GENERATION.fetch_add(1, Ordering::Relaxed),
             output_resource_incarnation: GpuResourceIncarnation(1),

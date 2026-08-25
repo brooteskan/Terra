@@ -132,6 +132,16 @@ pub struct GpuPlanOperations {
 
 impl GpuPlanOperations {
     pub fn new(device: &wgpu::Device) -> Self {
+        let pipelines = crate::PipelineCacheRegistry::new(device);
+        Self::new_with_pipelines(device, &pipelines)
+    }
+
+    pub fn new_with_pipelines(
+        device: &wgpu::Device,
+        pipelines: &crate::PipelineCacheRegistry,
+    ) -> Self {
+        let make_pipe =
+            |device, label, shader, entries| make_pipe(device, pipelines, label, shader, entries);
         Self {
             fill: make_pipe(
                 device,
@@ -1061,6 +1071,7 @@ fn ensure_distinct(
 
 fn make_pipe(
     device: &wgpu::Device,
+    pipelines: &crate::PipelineCacheRegistry,
     label: &str,
     shader: &str,
     entries: &[wgpu::BindGroupLayoutEntry],
@@ -1088,7 +1099,7 @@ fn make_pipe(
                 module: &module,
                 entry_point: Some("main"),
                 compilation_options: Default::default(),
-                cache: None,
+                cache: pipelines.driver_cache(),
             })
         },
     );

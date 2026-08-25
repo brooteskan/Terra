@@ -500,16 +500,23 @@ impl GpuContext {
         queue: wgpu::Queue,
         surface_format: wgpu::TextureFormat,
     ) -> Self {
-        Self::with_adapter_metadata(device, queue, surface_format, AdapterMetadata::default())
+        let pipelines = std::sync::Arc::new(terra_gpu::PipelineCacheRegistry::new(&device));
+        Self::with_adapter_metadata(
+            device,
+            queue,
+            surface_format,
+            pipelines,
+            AdapterMetadata::default(),
+        )
     }
 
     fn with_adapter_metadata(
         device: wgpu::Device,
         queue: wgpu::Queue,
         surface_format: wgpu::TextureFormat,
+        pipelines: std::sync::Arc<terra_gpu::PipelineCacheRegistry>,
         adapter_metadata: AdapterMetadata,
     ) -> Self {
-        let pipelines = std::sync::Arc::new(terra_gpu::PipelineCacheRegistry::new(&device));
         Self {
             device,
             queue,
@@ -525,6 +532,14 @@ impl GpuContext {
 
     pub fn adapter_metadata(&self) -> &AdapterMetadata {
         &self.adapter_metadata
+    }
+
+    pub fn pipeline_cache_report(&self) -> terra_gpu::PipelineCacheReport {
+        self.pipelines.report()
+    }
+
+    pub fn save_pipeline_cache(&self) -> terra_gpu::PipelineCacheSaveResult {
+        self.pipelines.save()
     }
 }
 
@@ -547,6 +562,7 @@ pub struct SurfaceTarget {
 /// [`TerrainRenderer::new`].
 pub async fn init_gpu(
     window: std::sync::Arc<Window>,
+    pipeline_cache_config: Option<terra_gpu::PipelineCacheConfig>,
 ) -> Result<(GpuContext, SurfaceTarget), RenderError> {
     let size = window.inner_size();
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
@@ -633,19 +649,24 @@ pub async fn init_gpu(
     };
     surface.configure(&device, &config);
     let adapter_metadata = AdapterMetadata {
-        name: adapter_info.name,
+        name: adapter_info.name.clone(),
         vendor: adapter_info.vendor,
         device: adapter_info.device,
         device_type: format!("{:?}", adapter_info.device_type),
         backend: format!("{:?}", adapter_info.backend),
-        driver: adapter_info.driver,
-        driver_info: adapter_info.driver_info,
+        driver: adapter_info.driver.clone(),
+        driver_info: adapter_info.driver_info.clone(),
         downlevel_shader_model: format!("{:?}", downlevel.shader_model),
         pipeline_cache_supported,
         pipeline_cache_enabled: device.features().contains(wgpu::Features::PIPELINE_CACHE),
     };
+    let pipelines = std::sync::Arc::new(terra_gpu::PipelineCacheRegistry::persistent(
+        &device,
+        &adapter_info,
+        pipeline_cache_config,
+    ));
     Ok((
-        GpuContext::with_adapter_metadata(device, queue, format, adapter_metadata),
+        GpuContext::with_adapter_metadata(device, queue, format, pipelines, adapter_metadata),
         SurfaceTarget {
             surface,
             config,

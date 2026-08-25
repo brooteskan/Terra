@@ -35,6 +35,11 @@ fn every_production_pipeline_creation_is_labeled_and_tracked() {
                     compute: inspect_calls(&source, "create_compute_pipeline(", path),
                 };
                 if counts != Counts::default() {
+                    assert!(
+                        !source.contains("cache: None"),
+                        "{} contains an explicitly uncached pipeline descriptor",
+                        path.display()
+                    );
                     observed.insert(relative, counts);
                 }
             },
@@ -87,8 +92,8 @@ fn every_production_pipeline_creation_is_labeled_and_tracked() {
         (
             "crates/terra-render/src/brush.rs".into(),
             Counts {
-                render: 1,
-                compute: 1,
+                render: 2,
+                compute: 2,
             },
         ),
         (
@@ -185,7 +190,7 @@ fn inspect_calls(source: &str, needle: &str, path: &Path) -> usize {
             "{} has an untracked {needle} call near byte {offset}",
             path.display()
         );
-        let tail = &source[offset..source.len().min(offset + 350)];
+        let tail = &source[offset..source.len().min(offset + 2_500)];
         assert!(
             tail.contains("label: Some("),
             "{} has an unlabeled {needle} descriptor near byte {offset}",

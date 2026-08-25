@@ -268,6 +268,14 @@ pub struct GpuHeightPyramidMaterializer {
 
 impl GpuHeightPyramidMaterializer {
     pub fn new(device: &wgpu::Device) -> Self {
+        let pipelines = crate::PipelineCacheRegistry::new(device);
+        Self::new_with_pipelines(device, &pipelines)
+    }
+
+    pub fn new_with_pipelines(
+        device: &wgpu::Device,
+        pipelines: &crate::PipelineCacheRegistry,
+    ) -> Self {
         let downsample_layout = texture_compute_layout(device, "pyramid-downsample-bgl", false);
         let error_layout = texture_compute_layout(device, "pyramid-error-bgl", true);
         let downsample = compute_pipeline(
@@ -275,12 +283,14 @@ impl GpuHeightPyramidMaterializer {
             "pyramid-downsample",
             include_str!("shaders/terrain_pyramid_downsample.wgsl"),
             &downsample_layout,
+            pipelines,
         );
         let error = compute_pipeline(
             device,
             "pyramid-error",
             include_str!("shaders/terrain_pyramid_error.wgsl"),
             &error_layout,
+            pipelines,
         );
         Self {
             downsample_layout,
@@ -527,6 +537,7 @@ fn compute_pipeline(
     label: &str,
     source: &str,
     bind_group_layout: &wgpu::BindGroupLayout,
+    pipelines: &crate::PipelineCacheRegistry,
 ) -> wgpu::ComputePipeline {
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some(label),
@@ -547,7 +558,7 @@ fn compute_pipeline(
                 module: &shader,
                 entry_point: Some("main"),
                 compilation_options: Default::default(),
-                cache: None,
+                cache: pipelines.driver_cache(),
             })
         },
     )

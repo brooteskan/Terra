@@ -52,7 +52,7 @@ profiling = { version = "1", default-features = false }
 rfd = "0.15"
 directories = "6"
 
-wgpu = "24"
+wgpu = "=24.0.5"
 winit = "0.30"
 
 [profile.release]

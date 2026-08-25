@@ -2666,6 +2666,7 @@ dependencies = [
 name = "terra-gpu"
 version = "0.1.0-beta.1"
 dependencies = [
+ "blake3",
  "bytemuck",
  "glam",
  "log",
@@ -2676,6 +2677,7 @@ dependencies = [
  "terra-test-gpu",
  "thiserror 2.0.19",
  "wgpu",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

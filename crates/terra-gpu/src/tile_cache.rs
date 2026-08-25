@@ -238,6 +238,17 @@ impl GpuTileAtlas {
         halo: u32,
         max_pages: u32,
     ) -> Result<Self, GpuTileCacheError> {
+        let pipelines = crate::PipelineCacheRegistry::new(device);
+        Self::new_with_pipelines(device, &pipelines, tile_size, halo, max_pages)
+    }
+
+    pub fn new_with_pipelines(
+        device: &wgpu::Device,
+        pipelines: &crate::PipelineCacheRegistry,
+        tile_size: u32,
+        halo: u32,
+        max_pages: u32,
+    ) -> Result<Self, GpuTileCacheError> {
         if max_pages == 0 {
             return Err(GpuTileCacheError::EmptyAtlas);
         }
@@ -324,7 +335,7 @@ impl GpuTileAtlas {
                     module: &pack_shader,
                     entry_point: Some("main"),
                     compilation_options: Default::default(),
-                    cache: None,
+                    cache: pipelines.driver_cache(),
                 })
             },
         );

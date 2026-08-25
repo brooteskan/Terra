@@ -18,9 +18,21 @@ pub struct StartupBenchmarkReport {
     pub success: bool,
     pub error: Option<String>,
     pub adapter: AdapterReport,
+    pub pipeline_cache: PipelineCacheReport,
     pub boot_duration_ms: u64,
     pub dominant_pipeline: Option<PipelineReport>,
     pub pipelines: Vec<PipelineReport>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PipelineCacheReport {
+    pub schema: u32,
+    pub key: Option<String>,
+    pub blob_status: String,
+    pub blob_bytes: u64,
+    pub detail: String,
+    pub save_result: String,
+    pub saved_bytes: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -50,7 +62,17 @@ pub struct PipelineReport {
 pub struct StartupBenchmarkSuite {
     pub schema_version: u32,
     pub cold_warm_definition: String,
+    pub comparisons: Vec<StartupBenchmarkComparison>,
     pub reports: Vec<StartupBenchmarkReport>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StartupBenchmarkComparison {
+    pub profile: String,
+    pub cold_ms: u64,
+    pub warm_ms: u64,
+    pub speedup_ms: i64,
+    pub speedup_percent: f64,
 }
 
 pub fn output_path() -> Option<PathBuf> {
@@ -84,6 +106,18 @@ pub fn write_requested_report(
             pipeline_cache_enabled: metadata.pipeline_cache_enabled,
         }
     });
+    let pipeline_cache = gpu.map_or_else(PipelineCacheReport::default, |gpu| {
+        let report = gpu.pipeline_cache_report();
+        PipelineCacheReport {
+            schema: report.schema,
+            key: report.key,
+            blob_status: report.blob_status.as_str().into(),
+            blob_bytes: report.blob_bytes,
+            detail: report.detail,
+            save_result: report.save_result.as_str().into(),
+            saved_bytes: report.saved_bytes,
+        }
+    });
     let pipelines: Vec<_> = telemetry
         .completed
         .iter()
@@ -93,7 +127,7 @@ pub fn write_requested_report(
     validate_default_bounded_labels(&pipelines)?;
     let dominant_pipeline = telemetry.dominant_pipeline().map(pipeline_report);
     let report = StartupBenchmarkReport {
-        schema_version: 1,
+        schema_version: 2,
         profile: std::env::var(PROFILE_ENV).unwrap_or_else(|_| "unknown".into()),
         run_kind: std::env::var(RUN_KIND_ENV).unwrap_or_else(|_| "unknown".into()),
         pid: std::process::id(),
@@ -102,6 +136,7 @@ pub fn write_requested_report(
         success: error.is_none(),
         error,
         adapter,
+        pipeline_cache,
         boot_duration_ms: millis(telemetry.elapsed),
         dominant_pipeline,
         pipelines,
@@ -150,6 +185,20 @@ fn validate_default_bounded_labels(pipelines: &[PipelineReport]) -> Result<(), S
     }
 }
 
+fn pipeline_report(record: &terra_telemetry::CompilationRecord) -> PipelineReport {
+    PipelineReport {
+        kind: record.kind.as_str().to_string(),
+        label: record.label.clone(),
+        status: record.status.as_str().to_string(),
+        started_ms: millis(record.started_after_reset),
+        duration_ms: millis(record.duration),
+    }
+}
+
+fn millis(duration: std::time::Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,18 +237,4 @@ mod tests {
             );
         }
     }
-}
-
-fn pipeline_report(record: &terra_telemetry::CompilationRecord) -> PipelineReport {
-    PipelineReport {
-        kind: record.kind.as_str().to_string(),
-        label: record.label.clone(),
-        status: record.status.as_str().to_string(),
-        started_ms: millis(record.started_after_reset),
-        duration_ms: millis(record.duration),
-    }
-}
-
-fn millis(duration: std::time::Duration) -> u64 {
-    duration.as_millis().min(u128::from(u64::MAX)) as u64
 }

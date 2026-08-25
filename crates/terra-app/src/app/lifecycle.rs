@@ -637,7 +637,10 @@ impl ApplicationHandler<RuntimeEvent> for TerraApp {
         }
 
         let gpu_stage = terra_telemetry::begin_stage("Initializing GPU adapter and device");
-        let (gpu, target) = match pollster::block_on(terra_render::init_gpu(window.clone())) {
+        let (gpu, target) = match pollster::block_on(terra_render::init_gpu(
+            window.clone(),
+            crate::pipeline_cache::config(),
+        )) {
             Ok(result) => result,
             Err(error) => {
                 gpu_stage.fail();
@@ -661,7 +664,14 @@ impl ApplicationHandler<RuntimeEvent> for TerraApp {
         let mut gui_renderer = terra_telemetry::measure(
             terra_telemetry::CompilationKind::StartupStage,
             "Creating splash renderer",
-            || GuiRenderer::new(&gpu.device, &gpu.queue, gpu.surface_format),
+            || {
+                GuiRenderer::new_with_pipeline_cache(
+                    &gpu.device,
+                    &gpu.queue,
+                    gpu.pipeline_registry().driver_cache(),
+                    gpu.surface_format,
+                )
+            },
         );
         let pending = target.into_pending();
         Self::paint_splash_frame(&pending, &gpu, &mut gui_renderer, &window);
@@ -692,17 +702,36 @@ impl ApplicationHandler<RuntimeEvent> for TerraApp {
             let gpu_engine = terra_telemetry::measure(
                 terra_telemetry::CompilationKind::StartupStage,
                 "Building terrain evaluator",
-                || GpuTerrainEngine::new(&worker_gpu.device, 256),
+                || {
+                    GpuTerrainEngine::new_with_pipelines(
+                        &worker_gpu.device,
+                        worker_gpu.pipeline_registry(),
+                        256,
+                    )
+                },
             );
             let gpu_pyramid_materializer = terra_telemetry::measure(
                 terra_telemetry::CompilationKind::StartupStage,
                 "Building height pyramid pipelines",
-                || terra_gpu::GpuHeightPyramidMaterializer::new(&worker_gpu.device),
+                || {
+                    terra_gpu::GpuHeightPyramidMaterializer::new_with_pipelines(
+                        &worker_gpu.device,
+                        worker_gpu.pipeline_registry(),
+                    )
+                },
             );
             let tile_atlas_result = terra_telemetry::measure(
                 terra_telemetry::CompilationKind::StartupStage,
                 "Building tile atlas",
-                || GpuTileAtlas::new(&worker_gpu.device, tile_size, tile_halo, 128),
+                || {
+                    GpuTileAtlas::new_with_pipelines(
+                        &worker_gpu.device,
+                        worker_gpu.pipeline_registry(),
+                        tile_size,
+                        tile_halo,
+                        128,
+                    )
+                },
             );
             let tile_atlas = match tile_atlas_result {
                 Ok(atlas) => Some(atlas),
@@ -716,6 +745,7 @@ impl ApplicationHandler<RuntimeEvent> for TerraApp {
                 "Building editor overlays",
                 || super::editor_overlays::EditorOverlays::new(&worker_gpu, &renderer),
             );
+            worker_gpu.save_pipeline_cache();
             super::BootResult {
                 renderer,
                 tile_atlas,
@@ -1040,7 +1070,8 @@ impl ApplicationHandler<RuntimeEvent> for TerraApp {
         self.drain_pipeline_compile();
         let camera_flying = self.apply_camera_fly();
         if let Some(gpu) = self.gpu.as_ref() {
-            self.height_pyramid_export.pump(&gpu.device, &gpu.queue);
+            self.height_pyramid_export
+                .pump(&gpu.device, &gpu.queue, gpu.pipeline_registry());
         }
         let mut export_busy = self.height_pyramid_export.is_busy() || !self.exporter.job.done;
         if export_busy {
@@ -1885,10 +1916,11 @@ fn log_compilation_summary(
         );
     }
     let adapter = gpu.adapter_metadata();
+    let cache = gpu.pipeline_cache_report();
     let dominant = telemetry.dominant_pipeline();
     log::info!(
         target: "terra_app::startup_compilation",
-        "boot_compilation_summary success={} generation={} total_ms={} dominant_label={:?} dominant_ms={} adapter={:?} vendor={:#06x} device={:#06x} device_type={} backend={} driver={:?} driver_info={:?} downlevel_shader_model={} pipeline_cache_supported={} pipeline_cache_enabled={}",
+        "boot_compilation_summary success={} generation={} total_ms={} dominant_label={:?} dominant_ms={} adapter={:?} vendor={:#06x} device={:#06x} device_type={} backend={} driver={:?} driver_info={:?} downlevel_shader_model={} pipeline_cache_supported={} pipeline_cache_enabled={} cache_schema={} cache_key={:?} cache_blob_status={} cache_blob_bytes={} cache_save_result={} cache_saved_bytes={} cache_detail={:?}",
         success,
         telemetry.generation,
         telemetry.elapsed.as_millis(),
@@ -1903,7 +1935,14 @@ fn log_compilation_summary(
         adapter.driver_info,
         adapter.downlevel_shader_model,
         adapter.pipeline_cache_supported,
-        adapter.pipeline_cache_enabled
+        adapter.pipeline_cache_enabled,
+        cache.schema,
+        cache.key,
+        cache.blob_status.as_str(),
+        cache.blob_bytes,
+        cache.save_result.as_str(),
+        cache.saved_bytes,
+        cache.detail
     );
 }
 

@@ -28,6 +28,7 @@ use std::path::Path;
 /// Exact set of crates terra-gui's `[dependencies]` may name.
 fn expected_dependencies() -> BTreeSet<String> {
     [
+        "terra-telemetry",
         "wgpu",
         "bytemuck",
         "glam",
@@ -215,7 +216,8 @@ fn scan_dir(dir: &Path, allow_test_gpu: bool, out: &mut Vec<String>) {
 
 /// First sibling-crate import token on `line`, if any. The needle is assembled
 /// at compile time so this scanner's own source carries no literal match to trip
-/// over; the crate's own `terra_gui`, and `terra_test_gpu` under `tests/`, pass.
+/// over; the crate's own `terra_gui`, app-agnostic `terra_telemetry`, and
+/// `terra_test_gpu` under `tests/`, pass.
 fn forbidden_token(line: &str, allow_test_gpu: bool) -> Option<String> {
     let code = strip_line_comment(line);
     let needle = concat!("terra", "_");
@@ -241,7 +243,9 @@ fn forbidden_token(line: &str, allow_test_gpu: bool) -> Option<String> {
 }
 
 fn ident_allowed(ident: &str, allow_test_gpu: bool) -> bool {
-    ident == "terra_gui" || (allow_test_gpu && ident == "terra_test_gpu")
+    ident == "terra_gui"
+        || ident == "terra_telemetry"
+        || (allow_test_gpu && ident == "terra_test_gpu")
 }
 
 fn is_ident_byte(b: u8) -> bool {

@@ -10,6 +10,7 @@ pub mod effect_filter;
 pub mod graph;
 pub mod output_identity;
 pub mod parity;
+mod pipeline_cache;
 pub mod pyramid;
 pub mod tile_cache;
 
@@ -17,11 +18,17 @@ pub use binding_layout::{
     uniform_texture_compute_layout, uniform_texture_compute_layout_entries,
     write_storage_texture_binding,
 };
-pub use derivatives::{cpu_slope_oracle, run_derivative_gpu, GpuDerivativeMode};
+pub use derivatives::{
+    cpu_slope_oracle, run_derivative_gpu, run_derivative_gpu_with_pipelines, GpuDerivativeMode,
+};
 pub use graph::{
     compile_gpu_graph, expand_dirty_rect, layer_gpu_supported, GpuComputeGraph, GpuDirtyPolicy,
     GpuFallbackCode, GpuFallbackDiagnostic, GpuFallbackReason, GpuKernel, GpuLayerPlan,
     BLUR_MAX_RADIUS, EFFECT_FILTER_MAX_RADIUS, RIVER_CARVE_MAX_RADIUS,
+};
+pub use pipeline_cache::{
+    PipelineCacheBlobStatus, PipelineCacheConfig, PipelineCacheRegistry, PipelineCacheReport,
+    PipelineCacheSaveResult, TERRA_PIPELINE_CACHE_SCHEMA, WGPU_PIPELINE_CACHE_COMPAT,
 };
 pub use pyramid::{
     GpuHeightPyramid, GpuHeightPyramidMaterializer, GpuPyramidContentIdentity, GpuPyramidError,
@@ -33,92 +40,6 @@ pub use tile_cache::{
 };
 
 use thiserror::Error;
-
-/// Pipeline reuse scoped to one owning GPU context.
-///
-/// The registry deliberately contains no device handle in its keys. Dropping
-/// the context drops this registry and all cached pipeline handles with it.
-pub struct PipelineCacheRegistry {
-    driver: Option<wgpu::PipelineCache>,
-    render: std::sync::Mutex<
-        std::collections::HashMap<(&'static str, wgpu::TextureFormat), wgpu::RenderPipeline>,
-    >,
-    compute: std::sync::Mutex<std::collections::HashMap<&'static str, wgpu::ComputePipeline>>,
-}
-
-impl PipelineCacheRegistry {
-    pub fn new(device: &wgpu::Device) -> Self {
-        let driver = device
-            .features()
-            .contains(wgpu::Features::PIPELINE_CACHE)
-            .then(|| {
-                // SAFETY: no externally supplied cache bytes are provided, so there
-                // is no data-validity invariant for the caller to uphold.
-                unsafe {
-                    device.create_pipeline_cache(&wgpu::PipelineCacheDescriptor {
-                        label: Some("terra-context-pipeline-cache"),
-                        data: None,
-                        fallback: true,
-                    })
-                }
-            });
-        Self {
-            driver,
-            render: std::sync::Mutex::new(std::collections::HashMap::new()),
-            compute: std::sync::Mutex::new(std::collections::HashMap::new()),
-        }
-    }
-
-    pub fn driver_cache(&self) -> Option<&wgpu::PipelineCache> {
-        self.driver.as_ref()
-    }
-
-    /// Return one exact render-pipeline handle per label and target format.
-    pub fn render_pipeline(
-        &self,
-        label: &'static str,
-        format: wgpu::TextureFormat,
-        create: impl FnOnce() -> wgpu::RenderPipeline,
-    ) -> wgpu::RenderPipeline {
-        let mut pipelines = self
-            .render
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let key = (label, format);
-        pipelines
-            .entry(key)
-            .or_insert_with(|| {
-                terra_telemetry::measure(
-                    terra_telemetry::CompilationKind::RenderPipeline,
-                    label,
-                    create,
-                )
-            })
-            .clone()
-    }
-
-    /// Return one exact compute-pipeline handle per label.
-    pub fn compute_pipeline(
-        &self,
-        label: &'static str,
-        create: impl FnOnce() -> wgpu::ComputePipeline,
-    ) -> wgpu::ComputePipeline {
-        let mut pipelines = self
-            .compute
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        pipelines
-            .entry(label)
-            .or_insert_with(|| {
-                terra_telemetry::measure(
-                    terra_telemetry::CompilationKind::ComputePipeline,
-                    label,
-                    create,
-                )
-            })
-            .clone()
-    }
-}
 
 #[derive(Debug, Error)]
 pub enum GpuError {

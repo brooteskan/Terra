@@ -38,6 +38,9 @@ pub struct ProgressivePresentationBundle {
     pub(crate) path_tracer: PathTracer,
 }
 
+// Bundles cross the one-shot compile channel once and are installed immediately;
+// boxing the progressive bundle would add allocation without reducing retained state.
+#[allow(clippy::large_enum_variant)]
 pub enum PresentationPipelineBundle {
     Terrain(TerrainPipelineBundle),
     Ocean(OceanPipelineBundle),
@@ -157,5 +160,9 @@ impl PresentationPipelineCompiler {
             ),
         };
         Ok(bundle)
+    }
+
+    pub fn save_pipeline_cache(&self) -> terra_gpu::PipelineCacheSaveResult {
+        self.pipelines.save()
     }
 }

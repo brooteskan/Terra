@@ -136,7 +136,12 @@ impl HeightPyramidExportController {
     }
 
     /// Advance at most one externally visible boundary per frame.
-    pub(super) fn pump(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> bool {
+    pub(super) fn pump(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pipelines: &terra_gpu::PipelineCacheRegistry,
+    ) -> bool {
         if !self.busy {
             return false;
         }
@@ -245,9 +250,10 @@ impl HeightPyramidExportController {
                 return false;
             }
         };
-        match self.producer.begin(
+        match self.producer.begin_with_pipelines(
             device,
             queue,
+            pipelines,
             self.stack.as_ref().expect("busy export owns stack"),
             &self.masks,
             self.plan.as_ref().expect("busy export owns plan"),
@@ -371,6 +377,7 @@ mod tests {
     #[test]
     fn gpu_controller_exports_complete_deterministic_package() {
         let gpu = terra_test_gpu::headless_required();
+        let pipelines = terra_gpu::PipelineCacheRegistry::new(&gpu.device);
         let root =
             std::env::temp_dir().join(format!("terra-app-height-pyramid-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -378,7 +385,7 @@ mod tests {
         controller.start(flat_document(), root.clone(), 71).unwrap();
         let start = std::time::Instant::now();
         while controller.is_busy() {
-            controller.pump(&gpu.device, &gpu.queue);
+            controller.pump(&gpu.device, &gpu.queue, &pipelines);
             let _ = gpu.device.poll(wgpu::Maintain::Wait);
             assert!(
                 start.elapsed() < std::time::Duration::from_secs(120),
@@ -405,6 +412,7 @@ mod tests {
     #[test]
     fn cancellation_drops_staging_without_publication() {
         let gpu = terra_test_gpu::headless_required();
+        let pipelines = terra_gpu::PipelineCacheRegistry::new(&gpu.device);
         let root = std::env::temp_dir().join(format!(
             "terra-app-height-pyramid-cancel-{}",
             std::process::id()
@@ -412,9 +420,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let mut controller = HeightPyramidExportController::default();
         controller.start(flat_document(), root.clone(), 73).unwrap();
-        controller.pump(&gpu.device, &gpu.queue);
+        controller.pump(&gpu.device, &gpu.queue, &pipelines);
         controller.cancel();
-        controller.pump(&gpu.device, &gpu.queue);
+        controller.pump(&gpu.device, &gpu.queue, &pipelines);
         assert!(!controller.is_busy());
         assert!(controller.take_result().is_none());
         assert!(!root.join("height-pyramid.current").exists());
