@@ -16,11 +16,16 @@ Use a recent stable Rust toolchain. GPU features need a working wgpu backend (DX
 
 | Crate | Must not depend on |
 |-------|--------------------|
-| `terra-world` | `terra-core`, evaluation, GPU, renderer, IO, or app crates |
+| `terra-world` | authored feature families, `terra-core`, evaluation, GPU, renderer, IO, or app crates |
+| `terra-authoring` | `terra-core`, evaluation, GPU, renderer, IO, or app crates |
 | `terra-core` | `wgpu`, any UI crate |
 | `terra-gui` | `terra-core` or other domain crates |
 
-Keep domain content (layer kinds, presets, archetypes) in `terra-core` when practical. UI crates present and apply; they should not become a second catalog of truth.
+Keep world coordinates, topology, bounds, tile addressing, and generic spatial indexing
+in `terra-world`. Persisted authored identities, feature stores, and mutation/query
+contracts belong in `terra-authoring`; documents, layer kinds, presets, archetypes,
+terrain-plan semantics, and evaluation inputs belong in `terra-core`. UI crates present
+and apply; they should not become a second catalog of truth.
 
 ## Pull request guidelines
 

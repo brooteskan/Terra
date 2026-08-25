@@ -1,0 +1,56 @@
+{
+  "strokes": [],
+  "world_metres_v1": [
+    {
+      "id": "11111111-2222-4333-8444-555555555555",
+      "kind": "HeightStamp",
+      "points": [
+        {
+          "position": {
+            "x_m": -0.25,
+            "z_m": 0.5
+          },
+          "pressure": 0.625
+        },
+        {
+          "position": {
+            "x_m": 0.25,
+            "z_m": -0.5
+          },
+          "pressure": 1.0
+        }
+      ],
+      "radius_m": 32.0,
+      "strength": 6.0,
+      "target_height": 950.0,
+      "falloff": 1.7,
+      "enabled": true
+    },
+    {
+      "id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+      "kind": "Valley",
+      "points": [
+        {
+          "position": {
+            "x_m": 4500000.125,
+            "z_m": -7250000.375
+          },
+          "pressure": 0.875
+        },
+        {
+          "position": {
+            "x_m": 4500000.375,
+            "z_m": -7250000.125
+          },
+          "pressure": 0.75
+        }
+      ],
+      "radius_m": 12.5,
+      "strength": 4.25,
+      "target_height": -125.0,
+      "falloff": 2.0,
+      "enabled": false
+    }
+  ],
+  "reconcile": 0.3
+}

@@ -9,8 +9,9 @@ design was reached, but they do not override this document.
 | Crate | Responsibility |
 |-------|----------------|
 | `terra-telemetry` | Backend-neutral startup-stage and pipeline-compilation tracking shared by GPU-facing crates |
-| `terra-world` | Fixed-origin coordinates, closed authored bounds/indexes, signed tile addresses, LODs, sample/world transforms, and bounded/infinite topology contracts |
-| `terra-core` | Backend-neutral domain model: heightfields, layer stack, masks, biomes, and editor commands |
+| `terra-world` | Fixed-origin coordinates, closed bounds, generic spatial indexes, signed tile addresses, LODs, sample/world transforms, and bounded/infinite topology contracts |
+| `terra-authoring` | Backend-neutral authored identity, persisted feature stores, and mutation and spatial-query contracts |
+| `terra-core` | Documents, layers, terrain-plan semantics, backend-neutral evaluation inputs, and editor commands |
 | `terra-cpu-eval` | Stateful CPU terrain evaluation, caches, scheduling, workers, timing, and output lifecycle |
 | `terra-jobs` | Cancellation primitive (`CancelToken`) and cancellable parallel-fill helpers shared by core algorithms and CPU evaluation |
 | `terra-gpu` | Reusable GPU kernels, capability descriptions, compiled-plan resources, derivatives, and tile caching |
@@ -22,10 +23,14 @@ design was reached, but they do not override this document.
 | `terra-test-gpu` | Non-published headless GPU harness used by render and UI tests |
 
 `terra-telemetry` is `wgpu`-free and depends only on the standard library.
-`terra-world` depends only on backend-independent serialization and stable-identity
-support and must stay free of domain content, evaluators, GPU, renderer, IO, and app
-crates.
-`terra-core` must stay free of evaluator, `wgpu`, and UI crates. `terra-cpu-eval`
+`terra-world` must stay free of authored feature families, domain content, evaluators,
+GPU, renderer, IO, and app crates. A temporary UUID authored-identity compatibility
+type remains while current callers migrate. `terra-authoring` depends on `terra-world`
+and backend-neutral serialization/identity support; it must not depend on `terra-core`
+or downstream crates. `terra-core` may depend on `terra-authoring` and must stay free
+of evaluator, `wgpu`, and UI crates. The intended dependency direction is
+`terra-world` → `terra-authoring` → `terra-core` → evaluators/application.
+`terra-cpu-eval`
 depends on `terra-core`, never the reverse. `terra-gpu-eval` depends on
 `terra-gpu`, never the reverse. `terra-gui` must stay free
 of `terra-core` and other domain types. `terra-render` and `terra-gui` do not
@@ -120,7 +125,8 @@ The ownership boundary is deliberate:
 - CPU/GPU evaluators own physical fields, caches, pipelines, and textures.
 - Per-frame scheduling owns transient execution state rather than authored identity.
 
-The app rebuilds `AuthoredFeatureIndex` from enabled Infinite stroke records whenever
+The app currently rebuilds the temporary `AuthoredFeatureIndex` compatibility alias
+from enabled Infinite stroke records whenever
 a document or topology is installed. Append, extend, enable, move, and delete edits
 apply old/new `WorldBounds` transitions to that runtime-only index. Bounds, index
 cells, tile residency, and visited-area state are never serialized with the project.
@@ -256,12 +262,14 @@ queries: it has no total dimensions, root tile, dense metadata index, or complet
 iterator. Terrain-content identity remains in `terra-core` and composes a world tile
 address with layer and field identity.
 
-`terra-world::AuthoredFeatureIndex` is the backend-independent runtime lookup for stable
-authored-feature identities and their finite bounds. It stores only occupied signed
-cells, filters cell candidates against exact bounds, and supports bounded tile,
-tile-plus-halo, and rectangle queries. Serialized feature-family records own the stable
-identity and bounds; loading rebuilds the index. Index buckets, generated terrain,
-residency state, and any complete-world enumeration are never persisted.
+`terra-world::SpatialIndex<K>` is the backend-independent runtime lookup from arbitrary
+stable keys to finite bounds. It stores only occupied signed cells, filters cell
+candidates against exact bounds, and supports bounded tile, tile-plus-halo, and
+rectangle queries. Serialized records own stable identity and geometry; loading
+rebuilds the index. Index buckets, generated terrain, residency state, and any
+complete-world enumeration are never persisted. `AuthoredFeatureIndex` is temporarily
+an alias using the existing UUID key; authored identity moves to `terra-authoring` in
+the next extraction session.
 
 `TerrainPyramid` is the bounded adapter over `terra-world::BoundedTopology` for a complete
 ceil-halving resolution hierarchy. It preserves the legacy coarse-first bounded level

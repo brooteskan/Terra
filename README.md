@@ -57,7 +57,9 @@ See the disclaimer above before relying on any of this.
 
 | Crate | Role |
 |-------|------|
-| `terra-core` | Backend-neutral heightfields, layers, masks, biomes, and commands |
+| `terra-world` | Fixed-origin coordinates, topology, bounds, tile addressing, and generic spatial indexing |
+| `terra-authoring` | Persisted authored-feature identities, stores, mutations, and queries |
+| `terra-core` | Backend-neutral documents, layers, terrain-plan semantics, evaluation inputs, and commands |
 | `terra-cpu-eval` | Stateful CPU terrain evaluation, caches, scheduling, and worker runtime |
 | `terra-gpu` | Reusable WGSL kernels, compiled-plan resources, derivatives, and tile caching |
 | `terra-gpu-eval` | Stateful GPU terrain evaluation, refinement, timing, and output lifecycle |
@@ -66,7 +68,9 @@ See the disclaimer above before relying on any of this.
 | `terra-app` | Editor chrome, panels, tools; application binary (winit event loop + wiring) |
 | `terra-io` | Project JSON, export package, limited grayscale GeoTIFF import |
 
-`terra-core` must stay free of `wgpu` and UI crates. `terra-gui` must stay free of domain types.
+Dependencies flow from `terra-world` through `terra-authoring` and `terra-core` to the
+evaluators and application. `terra-core` must stay free of `wgpu` and UI crates;
+`terra-gui` must stay free of domain types.
 
 ## Build & run
 

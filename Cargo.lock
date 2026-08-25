@@ -2629,6 +2629,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "terra-authoring"
+version = "0.1.0-beta.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "terra-world",
+ "uuid",
+]
+
+[[package]]
 name = "terra-core"
 version = "0.1.0-beta.1"
 dependencies = [

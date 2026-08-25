@@ -3,9 +3,10 @@
 //! `terra-world` owns fixed-origin CPU coordinates, signed tile addresses, LOD
 //! conventions, sample/world transforms, and topology math. It deliberately
 //! knows nothing about terrain fields, layers, evaluation, residency, GPU
-//! publication, rendering, IO, or application state. Its external dependencies
-//! are limited to `serde` for validated wire primitives and `uuid` for stable
-//! authored-feature identity.
+//! publication, rendering, IO, or application state. Its generic spatial-index
+//! implementation knows only caller-provided keys and finite world bounds. A
+//! temporary UUID authored-identity compatibility type remains while callers
+//! migrate to `terra-authoring`.
 //!
 //! # Conventions and invariants
 //!
@@ -30,6 +31,7 @@ mod bounds;
 mod coordinate;
 mod extent;
 mod infinite;
+mod spatial_index;
 mod transform;
 
 pub use address::{Lod, TileAddress, TileAddressRange, TileCoord, MAX_LOD};
@@ -39,6 +41,7 @@ pub use bounds::WorldBounds;
 pub use coordinate::{WorldPosition, WorldRect};
 pub use extent::{SampleCoord, SampleExtent, SpatialDomain, TileExtent};
 pub use infinite::{InfiniteTopology, InfiniteTopologyConfig};
+pub use spatial_index::{SpatialIndex, SpatialIndexError};
 pub use transform::{SampleSpacing, SampleWorldTransform};
 
 use std::fmt;

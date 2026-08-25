@@ -1,0 +1,17 @@
+[package]
+name = "terra-authoring"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Backend-neutral persisted authored-terrain stores and mutation contracts for Terra"
+
+[dependencies]
+terra-world = { workspace = true }
+serde = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[lints]
+workspace = true
