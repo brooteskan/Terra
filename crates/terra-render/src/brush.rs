@@ -74,6 +74,7 @@ pub struct BrushOverlay {
     overlay_pipeline: wgpu::RenderPipeline,
     compute_pipeline: wgpu::ComputePipeline,
     infinite_compute_pipeline: wgpu::ComputePipeline,
+    infinite_depth_pipeline: wgpu::RenderPipeline,
     infinite_overlay_pipeline: wgpu::RenderPipeline,
     render_bgl: wgpu::BindGroupLayout,
     compute_bgl: wgpu::BindGroupLayout,
@@ -266,10 +267,10 @@ impl BrushOverlay {
         // raster Depth32 attachment. Its cursor is composited after post and must
         // not be tested against the unrelated, stale raster attachment.
         let overlay_pipeline = make_render_pipeline("brush-overlay-pipeline", None);
-        let infinite_overlay_pipeline =
-            pipelines.render_pipeline("brush-infinite-overlay-pipeline", format, || {
+        let make_infinite_render_pipeline = |label: &'static str, depth_stencil| {
+            pipelines.render_pipeline(label, format, || {
                 device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                    label: Some("brush-infinite-overlay-pipeline"),
+                    label: Some(label),
                     layout: Some(&render_layout),
                     vertex: wgpu::VertexState {
                         module: &infinite_render_shader,
@@ -291,12 +292,29 @@ impl BrushOverlay {
                         topology: wgpu::PrimitiveTopology::LineStrip,
                         ..Default::default()
                     },
-                    depth_stencil: None,
+                    depth_stencil,
                     multisample: wgpu::MultisampleState::default(),
                     multiview: None,
                     cache: pipelines.driver_cache(),
                 })
-            });
+            })
+        };
+        let infinite_depth_pipeline = make_infinite_render_pipeline(
+            "brush-infinite-depth-pipeline",
+            Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: Default::default(),
+                bias: wgpu::DepthBiasState {
+                    constant: -2,
+                    slope_scale: -1.0,
+                    clamp: 0.0,
+                },
+            }),
+        );
+        let infinite_overlay_pipeline =
+            make_infinite_render_pipeline("brush-infinite-overlay-pipeline", None);
 
         let compute_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("brush-compute-layout"),
@@ -348,6 +366,7 @@ impl BrushOverlay {
             overlay_pipeline,
             compute_pipeline,
             infinite_compute_pipeline,
+            infinite_depth_pipeline,
             infinite_overlay_pipeline,
             render_bgl,
             compute_bgl,
@@ -643,6 +662,7 @@ impl BrushOverlay {
             return;
         };
         pass.set_pipeline(match self.traversal {
+            TerrainTraversalMode::Infinite if depth_tested => &self.infinite_depth_pipeline,
             TerrainTraversalMode::Infinite => &self.infinite_overlay_pipeline,
             TerrainTraversalMode::Bounded if depth_tested => &self.depth_pipeline,
             TerrainTraversalMode::Bounded => &self.overlay_pipeline,

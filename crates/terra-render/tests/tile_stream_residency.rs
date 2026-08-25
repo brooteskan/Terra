@@ -370,6 +370,7 @@ fn infinite_sparse_page_renders_at_large_signed_coordinates() {
     );
 
     let mut brush = BrushOverlay::new(&gpu.device, ctx.pipeline_registry(), FORMAT);
+    brush.rebind_height(&gpu.device, renderer.heights.display_height_view());
     brush.rebind_depth(&gpu.device, &renderer.depth);
     let aspect = W as f32 / H as f32;
     let render_origin = renderer.render_origin_xz();
@@ -421,6 +422,44 @@ fn infinite_sparse_page_renders_at_large_signed_coordinates() {
             )
             .is_none(),
         "an origin shift must reject the old asynchronous result"
+    );
+
+    gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let mut encoder = gpu
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("infinite-brush-depth-regression-encoder"),
+        });
+    {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("infinite-brush-depth-regression-pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &after_target.view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &renderer.depth,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        brush.draw(&mut pass, true);
+    }
+    gpu.queue.submit(Some(encoder.finish()));
+    let _ = gpu.device.poll(wgpu::Maintain::Wait);
+    let error = pollster::block_on(gpu.device.pop_error_scope());
+    assert!(
+        error.is_none(),
+        "Infinite brush pipeline must match the raster depth attachment: {error:?}"
     );
 
     renderer.set_tile_stream_debug_mode(0);
