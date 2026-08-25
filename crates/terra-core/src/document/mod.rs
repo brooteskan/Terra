@@ -24,7 +24,7 @@ use terra_world::{InfiniteTopology, InfiniteTopologyConfig, Lod, WorldPosition};
 /// authored identity and semantics. Persisted enum tags are additive (renames
 /// require aliases or migration), and every new persisted field requires a Serde
 /// default or an explicit migration. Writers always stamp this current version.
-pub const DOCUMENT_VERSION: u32 = 4;
+pub const DOCUMENT_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProjectWorldKind {

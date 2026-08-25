@@ -1051,6 +1051,7 @@ mod tests {
                     kind,
                     ..SculptStroke::default()
                 }],
+                world_strokes: Vec::new(),
                 reconcile,
             })
         };

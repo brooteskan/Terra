@@ -10,6 +10,7 @@ use crate::hydro::{self, StreamPowerParams};
 use crate::mask::{MaskField, MaskSource};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use terra_world::{AuthoredFeatureId, WorldBounds, WorldError, WorldPosition};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SculptStrokeKind {
@@ -180,10 +181,105 @@ impl Default for SculptStroke {
     }
 }
 
+/// Versioned fixed-origin point stored by Infinite sculpt histories.
+///
+/// The separate type is deliberate: legacy [`SculptPoint`] values are bounded
+/// UVs, while these coordinates are authoritative `f64` world metres and must
+/// never pass through normalized or render-relative storage.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct WorldSculptPoint {
+    pub position: WorldPosition,
+    #[serde(default = "one")]
+    pub pressure: f32,
+}
+
+/// One finite Infinite-world sculpt feature.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorldSculptStroke {
+    #[serde(default)]
+    pub id: AuthoredFeatureId,
+    pub kind: SculptStrokeKind,
+    #[serde(default)]
+    pub points: Vec<WorldSculptPoint>,
+    #[serde(default = "sculpt_radius")]
+    pub radius_m: f32,
+    #[serde(default = "sculpt_strength")]
+    pub strength: f32,
+    #[serde(default)]
+    pub target_height: f32,
+    #[serde(default = "sculpt_falloff")]
+    pub falloff: f32,
+    #[serde(default = "enabled_default")]
+    pub enabled: bool,
+}
+
+impl Default for WorldSculptStroke {
+    fn default() -> Self {
+        Self {
+            id: AuthoredFeatureId::new(),
+            kind: SculptStrokeKind::Raise,
+            points: vec![WorldSculptPoint {
+                position: WorldPosition::ORIGIN,
+                pressure: 1.0,
+            }],
+            radius_m: sculpt_radius(),
+            strength: sculpt_strength(),
+            target_height: 0.0,
+            falloff: sculpt_falloff(),
+            enabled: true,
+        }
+    }
+}
+
+/// Active authored bounds before and after one Infinite sculpt mutation.
+///
+/// Disabled and removed records have no active index bounds. Keeping both sides
+/// makes the result directly reusable by #205 invalidation without recomputing
+/// or losing the previous footprint.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SculptBoundsChange {
+    pub id: AuthoredFeatureId,
+    pub previous: Option<WorldBounds>,
+    pub replacement: Option<WorldBounds>,
+}
+
+pub fn world_sculpt_stroke_bounds(
+    stroke: &WorldSculptStroke,
+) -> Result<Option<WorldBounds>, WorldError> {
+    if !stroke.radius_m.is_finite() || stroke.radius_m <= 0.0 {
+        return Err(WorldError::InvalidWorldExpansion);
+    }
+    let Some(bounds) = WorldBounds::try_from_points(stroke.points.iter().map(|p| p.position))?
+    else {
+        return Ok(None);
+    };
+    bounds
+        .checked_expand(f64::from(stroke.radius_m), f64::from(stroke.radius_m))
+        .map(Some)
+}
+
+fn active_world_sculpt_bounds(
+    stroke: &WorldSculptStroke,
+) -> Result<Option<WorldBounds>, WorldError> {
+    if stroke.enabled {
+        world_sculpt_stroke_bounds(stroke)
+    } else {
+        Ok(None)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SculptStrokeParams {
     #[serde(default)]
     pub strokes: Vec<SculptStroke>,
+    /// Infinite points in fixed-origin world metres. The persisted field name is
+    /// the coordinate-space/version contract; legacy `strokes` remain bounded UV.
+    #[serde(
+        default,
+        rename = "world_metres_v1",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub world_strokes: Vec<WorldSculptStroke>,
     #[serde(default = "sculpt_reconcile")]
     pub reconcile: f32,
 }
@@ -196,6 +292,7 @@ impl Default for SculptStrokeParams {
     fn default() -> Self {
         Self {
             strokes: Vec::new(),
+            world_strokes: Vec::new(),
             reconcile: sculpt_reconcile(),
         }
     }
@@ -237,6 +334,184 @@ impl SculptStrokeParams {
                 falloff: 1.5,
                 enabled: true,
             });
+        }
+    }
+
+    /// Append or extend one Infinite stroke and report the exact active bounds
+    /// transition needed to keep the runtime authored-feature index coherent.
+    #[allow(clippy::too_many_arguments)]
+    pub fn stamp_world_stroke(
+        &mut self,
+        kind: SculptStrokeKind,
+        position: WorldPosition,
+        radius_m: f64,
+        strength: f32,
+        target_height: f32,
+        falloff: f32,
+        continuing: bool,
+    ) -> Result<SculptBoundsChange, WorldError> {
+        if !radius_m.is_finite() || radius_m <= 0.0 {
+            return Err(WorldError::InvalidWorldExpansion);
+        }
+        let radius_m = radius_m.min(f64::from(f32::MAX)) as f32;
+        let append = continuing
+            && self.world_strokes.last().is_some_and(|last| {
+                last.enabled
+                    && last.kind == kind
+                    && (last.radius_m - radius_m).abs() <= radius_m.max(1.0) * 0.05
+            });
+        if append {
+            let stroke = self
+                .world_strokes
+                .last_mut()
+                .expect("append checked a world stroke above");
+            let previous = active_world_sculpt_bounds(stroke)?;
+            stroke.points.push(WorldSculptPoint {
+                position,
+                pressure: 1.0,
+            });
+            stroke.strength = strength;
+            stroke.target_height = target_height;
+            stroke.falloff = falloff;
+            let replacement = active_world_sculpt_bounds(stroke)?;
+            Ok(SculptBoundsChange {
+                id: stroke.id,
+                previous,
+                replacement,
+            })
+        } else {
+            let stroke = WorldSculptStroke {
+                id: AuthoredFeatureId::new(),
+                kind,
+                points: vec![WorldSculptPoint {
+                    position,
+                    pressure: 1.0,
+                }],
+                radius_m,
+                strength,
+                target_height,
+                falloff,
+                enabled: true,
+            };
+            let replacement = active_world_sculpt_bounds(&stroke)?;
+            let id = stroke.id;
+            self.world_strokes.push(stroke);
+            Ok(SculptBoundsChange {
+                id,
+                previous: None,
+                replacement,
+            })
+        }
+    }
+
+    pub fn set_world_stroke_enabled(
+        &mut self,
+        id: AuthoredFeatureId,
+        enabled: bool,
+    ) -> Result<Option<SculptBoundsChange>, WorldError> {
+        let Some(stroke) = self.world_strokes.iter_mut().find(|stroke| stroke.id == id) else {
+            return Ok(None);
+        };
+        let previous = active_world_sculpt_bounds(stroke)?;
+        stroke.enabled = enabled;
+        let replacement = active_world_sculpt_bounds(stroke)?;
+        Ok(Some(SculptBoundsChange {
+            id,
+            previous,
+            replacement,
+        }))
+    }
+
+    /// Replace editable stroke semantics or geometry without changing feature
+    /// identity or chronological order.
+    pub fn replace_world_stroke(
+        &mut self,
+        id: AuthoredFeatureId,
+        mut replacement_stroke: WorldSculptStroke,
+    ) -> Result<Option<SculptBoundsChange>, WorldError> {
+        let Some(index) = self.world_strokes.iter().position(|stroke| stroke.id == id) else {
+            return Ok(None);
+        };
+        let previous = active_world_sculpt_bounds(&self.world_strokes[index])?;
+        replacement_stroke.id = id;
+        let replacement = active_world_sculpt_bounds(&replacement_stroke)?;
+        self.world_strokes[index] = replacement_stroke;
+        Ok(Some(SculptBoundsChange {
+            id,
+            previous,
+            replacement,
+        }))
+    }
+
+    pub fn remove_world_stroke(
+        &mut self,
+        id: AuthoredFeatureId,
+    ) -> Result<Option<(usize, WorldSculptStroke, SculptBoundsChange)>, WorldError> {
+        let Some(index) = self.world_strokes.iter().position(|stroke| stroke.id == id) else {
+            return Ok(None);
+        };
+        let stroke = self.world_strokes.remove(index);
+        let previous = active_world_sculpt_bounds(&stroke)?;
+        Ok(Some((
+            index,
+            stroke,
+            SculptBoundsChange {
+                id,
+                previous,
+                replacement: None,
+            },
+        )))
+    }
+
+    pub fn translate_world_stroke(
+        &mut self,
+        id: AuthoredFeatureId,
+        dx_m: f64,
+        dz_m: f64,
+    ) -> Result<Option<SculptBoundsChange>, WorldError> {
+        WorldPosition::try_new(dx_m, dz_m)?;
+        let Some(stroke) = self.world_strokes.iter_mut().find(|stroke| stroke.id == id) else {
+            return Ok(None);
+        };
+        let previous = active_world_sculpt_bounds(stroke)?;
+        let translated = stroke
+            .points
+            .iter()
+            .map(|point| {
+                WorldPosition::try_new(point.position.x_m() + dx_m, point.position.z_m() + dz_m)
+                    .map(|position| WorldSculptPoint {
+                        position,
+                        pressure: point.pressure,
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        stroke.points = translated;
+        let replacement = active_world_sculpt_bounds(stroke)?;
+        Ok(Some(SculptBoundsChange {
+            id,
+            previous,
+            replacement,
+        }))
+    }
+
+    pub fn world_feature_records(
+        &self,
+    ) -> Result<Vec<(AuthoredFeatureId, WorldBounds)>, WorldError> {
+        self.world_strokes
+            .iter()
+            .filter_map(|stroke| match active_world_sculpt_bounds(stroke) {
+                Ok(Some(bounds)) => Some(Ok((stroke.id, bounds))),
+                Ok(None) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect()
+    }
+
+    /// Give cloned records fresh authored identity while preserving geometry and
+    /// sculpt semantics.
+    pub fn reseed_world_stroke_ids(&mut self) {
+        for stroke in &mut self.world_strokes {
+            stroke.id = AuthoredFeatureId::new();
         }
     }
 }
@@ -2036,6 +2311,7 @@ mod tests {
                 &input,
                 &SculptStrokeParams {
                     strokes,
+                    world_strokes: Vec::new(),
                     reconcile: 0.0,
                 },
             )
@@ -2160,6 +2436,7 @@ mod tests {
                     enabled: true,
                 },
             ],
+            world_strokes: Vec::new(),
             reconcile: 0.2,
         };
         let whole = apply_sculpt_strokes(&h, &p);
@@ -2265,6 +2542,7 @@ mod tests {
     fn mk_params(strokes: Vec<SculptStroke>) -> SculptStrokeParams {
         SculptStrokeParams {
             strokes,
+            world_strokes: Vec::new(),
             reconcile: 0.2,
         }
     }
@@ -2806,6 +3084,7 @@ mod tests {
             }
             let p = SculptStrokeParams {
                 strokes,
+                world_strokes: Vec::new(),
                 reconcile: 0.2,
             };
             let got = apply_sculpt_strokes(&h, &p);
@@ -2888,6 +3167,7 @@ mod tests {
             ];
             let p = SculptStrokeParams {
                 strokes,
+                world_strokes: Vec::new(),
                 reconcile: 0.2,
             };
             let got = apply_sculpt_strokes(&h, &p);
@@ -2940,6 +3220,7 @@ mod tests {
                     mk_stroke(SculptStrokeKind::Flatten, 0.5, 0.5, 220.0),
                     mk_stroke(SculptStrokeKind::Uplift, 0.45, 0.5, 80.0),
                 ],
+                world_strokes: Vec::new(),
                 reconcile: 0.2,
             };
             let mut entry: Option<SculptPrefixEntry> = None;
@@ -3003,6 +3284,7 @@ mod tests {
             strokes: (0..5)
                 .map(|k| mk_stroke(SculptStrokeKind::Raise, 0.15 + 0.15 * k as f32, 0.5, 90.0))
                 .collect(),
+            world_strokes: Vec::new(),
             reconcile: 0.2,
         };
         let mut entry: Option<SculptPrefixEntry> = None;
@@ -3036,6 +3318,7 @@ mod tests {
                 mk_stroke(SculptStrokeKind::Raise, 0.3, 0.4, 120.0),
                 mk_stroke(SculptStrokeKind::Flatten, 0.5, 0.5, 160.0),
             ],
+            world_strokes: Vec::new(),
             reconcile: 0.2,
         };
         let mut entry: Option<SculptPrefixEntry> = None;
@@ -3070,6 +3353,7 @@ mod tests {
                 mk_stroke(SculptStrokeKind::Raise, 0.3, 0.4, 120.0),
                 mk_stroke(SculptStrokeKind::Raise, 0.6, 0.5, 120.0),
             ],
+            world_strokes: Vec::new(),
             reconcile: 0.2,
         };
         let mut entry: Option<SculptPrefixEntry> = None;
@@ -3092,11 +3376,139 @@ mod tests {
         let h = fp_field(m);
         let p = SculptStrokeParams {
             strokes: Vec::new(),
+            world_strokes: Vec::new(),
             reconcile: 0.2,
         };
         let mut entry: Option<SculptPrefixEntry> = None;
         let s = cached_step(&h, &p, &mut entry, m, "empty");
         assert_eq!(s.stroke_count, 0);
         assert!(entry.is_none(), "an empty list stores no checkpoint");
+    }
+
+    #[test]
+    fn infinite_stroke_crosses_zero_with_stable_identity_and_finite_bounds() {
+        let mut params = SculptStrokeParams::default();
+        let first = params
+            .stamp_world_stroke(
+                SculptStrokeKind::Raise,
+                WorldPosition::try_new(-300.25, -12.5).unwrap(),
+                20.0,
+                7.0,
+                0.0,
+                1.75,
+                false,
+            )
+            .unwrap();
+        assert!(first.previous.is_none());
+        let second = params
+            .stamp_world_stroke(
+                SculptStrokeKind::Raise,
+                WorldPosition::try_new(300.75, 18.5).unwrap(),
+                20.0,
+                9.0,
+                0.0,
+                2.0,
+                true,
+            )
+            .unwrap();
+        assert_eq!(first.id, second.id, "continuation retains feature identity");
+        let bounds = second.replacement.unwrap();
+        assert_eq!(bounds.min().x_m(), -320.25);
+        assert_eq!(bounds.max().x_m(), 320.75);
+        assert!(bounds.min().z_m() < 0.0 && bounds.max().z_m() > 0.0);
+        assert_eq!(params.world_strokes[0].strength, 9.0);
+        assert_eq!(params.world_strokes[0].falloff, 2.0);
+    }
+
+    #[test]
+    fn infinite_stroke_edits_report_old_and_new_active_bounds() {
+        let mut params = SculptStrokeParams::default();
+        let created = params
+            .stamp_world_stroke(
+                SculptStrokeKind::Flatten,
+                WorldPosition::try_new(-10.0, 5.0).unwrap(),
+                4.0,
+                0.8,
+                125.0,
+                1.25,
+                false,
+            )
+            .unwrap();
+        let original = created.replacement.unwrap();
+        let mut edited = params.world_strokes[0].clone();
+        edited.radius_m = 8.0;
+        edited.strength = 12.0;
+        let resized = params
+            .replace_world_stroke(created.id, edited)
+            .unwrap()
+            .unwrap();
+        assert_eq!(resized.previous, Some(original));
+        assert_eq!(resized.replacement.unwrap().min().x_m(), -18.0);
+        assert_eq!(params.world_strokes[0].strength, 12.0);
+        let moved = params
+            .translate_world_stroke(created.id, 25.0, -40.0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(moved.previous, resized.replacement);
+        assert_eq!(moved.replacement.unwrap().min().x_m(), 7.0);
+        assert_eq!(moved.replacement.unwrap().min().z_m(), -43.0);
+
+        let disabled = params
+            .set_world_stroke_enabled(created.id, false)
+            .unwrap()
+            .unwrap();
+        assert!(disabled.previous.is_some());
+        assert!(disabled.replacement.is_none());
+        let enabled = params
+            .set_world_stroke_enabled(created.id, true)
+            .unwrap()
+            .unwrap();
+        assert!(enabled.previous.is_none());
+        assert!(enabled.replacement.is_some());
+        let (_, removed, deleted) = params.remove_world_stroke(created.id).unwrap().unwrap();
+        assert_eq!(removed.id, created.id);
+        assert!(deleted.previous.is_some());
+        assert!(deleted.replacement.is_none());
+    }
+
+    #[test]
+    fn infinite_stroke_json_round_trip_retains_large_coordinate_precision() {
+        let mut params = SculptStrokeParams::default();
+        params
+            .stamp_world_stroke(
+                SculptStrokeKind::HeightStamp,
+                WorldPosition::try_new(2_345_678_901.125, -1_234_567_890.875).unwrap(),
+                0.25,
+                3.5,
+                912.25,
+                0.9,
+                false,
+            )
+            .unwrap();
+        params.world_strokes[0].points[0].pressure = 0.375;
+        let json = serde_json::to_string(&params).unwrap();
+        assert!(json.contains("world_metres_v1"));
+        assert!(!json.contains("bounds"));
+        assert!(!json.contains("index"));
+        let loaded: SculptStrokeParams = serde_json::from_str(&json).unwrap();
+        let point = loaded.world_strokes[0].points[0];
+        assert_eq!(point.position.x_m(), 2_345_678_901.125);
+        assert_eq!(point.position.z_m(), -1_234_567_890.875);
+        assert_eq!(point.pressure, 0.375);
+        assert_eq!(loaded.world_strokes[0].target_height, 912.25);
+        assert_eq!(loaded.world_strokes[0].id, params.world_strokes[0].id);
+    }
+
+    #[test]
+    fn legacy_bounded_stroke_json_keeps_uv_interpretation() {
+        let json = r#"{"strokes":[{"kind":"Raise","points":[{"u":0.25,"v":0.75,"pressure":0.5}],"radius_m":8.0,"strength":2.0,"target_height":0.0,"falloff":1.5,"enabled":true}],"reconcile":0.15}"#;
+        let loaded: SculptStrokeParams = serde_json::from_str(json).unwrap();
+        assert!(loaded.world_strokes.is_empty());
+        assert_eq!(loaded.strokes[0].points[0].u, 0.25);
+        assert_eq!(loaded.strokes[0].points[0].v, 0.75);
+        let saved = serde_json::to_string(&loaded).unwrap();
+        let reloaded: SculptStrokeParams = serde_json::from_str(&saved).unwrap();
+        assert_eq!(reloaded.strokes, loaded.strokes);
+        assert!(reloaded.world_strokes.is_empty());
     }
 }

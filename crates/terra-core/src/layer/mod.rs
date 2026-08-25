@@ -174,6 +174,9 @@ impl Layer {
         for out in &mut clone.common.outputs {
             out.id = OutputId::new();
         }
+        if let LayerKind::SculptStrokes(params) = &mut clone.kind {
+            params.reseed_world_stroke_ids();
+        }
         clone
     }
 }

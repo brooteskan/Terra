@@ -75,6 +75,21 @@ pub enum PanelAction {
         layer: LayerId,
         index: usize,
     },
+    SetWorldStrokeEnabled {
+        layer: LayerId,
+        stroke: terra_world::AuthoredFeatureId,
+        enabled: bool,
+    },
+    DeleteWorldStroke {
+        layer: LayerId,
+        stroke: terra_world::AuthoredFeatureId,
+    },
+    MoveWorldStroke {
+        layer: LayerId,
+        stroke: terra_world::AuthoredFeatureId,
+        dx_m: f64,
+        dz_m: f64,
+    },
     SetOpacity {
         id: LayerId,
         opacity: f32,

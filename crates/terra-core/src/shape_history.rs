@@ -277,6 +277,11 @@ pub fn create_shape_layer(name: impl Into<String>) -> Layer {
 pub fn merge_sculpt_stroke_layers(keep: &mut SculptStrokeParams, sources: &[&SculptStrokeParams]) {
     for src in sources {
         keep.strokes.extend(src.strokes.iter().cloned());
+        keep.world_strokes
+            .extend(src.world_strokes.iter().cloned().map(|mut stroke| {
+                stroke.id = terra_world::AuthoredFeatureId::new();
+                stroke
+            }));
     }
 }
 

@@ -410,6 +410,9 @@ impl TerraApp {
         self.pending_project_action = None;
 
         let presentation_ready = self.reset_runtime_for_document(&project_world, ocean);
+        if let Err(error) = self.rebuild_authored_feature_index() {
+            self.ui_state.status = format!("Could not rebuild authored-feature index: {error}");
+        }
         self.apply_document_lighting();
 
         // Editor chrome starts minimized on create/open.
@@ -479,6 +482,7 @@ impl TerraApp {
 
         let (world_size, traversal_mode, infinite_frame) = match project_world {
             terra_core::document::ProjectWorld::BoundedHeightfield(settings) => {
+                self.authored_feature_index = None;
                 self.terrain_runtime
                     .reconfigure(terra_core::PyramidConfig::new(
                         settings.preview_resolution.max(256),
@@ -494,6 +498,16 @@ impl TerraApp {
             terra_core::document::ProjectWorld::InfiniteProceduralWorld(settings) => {
                 match settings.topology() {
                     Ok(topology) => {
+                        self.authored_feature_index = terra_world::AuthoredFeatureIndex::try_new(
+                            topology,
+                            topology.config().max_lod,
+                        )
+                        .map(Some)
+                        .unwrap_or_else(|error| {
+                            self.ui_state.status =
+                                format!("Invalid authored-feature index: {error}");
+                            None
+                        });
                         if let Err(error) = self.terrain_runtime.try_reconfigure(
                             terra_core::TerrainRuntimeConfig::Infinite(topology.config()),
                         ) {
@@ -501,6 +515,7 @@ impl TerraApp {
                         }
                     }
                     Err(error) => {
+                        self.authored_feature_index = None;
                         self.ui_state.status = format!("Invalid Infinite topology: {error}");
                     }
                 }
@@ -623,6 +638,36 @@ impl TerraApp {
         // unreachable and stop streaming until the new document re-syncs.
         self.retire_streamed_residency();
         presentation_ready
+    }
+
+    pub(crate) fn rebuild_authored_feature_index(
+        &mut self,
+    ) -> Result<(), terra_world::FeatureIndexError> {
+        let Some(index) = self.authored_feature_index.as_mut() else {
+            return Ok(());
+        };
+        let mut records = Vec::new();
+        for layer in self.session.document.stack.flatten_layers() {
+            if let terra_core::layer::LayerKind::SculptStrokes(params) = &layer.kind {
+                records.extend(params.world_feature_records()?);
+            }
+        }
+        index.rebuild(records)
+    }
+
+    pub(crate) fn apply_sculpt_bounds_change(
+        &mut self,
+        change: terra_core::authoring::SculptBoundsChange,
+    ) -> Result<(), terra_world::FeatureIndexError> {
+        let Some(index) = self.authored_feature_index.as_mut() else {
+            return Ok(());
+        };
+        match (change.previous, change.replacement) {
+            (None, Some(bounds)) => index.insert(change.id, bounds),
+            (Some(_), Some(bounds)) => index.update(change.id, bounds),
+            (Some(_), None) => index.remove(change.id).map(|_| ()),
+            (None, None) => Ok(()),
+        }
     }
 
     pub(crate) fn request_presentation_pipeline(
@@ -1057,6 +1102,42 @@ impl TerraApp {
         );
         match decision {
             ShapeTargetDecision::UseExisting(id) => {
+                let coordinate_mismatch = self
+                    .session
+                    .document
+                    .stack
+                    .find(id)
+                    .and_then(|layer| match &layer.kind {
+                        terra_core::layer::LayerKind::SculptStrokes(params) => {
+                            Some(if self.session.document.infinite_settings().is_some() {
+                                !params.strokes.is_empty()
+                            } else {
+                                !params.world_strokes.is_empty()
+                            })
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or(false);
+                if coordinate_mismatch {
+                    let space_label = if self.session.document.infinite_settings().is_some() {
+                        "World"
+                    } else {
+                        "Bounded"
+                    };
+                    let name = format!("{} {space_label}", tool.default_layer_name());
+                    let layer = create_shape_layer(name.clone());
+                    let new_id = layer.id();
+                    self.session.document.stack.ensure_category_folders();
+                    self.session.document.stack.push_routed(layer, None, false);
+                    self.session.document.selected = Some(new_id);
+                    self.ui_state.shape_session_layer = Some(new_id);
+                    self.pending_plan_edits
+                        .push(terra_core::terrain_plan::TerrainEditClass::Structure);
+                    self.ui_state.status = format!(
+                        "Created new Shape Layer \"{name}\" for the project's coordinate space"
+                    );
+                    return Some(new_id);
+                }
                 if self.session.document.stack.find(id).is_some_and(|l| {
                     matches!(l.kind, terra_core::layer::LayerKind::SculptStrokes(_))
                 }) {
@@ -1256,6 +1337,9 @@ impl TerraApp {
             }
             _ => self.mark_all_layers_dirty(),
         }
+        if let Err(error) = self.rebuild_authored_feature_index() {
+            self.ui_state.status = format!("Undo left an invalid authored index: {error}");
+        }
         self.mark_document_dirty();
         self.request_rebuild();
     }
@@ -1284,6 +1368,9 @@ impl TerraApp {
                 self.preview_dirty = true;
             }
             _ => self.mark_all_layers_dirty(),
+        }
+        if let Err(error) = self.rebuild_authored_feature_index() {
+            self.ui_state.status = format!("Redo left an invalid authored index: {error}");
         }
         self.mark_document_dirty();
         self.request_rebuild();

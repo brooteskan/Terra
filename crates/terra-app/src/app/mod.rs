@@ -228,6 +228,9 @@ pub struct TerraApp {
     scheduler: EvalScheduler,
     /// Final-output tile residency, revisioning, and progressive refinement state.
     terrain_runtime: terra_core::TerrainRuntime,
+    /// Runtime-only sparse lookup rebuilt from serialized authored records.
+    /// It deliberately never becomes part of `TerrainDocument`.
+    authored_feature_index: Option<terra_world::AuthoredFeatureIndex>,
     runtime_started: Instant,
 
     /// Dedicated CPU evaluator for Medium/Full progressive refinement.
@@ -474,6 +477,7 @@ impl Default for TerraApp {
             ui_state,
             scheduler: EvalScheduler::new(),
             terrain_runtime,
+            authored_feature_index: None,
             runtime_started: now,
             eval_worker: EvalWorker::spawn(),
             eval_token: 0,

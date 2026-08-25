@@ -210,6 +210,56 @@ fn infinite_world_round_trips_all_authoritative_settings() {
 }
 
 #[test]
+fn infinite_world_sculpt_records_round_trip_without_derived_index_data() {
+    let settings = InfiniteProceduralWorldSettings {
+        finest_spacing_m: 0.125,
+        ..InfiniteProceduralWorldSettings::default()
+    };
+    let mut doc = TerrainDocument::new_infinite(settings).unwrap();
+    let mut params = crate::authoring::SculptStrokeParams::default();
+    let change = params
+        .stamp_world_stroke(
+            crate::authoring::SculptStrokeKind::HeightStamp,
+            WorldPosition::try_new(4_500_000.125, -7_250_000.375).unwrap(),
+            32.0,
+            6.0,
+            950.0,
+            1.7,
+            false,
+        )
+        .unwrap();
+    let layer = Layer::new("World Sculpt", LayerKind::SculptStrokes(params));
+    let layer_id = layer.id();
+    doc.add_shape_layer(layer);
+
+    let json = doc.to_json().unwrap();
+    assert!(json.contains("world_metres_v1"));
+    assert!(!json.contains("occupied_cell"));
+    assert!(!json.contains("authored_feature_index"));
+    let loaded = TerrainDocument::from_json(&json).unwrap();
+    let LayerKind::SculptStrokes(params) = &loaded
+        .stack
+        .find(layer_id)
+        .expect("world sculpt layer")
+        .kind
+    else {
+        panic!("world sculpt layer kind changed")
+    };
+    assert!(params.strokes.is_empty());
+    assert_eq!(params.world_strokes.len(), 1);
+    assert_eq!(params.world_strokes[0].id, change.id);
+    assert_eq!(
+        params.world_strokes[0].points[0].position.x_m(),
+        4_500_000.125
+    );
+    assert_eq!(
+        params.world_strokes[0].points[0].position.z_m(),
+        -7_250_000.375
+    );
+    assert_eq!(params.world_strokes[0].target_height, 950.0);
+}
+
+#[test]
 fn infinite_world_validation_rejects_invalid_sparse_configuration() {
     let mut settings = InfiniteProceduralWorldSettings::default();
     settings.finest_spacing_m = 0.0;

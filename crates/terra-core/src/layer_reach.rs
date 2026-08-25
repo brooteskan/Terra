@@ -150,6 +150,7 @@ mod tests {
                 kind: SculptStrokeKind::Smooth,
                 ..SculptStroke::default()
             }],
+            world_strokes: Vec::new(),
             reconcile: 0.15,
         }));
         assert_eq!(

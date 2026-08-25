@@ -112,9 +112,18 @@ retained only as a compatibility diagnostic and layer-kernel capability adapter.
 The ownership boundary is deliberate:
 
 - `TerrainDocument` owns authored layers, masks, Base samples, and stroke history.
+- Legacy sculpt history is persisted in bounded UV, while Infinite sculpt history
+  is persisted separately under the versioned `world_metres_v1` contract. Infinite
+  points use fixed-origin `f64` X/Z metres and stable authored-feature IDs; brush
+  bounds are always derived from point records plus radius.
 - `CompiledTerrainPlan` owns runtime-derived semantic descriptors and provenance.
 - CPU/GPU evaluators own physical fields, caches, pipelines, and textures.
 - Per-frame scheduling owns transient execution state rather than authored identity.
+
+The app rebuilds `AuthoredFeatureIndex` from enabled Infinite stroke records whenever
+a document or topology is installed. Append, extend, enable, move, and delete edits
+apply old/new `WorldBounds` transitions to that runtime-only index. Bounds, index
+cells, tile residency, and visited-area state are never serialized with the project.
 
 Plan-local operation and field IDs are valid only for one structural revision. Stable
 cross-plan identity comes from authored layer/group/output IDs. Content edits such as

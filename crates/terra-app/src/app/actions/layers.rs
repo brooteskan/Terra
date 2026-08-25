@@ -133,6 +133,9 @@ pub(crate) fn try_apply(
                         app.session.document.stack.layer_ids().last().copied();
                     app.mark_all_layers_dirty();
                     app.request_rebuild();
+                    if let Err(error) = app.rebuild_authored_feature_index() {
+                        app.ui_state.status = format!("Could not update authored index: {error}");
+                    }
                     ctx.doc_mutated = true;
                 }
             }
@@ -155,6 +158,9 @@ pub(crate) fn try_apply(
                     let cmd = EditorCommand::Duplicate { source: id, new_id };
                     app.session.history.push_executed(cmd);
                     app.session.document.selected = Some(new_id);
+                    if let Err(error) = app.rebuild_authored_feature_index() {
+                        app.ui_state.status = format!("Could not update authored index: {error}");
+                    }
                     ctx.dirty_from = Some(new_id);
                     ctx.doc_mutated = true;
                 }
@@ -241,6 +247,144 @@ pub(crate) fn try_apply(
                 ctx.doc_mutated = true;
             }
         }
+        PanelAction::SetWorldStrokeEnabled {
+            layer,
+            stroke,
+            enabled,
+        } => {
+            let previous = app
+                .session
+                .document
+                .stack
+                .find(layer)
+                .map(|layer| layer.kind.clone());
+            let change = app
+                .session
+                .document
+                .stack
+                .find_mut(layer)
+                .and_then(|layer| match &mut layer.kind {
+                    LayerKind::SculptStrokes(params) => {
+                        params.set_world_stroke_enabled(stroke, enabled).transpose()
+                    }
+                    _ => None,
+                });
+            if let Some(Ok(change)) = change {
+                if let Err(error) = app.apply_sculpt_bounds_change(change) {
+                    app.ui_state.status = format!("Could not update sculpt index: {error}");
+                    let _ = app.rebuild_authored_feature_index();
+                }
+                if let (Some(previous), Some(current)) = (
+                    previous,
+                    app.session
+                        .document
+                        .stack
+                        .find(layer)
+                        .map(|l| l.kind.clone()),
+                ) {
+                    app.session.history.push_executed(EditorCommand::SetKind {
+                        id: layer,
+                        kind: current,
+                        previous,
+                    });
+                }
+                ctx.dirty_from = Some(layer);
+                ctx.doc_mutated = true;
+            } else if let Some(Err(error)) = change {
+                app.ui_state.status = format!("Could not edit world stroke: {error}");
+            }
+        }
+        PanelAction::DeleteWorldStroke { layer, stroke } => {
+            let previous = app
+                .session
+                .document
+                .stack
+                .find(layer)
+                .map(|layer| layer.kind.clone());
+            let removed = app
+                .session
+                .document
+                .stack
+                .find_mut(layer)
+                .and_then(|layer| match &mut layer.kind {
+                    LayerKind::SculptStrokes(params) => {
+                        params.remove_world_stroke(stroke).transpose()
+                    }
+                    _ => None,
+                });
+            if let Some(Ok((_index, _record, change))) = removed {
+                if let Err(error) = app.apply_sculpt_bounds_change(change) {
+                    app.ui_state.status = format!("Could not update sculpt index: {error}");
+                    let _ = app.rebuild_authored_feature_index();
+                }
+                if let (Some(previous), Some(current)) = (
+                    previous,
+                    app.session
+                        .document
+                        .stack
+                        .find(layer)
+                        .map(|l| l.kind.clone()),
+                ) {
+                    app.session.history.push_executed(EditorCommand::SetKind {
+                        id: layer,
+                        kind: current,
+                        previous,
+                    });
+                }
+                ctx.dirty_from = Some(layer);
+                ctx.doc_mutated = true;
+            } else if let Some(Err(error)) = removed {
+                app.ui_state.status = format!("Could not delete world stroke: {error}");
+            }
+        }
+        PanelAction::MoveWorldStroke {
+            layer,
+            stroke,
+            dx_m,
+            dz_m,
+        } => {
+            let previous = app
+                .session
+                .document
+                .stack
+                .find(layer)
+                .map(|layer| layer.kind.clone());
+            let change = app
+                .session
+                .document
+                .stack
+                .find_mut(layer)
+                .and_then(|layer| match &mut layer.kind {
+                    LayerKind::SculptStrokes(params) => params
+                        .translate_world_stroke(stroke, dx_m, dz_m)
+                        .transpose(),
+                    _ => None,
+                });
+            if let Some(Ok(change)) = change {
+                if let Err(error) = app.apply_sculpt_bounds_change(change) {
+                    app.ui_state.status = format!("Could not update sculpt index: {error}");
+                    let _ = app.rebuild_authored_feature_index();
+                }
+                if let (Some(previous), Some(current)) = (
+                    previous,
+                    app.session
+                        .document
+                        .stack
+                        .find(layer)
+                        .map(|l| l.kind.clone()),
+                ) {
+                    app.session.history.push_executed(EditorCommand::SetKind {
+                        id: layer,
+                        kind: current,
+                        previous,
+                    });
+                }
+                ctx.dirty_from = Some(layer);
+                ctx.doc_mutated = true;
+            } else if let Some(Err(error)) = change {
+                app.ui_state.status = format!("Could not move world stroke: {error}");
+            }
+        }
         PanelAction::SetEnabled { id, enabled } => {
             let previous = app
                 .session
@@ -322,6 +466,11 @@ pub(crate) fn try_apply(
             }
             let cmd = EditorCommand::SetKind { id, kind, previous };
             apply(&cmd, &mut app.session.document.stack);
+            if app.session.document.infinite_settings().is_some() {
+                if let Err(error) = app.rebuild_authored_feature_index() {
+                    app.ui_state.status = format!("Could not update authored index: {error}");
+                }
+            }
             app.session
                 .history
                 .push_coalesced(cmd, Some((coalesce_layer_id(id), "kind")));
@@ -527,6 +676,9 @@ pub(crate) fn try_apply(
             }
             for id in &others {
                 let _ = app.session.document.stack.remove(*id);
+            }
+            if let Err(error) = app.rebuild_authored_feature_index() {
+                app.ui_state.status = format!("Could not update authored index: {error}");
             }
             app.session.document.selected = Some(keep);
             ctx.dirty_from = Some(keep);
@@ -1395,6 +1547,7 @@ mod tests {
         app.session.document.selected = Some(id);
         let params = SculptStrokeParams {
             strokes,
+            world_strokes: Vec::new(),
             reconcile: 0.15,
         };
         if let Some(l) = app.session.document.stack.find_mut(id) {
@@ -1435,6 +1588,7 @@ mod tests {
         edited.strength = 24.0;
         let next = SculptStrokeParams {
             strokes: vec![edited],
+            world_strokes: Vec::new(),
             reconcile: prev.reconcile,
         };
         let expected = expected_footprint(&app, &prev, &next);
@@ -1493,6 +1647,7 @@ mod tests {
         off.enabled = false;
         let next = SculptStrokeParams {
             strokes: vec![keep, off],
+            world_strokes: Vec::new(),
             reconcile: prev.reconcile,
         };
         let expected = expected_footprint(&app, &prev, &next);
@@ -1517,6 +1672,7 @@ mod tests {
 
         let next = SculptStrokeParams {
             strokes: vec![keep],
+            world_strokes: Vec::new(),
             reconcile: prev.reconcile,
         };
         let expected = expected_footprint(&app, &prev, &next);
@@ -1542,6 +1698,7 @@ mod tests {
         edited.strength = 20.0;
         let next = SculptStrokeParams {
             strokes: vec![edited],
+            world_strokes: Vec::new(),
             reconcile: prev.reconcile,
         };
         let edit_fp = expected_footprint(&app, &prev, &next);
