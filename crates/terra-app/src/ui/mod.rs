@@ -166,6 +166,9 @@ pub struct UiState {
     /// RGBA pixels supplied by the app from the latest successful evaluation.
     pub preview_rgba: Option<(u32, u32, Vec<u8>)>,
     pub export_path: Option<String>,
+    pub export_options: terra_io::FieldExportOptions,
+    /// Open the completed export's directory in the system file manager.
+    pub open_export_folder_when_finished: bool,
     /// `Some(0..=1)` while a background export is running.
     pub export_progress: Option<f32>,
     pub status: String,

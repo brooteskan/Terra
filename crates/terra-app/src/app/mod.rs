@@ -2,7 +2,7 @@
 
 mod actions;
 mod eval;
-mod export;
+pub mod export;
 mod frame_trace;
 mod helpers;
 mod input;
@@ -37,7 +37,7 @@ use terra_gpu::{
 };
 use terra_gpu_eval::{GpuCompiledTileProducer, GpuTerrainEngine, GpuTileEvaluationJob};
 use terra_gui::{GuiRenderer, GuiState, Rect, WidgetLabState};
-use terra_io::{BackgroundExporter, BackgroundProjectIo};
+use terra_io::{BackgroundFieldExporter, BackgroundProjectIo};
 use terra_render::TerrainRenderer;
 use winit::event::MouseButton;
 use winit::event_loop::EventLoopProxy;
@@ -265,7 +265,7 @@ pub struct TerraApp {
 
     last_height: Option<Heightfield>,
     project_path: Option<PathBuf>,
-    exporter: BackgroundExporter,
+    exporter: BackgroundFieldExporter,
     height_pyramid_export: export::HeightPyramidExportController,
     project_io: BackgroundProjectIo,
     /// Zero-sized registry adapter for the tool-thumbnail decode pool.
@@ -476,7 +476,7 @@ impl Default for TerraApp {
             worker_mark_all_dirty: true,
             last_height: None,
             project_path: None,
-            exporter: BackgroundExporter::new(),
+            exporter: BackgroundFieldExporter::new(),
             height_pyramid_export: export::HeightPyramidExportController::default(),
             project_io: BackgroundProjectIo::new(),
             tool_thumbs: crate::ui::ToolThumbPump,

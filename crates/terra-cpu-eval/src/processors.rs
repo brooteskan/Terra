@@ -42,6 +42,110 @@ impl ProcessorRegistry {
         Self {}
     }
 
+    /// Scalar maps the export evaluator publishes for these authored options.
+    /// Unlike the broad dependency contract, this excludes optional outputs
+    /// that this processor will not produce and uses its actual aux-store keys.
+    pub fn scalar_export_fields(
+        kind: &LayerKind,
+        has_strata: bool,
+        resolution: u32,
+        level_steps: &analyze::LevelStepSettings,
+    ) -> Vec<terra_core::fields::FieldId> {
+        use terra_core::fields::FieldId::*;
+        let mut fields = match kind {
+            LayerKind::Materials(p) => {
+                let mut fields = vec![Materials, Hardness];
+                if !p.strata.is_empty() {
+                    fields.push(StrataReference);
+                }
+                fields
+            }
+            LayerKind::ThermalErosion(p) => {
+                let mut fields = vec![Hardness, Erosion, Deposition, DebrisDepth];
+                if p.layered_materials
+                    && !(has_strata && matches!(p.hardness_source, MaskSource::Hardness))
+                {
+                    fields.extend([
+                        BedrockHeight,
+                        SedimentThickness,
+                        TalusStability,
+                        Instability,
+                    ]);
+                }
+                fields
+            }
+            LayerKind::HydraulicErosion(p) => {
+                let levels = level_steps.schedule_for_filter(
+                    analyze::default_sim_levels(resolution),
+                    p.level_count,
+                    p.start_level,
+                    p.level_step_strength,
+                    &p.level_step_curve,
+                    terra_core::quality::PreviewQuality::Export,
+                );
+                let p = analyze::apply_transport_model(p, p.transport_model);
+                let mut fields = vec![Hardness, Wetness];
+                if has_strata && matches!(p.hardness_source, MaskSource::Hardness) {
+                    fields.extend([Materials, Erosion, Deposition]);
+                } else {
+                    if p.output_erosion {
+                        fields.push(Erosion);
+                    }
+                    if p.output_deposition {
+                        fields.push(Deposition);
+                    }
+                    if p.output_sediment {
+                        fields.push(Sediment);
+                    }
+                    if p.output_water {
+                        fields.push(WaterDepth);
+                    }
+                    if levels.len() <= 1 {
+                        fields.push(Rainfall);
+                        if p.output_water {
+                            fields.push(WaterVelocity);
+                        }
+                        if p.output_flow {
+                            fields.push(FlowAccumulation);
+                        }
+                        if p.output_channels {
+                            fields.push(ChannelMask);
+                        }
+                        if p.output_sediment {
+                            fields.extend([BedrockHeight, SedimentThickness]);
+                        }
+                    }
+                }
+                fields
+            }
+            LayerKind::RiverCarve(_) => vec![FlowDirection, FlowAccumulation, Wetness],
+            LayerKind::StreamPowerErosion(_) => vec![
+                Hardness,
+                FlowDirection,
+                FlowAccumulation,
+                StreamOrder,
+                SpeIncision,
+                Erosion,
+            ],
+            LayerKind::MultiScaleAmplify(_) => vec![Hardness, Erosion, Deposition],
+            LayerKind::Path(_) | LayerKind::RiverNetwork(_) => vec![Wetness],
+            LayerKind::FluidSimulation(_) => vec![Wetness, WaterDepth],
+            LayerKind::DebrisFlow(_) => {
+                let mut fields = kind.produced_fields();
+                fields.push(Hardness);
+                fields
+            }
+            LayerKind::Dunes(_) => kind
+                .produced_fields()
+                .into_iter()
+                .filter(|field| *field != SandMaterialMask)
+                .collect(),
+            _ => kind.produced_fields(),
+        };
+        fields.retain(|field| !matches!(field, Height | Normals | Gradient));
+        fields
+    }
+
     /// Evaluate a single layer by matching on its [`LayerKind`].
     ///
     /// This `match` is the real dispatch mechanism — the one place every

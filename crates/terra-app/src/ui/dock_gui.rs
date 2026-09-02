@@ -70,7 +70,7 @@ pub fn draw_bottom_dock(
     let (status_text, show_progress, progress, show_retry) =
         if let Some(progress) = ui_state.export_progress {
             (
-                format!("Exporting height pyramid {:.0}%", progress * 100.0),
+                format!("Exporting {:.0}%", progress * 100.0),
                 true,
                 progress.clamp(0.0, 1.0),
                 false,

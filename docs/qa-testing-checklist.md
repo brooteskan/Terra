@@ -199,11 +199,18 @@ Run each; watch bottom-dock status (Ready / Outdated / Running) and cancel behav
 **Import**
 - [ ] Heightmap PNG (16-bit) · [ ] Heightmap RAW · [ ] GeoTIFF (grayscale) · [ ] Height Map filter source
 
-**Export** *(not production-ready — expect the CTA blocked)*
-- [ ] Export panel opens; choose directory
-- [ ] Export resolution (512–8192) · [ ] Preview resolution (256–8192)
-- [ ] Outputs: height.png (16-bit), height.r32 + meta, mask_*.png, splat.png + ids, color.png, normal.png, vegetation_instances.json, terrain_collision.obj, tile_manifest.json
-- [ ] Toggles: include splat / splat IDs / collision mesh (+ stride)
+**Export**
+- [ ] File menu, command palette, and toolbar open the same dialog; choose directory
+- [ ] Format dropdown: PNG / Unsigned 16bit grayscale TIFF / R16 / R8
+- [ ] Field checkboxes follow enabled layers, solo state, and optional output settings
+- [ ] Height can be unchecked; an empty selection leaves Export visible but inactive
+- [ ] Export resolution dropdown (256, 512, 1024, 2048, 4096, 8192); background export uses the current document snapshot
+- [ ] Only selected field files plus mandatory `export_metadata.json` are written; no metadata toggle or LOD package
+- [ ] Metadata uses export dimensions and spacing, lists only this export's files, and reconstructs values within quantization error
+- [ ] Re-export replaces metadata; metadata is still written with Height unchecked, and metadata write errors fail the export
+- [ ] PNG/TIFF decode as unsigned grayscale 16-bit; raw R16/R8 have the expected byte count and orientation
+- [ ] Export is disabled while busy; cancellation and failures return it to idle
+- [ ] **Open after export** checkbox appears beneath the export directory controls; only successful exports open their actual output directory when checked
 
 ---
 

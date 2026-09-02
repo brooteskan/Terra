@@ -1014,17 +1014,14 @@ impl ApplicationHandler<RuntimeEvent> for TerraApp {
             self.terrain_runtime
                 .refinement
                 .finish_export(self.runtime_started.elapsed().as_millis() as u64);
-            match result {
-                Ok(res) => {
-                    self.ui_state.status = format!("Exported {}", res.height_path.display());
-                }
-                Err(err) => {
-                    log::error!("export failed: {err}");
-                    self.ui_state.status = format!("Export failed: {err}");
-                }
-            }
+            self.finish_field_export(result);
             export_busy = true; // one more frame to show status
         } else {
+            if self.ui_state.export_progress.is_some() {
+                self.terrain_runtime
+                    .refinement
+                    .finish_export(self.runtime_started.elapsed().as_millis() as u64);
+            }
             self.ui_state.export_progress = None;
         }
 

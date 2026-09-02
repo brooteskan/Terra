@@ -359,7 +359,7 @@ pub fn draw_menu_bar(
         state.right_open = None;
     }
 
-    // Primary EXPORT CTA — file export is not ready yet.
+    // Primary EXPORT CTA opens the same field export dialog as File > Export.
     let build_id = Id::new("tb_build");
     let build_hovered = ui.pointer_in(build_r);
     if build_hovered {
@@ -369,7 +369,7 @@ pub fn draw_menu_bar(
         ui.state.active = Some(build_id);
     }
     if ui.input.primary_released && ui.state.is_active(build_id) && build_hovered {
-        ui_state.show_export_unsupported = true;
+        ui_state.show_export = true;
         state.right_open = None;
     }
     ui.panel_rounded(

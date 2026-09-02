@@ -1,3 +1,5 @@
+//! Programmatic height-pyramid package exporter. The editor dialog uses scalar field exports.
+
 use std::path::PathBuf;
 
 use terra_core::document::TerrainDocument;
@@ -26,11 +28,45 @@ struct ReadbackWork {
     readback: GpuPackedTileReadback,
 }
 
+/// Shared preflight for the output list and the actual export action. This only
+/// inspects authored data: it neither evaluates terrain nor writes any files.
+fn prepare_height_pyramid_export(
+    document: &TerrainDocument,
+    generation: u64,
+) -> Result<(CompiledTerrainPlan, TerrainPyramid, u32), String> {
+    document
+        .metrics
+        .at_resolution(document.export_resolution)
+        .map_err(|error| error.to_string())?;
+    let revision = PlanStructureRevision::new(generation);
+    let plan = compile_terrain_plan(
+        &document.stack,
+        &document.masks,
+        TerrainPlanStamp::new(revision),
+    )
+    .map_err(|error| format!("compiled export plan failed: {error:?}"))?;
+    let slice = GpuCompiledTileProducer::analyze(&document.stack, &plan)
+        .map_err(|error| format!("streaming export is unsupported: {error:?}"))?;
+    let mut config = PyramidConfig::new(
+        document.export_resolution,
+        document.metrics.world_size_x,
+        document.metrics.world_size_z,
+    );
+    config.tile_size = document.metrics.tile_size;
+    config.halo = document.metrics.halo;
+    Ok((plan, TerrainPyramid::new(config), slice.operation_halo))
+}
+
+#[cfg(test)]
+fn height_pyramid_export_preview(document: &TerrainDocument) -> Result<TerrainPyramid, String> {
+    prepare_height_pyramid_export(document, 1).map(|(_, pyramid, _)| pyramid)
+}
+
 /// App-owned export state. It changes only the demand source and publication
 /// consumer; plan execution is the same `GpuCompiledTileProducer` path used by
 /// camera-driven terrain work.
 #[derive(Default)]
-pub(super) struct HeightPyramidExportController {
+pub struct HeightPyramidExportController {
     stack: Option<LayerStack>,
     masks: Vec<MaskAsset>,
     plan: Option<CompiledTerrainPlan>,
@@ -51,7 +87,7 @@ pub(super) struct HeightPyramidExportController {
 }
 
 impl HeightPyramidExportController {
-    pub(super) fn start(
+    pub fn start(
         &mut self,
         mut document: TerrainDocument,
         root: PathBuf,
@@ -61,25 +97,10 @@ impl HeightPyramidExportController {
             return Err("height-pyramid export is already running".into());
         }
         document.sync_all_biome_paint_masks();
-        document
-            .metrics
-            .at_resolution(document.export_resolution)
-            .map_err(|error| error.to_string())?;
+        let (plan, pyramid, operation_halo) = prepare_height_pyramid_export(&document, generation)?;
         let stack = document.preview_eval_stack();
         let revision = PlanStructureRevision::new(generation);
-        let plan = compile_terrain_plan(&stack, &document.masks, TerrainPlanStamp::new(revision))
-            .map_err(|error| format!("compiled export plan failed: {error:?}"))?;
-        let slice = GpuCompiledTileProducer::analyze(&stack, &plan)
-            .map_err(|error| format!("streaming export is unsupported: {error:?}"))?;
         let invalidation = propagate_plan_edits(&plan, &[TerrainEditClass::Structure]);
-        let mut config = PyramidConfig::new(
-            document.export_resolution,
-            document.metrics.world_size_x,
-            document.metrics.world_size_z,
-        );
-        config.tile_size = document.metrics.tile_size;
-        config.halo = document.metrics.halo;
-        let pyramid = TerrainPyramid::new(config);
         let total_tiles = pyramid.metadata_len() as usize;
         let finest_tiles = pyramid
             .level_metrics(pyramid.max_level())
@@ -109,30 +130,30 @@ impl HeightPyramidExportController {
         self.cancel_requested = false;
         self.busy = true;
         self.result = None;
-        self.queue_level(0, slice.operation_halo);
+        self.queue_level(0, operation_halo);
         Ok(())
     }
 
-    pub(super) fn is_busy(&self) -> bool {
+    pub fn is_busy(&self) -> bool {
         self.busy
     }
 
-    pub(super) fn progress(&self) -> f32 {
+    pub fn progress(&self) -> f32 {
         self.completed_tiles as f32 / self.total_tiles.max(1) as f32
     }
 
-    pub(super) fn cancel(&mut self) {
+    pub fn cancel(&mut self) {
         if self.busy {
             self.cancel_requested = true;
         }
     }
 
-    pub(super) fn take_result(&mut self) -> Option<Result<HeightPyramidPackageResult, String>> {
+    pub fn take_result(&mut self) -> Option<Result<HeightPyramidPackageResult, String>> {
         self.result.take()
     }
 
     /// Advance at most one externally visible boundary per frame.
-    pub(super) fn pump(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> bool {
+    pub fn pump(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> bool {
         if !self.busy {
             return false;
         }
@@ -362,6 +383,62 @@ mod tests {
             LayerKind::Flat(FlatParams { height: 37.5 }),
         ));
         document
+    }
+
+    #[test]
+    fn export_preview_tracks_resolution_and_tile_size_not_preview_resolution() {
+        let mut document = flat_document();
+        document.metrics.tile_size = 8;
+        let preview = height_pyramid_export_preview(&document).unwrap();
+        let files = terra_io::height_pyramid_output_paths(&preview).collect::<Vec<_>>();
+        // Levels 2, 3, 5, 9, 17 have 1 + 1 + 1 + 4 + 9 tiles, plus two metadata files.
+        assert_eq!(files.len(), 18);
+        assert_eq!(
+            files.last().unwrap(),
+            "packages/<content-id>/height/l04/000002_000002.<hash>.r32"
+        );
+
+        document.preview_resolution = 8192;
+        assert_eq!(
+            terra_io::height_pyramid_output_paths(
+                &height_pyramid_export_preview(&document).unwrap()
+            )
+            .collect::<Vec<_>>(),
+            files
+        );
+        document.export_resolution = 8;
+        assert_eq!(
+            height_pyramid_export_preview(&document)
+                .unwrap()
+                .metadata_len(),
+            3
+        );
+        document.export_resolution = 17;
+        document.metrics.tile_size = 16;
+        assert_eq!(
+            height_pyramid_export_preview(&document)
+                .unwrap()
+                .metadata_len(),
+            8
+        );
+    }
+
+    #[test]
+    fn export_preview_rejects_invalid_metrics_and_broken_active_mask_references() {
+        let mut document = flat_document();
+        document.metrics.world_size_x = 0.0;
+        assert!(height_pyramid_export_preview(&document).is_err());
+
+        let mut document = flat_document();
+        let mut layer = Layer::new("Masked height", LayerKind::Flat(Default::default()));
+        layer.common.masks.push(terra_core::mask::MaskRef::new(
+            terra_core::mask::MaskId::new(),
+        ));
+        let id = layer.id();
+        document.stack.push(layer);
+        assert!(height_pyramid_export_preview(&document).is_err());
+        document.stack.find_mut(id).unwrap().common.enabled = false;
+        assert!(height_pyramid_export_preview(&document).is_ok());
     }
 
     #[test]

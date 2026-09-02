@@ -39,7 +39,7 @@ fn apply_update(
     if let Some(value) = update.export_resolution {
         assign_if_changed(
             &mut document.export_resolution,
-            value.clamp(512, 8192),
+            value.clamp(256, 8192),
             &mut changed,
         );
     }
@@ -141,12 +141,12 @@ mod tests {
 
         app.apply_actions(vec![PanelAction::UpdateTerrainSettings(
             TerrainSettingsUpdate {
-                export_resolution: Some(4096),
+                export_resolution: Some(256),
                 ..Default::default()
             },
         )]);
 
-        assert_eq!(app.session.document.export_resolution, 4096);
+        assert_eq!(app.session.document.export_resolution, 256);
         assert!(app.document_dirty);
         assert_eq!(app.eval_token, token_before);
         assert_eq!(app.terrain_runtime.output_revision(), runtime_before);
@@ -158,7 +158,7 @@ mod tests {
     #[test]
     fn normalized_no_op_and_non_finite_values_do_nothing() {
         let mut app = TerraApp::default();
-        app.session.document.export_resolution = 512;
+        app.session.document.export_resolution = 256;
         app.session.document.preview_resolution = 256;
         app.worker_mark_all_dirty = false;
         let cached_layer = seed_clean_evaluator_cache(&mut app);

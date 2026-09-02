@@ -7,7 +7,7 @@ use terra_core::document::TerrainDocument;
 use terra_core::mask::{MaskAsset, MaskId, MaskOp, MaskSource, PaintBuffer};
 use terra_gui::{
     button, button_id, checkbox, combo, label, label_dim, section_header, selectable, slider_f32,
-    slider_f32_id, slider_i32, GuiContext, Id, Rect,
+    slider_f32_id, GuiContext, Id, Rect,
 };
 
 pub use crate::ui::actions::{MaskEditAction, PanelAction};
@@ -72,7 +72,7 @@ pub fn draw_windows(
     }
 
     if ui_state.show_export {
-        let rect = viewport_float_rect(ui, 380.0, 420.0, 0.2);
+        let rect = viewport_float_rect(ui, 520.0, 560.0, 0.2);
         if ui.begin_window(
             Id::new("win_export"),
             "Export",
@@ -413,54 +413,55 @@ fn export_panel(
     ui_state: &mut UiState,
     out: &mut FrameUiOutput,
 ) {
-    label(ui, "What you'll get");
-    label(ui, "- height.png / height.r32 - heightmap");
-    label(ui, "- height_meta.json - size / world extents");
-    label(ui, "- mask_*.png - baked aux masks");
-    label(ui, "- splat.png + splat_ids.json - material IDs");
-    label(ui, "- vegetation_instances.json - foliage points");
-    label(ui, "- terrain_collision.obj - coarse mesh");
-    label(ui, "- tile_manifest.json - streaming tiles");
-    ui.separator();
-
-    label(ui, "Resolution");
-    let mut export_res = doc.export_resolution as i32;
-    let mut update = TerrainSettingsUpdate::default();
-    if slider_i32(ui, "Export res", &mut export_res, 512, 8192) {
-        update.export_resolution = Some(export_res as u32);
+    use terra_io::FieldExportFormat;
+    let mut format_index = FieldExportFormat::ALL
+        .iter()
+        .position(|format| *format == ui_state.export_options.format)
+        .unwrap_or(0);
+    let formats = FieldExportFormat::ALL.map(FieldExportFormat::label);
+    if combo(ui, "Format", &mut format_index, &formats) {
+        ui_state.export_options.format = FieldExportFormat::ALL[format_index];
     }
-    let mut preview_res = doc.preview_resolution as i32;
-    if slider_i32(ui, "Preview res", &mut preview_res, 256, 8192) {
-        update.preview_resolution = Some(preview_res as u32);
-    }
-    ui.separator();
-    label(ui, "LEVEL STEPS (Terrain)");
-    let levels =
-        terra_core::analyze::LevelStepSettings::level_count_for_resolution(preview_res as u32);
-    label(ui, &format!("Upsample levels at preview: {levels}"));
-    changed_slider_terrain(doc, ui, &mut update);
-    label(
-        ui,
-        &format!(
-            "Export uses {}x{} at export quality (not Draft).",
-            export_res, export_res
-        ),
-    );
-    if !update.is_empty() {
-        out.actions.push(PanelAction::UpdateTerrainSettings(update));
+    let available = terra_io::exportable_fields(doc);
+    match &available {
+        Ok(fields) => {
+            ui_state.export_options.retain_available(fields);
+            for field in fields {
+                let mut selected = ui_state.export_options.fields.contains(field);
+                if terra_gui::checkbox_id(
+                    ui,
+                    Id::new("export_field").child(&field.cache_key()),
+                    &field.display_name(),
+                    &mut selected,
+                ) {
+                    if selected {
+                        ui_state.export_options.fields.push(field.clone());
+                    } else {
+                        ui_state.export_options.fields.retain(|id| id != field);
+                    }
+                }
+            }
+        }
+        Err(error) => label_dim(ui, error),
     }
     ui.separator();
-
-    label(ui, "Outputs (per Start Export)");
-    label(ui, "- deterministic multiresolution R32F height tiles");
-    label(ui, "- measured geometric errors + seam metadata");
-    label(ui, "- content-addressed manifest and payloads");
-    label(
-        ui,
-        "Materials and engine adapters follow the height package.",
-    );
+    const RESOLUTIONS: [u32; 6] = [256, 512, 1024, 2048, 4096, 8192];
+    const RESOLUTION_LABELS: [&str; 6] = ["256", "512", "1024", "2048", "4096", "8192"];
+    // Older projects may contain arbitrary slider values. Round those up to
+    // the next supported size so the displayed choice matches the export grid.
+    let mut resolution_index = RESOLUTIONS
+        .partition_point(|resolution| *resolution < doc.export_resolution)
+        .min(RESOLUTIONS.len() - 1);
+    if combo(ui, "Resolution", &mut resolution_index, &RESOLUTION_LABELS)
+        || RESOLUTIONS[resolution_index] != doc.export_resolution
+    {
+        out.actions
+            .push(PanelAction::UpdateTerrainSettings(TerrainSettingsUpdate {
+                export_resolution: Some(RESOLUTIONS[resolution_index]),
+                ..Default::default()
+            }));
+    }
     ui.separator();
-
     label(
         ui,
         &format!(
@@ -471,19 +472,39 @@ fn export_panel(
     if button(ui, "Choose Export Directory...") {
         out.request_export_path = true;
     }
-    if button_id(ui, Id::new("export_start"), "Start Export") {
+    terra_gui::checkbox_id(
+        ui,
+        Id::new("export_open_folder"),
+        "Open after export",
+        &mut ui_state.open_export_folder_when_finished,
+    );
+    ui.gap(3.0);
+    let enabled = available.is_ok()
+        && !ui_state.export_options.fields.is_empty()
+        && ui_state.export_progress.is_none();
+    if export_button(ui, enabled) {
         out.request_start_export = true;
     }
-
     if let Some(progress) = ui_state.export_progress {
         label(ui, &format!("Exporting... {:.0}%", progress * 100.0));
-    } else if ui_state.export_path.is_some() {
-        label(ui, "Ready - Start Export writes files in the background.");
-    } else {
-        label(ui, "Pick a directory, then Start Export.");
     }
 }
 
+fn export_button(ui: &mut GuiContext<'_>, enabled: bool) -> bool {
+    let id = Id::new("export_start");
+    if enabled {
+        return button_id(ui, id, "Export");
+    }
+    // Keep the button visible, but remove both its hit target and any held press.
+    if ui.state.is_active(id) {
+        ui.state.active = None;
+    }
+    let rect = ui.allocate(style::ROW_H);
+    ui.panel_rounded(rect, style::BUTTON_BG, style::RADIUS_SM);
+    ui.label_centered_in_rect(rect, "Export", style::TEXT_DIM, style::FONT_SCALE);
+    ui.gap(3.0);
+    false
+}
 fn preview_panel(ui: &mut GuiContext<'_>, ui_state: &mut UiState) {
     let modes = [
         (Preview2dMode::Height, "Height"),
@@ -765,32 +786,159 @@ fn profiler_panel(ui: &mut GuiContext<'_>, ui_state: &UiState) {
     }
 }
 
-fn changed_slider_terrain(
-    doc: &TerrainDocument,
-    ui: &mut GuiContext<'_>,
-    update: &mut TerrainSettingsUpdate,
-) {
-    let mut precision = doc.level_steps.precision;
-    if slider_f32(ui, "Precision", &mut precision, 0.25, 4.0) {
-        update.precision = Some(precision);
+#[cfg(test)]
+mod export_tests {
+    use super::*;
+    use terra_core::fields::FieldId;
+    use terra_gui::{GuiInput, GuiState};
+    use terra_io::FieldExportFormat;
+
+    fn draw_export(
+        ui_state: &mut UiState,
+        state: &mut GuiState,
+        input: GuiInput,
+    ) -> (FrameUiOutput, f32) {
+        let doc = TerrainDocument::new_default();
+        draw_export_document(&doc, ui_state, state, input)
     }
-    let mut world = doc.level_steps.world_scale;
-    if slider_f32(ui, "World Scale", &mut world, 0.1, 10.0) {
-        update.world_scale = Some(world);
+
+    fn draw_export_document(
+        doc: &TerrainDocument,
+        ui_state: &mut UiState,
+        state: &mut GuiState,
+        input: GuiInput,
+    ) -> (FrameUiOutput, f32) {
+        let mut ui = GuiContext::begin(800.0, 900.0, 1.0, input, state);
+        ui.begin_panel(Rect::from_pos_size(0.0, 0.0, 520.0, 900.0), style::PANEL_BG);
+        let mut out = FrameUiOutput::default();
+        export_panel(&mut ui, doc, ui_state, &mut out);
+        let button_y = ui.layout_cursor_y().unwrap() - 3.0 - style::ROW_H / 2.0;
+        ui.end_panel();
+        ui.end();
+        (out, button_y)
     }
-    let mut max_level = doc.level_steps.max_level as i32;
-    if slider_i32(ui, "Max Level (0=auto)", &mut max_level, 0, 12) {
-        update.max_level = Some(max_level as u32);
+
+    #[test]
+    fn export_dialog_updates_format_and_allows_deselecting_height() {
+        let mut state = GuiState::default();
+        let mut ui_state = UiState::default();
+        state.combo_pick = Some((Id::new("Format").child("combo"), 1));
+        draw_export(&mut ui_state, &mut state, GuiInput::default());
+        assert_eq!(ui_state.export_options.format, FieldExportFormat::Tiff16);
+        let pointer = Some((
+            100.0,
+            style::PAD + style::CONTROL_ROW_H + style::ROW_H / 2.0,
+        ));
+        for primary_down in [true, false] {
+            draw_export(
+                &mut ui_state,
+                &mut state,
+                GuiInput {
+                    pointer,
+                    primary_down,
+                    ..Default::default()
+                },
+            );
+        }
+        assert!(ui_state.export_options.fields.is_empty());
     }
-    if button_id(
-        ui,
-        Id::new("hd_mode_cycle"),
-        &format!("HD Preview: {}", doc.level_steps.high_detail.label()),
-    ) {
-        update.high_detail = Some(doc.level_steps.high_detail.cycle());
+
+    #[test]
+    fn export_resolution_dropdown_selects_each_supported_size() {
+        for (index, resolution) in [256, 512, 1024, 2048, 4096, 8192].into_iter().enumerate() {
+            let mut state = GuiState::default();
+            let mut ui_state = UiState::default();
+            state.combo_pick = Some((Id::new("Resolution").child("combo"), index));
+            let (out, _) = draw_export(&mut ui_state, &mut state, GuiInput::default());
+            let update = out.actions.iter().find_map(|action| match action {
+                PanelAction::UpdateTerrainSettings(update) => update.export_resolution,
+                _ => None,
+            });
+            if resolution == TerrainDocument::new_default().export_resolution {
+                assert_eq!(
+                    update, None,
+                    "the current size should not dirty the project"
+                );
+            } else {
+                assert_eq!(update, Some(resolution));
+            }
+        }
     }
-    let mut outline = doc.level_steps.show_hd_outline;
-    if checkbox(ui, "Show HD Outline", &mut outline) {
-        update.show_hd_outline = Some(outline);
+
+    #[test]
+    fn export_resolution_dropdown_normalizes_legacy_sizes() {
+        for (stored, expected) in [(128, 256), (1000, 1024), (8193, 8192)] {
+            let mut doc = TerrainDocument::new_default();
+            doc.export_resolution = stored;
+            let (out, _) = draw_export_document(
+                &doc,
+                &mut UiState::default(),
+                &mut GuiState::default(),
+                GuiInput::default(),
+            );
+            assert!(out.actions.iter().any(|action| matches!(
+                action,
+                PanelAction::UpdateTerrainSettings(update)
+                    if update.export_resolution == Some(expected)
+            )));
+        }
+    }
+
+    #[test]
+    fn export_button_is_inert_without_fields_or_while_busy() {
+        for (fields, progress, expected) in [
+            (vec![], None, false),
+            (vec![FieldId::Height], Some(0.5), false),
+            (vec![FieldId::Height], None, true),
+        ] {
+            let mut ui_state = UiState::default();
+            ui_state.export_options.fields = fields;
+            let mut state = GuiState::default();
+            let (_, button_y) = draw_export(&mut ui_state, &mut state, GuiInput::default());
+            ui_state.export_progress = progress;
+            let pointer = Some((180.0, button_y));
+            draw_export(
+                &mut ui_state,
+                &mut state,
+                GuiInput {
+                    pointer,
+                    primary_down: true,
+                    ..Default::default()
+                },
+            );
+            let (out, _) = draw_export(
+                &mut ui_state,
+                &mut state,
+                GuiInput {
+                    pointer,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(out.request_start_export, expected);
+        }
+    }
+
+    #[test]
+    fn export_open_folder_checkbox_toggles_without_starting_export() {
+        let mut state = GuiState::default();
+        let mut ui_state = UiState::default();
+        assert!(!ui_state.open_export_folder_when_finished);
+        let (_, export_button_y) = draw_export(&mut ui_state, &mut state, GuiInput::default());
+        let pointer = Some((180.0, export_button_y - style::ROW_H - 3.0));
+        for expected in [true, false] {
+            for primary_down in [true, false] {
+                let (out, _) = draw_export(
+                    &mut ui_state,
+                    &mut state,
+                    GuiInput {
+                        pointer,
+                        primary_down,
+                        ..Default::default()
+                    },
+                );
+                assert!(!out.request_start_export);
+            }
+            assert_eq!(ui_state.open_export_folder_when_finished, expected);
+        }
     }
 }

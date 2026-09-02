@@ -14,6 +14,30 @@ const POINTER_FILE: &str = "height-pyramid.current";
 const PACKAGES_DIR: &str = "packages";
 static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+fn height_tile_path(key: &TerrainTileKey, hash: &str) -> String {
+    format!(
+        "height/l{:02}/{:06}_{:06}.{hash}.r32",
+        key.level, key.tile.tx, key.tile.tz
+    )
+}
+
+/// Final output paths relative to the chosen export directory, with metadata first.
+/// Content IDs and payload hashes cannot be known until terrain evaluation finishes.
+/// Temporary staging files are deliberately excluded.
+pub fn height_pyramid_output_paths(pyramid: &TerrainPyramid) -> impl Iterator<Item = String> + '_ {
+    [
+        POINTER_FILE.to_string(),
+        format!("{PACKAGES_DIR}/<content-id>/manifest.json"),
+    ]
+    .into_iter()
+    .chain(pyramid.height_tiles().map(|key| {
+        format!(
+            "{PACKAGES_DIR}/<content-id>/{}",
+            height_tile_path(&key, "<hash>")
+        )
+    }))
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct HeightPyramidWorld {
     pub size_x: f32,
@@ -237,10 +261,7 @@ impl HeightPyramidPackageBuilder {
         };
         let bytes = floats_to_le_bytes(packed);
         let payload_hash = blake3::hash(&bytes).to_hex().to_string();
-        let relative = format!(
-            "height/l{:02}/{:06}_{:06}.{}.r32",
-            key.level, key.tile.tx, key.tile.tz, payload_hash
-        );
+        let relative = height_tile_path(key, &payload_hash);
         let path = self
             .staging
             .join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
@@ -719,6 +740,21 @@ mod tests {
             package.manifest.tiles.len(),
             pyramid.metadata_len() as usize
         );
+        // Every preview row resolves to a file published by the actual writer.
+        let preview = height_pyramid_output_paths(&pyramid).collect::<Vec<_>>();
+        assert_eq!(preview.len(), package.manifest.tiles.len() + 2);
+        assert!(root.join(&preview[0]).is_file());
+        assert_eq!(
+            root.join(preview[1].replace("<content-id>", &first.content_id)),
+            first.manifest_path
+        );
+        for (path, tile) in preview[2..].iter().zip(&package.manifest.tiles) {
+            let resolved = path
+                .replace("<content-id>", &first.content_id)
+                .replace("<hash>", &tile.payload_hash);
+            assert_eq!(root.join(&resolved), first.package_dir.join(&tile.payload));
+            assert!(root.join(resolved).is_file());
+        }
         assert_eq!(
             package
                 .reconstruct_region(pyramid.max_level(), 6, 6, 5, 4)

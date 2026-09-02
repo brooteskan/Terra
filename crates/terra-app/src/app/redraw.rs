@@ -702,6 +702,10 @@ impl TerraApp {
                         self.height_pyramid_export.cancel();
                         self.ui_state.status = "Cancelling export".into();
                         self.request_app_frame(FrameRequestReason::UiActions);
+                    } else if !self.exporter.job.done {
+                        self.exporter.cancel();
+                        self.ui_state.status = "Cancelling export".into();
+                        self.request_app_frame(FrameRequestReason::UiActions);
                     } else {
                         self.eval_token = self.eval_token.wrapping_add(1);
                         self.eval_worker.set_token(self.eval_token);

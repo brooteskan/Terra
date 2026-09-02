@@ -559,9 +559,59 @@ impl TerraApp {
         self.ui_state.status = format!("Export directory: {}", path.display());
     }
 
+    pub(crate) fn finish_field_export(
+        &mut self,
+        result: Result<terra_io::FieldExportResult, terra_io::ExportError>,
+    ) {
+        self.finish_field_export_with(result, open_directory);
+    }
+
+    fn finish_field_export_with(
+        &mut self,
+        result: Result<terra_io::FieldExportResult, terra_io::ExportError>,
+        open_folder: impl FnOnce(&Path) -> std::io::Result<()>,
+    ) {
+        match result {
+            Ok(result) => {
+                self.ui_state.status = format!("Exported {} file(s)", result.paths.len());
+                if self.ui_state.open_export_folder_when_finished {
+                    // Use the completed job's actual destination: the user may
+                    // have selected a different directory while it was running.
+                    if let Some(directory) = result.paths.first().and_then(|path| path.parent()) {
+                        if let Err(error) = open_folder(directory) {
+                            log::warn!(
+                                "could not open export directory {}: {error}",
+                                directory.display()
+                            );
+                            self.ui_state
+                                .status
+                                .push_str(&format!("; could not open folder: {error}"));
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                log::error!("export failed: {error}");
+                self.ui_state.status = format!("Export failed: {error}");
+            }
+        }
+    }
+
     pub(crate) fn start_export(&mut self) {
-        if self.gpu.is_none() {
-            self.ui_state.status = "Export requires an initialized GPU".into();
+        if self.height_pyramid_export.is_busy() || !self.exporter.job.done {
+            self.ui_state.status = "Export already running".into();
+            return;
+        }
+        let available = match terra_io::exportable_fields(&self.session.document) {
+            Ok(fields) => fields,
+            Err(error) => {
+                self.ui_state.status = format!("Export unavailable: {error}");
+                return;
+            }
+        };
+        self.ui_state.export_options.retain_available(&available);
+        if self.ui_state.export_options.fields.is_empty() {
+            self.ui_state.status = "Select at least one field".into();
             return;
         }
         let path = if let Some(existing) = self.ui_state.export_path.clone() {
@@ -573,26 +623,14 @@ impl TerraApp {
             self.ui_state.export_path = Some(path.display().to_string());
             path
         };
-        if self.height_pyramid_export.is_busy() || !self.exporter.job.done {
-            self.ui_state.status = "Export already running".into();
-            return;
-        }
-        // Bake sparse biome paint into masks before the export worker clones the doc.
-        self.session.document.sync_all_biome_paint_masks();
         self.terrain_runtime.refinement.begin_export();
         self.ui_state.export_progress = Some(0.0);
         self.ui_state.status = format!("Exporting to {}", path.display());
-        let generation = self.eval_token.wrapping_add(1).max(1);
-        if let Err(error) =
-            self.height_pyramid_export
-                .start(self.session.document.clone(), path, generation)
-        {
-            self.ui_state.export_progress = None;
-            self.ui_state.status = format!("Export failed: {error}");
-            self.terrain_runtime
-                .refinement
-                .finish_export(self.runtime_started.elapsed().as_millis() as u64);
-        }
+        self.exporter.start_fields(
+            self.session.document.clone(),
+            path,
+            self.ui_state.export_options.clone(),
+        );
     }
 
     /// Ensure a Shape history layer for the active sculpt tool.
@@ -857,6 +895,49 @@ mod tests {
     use terra_core::{FieldId, Heightfield, HeightfieldMetrics, TerrainTileKey};
     use terra_gpu::{GpuPageTableEntry, GpuTileAtlas};
     use terra_render::{GpuContext, TerrainRenderer};
+
+    #[test]
+    fn export_completion_opens_only_the_successful_jobs_directory_when_enabled() {
+        let mut app = TerraApp::default();
+        let directory = std::env::temp_dir().join("Terra export with spaces");
+        let success = || {
+            Ok(terra_io::FieldExportResult {
+                paths: vec![
+                    directory.join("height.png"),
+                    directory.join("export_metadata.json"),
+                ],
+            })
+        };
+        app.finish_field_export_with(success(), |_| panic!("toggle is off"));
+        assert_eq!(app.ui_state.status, "Exported 2 file(s)");
+
+        app.ui_state.open_export_folder_when_finished = true;
+        app.ui_state.export_path = Some("a-different-export-folder".into());
+        let mut opened = None;
+        app.finish_field_export_with(success(), |path| {
+            opened = Some(path.to_path_buf());
+            Ok(())
+        });
+        assert_eq!(opened, Some(directory.clone()));
+        assert_eq!(app.ui_state.status, "Exported 2 file(s)");
+
+        app.finish_field_export_with(
+            Err(terra_io::IoError::Msg("write failed".into()).into()),
+            |_| panic!("failed exports must not open a folder"),
+        );
+        assert_eq!(app.ui_state.status, "Export failed: write failed");
+
+        app.finish_field_export_with(success(), |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "file manager unavailable",
+            ))
+        });
+        assert!(app
+            .ui_state
+            .status
+            .starts_with("Exported 2 file(s); could not open folder:"));
+    }
 
     #[test]
     fn new_world_settings_document_round_trips_material_bounds() {

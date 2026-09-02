@@ -1,6 +1,7 @@
 //! Import/export and background build jobs.
 
 mod export;
+mod field_export;
 mod geotiff;
 mod height_pyramid;
 mod import;
@@ -9,11 +10,15 @@ pub use export::{
     build_tile_manifest, changed_tiles, export_package, ExportRequest, ExportResult, TileManifest,
     TileManifestEntry,
 };
+pub use field_export::{
+    exportable_fields, field_export_filename, BackgroundFieldExporter, FieldExportFormat,
+    FieldExportOptions, FieldExportResult,
+};
 pub use geotiff::{read_geotiff_heights, GeoTiffInfo};
 pub use height_pyramid::{
-    HeightPyramidEncoding, HeightPyramidLevelManifest, HeightPyramidManifest, HeightPyramidPackage,
-    HeightPyramidPackageBuilder, HeightPyramidPackageResult, HeightPyramidTileManifest,
-    HeightPyramidWorld,
+    height_pyramid_output_paths, HeightPyramidEncoding, HeightPyramidLevelManifest,
+    HeightPyramidManifest, HeightPyramidPackage, HeightPyramidPackageBuilder,
+    HeightPyramidPackageResult, HeightPyramidTileManifest, HeightPyramidWorld,
 };
 pub use import::{import_heightmap_png, import_heightmap_raw};
 
@@ -64,19 +69,19 @@ pub enum ProjectIoError {
     Job(#[from] terra_jobs::JobError),
 }
 
-pub struct BuildJob {
+pub struct BuildJob<T = ExportResult> {
     pub progress: f32,
     pub done: bool,
-    pub result: Option<Result<ExportResult, ExportError>>,
+    pub result: Option<Result<T, ExportError>>,
 }
 
 /// Non-blocking export worker.
-pub struct BackgroundExporter {
-    handle: Option<JobHandle<Result<ExportResult, ExportError>>>,
-    pub job: BuildJob,
+pub struct BackgroundExporter<T = ExportResult> {
+    handle: Option<JobHandle<Result<T, ExportError>>>,
+    pub job: BuildJob<T>,
 }
 
-impl BackgroundExporter {
+impl<T: Send + 'static> BackgroundExporter<T> {
     pub fn new() -> Self {
         Self {
             handle: None,
@@ -87,7 +92,9 @@ impl BackgroundExporter {
             },
         }
     }
+}
 
+impl BackgroundExporter {
     pub fn start(&mut self, doc: TerrainDocument, out_dir: PathBuf) {
         self.start_job(move |ctx| {
             ctx.set_progress(0.1);
@@ -110,14 +117,16 @@ impl BackgroundExporter {
             }
         });
     }
+}
 
+impl<T: Send + 'static> BackgroundExporter<T> {
     /// Spawn `f` as the export job, superseding any job already in flight.
     ///
     /// Private seam: `start` is the only public entry, but tests drive this with
     /// arbitrary bodies (a panicking one, a spin-until-cancelled one).
     fn start_job<F>(&mut self, f: F)
     where
-        F: FnOnce(&JobCtx) -> Result<ExportResult, ExportError> + Send + 'static,
+        F: FnOnce(&JobCtx) -> Result<T, ExportError> + Send + 'static,
     {
         // A superseded job should stop burning CPU rather than run on detached.
         if let Some(handle) = self.handle.take() {
@@ -204,13 +213,13 @@ fn evaluate_document_for_export(
     Ok((height, ctx))
 }
 
-impl Default for BackgroundExporter {
+impl<T: Send + 'static> Default for BackgroundExporter<T> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Pollable for BackgroundExporter {
+impl<T: Send + 'static> Pollable for BackgroundExporter<T> {
     /// Poll the in-flight export, then report whether one is still running. An
     /// export streams to disk with a progress bar the surrounding frame already
     /// repaints at loop cadence, so it wants `redraw` while busy but not the
@@ -473,7 +482,7 @@ mod worker_tests {
     fn panicking_export_surfaces_as_failed_not_hung() {
         // Regression: a panicking export thread used to leave job.done == false
         // forever (silent stuck progress bar).
-        let mut exporter = BackgroundExporter::new();
+        let mut exporter: BackgroundExporter = BackgroundExporter::new();
         exporter.start_job(|_| panic!("boom in export"));
         wait_until(|| {
             exporter.poll();
@@ -499,7 +508,7 @@ mod worker_tests {
 
     #[test]
     fn cancelled_export_finishes_with_no_result() {
-        let mut exporter = BackgroundExporter::new();
+        let mut exporter: BackgroundExporter = BackgroundExporter::new();
         // Body spins until cancelled, then returns a value the cancel must discard.
         exporter.start_job(|ctx| {
             while !ctx.token().is_cancelled() {
@@ -575,7 +584,7 @@ mod worker_tests {
         use std::sync::mpsc;
         use terra_jobs::Pollable;
 
-        let mut exporter = BackgroundExporter::new();
+        let mut exporter: BackgroundExporter = BackgroundExporter::new();
         // Idle before any job: no busy, no repaint, never animation-cadence.
         let idle = exporter.pump();
         assert!(!idle.busy && !idle.redraw && !idle.animate);
@@ -605,7 +614,7 @@ mod worker_tests {
     fn exporter_pump_returns_to_idle_after_cancel() {
         use terra_jobs::Pollable;
 
-        let mut exporter = BackgroundExporter::new();
+        let mut exporter: BackgroundExporter = BackgroundExporter::new();
         exporter.start_job(|ctx| {
             while !ctx.token().is_cancelled() {
                 std::thread::yield_now();
@@ -735,7 +744,7 @@ mod worker_tests {
         let mut doc = flat_doc();
         doc.export_resolution = 0;
 
-        let mut exporter = BackgroundExporter::new();
+        let mut exporter: BackgroundExporter = BackgroundExporter::new();
         exporter.start(doc, std::env::temp_dir());
         wait_until(|| {
             exporter.poll();
@@ -755,7 +764,7 @@ mod worker_tests {
             std::env::temp_dir().join(format!("terra-io-export-blocker-{}", std::process::id()));
         std::fs::write(&blocker, b"block").expect("write blocker");
 
-        let mut exporter = BackgroundExporter::new();
+        let mut exporter: BackgroundExporter = BackgroundExporter::new();
         exporter.start(doc, blocker.clone());
         wait_until(|| {
             exporter.poll();
