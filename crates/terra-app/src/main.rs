@@ -1,50 +1,83 @@
 //! Terra editor application shell.
 
-use terra_app::app::TerraApp;
+use std::process::ExitCode;
+
+use terra_app::app::{RuntimeEvent, TerraApp};
+use terra_app::startup::{self, StartupError};
 use winit::event_loop::{ControlFlow, EventLoop};
 
-fn main() {
-    if let Some(exit_code) = handle_release_cli() {
-        std::process::exit(exit_code);
+fn main() -> ExitCode {
+    if let Some(code) = handle_release_cli() {
+        return code;
     }
 
+    let logging = terra_app::logging::init();
     harden_gpu_env();
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let event_loop = EventLoop::new().expect("event loop");
-    // Wait on OS events; about_to_wait arms WaitUntil only while refining.
+    if startup::injected_fault("event-loop") {
+        let error = StartupError::EventLoop(winit::error::EventLoopError::ExitFailure(1));
+        startup::report_failure(&error, logging.log_file(), true);
+        return ExitCode::FAILURE;
+    }
+
+    let event_loop = match EventLoop::<RuntimeEvent>::with_user_event().build() {
+        Ok(el) => el,
+        Err(error) => {
+            let error = StartupError::EventLoop(error);
+            startup::report_failure(&error, logging.log_file(), true);
+            return ExitCode::FAILURE;
+        }
+    };
     event_loop.set_control_flow(ControlFlow::Wait);
 
     let mut app = TerraApp::default();
-    event_loop.run_app(&mut app).expect("run app");
+    app.set_runtime_event_proxy(event_loop.create_proxy());
+    let run_result = event_loop.run_app(&mut app);
+
+    // Check for a startup failure stored by the ApplicationHandler (surfaces
+    // 3–5: window, init_gpu, boot worker). `presented` is true when the
+    // boot-failure splash already showed the error — skip the dialog.
+    if let Some((error, presented)) = app.take_startup_failure() {
+        startup::report_failure(&error, logging.log_file(), !presented);
+        return ExitCode::FAILURE;
+    }
+
+    match run_result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            let error = StartupError::RunApp(error);
+            startup::report_failure(&error, logging.log_file(), true);
+            ExitCode::FAILURE
+        }
+    }
 }
 
-fn handle_release_cli() -> Option<i32> {
+fn handle_release_cli() -> Option<ExitCode> {
     let mut args = std::env::args().skip(1);
     let first = args.next()?;
     if args.next().is_some() {
         eprintln!("unexpected extra arguments");
-        return Some(2);
+        return Some(ExitCode::from(2));
     }
 
     match first.as_str() {
         "--version" | "-V" => {
             println!("Terra {}", env!("CARGO_PKG_VERSION"));
-            Some(0)
+            Some(ExitCode::SUCCESS)
         }
         "--self-check" => {
             if let Err(err) = run_self_check() {
                 eprintln!("Terra self-check failed: {err}");
-                Some(1)
+                Some(ExitCode::FAILURE)
             } else {
                 println!("Terra {} self-check ok", env!("CARGO_PKG_VERSION"));
-                Some(0)
+                Some(ExitCode::SUCCESS)
             }
         }
         "--help" | "-h" => {
             println!("Terra {}", env!("CARGO_PKG_VERSION"));
             println!("Usage: terra [--version] [--self-check]");
-            Some(0)
+            Some(ExitCode::SUCCESS)
         }
         _ => None,
     }

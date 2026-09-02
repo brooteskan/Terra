@@ -3,6 +3,9 @@ use crate::ui::{PanelAction, TerrainSettingsUpdate};
 use super::super::TerraApp;
 use super::ApplyCtx;
 
+// Returns the unhandled action on `Err` so the next handler in the chain can try it
+// (see actions/mod.rs); that payload is the intrinsic-size `PanelAction` (`LayerKind`).
+#[allow(clippy::result_large_err)]
 pub(crate) fn try_apply(
     app: &mut TerraApp,
     action: PanelAction,
@@ -36,7 +39,7 @@ fn apply_update(
     if let Some(value) = update.export_resolution {
         assign_if_changed(
             &mut document.export_resolution,
-            value.clamp(512, 8192),
+            value.clamp(256, 8192),
             &mut changed,
         );
     }
@@ -106,9 +109,9 @@ mod tests {
     use std::collections::HashMap;
 
     use terra_core::analyze::HighDetailMode;
-    use terra_core::eval::CachedOutput;
     use terra_core::heightfield::{Heightfield, HeightfieldMetrics};
     use terra_core::layer::LayerId;
+    use terra_cpu_eval::CachedOutput;
 
     use super::*;
 
@@ -138,12 +141,12 @@ mod tests {
 
         app.apply_actions(vec![PanelAction::UpdateTerrainSettings(
             TerrainSettingsUpdate {
-                export_resolution: Some(4096),
+                export_resolution: Some(256),
                 ..Default::default()
             },
         )]);
 
-        assert_eq!(app.session.document.export_resolution, 4096);
+        assert_eq!(app.session.document.export_resolution, 256);
         assert!(app.document_dirty);
         assert_eq!(app.eval_token, token_before);
         assert_eq!(app.terrain_runtime.output_revision(), runtime_before);
@@ -155,7 +158,7 @@ mod tests {
     #[test]
     fn normalized_no_op_and_non_finite_values_do_nothing() {
         let mut app = TerraApp::default();
-        app.session.document.export_resolution = 512;
+        app.session.document.export_resolution = 256;
         app.session.document.preview_resolution = 256;
         app.worker_mark_all_dirty = false;
         let cached_layer = seed_clean_evaluator_cache(&mut app);

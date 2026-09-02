@@ -1,22 +1,33 @@
 //! Import/export and background build jobs.
 
 mod export;
+mod field_export;
 mod geotiff;
+mod height_pyramid;
 mod import;
 
 pub use export::{
     build_tile_manifest, changed_tiles, export_package, ExportRequest, ExportResult, TileManifest,
     TileManifestEntry,
 };
+pub use field_export::{
+    exportable_fields, field_export_filename, BackgroundFieldExporter, FieldExportFormat,
+    FieldExportOptions, FieldExportResult,
+};
 pub use geotiff::{read_geotiff_heights, GeoTiffInfo};
+pub use height_pyramid::{
+    height_pyramid_output_paths, HeightPyramidEncoding, HeightPyramidLevelManifest,
+    HeightPyramidManifest, HeightPyramidPackage, HeightPyramidPackageBuilder,
+    HeightPyramidPackageResult, HeightPyramidTileManifest, HeightPyramidWorld,
+};
 pub use import::{import_heightmap_png, import_heightmap_raw};
 
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::thread;
 use terra_core::document::TerrainDocument;
-use terra_core::eval::{EvalContext, PreviewQuality, StackEvaluator};
-use terra_core::heightfield::{Heightfield, HeightfieldMetrics};
+use terra_core::heightfield::Heightfield;
+use terra_core::quality::PreviewQuality;
+use terra_cpu_eval::{EvalContext, StackEvaluator};
+use terra_jobs::{spawn_one_shot, CancelToken, JobCtx, JobError, JobHandle, Pending, Pollable};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -29,32 +40,51 @@ pub enum IoError {
     Json(#[from] serde_json::Error),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Metrics(#[from] terra_core::heightfield::MetricsError),
 }
 
-pub struct BuildJob {
+/// Why a background export failed.
+///
+/// Cancellation is not represented here: a cancelled export resolves to idle
+/// with no result (the `BuildJob::result` stays `None`).
+#[derive(Debug, Error)]
+pub enum ExportError {
+    #[error(transparent)]
+    Eval(#[from] terra_cpu_eval::EvalError),
+    #[error(transparent)]
+    Package(#[from] IoError),
+    #[error("panicked: {0}")]
+    Panicked(String),
+}
+
+/// Why a background project save or load failed.
+#[derive(Debug, Error)]
+pub enum ProjectIoError {
+    #[error(transparent)]
+    Fs(#[from] std::io::Error),
+    #[error(transparent)]
+    Document(#[from] serde_json::Error),
+    #[error(transparent)]
+    Job(#[from] terra_jobs::JobError),
+}
+
+pub struct BuildJob<T = ExportResult> {
     pub progress: f32,
     pub done: bool,
-    pub result: Option<Result<ExportResult, String>>,
-}
-
-enum JobMsg {
-    Progress(f32),
-    Done(Result<ExportResult, String>),
+    pub result: Option<Result<T, ExportError>>,
 }
 
 /// Non-blocking export worker.
-pub struct BackgroundExporter {
-    tx: Option<Sender<JobMsg>>,
-    rx: Receiver<JobMsg>,
-    pub job: BuildJob,
+pub struct BackgroundExporter<T = ExportResult> {
+    handle: Option<JobHandle<Result<T, ExportError>>>,
+    pub job: BuildJob<T>,
 }
 
-impl BackgroundExporter {
+impl<T: Send + 'static> BackgroundExporter<T> {
     pub fn new() -> Self {
-        let (_tx, rx) = mpsc::channel();
         Self {
-            tx: None,
-            rx,
+            handle: None,
             job: BuildJob {
                 progress: 0.0,
                 done: true,
@@ -62,49 +92,92 @@ impl BackgroundExporter {
             },
         }
     }
+}
 
+impl BackgroundExporter {
     pub fn start(&mut self, doc: TerrainDocument, out_dir: PathBuf) {
-        let (tx, rx) = mpsc::channel();
-        self.rx = rx;
-        self.tx = Some(tx.clone());
+        self.start_job(move |ctx| {
+            ctx.set_progress(0.1);
+            let mut doc = doc;
+            // Ensure sparse biome paint is baked into mask assets for this export.
+            doc.sync_all_biome_paint_masks();
+            ctx.set_progress(0.3);
+            // Thread the job's cancel token into eval so a cancelled export stops
+            // between layers and inside fill-based generators (#101).
+            match evaluate_document_for_export(&doc, ctx.token().clone()) {
+                Ok((hf, eval_ctx)) => {
+                    ctx.set_progress(0.7);
+                    let req = ExportRequest {
+                        out_dir,
+                        ..ExportRequest::default()
+                    };
+                    export_package(&hf, &eval_ctx, &req).map_err(ExportError::from)
+                }
+                Err(e) => Err(e.into()),
+            }
+        });
+    }
+}
+
+impl<T: Send + 'static> BackgroundExporter<T> {
+    /// Spawn `f` as the export job, superseding any job already in flight.
+    ///
+    /// Private seam: `start` is the only public entry, but tests drive this with
+    /// arbitrary bodies (a panicking one, a spin-until-cancelled one).
+    fn start_job<F>(&mut self, f: F)
+    where
+        F: FnOnce(&JobCtx) -> Result<T, ExportError> + Send + 'static,
+    {
+        // A superseded job should stop burning CPU rather than run on detached.
+        if let Some(handle) = self.handle.take() {
+            handle.cancel();
+        }
         self.job = BuildJob {
             progress: 0.0,
             done: false,
             result: None,
         };
-        thread::spawn(move || {
-            let _ = tx.send(JobMsg::Progress(0.1));
-            let mut doc = doc;
-            // Ensure sparse biome paint is baked into mask assets for this export.
-            doc.sync_all_biome_paint_masks();
-            let _ = tx.send(JobMsg::Progress(0.3));
-            match evaluate_document_for_export(&doc) {
-                Ok((hf, ctx)) => {
-                    let _ = tx.send(JobMsg::Progress(0.7));
-                    let req = ExportRequest {
-                        out_dir,
-                        ..ExportRequest::default()
-                    };
-                    let result = export_package(&hf, &ctx, &req).map_err(|e| e.to_string());
-                    let _ = tx.send(JobMsg::Done(result));
-                }
-                Err(e) => {
-                    let _ = tx.send(JobMsg::Done(Err(e.to_string())));
-                }
-            }
-        });
+        self.handle = Some(spawn_one_shot("terra-export", f));
     }
 
     pub fn poll(&mut self) {
-        while let Ok(msg) = self.rx.try_recv() {
-            match msg {
-                JobMsg::Progress(p) => self.job.progress = p,
-                JobMsg::Done(r) => {
-                    self.job.progress = 1.0;
-                    self.job.done = true;
-                    self.job.result = Some(r);
-                }
+        let (progress, outcome) = match self.handle.as_ref() {
+            Some(handle) => (handle.progress(), handle.try_take()),
+            None => return,
+        };
+        self.job.progress = progress;
+        let Some(outcome) = outcome else {
+            return;
+        };
+        self.handle = None;
+        match outcome {
+            Ok(result) => {
+                self.job.progress = 1.0;
+                self.job.done = true;
+                self.job.result = Some(result);
             }
+            Err(JobError::Panicked(message)) => {
+                // A panicking export used to leave `done == false` forever (silent
+                // stuck progress bar); surface it as a failed job instead.
+                self.job.progress = 1.0;
+                self.job.done = true;
+                self.job.result = Some(Err(ExportError::Panicked(message)));
+            }
+            Err(JobError::Cancelled) => {
+                // A cancelled export returns to idle: no Done result, no stuck
+                // busy/done state.
+                self.job.progress = 0.0;
+                self.job.done = true;
+                self.job.result = None;
+            }
+        }
+    }
+
+    /// Request cancellation of the in-flight export, if any. The next `poll`
+    /// observes the job resolve to cancelled and returns the exporter to idle.
+    pub fn cancel(&self) {
+        if let Some(handle) = self.handle.as_ref() {
+            handle.cancel();
         }
     }
 }
@@ -115,17 +188,17 @@ impl BackgroundExporter {
 /// (`TerrainDocument::world`) from silently becoming an export source again.
 fn evaluate_document_for_export(
     doc: &TerrainDocument,
-) -> Result<(Heightfield, EvalContext), terra_core::eval::EvalError> {
-    let metrics = HeightfieldMetrics {
-        width: doc.export_resolution,
-        height: doc.export_resolution,
-        world_size_x: doc.metrics.world_size_x,
-        world_size_z: doc.metrics.world_size_z,
-        tile_size: doc.metrics.tile_size.min(doc.export_resolution),
-        halo: doc.metrics.halo,
-    };
+    cancel: CancelToken,
+) -> Result<(Heightfield, EvalContext), terra_cpu_eval::EvalError> {
+    let metrics = doc.metrics.at_resolution(doc.export_resolution)?;
     let mut evaluator = StackEvaluator::new();
+    // Export runs a full rebuild from scratch and never reloads its own baked
+    // checkpoints; spilling export-resolution bakes into the shared cache dir (and
+    // stomping preview bakes) was pure waste. Run memory-only (B1-D8).
+    evaluator.cache.disable_disk();
     let mut ctx = EvalContext::new(metrics);
+    // Cancellation from the export job (or `never` on the synchronous test path).
+    ctx.set_cancel_token(cancel);
     ctx.quality = PreviewQuality::Export;
     ctx.level_steps = doc.level_steps.clone();
     ctx.mask_assets = doc.masks.clone();
@@ -140,9 +213,26 @@ fn evaluate_document_for_export(
     Ok((height, ctx))
 }
 
-impl Default for BackgroundExporter {
+impl<T: Send + 'static> Default for BackgroundExporter<T> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl<T: Send + 'static> Pollable for BackgroundExporter<T> {
+    /// Poll the in-flight export, then report whether one is still running. An
+    /// export streams to disk with a progress bar the surrounding frame already
+    /// repaints at loop cadence, so it wants `redraw` while busy but not the
+    /// ~16 ms `animate` wakes. The completion frame (the "one more frame to show
+    /// status" case) is driven app-side off `job.done`, not from here.
+    fn pump(&mut self) -> Pending {
+        self.poll();
+        let busy = !self.job.done;
+        Pending {
+            busy,
+            animate: false,
+            redraw: busy,
+        }
     }
 }
 
@@ -157,24 +247,30 @@ pub fn load_project(path: &std::path::Path) -> Result<TerrainDocument, IoError> 
     Ok(TerrainDocument::from_json(&s)?)
 }
 
-enum ProjectIoMsg {
-    Progress(&'static str),
-    Saved { path: PathBuf },
-    Loaded { path: PathBuf, doc: TerrainDocument },
-    Failed { path: PathBuf, error: String },
-}
-
 /// Result of a finished background project I/O job.
 #[derive(Debug)]
 pub enum ProjectIoResult {
-    Saved { path: PathBuf },
-    Loaded { path: PathBuf, doc: TerrainDocument },
-    Failed { path: PathBuf, error: String },
+    Saved {
+        path: PathBuf,
+    },
+    Loaded {
+        path: PathBuf,
+        // Boxed so lighter variants aren't sized to the large `TerrainDocument`
+        // payload (clippy::large_enum_variant).
+        doc: Box<TerrainDocument>,
+    },
+    Failed {
+        path: PathBuf,
+        error: ProjectIoError,
+    },
 }
 
 /// Non-blocking project save/load worker (serialize/parse/fs off the UI thread).
 pub struct BackgroundProjectIo {
-    rx: Receiver<ProjectIoMsg>,
+    handle: Option<JobHandle<ProjectIoResult>>,
+    // Remembered at spawn so a panicked/cancelled job (which yields no
+    // `ProjectIoResult`) can still report which path failed.
+    pending_path: Option<PathBuf>,
     busy: bool,
     status: Option<&'static str>,
     pub result: Option<ProjectIoResult>,
@@ -182,9 +278,9 @@ pub struct BackgroundProjectIo {
 
 impl BackgroundProjectIo {
     pub fn new() -> Self {
-        let (_tx, rx) = mpsc::channel();
         Self {
-            rx,
+            handle: None,
+            pending_path: None,
             busy: false,
             status: None,
             result: None,
@@ -201,86 +297,93 @@ impl BackgroundProjectIo {
 
     /// Clone-owned document is moved to the worker for sync + compact JSON + write.
     pub fn start_save(&mut self, doc: TerrainDocument, path: PathBuf) {
-        let (tx, rx) = mpsc::channel();
-        self.rx = rx;
+        self.pending_path = Some(path.clone());
         self.busy = true;
         self.status = Some("Saving…");
         self.result = None;
-        thread::spawn(move || {
-            let _ = tx.send(ProjectIoMsg::Progress("Saving…"));
-            match doc.into_json() {
-                Ok(json) => match std::fs::write(&path, json) {
-                    Ok(()) => {
-                        let _ = tx.send(ProjectIoMsg::Saved { path });
-                    }
-                    Err(e) => {
-                        let _ = tx.send(ProjectIoMsg::Failed {
-                            path,
-                            error: e.to_string(),
-                        });
-                    }
-                },
+        self.handle = Some(spawn_one_shot("terra-project-save", move |_ctx| {
+            let json = match doc.into_json() {
+                Ok(json) => json,
                 Err(e) => {
-                    let _ = tx.send(ProjectIoMsg::Failed {
+                    return ProjectIoResult::Failed {
                         path,
-                        error: e.to_string(),
-                    });
+                        error: e.into(),
+                    }
                 }
+            };
+            match std::fs::write(&path, json) {
+                Ok(()) => ProjectIoResult::Saved { path },
+                Err(e) => ProjectIoResult::Failed {
+                    path,
+                    error: e.into(),
+                },
             }
-        });
+        }));
     }
 
     pub fn start_load(&mut self, path: PathBuf) {
-        let (tx, rx) = mpsc::channel();
-        self.rx = rx;
+        self.pending_path = Some(path.clone());
         self.busy = true;
         self.status = Some("Loading…");
         self.result = None;
-        thread::spawn(move || {
-            let _ = tx.send(ProjectIoMsg::Progress("Loading…"));
-            match std::fs::read_to_string(&path) {
-                Ok(s) => match TerrainDocument::from_json(&s) {
-                    Ok(doc) => {
-                        let _ = tx.send(ProjectIoMsg::Loaded { path, doc });
-                    }
-                    Err(e) => {
-                        let _ = tx.send(ProjectIoMsg::Failed {
-                            path,
-                            error: e.to_string(),
-                        });
-                    }
-                },
+        self.handle = Some(spawn_one_shot("terra-project-load", move |_ctx| {
+            let contents = match std::fs::read_to_string(&path) {
+                Ok(s) => s,
                 Err(e) => {
-                    let _ = tx.send(ProjectIoMsg::Failed {
+                    return ProjectIoResult::Failed {
                         path,
-                        error: e.to_string(),
-                    });
+                        error: e.into(),
+                    }
                 }
+            };
+            match TerrainDocument::from_json(&contents) {
+                Ok(doc) => ProjectIoResult::Loaded {
+                    path,
+                    doc: Box::new(doc),
+                },
+                Err(e) => ProjectIoResult::Failed {
+                    path,
+                    error: e.into(),
+                },
             }
-        });
+        }));
     }
 
     pub fn poll(&mut self) {
-        while let Ok(msg) = self.rx.try_recv() {
-            match msg {
-                ProjectIoMsg::Progress(s) => self.status = Some(s),
-                ProjectIoMsg::Saved { path } => {
-                    self.busy = false;
-                    self.status = None;
-                    self.result = Some(ProjectIoResult::Saved { path });
-                }
-                ProjectIoMsg::Loaded { path, doc } => {
-                    self.busy = false;
-                    self.status = None;
-                    self.result = Some(ProjectIoResult::Loaded { path, doc });
-                }
-                ProjectIoMsg::Failed { path, error } => {
-                    self.busy = false;
-                    self.status = None;
-                    self.result = Some(ProjectIoResult::Failed { path, error });
-                }
-            }
-        }
+        let outcome = match self.handle.as_ref() {
+            Some(handle) => handle.try_take(),
+            None => return,
+        };
+        let Some(outcome) = outcome else {
+            return;
+        };
+        self.handle = None;
+        self.busy = false;
+        self.status = None;
+        let path = self.pending_path.take().unwrap_or_default();
+        self.result = Some(match outcome {
+            Ok(result) => result,
+            // No cancel surface is exposed for project IO; map defensively so an
+            // impossible state surfaces loudly rather than vanishing.
+            Err(e) => ProjectIoResult::Failed {
+                path,
+                error: e.into(),
+            },
+        });
+    }
+
+    /// Spawn `f` as the project-IO job. Test-only seam so a panicking body can be
+    /// exercised; production uses `start_save` / `start_load`.
+    #[cfg(test)]
+    fn start_job_for_test<F>(&mut self, path: PathBuf, f: F)
+    where
+        F: FnOnce(&JobCtx) -> ProjectIoResult + Send + 'static,
+    {
+        self.pending_path = Some(path);
+        self.busy = true;
+        self.status = Some("Working…");
+        self.result = None;
+        self.handle = Some(spawn_one_shot("terra-project-test", f));
     }
 }
 
@@ -290,13 +393,42 @@ impl Default for BackgroundProjectIo {
     }
 }
 
+impl Pollable for BackgroundProjectIo {
+    /// Poll the in-flight save/load, then report whether one is still running.
+    /// The typed result (a `ProjectIoResult`) and the transient status string are
+    /// drained by the app after the tick — this only reports busy/repaint facts.
+    /// Save/load shows a static "Saving…"/"Loading…" status, so it wants `redraw`
+    /// while busy but not `animate` wakes.
+    fn pump(&mut self) -> Pending {
+        self.poll();
+        let busy = self.is_busy();
+        Pending {
+            busy,
+            animate: false,
+            redraw: busy,
+        }
+    }
+}
+
 #[cfg(test)]
-mod export_worker_tests {
+mod worker_tests {
     use super::*;
     use terra_core::layer::{FlatParams, Layer, LayerKind, LayerStack};
 
-    #[test]
-    fn v8_export_evaluates_the_authoritative_stack() {
+    /// Spin (yielding) until `cond` holds, with a generous safety timeout so a
+    /// regression fails loudly instead of hanging the suite.
+    fn wait_until(mut cond: impl FnMut() -> bool) {
+        let start = std::time::Instant::now();
+        while !cond() {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(5),
+                "background job did not reach the expected state within the timeout"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    fn flat_doc() -> TerrainDocument {
         let mut doc = TerrainDocument::new_default();
         doc.export_resolution = 32;
         doc.stack = LayerStack::new();
@@ -304,11 +436,344 @@ mod export_worker_tests {
             "Export Height",
             LayerKind::Flat(FlatParams { height: 73.0 }),
         ));
+        doc
+    }
 
+    #[test]
+    fn v8_export_evaluates_the_authoritative_stack() {
+        let doc = flat_doc();
         assert!(!doc.stack.flatten_layers().is_empty());
 
-        let (height, _) =
-            evaluate_document_for_export(&doc).expect("the stack should evaluate for export");
+        let (height, _) = evaluate_document_for_export(&doc, CancelToken::never())
+            .expect("the stack should evaluate for export");
         assert!((height.get(16, 16) - 73.0).abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn export_eval_honors_a_pre_cancelled_token() {
+        // Proves the job's token is actually threaded into EvalContext: a
+        // pre-cancelled token trips the between-layer check immediately. If the
+        // `set_cancel_token` wiring is ever dropped, this fails without relying on
+        // any timing.
+        let doc = flat_doc();
+        let (token, flag) = CancelToken::flag();
+        flag.cancel();
+        let result = evaluate_document_for_export(&doc, token);
+        assert!(
+            matches!(result, Err(terra_cpu_eval::EvalError::Cancelled)),
+            "a cancelled token must abort export eval"
+        );
+    }
+
+    #[test]
+    fn export_rejects_invalid_resolution_without_panicking() {
+        // A zero export resolution would derive a zero-dimension, zero-tile
+        // metrics and panic in tile arithmetic. It must surface as a typed error.
+        let mut doc = flat_doc();
+        doc.export_resolution = 0;
+        let result = evaluate_document_for_export(&doc, CancelToken::never());
+        assert!(
+            matches!(result, Err(terra_cpu_eval::EvalError::InvalidMetrics(_))),
+            "an invalid export resolution must abort export eval with a typed error"
+        );
+    }
+
+    #[test]
+    fn panicking_export_surfaces_as_failed_not_hung() {
+        // Regression: a panicking export thread used to leave job.done == false
+        // forever (silent stuck progress bar).
+        let mut exporter: BackgroundExporter = BackgroundExporter::new();
+        exporter.start_job(|_| panic!("boom in export"));
+        wait_until(|| {
+            exporter.poll();
+            exporter.job.done && exporter.job.result.is_some()
+        });
+        match exporter.job.result.take() {
+            Some(Err(ExportError::Panicked(message))) => {
+                assert!(
+                    message.contains("boom in export"),
+                    "the panic message should surface, got: {message}"
+                );
+                let display = format!("{}", ExportError::Panicked(message));
+                assert!(
+                    display.starts_with("panicked:"),
+                    "Display format: {display}"
+                );
+            }
+            Some(Err(other)) => panic!("expected Panicked, got: {other}"),
+            Some(Ok(_)) => panic!("expected a failed export, got a successful result"),
+            None => panic!("expected a failed export result, got none"),
+        }
+    }
+
+    #[test]
+    fn cancelled_export_finishes_with_no_result() {
+        let mut exporter: BackgroundExporter = BackgroundExporter::new();
+        // Body spins until cancelled, then returns a value the cancel must discard.
+        exporter.start_job(|ctx| {
+            while !ctx.token().is_cancelled() {
+                std::thread::yield_now();
+            }
+            Err(ExportError::Panicked(
+                "value produced after cancel — must be discarded".into(),
+            ))
+        });
+        exporter.cancel();
+        wait_until(|| {
+            exporter.poll();
+            exporter.job.done
+        });
+        assert!(
+            exporter.job.result.is_none(),
+            "a cancelled export must leave no Done result"
+        );
+    }
+
+    #[test]
+    fn panicking_project_io_surfaces_as_failed() {
+        let mut io = BackgroundProjectIo::new();
+        io.start_job_for_test(PathBuf::from("project.terra"), |_| panic!("io boom"));
+        wait_until(|| {
+            io.poll();
+            !io.is_busy() && io.result.is_some()
+        });
+        match io.result.take() {
+            Some(ProjectIoResult::Failed { path, error }) => {
+                assert_eq!(path, PathBuf::from("project.terra"));
+                assert!(
+                    matches!(error, ProjectIoError::Job(JobError::Panicked(_))),
+                    "expected a Job(Panicked) error, got: {error}"
+                );
+                assert!(error.to_string().contains("io boom"), "got: {error}");
+            }
+            other => panic!("expected a Failed result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn save_then_load_round_trips_through_the_worker() {
+        let path = std::env::temp_dir().join(format!("terra-io-test-{}.terra", std::process::id()));
+
+        let doc = TerrainDocument::new_default();
+        let mut io = BackgroundProjectIo::new();
+        io.start_save(doc, path.clone());
+        wait_until(|| {
+            io.poll();
+            !io.is_busy() && io.result.is_some()
+        });
+        assert!(
+            matches!(io.result.take(), Some(ProjectIoResult::Saved { .. })),
+            "save should complete"
+        );
+
+        io.start_load(path.clone());
+        wait_until(|| {
+            io.poll();
+            !io.is_busy() && io.result.is_some()
+        });
+        assert!(
+            matches!(io.result.take(), Some(ProjectIoResult::Loaded { .. })),
+            "load should complete"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn exporter_pump_reports_busy_while_running_then_idle() {
+        use std::sync::mpsc;
+        use terra_jobs::Pollable;
+
+        let mut exporter: BackgroundExporter = BackgroundExporter::new();
+        // Idle before any job: no busy, no repaint, never animation-cadence.
+        let idle = exporter.pump();
+        assert!(!idle.busy && !idle.redraw && !idle.animate);
+
+        // Gate the body so the export is provably in flight when we pump.
+        let (gate_tx, gate_rx) = mpsc::channel::<()>();
+        exporter.start_job(move |_ctx| {
+            gate_rx.recv().expect("await release");
+            Err(ExportError::Panicked("done".into()))
+        });
+        let busy = exporter.pump();
+        assert!(busy.busy, "export in flight");
+        assert!(busy.redraw, "a busy export repaints its progress");
+        assert!(!busy.animate, "export is not animation-cadence work");
+
+        gate_tx.send(()).expect("release");
+        // Pump reports idle once the job resolves; the "one more frame to show
+        // status" is an app-side concern keyed off job.done, not a pump fact.
+        wait_until(|| {
+            let p = exporter.pump();
+            !p.busy && !p.redraw
+        });
+        assert!(exporter.job.done);
+    }
+
+    #[test]
+    fn exporter_pump_returns_to_idle_after_cancel() {
+        use terra_jobs::Pollable;
+
+        let mut exporter: BackgroundExporter = BackgroundExporter::new();
+        exporter.start_job(|ctx| {
+            while !ctx.token().is_cancelled() {
+                std::thread::yield_now();
+            }
+            Err(ExportError::Panicked(
+                "produced after cancel — must be discarded".into(),
+            ))
+        });
+        assert!(exporter.pump().busy, "busy until cancelled");
+
+        exporter.cancel();
+        wait_until(|| !exporter.pump().busy);
+        assert!(
+            exporter.job.result.is_none(),
+            "a cancelled export leaves no Done result"
+        );
+    }
+
+    #[test]
+    fn project_io_pump_reports_busy_while_running_then_idle() {
+        use std::sync::mpsc;
+        use terra_jobs::Pollable;
+
+        let mut io = BackgroundProjectIo::new();
+        assert!(!io.pump().busy, "idle before any job");
+
+        let (gate_tx, gate_rx) = mpsc::channel::<()>();
+        io.start_job_for_test(PathBuf::from("gated.terra"), move |_| {
+            gate_rx.recv().expect("await release");
+            ProjectIoResult::Saved {
+                path: PathBuf::from("gated.terra"),
+            }
+        });
+        let busy = io.pump();
+        assert!(busy.busy, "save in flight");
+        assert!(busy.redraw, "a busy save repaints its status");
+        assert!(!busy.animate, "project IO is not animation-cadence work");
+
+        gate_tx.send(()).expect("release");
+        wait_until(|| !io.pump().busy);
+        // The typed result survives the pump for the app-side drain.
+        assert!(matches!(
+            io.result.take(),
+            Some(ProjectIoResult::Saved { .. })
+        ));
+    }
+
+    // ---- Typed-error boundary tests (#76) ----
+
+    #[test]
+    fn load_malformed_json_crosses_worker_as_document_error() {
+        let path =
+            std::env::temp_dir().join(format!("terra-io-bad-json-{}.terra", std::process::id()));
+        std::fs::write(&path, "{ not json").expect("write fixture");
+
+        let mut io = BackgroundProjectIo::new();
+        io.start_load(path.clone());
+        wait_until(|| {
+            io.poll();
+            !io.is_busy() && io.result.is_some()
+        });
+        match io.result.take() {
+            Some(ProjectIoResult::Failed { error, .. }) => {
+                assert!(
+                    matches!(error, ProjectIoError::Document(_)),
+                    "malformed JSON must surface as Document, got: {error}"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_missing_file_crosses_worker_as_fs_error() {
+        let path = std::env::temp_dir().join(format!(
+            "terra-io-missing-{}-nonexistent.terra",
+            std::process::id()
+        ));
+        assert!(!path.exists(), "fixture must not exist");
+
+        let mut io = BackgroundProjectIo::new();
+        io.start_load(path);
+        wait_until(|| {
+            io.poll();
+            !io.is_busy() && io.result.is_some()
+        });
+        match io.result.take() {
+            Some(ProjectIoResult::Failed { error, .. }) => match &error {
+                ProjectIoError::Fs(e) => {
+                    assert_eq!(e.kind(), std::io::ErrorKind::NotFound);
+                }
+                _ => panic!("expected Fs(NotFound), got: {error}"),
+            },
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn save_into_missing_directory_crosses_worker_as_fs_error() {
+        let path = std::env::temp_dir().join(format!(
+            "terra-io-nodir-{}/deep/project.terra",
+            std::process::id()
+        ));
+        assert!(!path.parent().unwrap().exists(), "parent must not exist");
+
+        let doc = TerrainDocument::new_default();
+        let mut io = BackgroundProjectIo::new();
+        io.start_save(doc, path);
+        wait_until(|| {
+            io.poll();
+            !io.is_busy() && io.result.is_some()
+        });
+        match io.result.take() {
+            Some(ProjectIoResult::Failed { error, .. }) => {
+                assert!(
+                    matches!(error, ProjectIoError::Fs(_)),
+                    "write into missing dir must surface as Fs, got: {error}"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn export_eval_failure_crosses_worker_typed() {
+        let mut doc = flat_doc();
+        doc.export_resolution = 0;
+
+        let mut exporter: BackgroundExporter = BackgroundExporter::new();
+        exporter.start(doc, std::env::temp_dir());
+        wait_until(|| {
+            exporter.poll();
+            exporter.job.done && exporter.job.result.is_some()
+        });
+        match exporter.job.result.take() {
+            Some(Err(ExportError::Eval(terra_cpu_eval::EvalError::InvalidMetrics(_)))) => {}
+            other => panic!("expected Eval(InvalidMetrics), got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn export_package_failure_crosses_worker_typed() {
+        let doc = flat_doc();
+        // Point out_dir at a regular file so create_dir_all fails.
+        let blocker =
+            std::env::temp_dir().join(format!("terra-io-export-blocker-{}", std::process::id()));
+        std::fs::write(&blocker, b"block").expect("write blocker");
+
+        let mut exporter: BackgroundExporter = BackgroundExporter::new();
+        exporter.start(doc, blocker.clone());
+        wait_until(|| {
+            exporter.poll();
+            exporter.job.done && exporter.job.result.is_some()
+        });
+        match exporter.job.result.take() {
+            Some(Err(ExportError::Package(IoError::Io(_)))) => {}
+            other => panic!("expected Package(Io(_)), got: {other:?}"),
+        }
+        let _ = std::fs::remove_file(&blocker);
     }
 }

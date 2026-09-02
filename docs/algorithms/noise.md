@@ -23,7 +23,7 @@
 
 For the supported CPU build contract, the same `(seed, params, world x/z)`
 produces bit-identical `f32` output. The executable
-[CPU determinism contract](../../crates/terra-core/tests/cpu_determinism_contract.rs)
+[CPU determinism contract](../../crates/terra-cpu-eval/tests/cpu_determinism_contract.rs)
 pins representative low-seed results, proves that upper `u64` seed bits affect
 output, and exercises the authored `StackEvaluator` path across storage tile
 counts. It does not claim bit portability across arbitrary toolchain or libm

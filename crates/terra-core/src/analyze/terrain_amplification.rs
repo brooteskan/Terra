@@ -337,6 +337,9 @@ enum BandRole {
     Micro,
 }
 
+// Multi-band amplification kernel: one input field plus ten independent
+// derivative/analysis fields (gradients, slope, curvature, ridge/valley/flow),
+// each sampled distinctly — no coherent sub-struct. Kept flat.
 #[allow(clippy::too_many_arguments)]
 fn apply_cascade_band(
     role: BandRole,

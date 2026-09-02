@@ -6,12 +6,15 @@ use super::super::helpers::coalesce_layer_id;
 use super::super::TerraApp;
 use super::ApplyCtx;
 
+// Returns the unhandled action on `Err` so the next handler in the chain can try it
+// (see actions/mod.rs); that payload is the intrinsic-size `PanelAction` (`LayerKind`).
+#[allow(clippy::result_large_err)]
 pub(crate) fn try_apply(
     app: &mut TerraApp,
     action: PanelAction,
     ctx: &mut ApplyCtx,
 ) -> Result<(), PanelAction> {
-    let result = match action {
+    match action {
         PanelAction::SetOperationApplyWhere { id, apply: mode } => {
             let (previous, previous_masks) = app
                 .session
@@ -174,6 +177,5 @@ pub(crate) fn try_apply(
         }
         other => return Err(other),
     };
-    let _ = result;
     Ok(())
 }

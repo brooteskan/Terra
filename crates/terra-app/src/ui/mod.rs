@@ -3,6 +3,7 @@
 mod actions;
 mod bookmarks_gui;
 mod brand;
+pub(crate) use brand::brand_logo;
 mod chrome_gui;
 mod chrome_layout;
 mod command_palette;
@@ -29,18 +30,12 @@ mod tools_gui;
 mod viewport_gui;
 mod workspace;
 
-/// Poll completion of lazily decoded tool thumbnails.
-pub fn take_tool_thumbnail_ready_signal() -> bool {
-    tool_thumbs::take_ready_signal()
-}
-/// Keep the event loop awake only while lazy thumbnail work is outstanding.
-pub fn tool_thumbnails_pending() -> bool {
-    tool_thumbs::has_pending_work()
-}
 /// Warm the tool-thumb decode pool (call once after the window is up).
 pub fn prefetch_tool_thumbnails() {
     tool_thumbs::prefetch_all();
 }
+/// Registry adapter that pumps the tool-thumbnail decode pool once per frame.
+pub(crate) use tool_thumbs::ToolThumbPump;
 
 pub use actions::{MaskEditAction, PanelAction, TerrainSettingsUpdate};
 pub use chrome_gui::{
@@ -95,14 +90,38 @@ pub use workspace::{
 
 use serde::{Deserialize, Serialize};
 use terra_core::document::TerrainDocument;
-use terra_core::eval::PreviewQuality;
 use terra_core::layer::{LayerId, LayerKind};
 use terra_core::mask::MaskId;
+use terra_core::quality::PreviewQuality;
 use terra_gui::GuiContext;
 
 use crate::ui::chrome_gui::{draw_menu_bar, draw_menu_overlays};
 use crate::ui::dock_gui::draw_bottom_dock;
 use crate::ui::viewport_gui::draw_viewport_overlays;
+
+#[derive(Debug, Clone)]
+pub struct EvaluationFailureStatus {
+    pub layer_name: Option<String>,
+    pub quality: PreviewQuality,
+    pub message: String,
+    pub worker_restarted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum TerrainPreviewFreshness {
+    #[default]
+    Current,
+    Deferred {
+        layer_name: String,
+        deferred_layers: usize,
+        settling: bool,
+    },
+    RefiningSuffix {
+        layer_name: String,
+        quality: PreviewQuality,
+    },
+    LastCompleteStale,
+}
 
 #[derive(Default)]
 pub struct UiState {
@@ -147,9 +166,17 @@ pub struct UiState {
     /// RGBA pixels supplied by the app from the latest successful evaluation.
     pub preview_rgba: Option<(u32, u32, Vec<u8>)>,
     pub export_path: Option<String>,
+    pub export_options: terra_io::FieldExportOptions,
+    /// Open the completed export's directory in the system file manager.
+    pub open_export_folder_when_finished: bool,
     /// `Some(0..=1)` while a background export is running.
     pub export_progress: Option<f32>,
     pub status: String,
+    /// Persistent evaluation failure; cleared only by a successful current build or reset.
+    pub evaluation_failure: Option<EvaluationFailureStatus>,
+    /// Whether the visible terrain is the complete stack or a truthful local
+    /// prefix while a globally coupled suffix is deferred.
+    pub terrain_preview_freshness: TerrainPreviewFreshness,
     pub refining: bool,
     /// Best-effort progressive-build completion, from 0.0 through 1.0.
     pub build_progress: Option<f32>,
@@ -277,6 +304,8 @@ pub struct UiState {
     pub outdated_layer_ids: Vec<terra_core::layer::LayerId>,
     /// Cap 1 soft incomplete-project diagnostic for the dock (non-blocking).
     pub soft_project_diag: Option<String>,
+    /// Selected sub-stroke within a SculptStrokes layer (parent layer, vec index).
+    pub selected_stroke: Option<(terra_core::layer::LayerId, usize)>,
 }
 
 /// Presentation-only environment lighting for the 3D viewport.
@@ -685,6 +714,15 @@ impl UiState {
         if self.camera_speed <= 0.0 {
             self.camera_speed = 1.0;
         }
+    }
+
+    /// Map the brush edge-hardness [`Self::brush_falloff`] (0 soft … 1 hard) onto a
+    /// sculpt stroke's falloff exponent (`smoothstep_weight(..).powf(falloff)`):
+    /// a low exponent spreads the brush broadly, a high one draws it to a point.
+    /// The 0.5 default lands near the historical 1.5 so existing strokes read the same.
+    pub fn sculpt_falloff_exponent(&self) -> f32 {
+        let hardness = self.brush_falloff.clamp(0.0, 1.0);
+        0.4 + 5.0 * hardness * hardness
     }
 
     /// Remember and arm an editor tool. Sculpt brushes update [`Self::last_sculpt_tool`].
@@ -1102,6 +1140,41 @@ impl EditorTool {
             )
     }
 
+    /// Exact domain brush represented by this editor tool.
+    ///
+    /// This is used for edit-capability checks; unlike `shape_tool`, it does not
+    /// collapse semantic field tools into similarly shaped history tools.
+    pub fn sculpt_stroke_kind(self) -> Option<terra_core::authoring::SculptStrokeKind> {
+        use terra_core::authoring::SculptStrokeKind;
+        match self {
+            EditorTool::Raise => Some(SculptStrokeKind::Raise),
+            EditorTool::Lower => Some(SculptStrokeKind::Lower),
+            EditorTool::Smooth => Some(SculptStrokeKind::Smooth),
+            EditorTool::Ridge => Some(SculptStrokeKind::Ridge),
+            EditorTool::Valley => Some(SculptStrokeKind::Valley),
+            EditorTool::Roughness => Some(SculptStrokeKind::Roughness),
+            EditorTool::UpliftBrush => Some(SculptStrokeKind::Uplift),
+            EditorTool::Protect => Some(SculptStrokeKind::Protect),
+            EditorTool::Hardness => Some(SculptStrokeKind::Hardness),
+            EditorTool::Sediment => Some(SculptStrokeKind::Sediment),
+            EditorTool::RiverConstraint => Some(SculptStrokeKind::RiverPath),
+            EditorTool::Flatten => Some(SculptStrokeKind::Flatten),
+            EditorTool::Terrace => Some(SculptStrokeKind::Terrace),
+            EditorTool::Pinch => Some(SculptStrokeKind::Pinch),
+            EditorTool::Inflate => Some(SculptStrokeKind::Inflate),
+            EditorTool::ErodeBrush => Some(SculptStrokeKind::Erode),
+            EditorTool::MountainStamp => Some(SculptStrokeKind::MountainStamp),
+            EditorTool::ValleyStamp => Some(SculptStrokeKind::ValleyStamp),
+            EditorTool::PlateauStamp => Some(SculptStrokeKind::PlateauStamp),
+            EditorTool::CraterStamp => Some(SculptStrokeKind::CraterStamp),
+            EditorTool::CoastlineTool => Some(SculptStrokeKind::Coastline),
+            EditorTool::RiverPathTool => Some(SculptStrokeKind::RiverPath),
+            EditorTool::HeightStamp => Some(SculptStrokeKind::HeightStamp),
+            EditorTool::NoiseBrush => Some(SculptStrokeKind::Noise),
+            _ => None,
+        }
+    }
+
     /// Maps to Shape history [`terra_core::shape_history::ShapeTool`] when applicable.
     pub fn shape_tool(self) -> Option<terra_core::shape_history::ShapeTool> {
         use terra_core::shape_history::ShapeTool;
@@ -1175,6 +1248,14 @@ impl EditorTool {
 /// Per-frame timings in microseconds for the profiler overlay.
 #[derive(Debug, Clone, Default)]
 pub struct FrameProfile {
+    pub logical_frame_id: u64,
+    pub edit_generation: u64,
+    pub presented_generation: u64,
+    pub logical_phase: &'static str,
+    pub input_event_count: usize,
+    pub pointer_sample_count: usize,
+    pub input_frame_pending: bool,
+    pub trace_orphaned_events: u64,
     pub eval_us: u64,
     pub upload_us: u64,
     pub render_us: u64,
@@ -1186,6 +1267,27 @@ pub struct FrameProfile {
     pub quality: &'static str,
     /// `"GPU"` preview engine or `"CPU"` fallback.
     pub path: &'static str,
+    /// First layer and stable reason code at an intentional GPU-to-CPU boundary.
+    pub gpu_fallback: Option<terra_gpu::GpuFallbackDiagnostic>,
+    /// Explicit complete-field fallback used when a compiled tile/checkpoint is unsupported.
+    pub terrain_tile_fallback: Option<String>,
+    /// Interaction/generation observability required by #148.
+    pub first_visible_preview_us: u64,
+    pub settled_authoritative_us: u64,
+    pub brush_trace_samples: usize,
+    pub input_visible_p50_us: u64,
+    pub input_visible_p95_us: u64,
+    pub input_visible_max_us: u64,
+    pub refinement_p50_us: u64,
+    pub refinement_p95_us: u64,
+    pub refinement_max_us: u64,
+    pub follow_up_press_p50_us: u64,
+    pub follow_up_press_p95_us: u64,
+    pub follow_up_press_max_us: u64,
+    pub plan: terra_core::terrain_plan::PlanCacheStatsSnapshot,
+    pub gpu: terra_gpu_eval::GpuEvalStats,
+    pub cpu_worker: terra_cpu_eval::EvalWorkerStatsSnapshot,
+    pub cpu_published: u64,
     pub terrain_grid_size: u32,
     pub tiles_x: u32,
     pub tiles_z: u32,
@@ -1200,11 +1302,11 @@ pub struct FrameProfile {
     pub tile_cache_budget_mb: f32,
     pub tile_cache_evictions: u64,
     pub tile_uploads_pending: usize,
-    pub visible_tiles_exact: usize,
-    pub visible_tiles_fallback: usize,
-    pub visible_tiles_missing: usize,
+    pub terrain_tile_work: terra_core::TerrainTileWorkStats,
     /// GPU terrain pass microseconds (0 if TIMESTAMP_QUERY unsupported).
     pub gpu_terrain_us: u64,
+    /// Compiled terrain evaluation GPU microseconds (delayed timestamp readback).
+    pub gpu_evaluation_us: u64,
     /// GPU shadow pass microseconds.
     pub gpu_shadow_us: u64,
     pub gpu_timestamps_supported: bool,
@@ -1236,8 +1338,8 @@ pub struct FrameProfile {
 }
 
 impl FrameProfile {
-    pub fn update_layer_timings(&mut self, timings: &[terra_core::eval::LayerEvalTiming]) {
-        use terra_core::eval::LayerEvalStatus;
+    pub fn update_layer_timings(&mut self, timings: &[terra_cpu_eval::LayerEvalTiming]) {
+        use terra_cpu_eval::LayerEvalStatus;
 
         self.cache_hits = 0;
         self.computed_layers = 0;
@@ -1271,12 +1373,15 @@ impl FrameProfile {
         self.tile_uploads_pending = pending_uploads;
     }
 
-    pub fn update_visible_tiles(&mut self, exact: usize, fallback: usize, missing: usize) {
-        self.visible_tiles_exact = exact;
-        self.visible_tiles_fallback = fallback;
-        self.visible_tiles_missing = missing;
+    pub fn update_terrain_tile_work(&mut self, stats: terra_core::TerrainTileWorkStats) {
+        self.tile_uploads_pending = stats.queued;
+        self.terrain_tile_work = stats;
     }
 
+    // Distinct per-frame render-state inputs (scene versions, invalidation,
+    // frame counters, quality/timings, interaction, mode, sample count) with no
+    // natural sub-grouping. Kept flat.
+    #[allow(clippy::too_many_arguments)]
     pub fn update_progressive(
         &mut self,
         versions: terra_render::SceneVersions,
@@ -1428,6 +1533,8 @@ pub struct FrameUiOutput {
     pub camera_frame_selection: bool,
     /// Cancel the in-flight evaluation / refine job.
     pub request_cancel_build: bool,
+    /// Retry after a persistent evaluation failure.
+    pub request_retry_evaluation: bool,
     /// Force a full-quality rebuild (EXPORT button).
     pub request_full_build: bool,
     /// Save the current camera into the next free bookmark slot.
@@ -1451,6 +1558,10 @@ pub struct FrameUiOutput {
 }
 
 /// Draw all editor chrome with terra-gui.
+// Each argument is an independent &mut sub-panel state (chrome/tools/layers/
+// inspector/windows/dock); bundling them into one struct would just alias
+// separate borrows together. Kept flat.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_editor_gui(
     ui: &mut GuiContext<'_>,
     doc: &TerrainDocument,
@@ -1500,6 +1611,8 @@ pub fn draw_editor_gui(
         || layers.context_menu.is_some()
         || layers.add_menu_open
         || inspector.more_menu_open
+        || inspector.has_resize_confirmation()
+        || ui_state.show_command_palette
         || ui_state.lighting_menu_open
         || ui_state.camera_speed_menu_open
         || ui_state.viewport_context_menu.is_some()
@@ -1557,7 +1670,9 @@ pub fn draw_editor_gui(
     out.actions
         .extend(draw_viewport_context_menu(ui, doc, ui_state));
     let mut command_palette = std::mem::take(&mut ui_state.command_palette);
-    for action in draw_command_palette(ui, doc, ui_state, &mut command_palette) {
+    let palette_actions =
+        ui.with_menu_input(|ui| draw_command_palette(ui, doc, ui_state, &mut command_palette));
+    for action in palette_actions {
         match action {
             PaletteAction::Panel(action) => out.actions.push(action),
             PaletteAction::Undo => out.request_undo = true,
@@ -1574,7 +1689,14 @@ pub fn draw_editor_gui(
         }
     }
     ui_state.command_palette = command_palette;
-    draw_export_unsupported_modal(ui, &mut ui_state.show_export_unsupported);
+    if let Some(action) =
+        ui.with_menu_input(|ui| inspector::draw_resize_confirmation_modal(ui, inspector))
+    {
+        out.actions.push(action);
+    }
+    ui.with_menu_input(|ui| {
+        draw_export_unsupported_modal(ui, &mut ui_state.show_export_unsupported)
+    });
     out.selected = doc.selected;
     out
 }

@@ -166,10 +166,12 @@ pub fn aspect_radians(hf: &Heightfield, radius_m: f32) -> MaskField {
     out
 }
 
-fn second_derivatives(
-    hf: &Heightfield,
-    radius_m: f32,
-) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+/// Per-cell first and second partial derivatives of the height field, as
+/// parallel buffers `(p, q, r, t, s)` over the two horizontal axes x and z:
+/// `p = ∂h/∂x`, `q = ∂h/∂z`, `r = ∂²h/∂x²`, `t = ∂²h/∂z²`, `s = ∂²h/∂x∂z`.
+type PartialDerivatives = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>);
+
+fn second_derivatives(hf: &Heightfield, radius_m: f32) -> PartialDerivatives {
     let m = hf.metrics;
     let w = m.width as usize;
     let h = m.height as usize;

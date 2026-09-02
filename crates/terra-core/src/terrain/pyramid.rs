@@ -1,26 +1,9 @@
-use super::{TerrainTileKey, TilePageHandle};
 use crate::fields::FieldId;
 use crate::heightfield::{HeightfieldMetrics, TileId, DEFAULT_HALO, DEFAULT_TILE_SIZE};
-use crate::layer::LayerId;
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+
+use super::TerrainTileKey;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct TileRecord {
-    /// Backend payload backing this residency record.
-    pub handle: TilePageHandle,
-    pub revision: u64,
-    pub input_revision_hash: u64,
-    /// Min height in metres for resident payload (0 when unknown).
-    pub height_min: f32,
-    /// Max height in metres for resident payload (0 when unknown).
-    pub height_max: f32,
-    /// World-space geometric error at this pyramid level (metres).
-    pub geometric_error: f32,
-    pub last_used_frame: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct PyramidConfig {
     pub target_resolution: u32,
     pub world_size_x: f32,
@@ -41,136 +24,233 @@ impl PyramidConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TerrainLevel {
     pub index: u8,
     pub resolution: u32,
-    pub metrics: HeightfieldMetrics,
 }
 
-/// Sparse, payload-backed residency pyramid for viewport terrain tiles.
+/// Interior sample extent of one tile in a pyramid level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerrainTileExtent {
+    pub origin_x: u32,
+    pub origin_z: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Inclusive tile-coordinate range covering a normalized terrain footprint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerrainTileRange {
+    pub min: TileId,
+    pub max: TileId,
+}
+
+impl TerrainTileRange {
+    pub fn iter(self) -> impl Iterator<Item = TileId> {
+        (self.min.tz..=self.max.tz)
+            .flat_map(move |tz| (self.min.tx..=self.max.tx).map(move |tx| TileId { tx, tz }))
+    }
+}
+
+/// The final-output resolution ladder: coarse → target, with every parent
+/// dimension equal to the exact ceil-half of its child.
+///
+/// This is a plain level ladder, not a residency store. The tile-upload path
+/// reads `levels` to stamp streamed pages with the level that matches the final
+/// output resolution (`terra-app`'s `queue_final_tile_uploads` /
+/// `sync_tile_stream_to_renderer`). Residency itself is GPU-authoritative: the
+/// `GpuTileAtlas` page table is what the shader samples and `TileResidencyCache`
+/// is its single CPU mirror. Nothing on the CPU keeps a second residency record.
 #[derive(Debug, Clone)]
 pub struct TerrainPyramid {
     pub config: PyramidConfig,
     pub levels: Vec<TerrainLevel>,
-    records: HashMap<TerrainTileKey, TileRecord>,
 }
 
 impl TerrainPyramid {
     pub fn new(config: PyramidConfig) -> Self {
-        let mut resolutions = Vec::new();
-        let mut resolution = 2u32;
-        while resolution < config.target_resolution {
-            resolutions.push(resolution);
-            resolution = resolution.saturating_mul(2);
-            if resolution == u32::MAX {
-                break;
-            }
+        // Build from the requested output down so every parent dimension is the
+        // exact ceil-half of its child. This preserves a complete hierarchy for
+        // non-power-of-two outputs instead of ending with an irregular 512→1000
+        // transition.
+        let mut resolutions = vec![config.target_resolution.max(2)];
+        while resolutions.last().copied().unwrap_or(2) > 2 {
+            let child = resolutions.last().copied().unwrap_or(2);
+            resolutions.push(child.div_ceil(2).max(2));
         }
-        if resolutions.last().copied() != Some(config.target_resolution) {
-            resolutions.push(config.target_resolution);
-        }
+        resolutions.reverse();
         let levels = resolutions
             .into_iter()
             .enumerate()
             .map(|(index, resolution)| TerrainLevel {
                 index: index as u8,
                 resolution,
-                metrics: HeightfieldMetrics {
-                    width: resolution,
-                    height: resolution,
-                    world_size_x: config.world_size_x,
-                    world_size_z: config.world_size_z,
-                    tile_size: config.tile_size.min(resolution),
-                    halo: config.halo,
-                },
             })
             .collect();
-        Self {
-            config,
-            levels,
-            records: HashMap::new(),
-        }
+        Self { config, levels }
     }
 
     pub fn max_level(&self) -> u8 {
         self.levels.len().saturating_sub(1) as u8
     }
 
-    pub fn level_metrics(&self) -> Vec<HeightfieldMetrics> {
-        self.levels.iter().map(|level| level.metrics).collect()
+    pub fn level(&self, index: u8) -> Option<&TerrainLevel> {
+        self.levels.get(index as usize)
     }
 
-    pub fn record(&self, key: &TerrainTileKey) -> Option<&TileRecord> {
-        self.records.get(key)
+    pub fn level_metrics(&self, index: u8) -> Option<HeightfieldMetrics> {
+        let level = self.level(index)?;
+        Some(HeightfieldMetrics {
+            width: level.resolution,
+            height: level.resolution,
+            world_size_x: self.config.world_size_x,
+            world_size_z: self.config.world_size_z,
+            tile_size: self.config.tile_size.min(level.resolution).max(1),
+            halo: self.config.halo,
+        })
     }
 
-    /// Forget all residency metadata when a new final-output revision begins.
-    pub fn clear_residency(&mut self) {
-        self.records.clear();
-    }
-
-    pub fn remove_resident(&mut self, key: &TerrainTileKey) -> bool {
-        self.records.remove(key).is_some()
-    }
-
-    /// Publish metadata only after a backend has stored the corresponding payload.
-    pub fn publish_resident(
-        &mut self,
-        key: TerrainTileKey,
-        handle: TilePageHandle,
-        revision: u64,
-        input_revision_hash: u64,
-        frame: u64,
-    ) {
-        self.records.insert(
-            key,
-            TileRecord {
-                handle,
-                revision,
-                input_revision_hash,
-                height_min: 0.0,
-                height_max: 0.0,
-                geometric_error: 0.0,
-                last_used_frame: frame,
-            },
-        );
-    }
-
-    /// Find the finest resident tile at or below the desired level covering the same world point.
-    pub fn best_resident_ancestor(
-        &self,
-        layer: Option<LayerId>,
-        field: &FieldId,
-        desired_level: u8,
-        desired_tile: TileId,
-    ) -> Option<TerrainTileKey> {
-        let desired = self.levels.get(desired_level as usize)?;
-        let center_u = ((desired_tile.tx * desired.metrics.tile_size) as f32
-            + desired.metrics.tile_size as f32 * 0.5)
-            / desired.metrics.width as f32;
-        let center_v = ((desired_tile.tz * desired.metrics.tile_size) as f32
-            + desired.metrics.tile_size as f32 * 0.5)
-            / desired.metrics.height as f32;
-        for level_index in (0..=desired_level).rev() {
-            let level = &self.levels[level_index as usize];
-            let sx = (center_u.clamp(0.0, 0.999_999) * level.metrics.width as f32) as u32;
-            let sz = (center_v.clamp(0.0, 0.999_999) * level.metrics.height as f32) as u32;
-            let key = TerrainTileKey {
-                layer,
-                field: field.clone(),
-                level: level_index,
-                tile: TileId {
-                    tx: sx / level.metrics.tile_size,
-                    tz: sz / level.metrics.tile_size,
-                },
-            };
-            if self.records.contains_key(&key) {
-                return Some(key);
-            }
+    pub fn tile_extent(&self, level: u8, tile: TileId) -> Option<TerrainTileExtent> {
+        let metrics = self.level_metrics(level)?;
+        if tile.tx >= metrics.tiles_x() || tile.tz >= metrics.tiles_z() {
+            return None;
         }
-        None
+        let origin_x = tile.tx * metrics.tile_size;
+        let origin_z = tile.tz * metrics.tile_size;
+        Some(TerrainTileExtent {
+            origin_x,
+            origin_z,
+            width: (metrics.width - origin_x).min(metrics.tile_size),
+            height: (metrics.height - origin_z).min(metrics.tile_size),
+        })
     }
+
+    /// Stable dense index used by immutable per-content metadata buffers.
+    pub fn tile_metadata_index(&self, level: u8, tile: TileId) -> Option<u32> {
+        self.tile_extent(level, tile)?;
+        let before = self
+            .levels
+            .iter()
+            .take(level as usize)
+            .map(|entry| {
+                let tile_size = self.config.tile_size.min(entry.resolution).max(1);
+                entry.resolution.div_ceil(tile_size).pow(2)
+            })
+            .sum::<u32>();
+        let metrics = self.level_metrics(level)?;
+        Some(before + tile.tz * metrics.tiles_x() + tile.tx)
+    }
+
+    pub fn metadata_len(&self) -> u32 {
+        self.levels
+            .iter()
+            .map(|level| {
+                let tile_size = self.config.tile_size.min(level.resolution).max(1);
+                level.resolution.div_ceil(tile_size).pow(2)
+            })
+            .sum()
+    }
+
+    /// Every final-height tile in stable package order: levels coarse to fine,
+    /// then tile rows and columns. The iterator is complete by construction and
+    /// its position agrees with [`Self::tile_metadata_index`].
+    pub fn height_tiles(&self) -> impl Iterator<Item = TerrainTileKey> + '_ {
+        self.levels.iter().flat_map(|level| {
+            let metrics = self
+                .level_metrics(level.index)
+                .expect("pyramid owns valid level metadata");
+            (0..metrics.tiles_z()).flat_map(move |tz| {
+                (0..metrics.tiles_x()).map(move |tx| TerrainTileKey {
+                    layer: None,
+                    field: FieldId::Height,
+                    level: level.index,
+                    tile: TileId { tx, tz },
+                })
+            })
+        })
+    }
+
+    /// Stable final-height traversal for one level.
+    pub fn height_tiles_at_level(
+        &self,
+        level: u8,
+    ) -> Option<impl Iterator<Item = TerrainTileKey> + '_> {
+        let metrics = self.level_metrics(level)?;
+        Some((0..metrics.tiles_z()).flat_map(move |tz| {
+            (0..metrics.tiles_x()).map(move |tx| TerrainTileKey {
+                layer: None,
+                field: FieldId::Height,
+                level,
+                tile: TileId { tx, tz },
+            })
+        }))
+    }
+
+    /// Parent tiles whose normalized sample footprint intersects `tile`.
+    ///
+    /// A non-power-of-two edge can overlap more than one parent page, so this
+    /// deliberately returns a range rather than inventing a one-to-one parent.
+    pub fn covering_parent_tiles(&self, level: u8, tile: TileId) -> Option<TerrainTileRange> {
+        if level == 0 {
+            return None;
+        }
+        self.covering_tiles_between(level, tile, level - 1)
+    }
+
+    /// Child tiles whose normalized sample footprint intersects `tile`.
+    pub fn covering_child_tiles(&self, level: u8, tile: TileId) -> Option<TerrainTileRange> {
+        if level >= self.max_level() {
+            return None;
+        }
+        self.covering_tiles_between(level, tile, level + 1)
+    }
+
+    fn covering_tiles_between(
+        &self,
+        source_level: u8,
+        source_tile: TileId,
+        target_level: u8,
+    ) -> Option<TerrainTileRange> {
+        let source = self.level_metrics(source_level)?;
+        let target = self.level_metrics(target_level)?;
+        let extent = self.tile_extent(source_level, source_tile)?;
+        let x0 = scaled_floor(extent.origin_x, target.width, source.width);
+        let z0 = scaled_floor(extent.origin_z, target.height, source.height);
+        let x1 = scaled_ceil(
+            extent.origin_x.saturating_add(extent.width),
+            target.width,
+            source.width,
+        )
+        .saturating_sub(1)
+        .min(target.width - 1);
+        let z1 = scaled_ceil(
+            extent.origin_z.saturating_add(extent.height),
+            target.height,
+            source.height,
+        )
+        .saturating_sub(1)
+        .min(target.height - 1);
+        Some(TerrainTileRange {
+            min: TileId {
+                tx: x0 / target.tile_size,
+                tz: z0 / target.tile_size,
+            },
+            max: TileId {
+                tx: x1 / target.tile_size,
+                tz: z1 / target.tile_size,
+            },
+        })
+    }
+}
+
+fn scaled_floor(value: u32, target: u32, source: u32) -> u32 {
+    ((u64::from(value) * u64::from(target)) / u64::from(source)) as u32
+}
+
+fn scaled_ceil(value: u32, target: u32, source: u32) -> u32 {
+    let numerator = u64::from(value) * u64::from(target);
+    numerator.div_ceil(u64::from(source)) as u32
 }
 
 #[cfg(test)]
@@ -182,55 +262,120 @@ mod tests {
         let pyramid = TerrainPyramid::new(PyramidConfig::new(1000, 4096.0, 4096.0));
         assert_eq!(pyramid.levels.first().unwrap().resolution, 2);
         assert_eq!(pyramid.levels.last().unwrap().resolution, 1000);
-        assert!(pyramid.levels.windows(2).all(|pair| {
-            pair[1].resolution == pair[0].resolution * 2 || pair[1].resolution == 1000
-        }));
+        assert_eq!(
+            pyramid
+                .levels
+                .iter()
+                .map(|level| level.resolution)
+                .collect::<Vec<_>>(),
+            vec![2, 4, 8, 16, 32, 63, 125, 250, 500, 1000]
+        );
+        assert!(pyramid
+            .levels
+            .windows(2)
+            .all(|pair| pair[0].resolution == pair[1].resolution.div_ceil(2)));
     }
 
     #[test]
-    fn renderer_can_fall_back_to_resident_coarse_tile() {
-        let mut pyramid = TerrainPyramid::new(PyramidConfig::new(1024, 4096.0, 4096.0));
-        let coarse = TerrainTileKey {
-            layer: None,
-            field: FieldId::Height,
-            level: 0,
-            tile: TileId { tx: 0, tz: 0 },
-        };
-        let handle = TilePageHandle {
-            slot: 4,
-            generation: 2,
-        };
-        pyramid.publish_resident(coarse.clone(), handle, 1, 1, 0);
-        assert_eq!(pyramid.record(&coarse).unwrap().handle, handle);
-        let found = pyramid.best_resident_ancestor(
-            None,
-            &FieldId::Height,
-            pyramid.max_level(),
-            TileId { tx: 3, tz: 2 },
+    fn partial_edge_tiles_have_exact_extents_and_dense_indices() {
+        let mut config = PyramidConfig::new(1000, 4096.0, 2048.0);
+        config.tile_size = 256;
+        let pyramid = TerrainPyramid::new(config);
+        let finest = pyramid.max_level();
+        assert_eq!(
+            pyramid.tile_extent(finest, TileId { tx: 3, tz: 3 }),
+            Some(TerrainTileExtent {
+                origin_x: 768,
+                origin_z: 768,
+                width: 232,
+                height: 232,
+            })
         );
-        assert_eq!(found, Some(coarse));
+        let mut indices = Vec::new();
+        for level in &pyramid.levels {
+            let metrics = pyramid.level_metrics(level.index).unwrap();
+            for tz in 0..metrics.tiles_z() {
+                for tx in 0..metrics.tiles_x() {
+                    indices.push(
+                        pyramid
+                            .tile_metadata_index(level.index, TileId { tx, tz })
+                            .unwrap(),
+                    );
+                }
+            }
+        }
+        assert_eq!(indices, (0..pyramid.metadata_len()).collect::<Vec<_>>());
+        let keys = pyramid.height_tiles().collect::<Vec<_>>();
+        assert_eq!(keys.len(), pyramid.metadata_len() as usize);
+        for (index, key) in keys.iter().enumerate() {
+            assert_eq!(
+                pyramid.tile_metadata_index(key.level, key.tile),
+                Some(index as u32)
+            );
+        }
     }
 
     #[test]
-    fn evicted_payload_is_not_reported_resident() {
-        let mut pyramid = TerrainPyramid::new(PyramidConfig::new(256, 1024.0, 1024.0));
-        let key = TerrainTileKey {
-            layer: Some(LayerId::new()),
-            field: FieldId::Height,
-            level: 0,
-            tile: TileId { tx: 0, tz: 0 },
-        };
-        pyramid.publish_resident(
-            key.clone(),
-            TilePageHandle {
-                slot: 1,
-                generation: 1,
-            },
-            1,
-            1,
-            0,
+    fn non_power_of_two_parent_and_child_ranges_cover_every_tile() {
+        let mut config = PyramidConfig::new(513, 4096.0, 2048.0);
+        config.tile_size = 128;
+        let pyramid = TerrainPyramid::new(config);
+        for level in 1..=pyramid.max_level() {
+            let child = pyramid.level_metrics(level).unwrap();
+            let parent = pyramid.level_metrics(level - 1).unwrap();
+            for tz in 0..child.tiles_z() {
+                for tx in 0..child.tiles_x() {
+                    let range = pyramid
+                        .covering_parent_tiles(level, TileId { tx, tz })
+                        .unwrap();
+                    assert!(range.max.tx < parent.tiles_x());
+                    assert!(range.max.tz < parent.tiles_z());
+                    assert!(range.iter().next().is_some());
+                }
+            }
+        }
+
+        for level in 0..pyramid.max_level() {
+            let parent = pyramid.level_metrics(level).unwrap();
+            let child = pyramid.level_metrics(level + 1).unwrap();
+            for tz in 0..parent.tiles_z() {
+                for tx in 0..parent.tiles_x() {
+                    let range = pyramid
+                        .covering_child_tiles(level, TileId { tx, tz })
+                        .unwrap();
+                    assert!(range.max.tx < child.tiles_x());
+                    assert!(range.max.tz < child.tiles_z());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn power_of_two_parent_and_child_ranges_follow_normalized_footprints() {
+        let mut config = PyramidConfig::new(512, 4096.0, 4096.0);
+        config.tile_size = 64;
+        let pyramid = TerrainPyramid::new(config);
+        assert_eq!(
+            pyramid
+                .levels
+                .iter()
+                .map(|level| level.resolution)
+                .collect::<Vec<_>>(),
+            vec![2, 4, 8, 16, 32, 64, 128, 256, 512]
         );
-        assert!(pyramid.remove_resident(&key));
-        assert!(pyramid.record(&key).is_none());
+        assert_eq!(
+            pyramid.covering_child_tiles(6, TileId { tx: 1, tz: 1 }),
+            Some(TerrainTileRange {
+                min: TileId { tx: 2, tz: 2 },
+                max: TileId { tx: 3, tz: 3 },
+            })
+        );
+        assert_eq!(
+            pyramid.covering_parent_tiles(7, TileId { tx: 2, tz: 2 }),
+            Some(TerrainTileRange {
+                min: TileId { tx: 1, tz: 1 },
+                max: TileId { tx: 1, tz: 1 },
+            })
+        );
     }
 }

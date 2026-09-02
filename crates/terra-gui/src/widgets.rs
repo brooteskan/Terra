@@ -926,6 +926,7 @@ pub fn combo(ui: &mut GuiContext<'_>, text: &str, selected: &mut usize, items: &
             ui.state.open_combo = None;
         } else {
             ui.state.open_combo = Some(id);
+            ui.state.combo_scroll.remove(&id.0);
         }
     }
 
@@ -955,19 +956,7 @@ pub fn combo(ui: &mut GuiContext<'_>, text: &str, selected: &mut usize, items: &
     );
 
     if ui.state.open_combo == Some(id) {
-        let below = field.max_y + 2.0;
-        let menu_h = ROW_H * items.len() as f32;
-        let open_down = below + menu_h <= ui.screen_h - 4.0;
-        let menu = if open_down {
-            Rect::from_pos_size(field.min_x, below, field.width(), menu_h)
-        } else {
-            Rect::from_pos_size(
-                field.min_x,
-                (field.min_y - menu_h - 2.0).max(0.0),
-                field.width(),
-                menu_h,
-            )
-        };
+        let menu = combo_menu_rect(ui.screen_h, field, items.len());
         ui.queue_combo_menu(id, menu, field, items, *selected);
     }
 
@@ -1005,6 +994,7 @@ pub fn combo_in_rect(
             ui.state.open_combo = None;
         } else {
             ui.state.open_combo = Some(id);
+            ui.state.combo_scroll.remove(&id.0);
         }
     }
 
@@ -1034,23 +1024,30 @@ pub fn combo_in_rect(
     );
 
     if ui.state.open_combo == Some(id) {
-        let below = field.max_y + 2.0;
-        let menu_h = ROW_H * items.len() as f32;
-        let open_down = below + menu_h <= ui.screen_h - 4.0;
-        let menu = if open_down {
-            Rect::from_pos_size(field.min_x, below, field.width(), menu_h)
-        } else {
-            Rect::from_pos_size(
-                field.min_x,
-                (field.min_y - menu_h - 2.0).max(0.0),
-                field.width(),
-                menu_h,
-            )
-        };
+        let menu = combo_menu_rect(ui.screen_h, field, items.len());
         ui.queue_combo_menu(id, menu, field, items, *selected);
     }
 
     changed
+}
+
+const MAX_COMBO_ROWS: f32 = 12.0;
+
+fn combo_menu_rect(screen_h: f32, field: Rect, item_count: usize) -> Rect {
+    let total_h = ROW_H * item_count as f32;
+    let capped_h = total_h.min(ROW_H * MAX_COMBO_ROWS);
+    let below_y = field.max_y + 2.0;
+    let below_space = (screen_h - 4.0 - below_y).max(0.0);
+    let above_space = (field.min_y - 6.0).max(0.0);
+    let open_down = below_space >= capped_h || below_space >= above_space;
+    let available = if open_down { below_space } else { above_space };
+    let menu_h = capped_h.min(available).max(ROW_H.min(total_h));
+    let menu_y = if open_down {
+        below_y
+    } else {
+        field.min_y - 2.0 - menu_h
+    };
+    Rect::from_pos_size(field.min_x, menu_y.max(4.0), field.width(), menu_h)
 }
 
 pub(crate) fn draw_combo_menu(
@@ -1062,15 +1059,35 @@ pub(crate) fn draw_combo_menu(
 ) {
     ui.panel(menu, style::COMBO_MENU_BG);
     let popup_id = combo_id.child("popup");
-    if ui.pointer_in(menu) {
+    let hovered_menu = ui.pointer_in(menu);
+    if hovered_menu {
         ui.state.set_hot(popup_id);
     }
 
-    for (i, item) in items.iter().enumerate() {
+    let total_h = ROW_H * items.len() as f32;
+    let max_scroll = (total_h - menu.height()).max(0.0);
+    let initial_scroll =
+        (selected as f32 * ROW_H - (menu.height() - ROW_H) * 0.5).clamp(0.0, max_scroll);
+    let scroll = ui
+        .state
+        .combo_scroll
+        .entry(combo_id.0)
+        .or_insert(initial_scroll);
+    if hovered_menu && ui.input.scroll_delta.abs() >= 1.0e-4 {
+        *scroll = (*scroll - ui.input.scroll_delta * 24.0).clamp(0.0, max_scroll);
+    } else {
+        *scroll = scroll.clamp(0.0, max_scroll);
+    }
+    let scroll = *scroll;
+    let first = (scroll / ROW_H).floor() as usize;
+    let last = (((scroll + menu.height()) / ROW_H).ceil() as usize).min(items.len());
+
+    ui.set_active_clip(Some(menu));
+    for (i, item) in items.iter().enumerate().take(last).skip(first) {
         let item_id = combo_id.child("item").with(i as u64);
         let row = Rect::from_pos_size(
             menu.min_x,
-            menu.min_y + ROW_H * i as f32,
+            menu.min_y + ROW_H * i as f32 - scroll,
             menu.width(),
             ROW_H,
         );
@@ -1099,6 +1116,20 @@ pub(crate) fn draw_combo_menu(
             item,
             style::TEXT,
             FONT_SCALE,
+        );
+    }
+    ui.set_active_clip(None);
+
+    if max_scroll > 0.0 {
+        let track =
+            Rect::from_pos_size(menu.max_x - 4.0, menu.min_y + 2.0, 2.0, menu.height() - 4.0);
+        let thumb_h = (track.height() * menu.height() / total_h).max(18.0);
+        let thumb_y = track.min_y + (track.height() - thumb_h) * (scroll / max_scroll);
+        ui.panel_rounded(track, style::TRACK_BG, 1.0);
+        ui.panel_rounded(
+            Rect::from_pos_size(track.min_x, thumb_y, track.width(), thumb_h),
+            style::TEXT_MUTED,
+            1.0,
         );
     }
 }

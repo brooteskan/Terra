@@ -4,6 +4,14 @@ Rules that must hold on every shipping build. Violations are release blockers.
 
 ## NEVER
 
+- NEVER perform terrain evaluation or other substantial editor work directly in
+  a winit input callback; record input and request a logical frame.
+- NEVER apply domain UI actions, resize/reconfigure the renderer, or prepare
+  terrain resources in `RedrawRequested`; that callback only composes and presents.
+- NEVER call `Window::request_redraw` outside the coordinator presentation adapter,
+  except for the documented pre-coordinator bootstrap splash/failure path.
+- NEVER coalesce ordered pointer samples, button edges, modifier transitions, or
+  cancellation across logical input snapshots.
 - NEVER reset progressive accumulation on UI chrome hover, panel focus, or menu open alone.
 - NEVER block the viewport on CPU terrain evaluation — last-good GPU textures stay visible.
 - NEVER treat mouse-button-down without a scene change as meaningful interaction for refinement.
@@ -12,9 +20,24 @@ Rules that must hold on every shipping build. Violations are release blockers.
 - NEVER mark basin-coupled edits (SPE, amplify, river network) as strictly local invalidation.
 - NEVER couple terrain `PreviewQuality` and path-tracing sample budgets in a single knob.
 - NEVER `Maintain::Wait` on GPU timestamp readback on the interactive path.
+- NEVER publish a Medium/Full candidate before its final submission fence resolves
+  and its edit generation is revalidated.
+- NEVER allow more than one optional refinement submission to remain in flight,
+  including a fence retained from a superseded job.
 
 ## ALWAYS
 
+- ALWAYS consume sealed input and required interactive Draft work before optional
+  Medium/Full refinement.
+- ALWAYS consume each sealed input snapshot exactly once; capture loss and focus
+  loss are ordered cancellation events in that same stream.
+- ALWAYS retain input received after snapshot sealing for a follow-up logical frame.
+- ALWAYS return the event loop to `ControlFlow::Wait` when no logical frame work remains.
+- ALWAYS stamp evaluation/refinement deadlines with the edit generation and let
+  `LogicalFrameCoordinator` choose the next idle wakeup.
+- ALWAYS reject detailed frame-trace events that lack a real logical-frame identity.
+- ALWAYS invalidate background work and clear active/pending presentation on
+  shutdown or device loss; resize and recoverable surface loss are frame work.
 - ALWAYS bump the correct scene version counter for each invalidation reason.
 - ALWAYS call `notify_invalidation` when terrain, materials, geometry, lighting, or viewport mode changes.
 - ALWAYS drive `EditorRefinementState` from meaningful scene changes (camera, terrain, lighting, edits).
@@ -26,4 +49,10 @@ Rules that must hold on every shipping build. Violations are release blockers.
 - ALWAYS replace renderer height/normal slots and evaluator working textures with the 8×8
   resident baseline on document reset; existing size checks restore the next project dimensions.
 - ALWAYS document measured GPU pass timings in profiling reports before claiming performance targets.
-- ALWAYS fall back to the monolithic height texture on tile-stream page misses.
+- ALWAYS resolve the finest current resident ancestor from GPU page-table state; require
+  pinned current root coverage for GPU-pyramid streaming and use monolithic terminal
+  fallback only for explicit bounded-project/CPU migration presentation.
+- ALWAYS abandon unsubmitted refinement work when input advances the edit generation;
+  an already-submitted unit is non-cancellable and its fence remains tracked.
+- ALWAYS advance optional GPU refinement by one safe unit only after required Draft
+  work and the logical-frame optional-work budget gate.

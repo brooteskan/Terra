@@ -23,6 +23,9 @@ pub struct ProgressivePostPipeline;
 
 impl ProgressivePostPipeline {
     /// Resolve progressive history from an explicit HDR + depth pair.
+    // wgpu resolve pass: the progressive renderer + device/queue/encoder + the
+    // HDR/g-buffer/surface handles + view-projection and per-pass tuning, each
+    // bound once. Kept flat.
     #[allow(clippy::too_many_arguments)]
     pub fn resolve_hdr(
         progressive: &mut crate::progressive::ProgressiveRenderer,

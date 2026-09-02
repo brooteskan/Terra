@@ -4,6 +4,42 @@ All notable changes to Terra will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.0-beta.2] - 2026-08-22
+
+Second Windows beta, focused on responsive non-destructive authoring, compiled GPU
+evaluation, and scalable terrain streaming/export.
+
+### Added
+- Deterministic streaming height-pyramid export now drives complete coarse-to-fine coverage
+  through the shared compiled GPU tile producer and writes content-addressed R32F pages,
+  measured geometric errors, validated seam metadata, and an exact-or-ancestor test reader.
+- Compiled terrain-plan IR, caching, provenance, dirty-impact analysis, and GPU execution now
+  provide one shared semantic plan for interactive previews and final output.
+- Hierarchical GPU terrain streaming now schedules camera-visible pages with bounded work,
+  checkpointed global operations, geometric-error metadata, and deterministic residency.
+- GPU preview coverage now includes sculpt strokes, authored shapes, noise and island generators,
+  heightmaps, multi-scale amplification, filters, river carving, and stream-power erosion.
+- Per-stroke Semantic Sculpt rows now support selection, inspection, enable/disable, undo,
+  footprint-scoped edits, and prefix-cached incremental evaluation.
+- Editable source-resolution controls, resolution-semantics reporting, structured application
+  logging, recoverable startup failures, and a consolidated background-job runtime.
+
+### Changed
+- CPU and GPU evaluators now live in dedicated crates, while the app coordinates evaluation
+  through an event-driven logical-frame and progressive-refinement pipeline.
+- Interactive edits carry bounded UV footprints through CPU and GPU invalidation, reducing
+  post-stroke work and avoiding unnecessary whole-field rebuilds.
+- Sculpt brushes once again auto-create a Semantic Sculpt layer when needed. Selecting
+  Foundation explicitly edits its raster and leaves unsupported brushes unavailable.
+
+### Fixed
+- Progressive Draft-to-Full evaluation now resamples carried auxiliary mask fields to the active grid, preventing boundary panics in masked CPU filters such as Crater.
+- Evaluation panics are reported as recoverable layer failures, unexpected worker disconnects restart the worker, and the editor keeps the last-good terrain visible with a persistent Retry status.
+- Creating a filter or reopening a project with populated biome sections now expands the relevant `Biomes -> biome -> Filters` hierarchy paths, keeping filters discoverable in Layers even when another layer was saved as selected.
+- Long inspector drop-downs, including the Effect Filter type picker, are now viewport-bounded and mouse-wheel scrollable instead of rendering rows beyond the screen and selecting an unintended filter.
+- Brush projection, pinch footprints, flatten targets, terrace ranges, stamp transform masks,
+  shared-to-regional presentation, and partial tile publication now remain stable during live edits.
+
 ## [0.1.0-beta.1] - 2026-08-14
 
 First beta binary release candidate for Windows.

@@ -132,6 +132,8 @@ fn flat_d8_drainage_matches_flow_graph() {
         HeightfieldMetrics::new(32, 32, 320.0, 320.0),
         HeightfieldMetrics::new(40, 24, 400.0, 240.0),
     ];
+    // (name, builder-fn) fixture table; the fn-pointer tuple is inherent to the test data.
+    #[allow(clippy::type_complexity)]
     let builders: &[(&str, fn(HeightfieldMetrics) -> Heightfield)] = &[
         ("plane", plane),
         ("cone", cone),
@@ -221,8 +223,6 @@ fn tiled_derivative_halo_has_no_interior_seams() {
     let mut stitched = MaskField::zeros(hf.metrics);
     for tj in (0..hf.metrics.height).step_by(tile as usize) {
         for ti in (0..hf.metrics.width).step_by(tile as usize) {
-            let ti = ti as u32;
-            let tj = tj as u32;
             let i0 = ti.saturating_sub(halo);
             let j0 = tj.saturating_sub(halo);
             let i1 = (ti + tile + halo).min(hf.metrics.width);

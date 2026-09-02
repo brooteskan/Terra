@@ -12,6 +12,39 @@ use terra_core::tiling::SampleRect;
 /// Existing upload/presentation paths restore the next document's dimensions.
 const PROJECT_RESET_TEXTURE_EXTENT: u32 = 8;
 
+/// The nine surface aux-map channels uploaded together by
+/// [`HeightGpu::upload_aux_maps_ex`]. Every field is the same
+/// `Option<&MaskField>`, so this struct exists purely so callers match channels
+/// by name rather than by a fragile nine-deep positional argument list. Absent
+/// channels default to `None` (uploaded as a 1×1 zero map).
+#[derive(Default, Clone, Copy)]
+pub struct AuxMaps<'a> {
+    pub materials: Option<&'a MaskField>,
+    pub wetness: Option<&'a MaskField>,
+    pub vegetation: Option<&'a MaskField>,
+    pub temperature: Option<&'a MaskField>,
+    pub rainfall: Option<&'a MaskField>,
+    pub snow: Option<&'a MaskField>,
+    pub soil_moisture: Option<&'a MaskField>,
+    pub biomes: Option<&'a MaskField>,
+    pub flow: Option<&'a MaskField>,
+}
+
+/// Source geometry shared by every GPU height present/copy entry point: the
+/// texture dimensions plus the world-space mapping the shader needs to place
+/// the field. Groups the six values (`width`, `height`, `world_size`,
+/// `height_range`, `dx`, `dz`) that otherwise travel as a positional tail
+/// through the whole present/copy call chain.
+#[derive(Clone, Copy)]
+pub struct HeightPresentGeom {
+    pub width: u32,
+    pub height: u32,
+    pub world_size: (f32, f32),
+    pub height_range: (f32, f32),
+    pub dx: f32,
+    pub dz: f32,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct NormalUniforms {
@@ -66,7 +99,10 @@ impl HeightSlot {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba16Float,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
         Self {
@@ -78,65 +114,6 @@ impl HeightSlot {
             width,
             height_px: height,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use terra_core::heightfield::HeightfieldMetrics;
-
-    fn assert_slot_dimensions(height: &HeightGpu, width: u32, height_px: u32) {
-        assert_eq!(height.tex_size, (width, height_px));
-        for slot in &height.slots {
-            assert_eq!((slot.width, slot.height_px), (width, height_px));
-            assert_eq!(
-                (slot.height.width(), slot.height.height()),
-                (width, height_px)
-            );
-            assert_eq!(
-                (slot.normal.width(), slot.normal.height()),
-                (width, height_px)
-            );
-        }
-    }
-
-    /// Revert check for #35: reset must replace, rather than retain, project-sized slots.
-    #[test]
-    fn project_reset_shrinks_slots_and_defers_old_textures() {
-        let Some(gpu) = terra_test_gpu::headless() else {
-            return;
-        };
-        let mut height = HeightGpu::new(&gpu.device, 64);
-
-        height.reset_project_state(&gpu.device, &gpu.queue, (1000.0, 750.0));
-
-        assert_slot_dimensions(
-            &height,
-            PROJECT_RESET_TEXTURE_EXTENT,
-            PROJECT_RESET_TEXTURE_EXTENT,
-        );
-        assert!(height.shared_height_view.is_none());
-        assert_eq!(height.retirement.pending(), 4);
-        height.tick_retirement(2);
-        assert_eq!(height.retirement.pending(), 4);
-        height.tick_retirement(3);
-        assert_eq!(height.retirement.pending(), 0);
-    }
-
-    #[test]
-    fn upload_after_project_reset_restores_requested_size() {
-        let Some(gpu) = terra_test_gpu::headless() else {
-            return;
-        };
-        let mut height = HeightGpu::new(&gpu.device, 64);
-        height.reset_project_state(&gpu.device, &gpu.queue, (1000.0, 750.0));
-
-        let metrics = HeightfieldMetrics::new(32, 48, 320.0, 480.0);
-        height.upload_and_swap(&gpu.device, &gpu.queue, &Heightfield::zeros(metrics));
-
-        assert_slot_dimensions(&height, 32, 48);
-        assert_eq!(height.world_size, (320.0, 480.0));
     }
 }
 
@@ -235,11 +212,19 @@ pub struct HeightGpu {
     placement_tint: RgbaAuxMap,
     /// External R32Float height view (GPU engine output) when sharing without copy.
     shared_height_view: Option<wgpu::TextureView>,
+    /// Both renderer-local slots contain the same complete height and normal state.
+    /// Shared presentation and one-slot CPU uploads invalidate this; the next GPU
+    /// regional present promotes to a full copy before bounded updates resume.
+    local_slots_coherent: bool,
     retirement: crate::retirement::DeferredGpuRetirement,
     current_frame: u64,
 }
 
 impl HeightGpu {
+    pub const fn local_slots_coherent(&self) -> bool {
+        self.local_slots_coherent
+    }
+
     pub fn new(device: &wgpu::Device, initial: u32) -> Self {
         let w = initial.max(PROJECT_RESET_TEXTURE_EXTENT);
         let slots = [HeightSlot::new(device, w, w), HeightSlot::new(device, w, w)];
@@ -252,6 +237,7 @@ impl HeightGpu {
             ..Default::default()
         });
 
+        terra_core::shader_progress::record_shader_compiled();
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("normals"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/normals.wgsl").into()),
@@ -343,6 +329,7 @@ impl HeightGpu {
             biomes,
             placement_tint,
             shared_height_view: None,
+            local_slots_coherent: false,
             retirement: crate::retirement::DeferredGpuRetirement::new(3),
             current_frame: 0,
         }
@@ -363,6 +350,7 @@ impl HeightGpu {
         if self.slots[self.write].width == width && self.slots[self.write].height_px == height {
             return;
         }
+        self.local_slots_coherent = false;
         let old_write = std::mem::replace(
             &mut self.slots[self.write],
             HeightSlot::new(device, width, height),
@@ -413,6 +401,7 @@ impl HeightGpu {
         // Without this, interactive filter stamps / async CPU results upload
         // invisibly while the terrain keeps showing a stale shared texture.
         self.shared_height_view = None;
+        self.local_slots_coherent = false;
         let w = hf.metrics.width;
         let h = hf.metrics.height;
         self.ensure_size(device, w, h);
@@ -568,25 +557,9 @@ impl HeightGpu {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         src: &wgpu::Texture,
-        width: u32,
-        height: u32,
-        world_size: (f32, f32),
-        height_range: (f32, f32),
-        dx: f32,
-        dz: f32,
+        geom: HeightPresentGeom,
     ) {
-        self.copy_from_texture_region_and_swap(
-            device,
-            queue,
-            src,
-            width,
-            height,
-            world_size,
-            height_range,
-            dx,
-            dz,
-            None,
-        );
+        self.copy_from_texture_region_and_swap(device, queue, src, geom, None);
     }
 
     pub fn copy_from_texture_region_and_swap(
@@ -594,14 +567,17 @@ impl HeightGpu {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         src: &wgpu::Texture,
-        width: u32,
-        height: u32,
-        world_size: (f32, f32),
-        height_range: (f32, f32),
-        dx: f32,
-        dz: f32,
+        geom: HeightPresentGeom,
         region: Option<SampleRect>,
     ) {
+        let HeightPresentGeom {
+            width,
+            height,
+            world_size,
+            height_range,
+            dx,
+            dz,
+        } = geom;
         self.shared_height_view = None;
         self.ensure_size(device, width, height);
         self.world_size = world_size;
@@ -618,37 +594,22 @@ impl HeightGpu {
             w: width,
             h: height,
         };
-        let rect = region.unwrap_or(full);
-        let partial = rect.w != width || rect.h != height;
+        let requested = region.unwrap_or(full);
+        let requested_is_partial =
+            requested.x != 0 || requested.y != 0 || requested.w != width || requested.h != height;
+        // A shared present, first present, CPU upload, or resize leaves no proof that
+        // both local slots hold a complete current field. The engine source is complete,
+        // so promote this one transition to a full GPU copy and restore the invariant.
+        let rect = if requested_is_partial && !self.local_slots_coherent {
+            full
+        } else {
+            requested
+        };
+        let partial = rect.x != 0 || rect.y != 0 || rect.w != width || rect.h != height;
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("height-copy-enc"),
         });
-        if partial
-            && self.slots[self.display].width == width
-            && self.slots[self.display].height_px == height
-        {
-            // Seed write slot from last display, then overlay dirty region.
-            encoder.copy_texture_to_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &self.slots[self.display].height,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::TexelCopyTextureInfo {
-                    texture: &self.slots[self.write].height,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::Extent3d {
-                    width,
-                    height,
-                    depth_or_array_layers: 1,
-                },
-            );
-        }
         encoder.copy_texture_to_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: src,
@@ -676,8 +637,6 @@ impl HeightGpu {
                 depth_or_array_layers: 1,
             },
         );
-        queue.submit(Some(encoder.finish()));
-
         let normal_rect = if partial {
             SampleRect {
                 x: rect.x.saturating_sub(1),
@@ -688,14 +647,109 @@ impl HeightGpu {
         } else {
             rect
         };
+        self.encode_normals_for_write(
+            device,
+            queue,
+            &mut encoder,
+            width,
+            height,
+            dx,
+            dz,
+            normal_rect,
+        );
 
-        self.compute_normals_region_and_swap(device, queue, width, height, dx, dz, normal_rect);
+        // Keep the other slot caught up using only the regions changed above. This
+        // preserves alternating-slot correctness without a full-field seed on every dab.
+        let write_slot = &self.slots[self.write];
+        let display_slot = &self.slots[self.display];
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &write_slot.height,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: rect.x,
+                    y: rect.y,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &display_slot.height,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: rect.x,
+                    y: rect.y,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width: rect.w,
+                height: rect.h,
+                depth_or_array_layers: 1,
+            },
+        );
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &write_slot.normal,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: normal_rect.x,
+                    y: normal_rect.y,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &display_slot.normal,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: normal_rect.x,
+                    y: normal_rect.y,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width: normal_rect.w,
+                height: normal_rect.h,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(Some(encoder.finish()));
+        std::mem::swap(&mut self.display, &mut self.write);
+        self.local_slots_coherent = true;
     }
 
+    // Carries the normals-dispatch geometry (grid `w`/`h`, spacings `dx`/`dz`,
+    // dirty `region`) — a different, smaller tuple than `HeightPresentGeom` with
+    // no world-space mapping. Two private call sites; kept flat.
+    #[allow(clippy::too_many_arguments)]
     fn compute_normals_region_and_swap(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        w: u32,
+        h: u32,
+        dx: f32,
+        dz: f32,
+        region: SampleRect,
+    ) {
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("normal-enc"),
+        });
+        self.encode_normals_for_write(device, queue, &mut encoder, w, h, dx, dz, region);
+        queue.submit(Some(encoder.finish()));
+        std::mem::swap(&mut self.display, &mut self.write);
+        self.local_slots_coherent = false;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_normals_for_write(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
         w: u32,
         h: u32,
         dx: f32,
@@ -742,9 +796,6 @@ impl HeightGpu {
             .as_ref()
             .expect("normal bind group");
 
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("normal-enc"),
-        });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("normals"),
@@ -752,10 +803,8 @@ impl HeightGpu {
             });
             pass.set_pipeline(&self.normal_pipeline);
             pass.set_bind_group(0, bind, &[]);
-            pass.dispatch_workgroups((region.w + 7) / 8, (region.h + 7) / 8, 1);
+            pass.dispatch_workgroups(region.w.div_ceil(8), region.h.div_ceil(8), 1);
         }
-        queue.submit(Some(encoder.finish()));
-        std::mem::swap(&mut self.display, &mut self.write);
     }
 
     /// Sample an external R32Float height texture in place; normals are computed locally.
@@ -764,14 +813,18 @@ impl HeightGpu {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         src_view: &wgpu::TextureView,
-        width: u32,
-        height: u32,
-        world_size: (f32, f32),
-        height_range: (f32, f32),
-        dx: f32,
-        dz: f32,
+        geom: HeightPresentGeom,
     ) {
+        let HeightPresentGeom {
+            width,
+            height,
+            world_size,
+            height_range,
+            dx,
+            dz,
+        } = geom;
         self.shared_height_view = Some(src_view.clone());
+        self.local_slots_coherent = false;
         self.tex_size = (width, height);
         self.world_size = world_size;
         let (lo, hi) = if height_range.0 <= height_range.1 {
@@ -790,6 +843,9 @@ impl HeightGpu {
         self.dispatch_normals_for_view(device, queue, src_view, width, height, dx, dz, region);
     }
 
+    // Same normals-dispatch geometry as `compute_normals_region_and_swap`, plus
+    // the source view to sample. Two private call sites; kept flat.
+    #[allow(clippy::too_many_arguments)]
     fn dispatch_normals_for_view(
         &mut self,
         device: &wgpu::Device,
@@ -843,7 +899,7 @@ impl HeightGpu {
             });
             pass.set_pipeline(&self.normal_pipeline);
             pass.set_bind_group(0, &bind, &[]);
-            pass.dispatch_workgroups((region.w + 7) / 8, (region.h + 7) / 8, 1);
+            pass.dispatch_workgroups(region.w.div_ceil(8), region.h.div_ceil(8), 1);
         }
         queue.submit(Some(encoder.finish()));
     }
@@ -865,6 +921,7 @@ impl HeightGpu {
         world_size: (f32, f32),
     ) {
         self.shared_height_view = None;
+        self.local_slots_coherent = false;
         self.world_size = world_size;
         self.height_range = (0.0, 1.0);
         let w = PROJECT_RESET_TEXTURE_EXTENT;
@@ -902,6 +959,12 @@ impl HeightGpu {
             world_size.1 / h.max(1) as f32,
             SampleRect { x: 0, y: 0, w, h },
         );
+        // Aux maps belong to the document just as much as height does. Reset all
+        // channels immediately so a newly opened project cannot display wetness,
+        // flow, material, or climate results from the previous document while its
+        // CPU evaluation is still running.
+        self.upload_aux_maps_ex(device, queue, AuxMaps::default());
+        self.upload_placement_tint(device, queue, 0, 0, &[]);
     }
 
     pub fn display_normal_view(&self) -> &wgpu::TextureView {
@@ -923,58 +986,58 @@ impl HeightGpu {
         vegetation: Option<&MaskField>,
     ) {
         self.upload_aux_maps_ex(
-            device, queue, materials, wetness, vegetation, None, None, None, None, None, None,
+            device,
+            queue,
+            AuxMaps {
+                materials,
+                wetness,
+                vegetation,
+                ..Default::default()
+            },
         );
     }
 
     /// Upload materials/wetness/vegetation plus optional climate aux and flow (Phase H polish).
-    pub fn upload_aux_maps_ex(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        materials: Option<&MaskField>,
-        wetness: Option<&MaskField>,
-        vegetation: Option<&MaskField>,
-        temperature: Option<&MaskField>,
-        rainfall: Option<&MaskField>,
-        snow: Option<&MaskField>,
-        soil_moisture: Option<&MaskField>,
-        biomes: Option<&MaskField>,
-        flow: Option<&MaskField>,
-    ) {
+    pub fn upload_aux_maps_ex(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, aux: AuxMaps) {
         Self::upload_aux_map(
             device,
             queue,
             &mut self.materials,
-            materials,
+            aux.materials,
             "materials-r32",
         );
-        Self::upload_aux_map(device, queue, &mut self.wetness, wetness, "wetness-r32");
+        Self::upload_aux_map(device, queue, &mut self.wetness, aux.wetness, "wetness-r32");
         Self::upload_aux_map(
             device,
             queue,
             &mut self.vegetation,
-            vegetation,
+            aux.vegetation,
             "vegetation-r32",
         );
-        Self::upload_aux_map(device, queue, &mut self.flow, flow, "flow-r32");
+        Self::upload_aux_map(device, queue, &mut self.flow, aux.flow, "flow-r32");
         Self::upload_aux_map(
             device,
             queue,
             &mut self.temperature,
-            temperature,
+            aux.temperature,
             "temperature-r32",
         );
-        Self::upload_aux_map(device, queue, &mut self.rainfall, rainfall, "rainfall-r32");
-        Self::upload_aux_map(device, queue, &mut self.snow, snow, "snow-r32");
+        Self::upload_aux_map(
+            device,
+            queue,
+            &mut self.rainfall,
+            aux.rainfall,
+            "rainfall-r32",
+        );
+        Self::upload_aux_map(device, queue, &mut self.snow, aux.snow, "snow-r32");
         Self::upload_aux_map(
             device,
             queue,
             &mut self.soil_moisture,
-            soil_moisture,
+            aux.soil_moisture,
             "soil-moisture-r32",
         );
-        Self::upload_aux_map(device, queue, &mut self.biomes, biomes, "biomes-r32");
+        Self::upload_aux_map(device, queue, &mut self.biomes, aux.biomes, "biomes-r32");
     }
 
     fn upload_aux_map(
@@ -1088,6 +1151,105 @@ impl HeightGpu {
                 height: h,
                 depth_or_array_layers: 1,
             },
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use terra_core::heightfield::HeightfieldMetrics;
+    use terra_core::mask::MaskField;
+
+    fn assert_slot_dimensions(height: &HeightGpu, width: u32, height_px: u32) {
+        assert_eq!(height.tex_size, (width, height_px));
+        for slot in &height.slots {
+            assert_eq!((slot.width, slot.height_px), (width, height_px));
+            assert_eq!(
+                (slot.height.width(), slot.height.height()),
+                (width, height_px)
+            );
+            assert_eq!(
+                (slot.normal.width(), slot.normal.height()),
+                (width, height_px)
+            );
+        }
+    }
+
+    /// Revert check for #35: reset must replace, rather than retain, project-sized slots.
+    #[test]
+    fn project_reset_shrinks_slots_and_defers_old_textures() {
+        let Some(gpu) = terra_test_gpu::headless() else {
+            return;
+        };
+        let mut height = HeightGpu::new(&gpu.device, 64);
+
+        height.reset_project_state(&gpu.device, &gpu.queue, (1000.0, 750.0));
+
+        assert_slot_dimensions(
+            &height,
+            PROJECT_RESET_TEXTURE_EXTENT,
+            PROJECT_RESET_TEXTURE_EXTENT,
+        );
+        assert!(height.shared_height_view.is_none());
+        assert_eq!(height.retirement.pending(), 4);
+        height.tick_retirement(2);
+        assert_eq!(height.retirement.pending(), 4);
+        height.tick_retirement(3);
+        assert_eq!(height.retirement.pending(), 0);
+    }
+
+    #[test]
+    fn upload_after_project_reset_restores_requested_size() {
+        let Some(gpu) = terra_test_gpu::headless() else {
+            return;
+        };
+        let mut height = HeightGpu::new(&gpu.device, 64);
+        height.reset_project_state(&gpu.device, &gpu.queue, (1000.0, 750.0));
+
+        let metrics = HeightfieldMetrics::new(32, 48, 320.0, 480.0);
+        height.upload_and_swap(&gpu.device, &gpu.queue, &Heightfield::zeros(metrics));
+
+        assert_slot_dimensions(&height, 32, 48);
+        assert_eq!(height.world_size, (320.0, 480.0));
+    }
+
+    #[test]
+    fn project_reset_replaces_aux_maps_with_blank_textures() {
+        let Some(gpu) = terra_test_gpu::headless() else {
+            return;
+        };
+        let mut height = HeightGpu::new(&gpu.device, 64);
+        let metrics = HeightfieldMetrics::new(32, 32, 320.0, 320.0);
+        let wetness = MaskField::filled(metrics, 1.0);
+        height.upload_aux_maps_ex(
+            &gpu.device,
+            &gpu.queue,
+            AuxMaps {
+                wetness: Some(&wetness),
+                ..Default::default()
+            },
+        );
+        assert_eq!((height.wetness.width, height.wetness.height), (32, 32));
+
+        height.reset_project_state(&gpu.device, &gpu.queue, (1000.0, 750.0));
+
+        for map in [
+            &height.materials,
+            &height.wetness,
+            &height.vegetation,
+            &height.flow,
+            &height.temperature,
+            &height.rainfall,
+            &height.snow,
+            &height.soil_moisture,
+            &height.biomes,
+        ] {
+            assert_eq!((map.width, map.height), (1, 1));
+        }
+        assert_eq!(
+            (height.placement_tint.width, height.placement_tint.height),
+            (1, 1)
         );
     }
 }

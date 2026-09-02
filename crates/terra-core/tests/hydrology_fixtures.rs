@@ -8,6 +8,7 @@ use terra_core::layer::{
     FbmParams, FractalNoiseType, NoiseParams, RiverCarveParams, StreamPowerParams, UpliftParams,
 };
 use terra_core::mask::MaskField;
+use terra_core::CancelToken;
 
 fn depression_fill_volume(hf: &Heightfield) -> f32 {
     let filled = fill_depressions(hf);
@@ -43,13 +44,15 @@ fn spe_deterministic_fixture() {
     let m = HeightfieldMetrics::new(48, 48, 1500.0, 1500.0);
     let up = uplift(
         m,
+        &CancelToken::never(),
         &UpliftParams {
             seed: 99,
             detail_amplitude: 20.0,
             altitude_fade: 0.8,
             ..UpliftParams::default()
         },
-    );
+    )
+    .unwrap();
     let p = StreamPowerParams {
         iterations: 8,
         k: 0.06,
@@ -100,6 +103,7 @@ fn uplift_spe_aligns_valleys_better_than_noise_carve() {
     let m = HeightfieldMetrics::new(64, 64, 2000.0, 2000.0);
     let up = uplift(
         m,
+        &CancelToken::never(),
         &UpliftParams {
             seed: 42,
             amplitude: 300.0,
@@ -108,7 +112,8 @@ fn uplift_spe_aligns_valleys_better_than_noise_carve() {
             warp_strength: 0.3,
             ..UpliftParams::default()
         },
-    );
+    )
+    .unwrap();
     let spe = stream_power_erode(
         &up,
         &StreamPowerParams {
@@ -123,6 +128,7 @@ fn uplift_spe_aligns_valleys_better_than_noise_carve() {
 
     let mut noise = fbm_field(
         m,
+        &CancelToken::never(),
         &FbmParams {
             base: NoiseParams {
                 seed: 42,
@@ -133,7 +139,8 @@ fn uplift_spe_aligns_valleys_better_than_noise_carve() {
             },
             noise: FractalNoiseType::Perlin,
         },
-    );
+    )
+    .unwrap();
     let min_h = noise.to_dense().into_iter().fold(f32::INFINITY, f32::min);
     noise.map_mut(|h| h - min_h + 20.0);
     let (carved, _, _, _) = carve_rivers(

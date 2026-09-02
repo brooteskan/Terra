@@ -1,8 +1,11 @@
 //! Poisson-disk / blue-noise sampling for vegetation.
 
-use crate::analyze::slope_degrees;
+mod params;
+
+pub use params::VegetationParams;
+
 use crate::heightfield::Heightfield;
-use crate::layer::VegetationParams;
+use crate::spatial_kernels::slope_degrees;
 
 /// Bridson-style Poisson disk in world XZ, filtered by slope/biome proxies.
 pub fn poisson_disk(hf: &Heightfield, p: &VegetationParams) -> Vec<(f32, f32)> {
@@ -66,6 +69,9 @@ fn accepted(
     s >= p.min_slope_deg && s <= p.max_slope_deg
 }
 
+// Poisson-disk insertion: candidate point + min spacing + cell size + grid dims
+// and the two mutable containers (grid, points) it updates, each distinct. Kept flat.
+#[allow(clippy::too_many_arguments)]
 fn try_add(
     x: f32,
     z: f32,

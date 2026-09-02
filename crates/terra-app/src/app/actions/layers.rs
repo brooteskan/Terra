@@ -8,12 +8,15 @@ use super::super::{
 };
 use super::ApplyCtx;
 
+// Returns the unhandled action on `Err` so the next handler in the chain can try it
+// (see actions/mod.rs); that payload is the intrinsic-size `PanelAction` (`LayerKind`).
+#[allow(clippy::result_large_err)]
 pub(crate) fn try_apply(
     app: &mut TerraApp,
     action: PanelAction,
     ctx: &mut ApplyCtx,
 ) -> Result<(), PanelAction> {
-    let result = match action {
+    match action {
         PanelAction::AddLayer(layer) => {
             let kind = layer.kind.clone();
             if layer.kind.is_sculpt_base() {
@@ -145,6 +148,76 @@ pub(crate) fn try_apply(
         }
         PanelAction::Select(id) => {
             app.session.document.selected = Some(id);
+            app.ui_state.selected_stroke = None;
+        }
+        PanelAction::SelectStroke { layer, index } => {
+            app.session.document.selected = Some(layer);
+            app.ui_state.selected_stroke = Some((layer, index));
+            if let Some(l) = app.session.document.stack.find(layer) {
+                if matches!(l.kind, LayerKind::SculptStrokes(_)) {
+                    app.ui_state.shape_session_layer = Some(layer);
+                    app.ui_state.shape_edit_mode =
+                        terra_core::shape_history::ShapeEditMode::ContinueSelected;
+                }
+            }
+        }
+        PanelAction::SetStrokeEnabled {
+            layer,
+            index,
+            enabled,
+        } => {
+            let previous = app
+                .session
+                .document
+                .stack
+                .find(layer)
+                .and_then(|l| {
+                    if let LayerKind::SculptStrokes(p) = &l.kind {
+                        p.strokes.get(index).map(|s| s.enabled)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(true);
+            // Snapshot the stroke set before the toggle so the footprint diff can
+            // scope the worker to just the toggled stroke (#121).
+            let prev_params = sculpt_stroke_params(app, layer);
+            let cmd = EditorCommand::SetStrokeEnabled {
+                id: layer,
+                index,
+                enabled,
+                previous,
+            };
+            apply(&cmd, &mut app.session.document.stack);
+            app.session.history.push_executed(cmd);
+            if let (Some(prev), Some(next)) = (prev_params, sculpt_stroke_params(app, layer)) {
+                accumulate_stroke_edit_footprint(app, ctx, &prev, &next);
+            }
+            ctx.dirty_from = Some(layer);
+            ctx.doc_mutated = true;
+        }
+        PanelAction::DeleteStroke { layer, index } => {
+            // Snapshot before removal; the diff yields exactly the removed stroke's
+            // footprint (no index-shift over-dirty) plus any coupled Flatten (#121).
+            let prev_params = sculpt_stroke_params(app, layer);
+            let removed = prev_params
+                .as_ref()
+                .and_then(|p| p.strokes.get(index).cloned());
+            if let (Some(prev), Some(stroke)) = (prev_params, removed) {
+                let cmd = EditorCommand::RemoveStroke {
+                    id: layer,
+                    index,
+                    stroke,
+                };
+                apply(&cmd, &mut app.session.document.stack);
+                app.session.history.push_executed(cmd);
+                app.ui_state.selected_stroke = None;
+                if let Some(next) = sculpt_stroke_params(app, layer) {
+                    accumulate_stroke_edit_footprint(app, ctx, &prev, &next);
+                }
+                ctx.dirty_from = Some(layer);
+                ctx.doc_mutated = true;
+            }
         }
         PanelAction::SetEnabled { id, enabled } => {
             let previous = app
@@ -212,6 +285,15 @@ pub(crate) fn try_apply(
                 .find(id)
                 .map(|l| l.kind.clone())
                 .unwrap_or(LayerKind::Flat(Default::default()));
+            // The SELECTED STROKE inspector sliders emit a whole-kind replace; when
+            // both sides are SculptStrokes, diff the strokes so the CPU worker
+            // rescopes to just the edited footprint instead of the whole field
+            // (#121). Any other shape (kind swap, missing layer) keeps whole-field.
+            if let (LayerKind::SculptStrokes(prev), LayerKind::SculptStrokes(next)) =
+                (&previous, &kind)
+            {
+                accumulate_stroke_edit_footprint(app, ctx, prev, next);
+            }
             let cmd = EditorCommand::SetKind { id, kind, previous };
             apply(&cmd, &mut app.session.document.stack);
             app.session
@@ -957,10 +1039,8 @@ pub(crate) fn try_apply(
                 app.ui_state.auto_switch_workspace_on_create,
             )
             .with_cursor(uv);
-            if let Some(o) = owner {
-                if let terra_core::contextual_create::CreateOwner::Biome(id) = o {
-                    create_ctx.active_biome = Some(id);
-                }
+            if let Some(terra_core::contextual_create::CreateOwner::Biome(id)) = owner {
+                create_ctx.active_biome = Some(id);
             }
             match execute_create(&mut app.session, kind, &create_ctx, owner, None) {
                 Ok(out) => {
@@ -1093,6 +1173,259 @@ pub(crate) fn try_apply(
         }
         other => return Err(other),
     };
-    let _ = result;
     Ok(())
+}
+
+/// Clone the `SculptStrokeParams` of layer `id`, or `None` when it is missing or
+/// not a SculptStrokes layer. Used to snapshot the stroke set around a per-stroke
+/// edit so its footprint can be diffed (#121).
+fn sculpt_stroke_params(
+    app: &TerraApp,
+    id: terra_core::layer::LayerId,
+) -> Option<terra_core::authoring::SculptStrokeParams> {
+    match &app.session.document.stack.find(id)?.kind {
+        LayerKind::SculptStrokes(p) => Some(p.clone()),
+        _ => None,
+    }
+}
+
+/// Diff `prev`→`next` stroke params and, when the edit has a bounded footprint,
+/// fold it into the batch's sculpt accumulators (#121). A whole-field edit
+/// (`reconcile` slider changed) yields `None` and is left to escalate normally.
+fn accumulate_stroke_edit_footprint(
+    app: &TerraApp,
+    ctx: &mut ApplyCtx,
+    prev: &terra_core::authoring::SculptStrokeParams,
+    next: &terra_core::authoring::SculptStrokeParams,
+) {
+    let m = app.session.document.metrics;
+    // One Full-res texel of pad covers the reconcile 3×3 halo (see
+    // `sculpt_edit_footprint`); matches the worker's Full resolution ceiling.
+    let pad = 1.0 / (app.session.document.preview_resolution.clamp(1, 8192) as f32);
+    if let Some(b) = terra_core::authoring::sculpt_edit_footprint(prev, next, &m, pad) {
+        // Lift the resolution-free authoring footprint into the tiling UvRect the
+        // worker scope speaks (authoring cannot depend on tiling — it sits below it).
+        let uv = terra_core::tiling::UvRect {
+            min_u: b.min_u,
+            min_v: b.min_v,
+            max_u: b.max_u,
+            max_v: b.max_v,
+        };
+        super::accumulate_sculpt_footprint(app, ctx, uv);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::super::TerraApp;
+    use crate::ui::PanelAction;
+    use terra_core::authoring::{
+        sculpt_edit_footprint, SculptPoint, SculptStroke, SculptStrokeKind, SculptStrokeParams,
+    };
+    use terra_core::layer::{LayerId, LayerKind, LayerStack};
+    use terra_core::shape_history::create_shape_layer;
+    use terra_core::tiling::UvRect;
+
+    fn raise(u: f32, v: f32, radius_m: f32, strength: f32) -> SculptStroke {
+        SculptStroke {
+            kind: SculptStrokeKind::Raise,
+            points: vec![SculptPoint {
+                u,
+                v,
+                pressure: 1.0,
+            }],
+            radius_m,
+            strength,
+            target_height: 0.0,
+            falloff: 1.5,
+            enabled: true,
+        }
+    }
+
+    /// App with a single SculptStrokes layer holding `strokes`; worker accumulators
+    /// reset to the steady state right after a completed job.
+    fn app_with_strokes(strokes: Vec<SculptStroke>) -> (TerraApp, LayerId, SculptStrokeParams) {
+        let mut app = TerraApp::default();
+        let layer = create_shape_layer("Shape");
+        let id = layer.id();
+        app.session.document.stack = LayerStack::new();
+        app.session.document.stack.push(layer);
+        app.session.document.selected = Some(id);
+        let params = SculptStrokeParams {
+            strokes,
+            reconcile: 0.15,
+        };
+        if let Some(l) = app.session.document.stack.find_mut(id) {
+            l.kind = LayerKind::SculptStrokes(params.clone());
+        }
+        app.worker_mark_all_dirty = false;
+        app.worker_dirty_from = None;
+        app.worker_dirty_region = None;
+        app.last_paint_uv = None;
+        (app, id, params)
+    }
+
+    fn expected_footprint(
+        app: &TerraApp,
+        prev: &SculptStrokeParams,
+        next: &SculptStrokeParams,
+    ) -> UvRect {
+        let m = app.session.document.metrics;
+        let pad = 1.0 / (app.session.document.preview_resolution.clamp(1, 8192) as f32);
+        let b = sculpt_edit_footprint(prev, next, &m, pad).expect("bounded footprint");
+        UvRect {
+            min_u: b.min_u,
+            min_v: b.min_v,
+            max_u: b.max_u,
+            max_v: b.max_v,
+        }
+    }
+
+    /// A SELECTED STROKE slider edit (a whole-kind `SetKind` replace) leaves the CPU
+    /// worker a bounded scope covering just the edited stroke, not a whole-field mark.
+    #[test]
+    fn set_kind_stroke_param_edit_scopes_worker_region() {
+        let original = raise(0.4, 0.4, 80.0, 6.0);
+        let (mut app, id, prev) = app_with_strokes(vec![original.clone()]);
+
+        let mut edited = original;
+        edited.strength = 24.0;
+        let next = SculptStrokeParams {
+            strokes: vec![edited],
+            reconcile: prev.reconcile,
+        };
+        let expected = expected_footprint(&app, &prev, &next);
+
+        app.apply_actions(vec![PanelAction::SetKind {
+            id,
+            kind: LayerKind::SculptStrokes(next),
+        }]);
+
+        assert_eq!(app.worker_dirty_region, Some(expected));
+        assert_eq!(app.worker_dirty_from, Some(id));
+        assert!(
+            !app.worker_mark_all_dirty,
+            "a per-stroke edit must not escalate to whole-field"
+        );
+    }
+
+    /// The layer-wide reconcile slider has no per-stroke box, so it must stay
+    /// whole-field (region escalates to None).
+    #[test]
+    fn reconcile_slider_edit_stays_whole_field() {
+        let (mut app, id, prev) = app_with_strokes(vec![raise(0.5, 0.5, 80.0, 6.0)]);
+        let mut next = prev.clone();
+        next.reconcile += 0.2;
+        app.apply_actions(vec![PanelAction::SetKind {
+            id,
+            kind: LayerKind::SculptStrokes(next),
+        }]);
+        assert_eq!(
+            app.worker_dirty_region, None,
+            "a reconcile change must escalate to whole-field"
+        );
+        assert_eq!(app.worker_dirty_from, Some(id));
+    }
+
+    /// A `SetKind` that swaps away from SculptStrokes has no stroke footprint and
+    /// keeps whole-field behavior.
+    #[test]
+    fn kind_swap_off_sculpt_strokes_stays_whole_field() {
+        let (mut app, id, _prev) = app_with_strokes(vec![raise(0.5, 0.5, 80.0, 6.0)]);
+        app.apply_actions(vec![PanelAction::SetKind {
+            id,
+            kind: LayerKind::Flat(Default::default()),
+        }]);
+        assert_eq!(app.worker_dirty_region, None);
+    }
+
+    /// The hierarchy eye toggle (`SetStrokeEnabled`) scopes to the toggled stroke.
+    #[test]
+    fn toggle_stroke_scopes_to_its_footprint() {
+        let keep = raise(0.2, 0.2, 60.0, 6.0);
+        let target = raise(0.7, 0.7, 60.0, 6.0);
+        let (mut app, id, prev) = app_with_strokes(vec![keep.clone(), target.clone()]);
+
+        let mut off = target;
+        off.enabled = false;
+        let next = SculptStrokeParams {
+            strokes: vec![keep, off],
+            reconcile: prev.reconcile,
+        };
+        let expected = expected_footprint(&app, &prev, &next);
+
+        app.apply_actions(vec![PanelAction::SetStrokeEnabled {
+            layer: id,
+            index: 1,
+            enabled: false,
+        }]);
+
+        assert_eq!(app.worker_dirty_region, Some(expected));
+        assert!(!app.worker_mark_all_dirty);
+    }
+
+    /// The context-menu delete (`DeleteStroke`) scopes to the removed stroke's box —
+    /// the trim-diff means no index-shift over-dirty from the strokes after it.
+    #[test]
+    fn delete_stroke_scopes_to_removed_footprint() {
+        let keep = raise(0.2, 0.2, 60.0, 6.0);
+        let target = raise(0.7, 0.7, 60.0, 6.0);
+        let (mut app, id, prev) = app_with_strokes(vec![keep.clone(), target]);
+
+        let next = SculptStrokeParams {
+            strokes: vec![keep],
+            reconcile: prev.reconcile,
+        };
+        let expected = expected_footprint(&app, &prev, &next);
+
+        app.apply_actions(vec![PanelAction::DeleteStroke {
+            layer: id,
+            index: 1,
+        }]);
+
+        assert_eq!(app.worker_dirty_region, Some(expected));
+        assert_eq!(app.worker_dirty_from, Some(id));
+        assert!(!app.worker_mark_all_dirty);
+    }
+
+    /// The issue's accumulator invariant: a per-stroke edit leaves a bounded scope,
+    /// and a subsequent paint dab unions with it rather than escalating.
+    #[test]
+    fn stroke_edit_then_paint_dab_unions_region() {
+        let original = raise(0.3, 0.3, 60.0, 6.0);
+        let (mut app, id, prev) = app_with_strokes(vec![original.clone()]);
+
+        let mut edited = original;
+        edited.strength = 20.0;
+        let next = SculptStrokeParams {
+            strokes: vec![edited],
+            reconcile: prev.reconcile,
+        };
+        let edit_fp = expected_footprint(&app, &prev, &next);
+        app.apply_actions(vec![PanelAction::SetKind {
+            id,
+            kind: LayerKind::SculptStrokes(next),
+        }]);
+        assert_eq!(app.worker_dirty_region, Some(edit_fp));
+
+        // A fresh dab on the same layer: its footprint must union in, never escalate.
+        app.last_paint_uv = None;
+        let (u, v, radius) = (0.7f32, 0.7f32, 0.05f32);
+        app.apply_actions(vec![PanelAction::PaintSculptStamp {
+            layer: id,
+            u,
+            v,
+            radius,
+            strength: 10.0,
+            stroke_kind: SculptStrokeKind::Raise,
+            target_height: 0.0,
+        }]);
+        let dab_fp = UvRect::from_center_radius(u, v, radius);
+        assert_eq!(
+            app.worker_dirty_region,
+            Some(edit_fp.union(dab_fp)),
+            "a dab must union with the pending stroke-edit scope"
+        );
+        assert!(!app.worker_mark_all_dirty);
+    }
 }

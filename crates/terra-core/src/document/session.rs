@@ -3,7 +3,7 @@
 use crate::command::CommandHistory;
 use crate::layer::LayerId;
 use crate::mask::MaskId;
-use crate::rebuild_feedback::RebuildFeedbackState;
+use crate::rebuild_state::RebuildFeedbackState;
 use crate::simulation_scenario::SimulationScenarioCommand;
 use crate::world_rules::WorldRuleCommand;
 use serde::{Deserialize, Serialize};

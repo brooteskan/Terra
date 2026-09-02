@@ -216,6 +216,10 @@ impl D8Drainage {
         self.receiver.resize(n, usize::MAX);
         self.indegree.clear();
         self.indegree.resize(n, 0);
+        // `idx` is decomposed into grid coordinates (`i = idx % w`, `j = idx / w`)
+        // to walk the D8 neighbour — the index is the loop's subject, not just a
+        // `dirs` cursor. Kept indexed.
+        #[allow(clippy::needless_range_loop)]
         for idx in 0..n {
             let d = dirs[idx];
             if d == NO_FLOW || d as usize >= D8_OFFSETS.len() {
@@ -264,8 +268,8 @@ impl D8Drainage {
             for &idx in &self.topo_order {
                 seen[idx] = true;
             }
-            for idx in 0..n {
-                if !seen[idx] {
+            for (idx, &was_seen) in seen.iter().enumerate() {
+                if !was_seen {
                     self.topo_order.push(idx);
                 }
             }
@@ -442,6 +446,10 @@ pub fn flow_direction_dinfinity(hf: &Heightfield) -> Vec<Vec<FlowReceiver>> {
 fn build_donors(receivers: &[Vec<FlowReceiver>], w: usize, h: usize) -> Vec<Vec<usize>> {
     let n = w * h;
     let mut donors = vec![Vec::new(); n];
+    // `idx` is decomposed into grid coordinates (`i = idx % w`, `j = idx / w`)
+    // to place each donor at its neighbour cell — the index is the loop's
+    // subject, not just a `receivers` cursor. Kept indexed.
+    #[allow(clippy::needless_range_loop)]
     for idx in 0..n {
         let i = (idx % w) as i32;
         let j = (idx / w) as i32;
@@ -511,8 +519,8 @@ fn topological_order(
         for &i in &order {
             seen[i] = true;
         }
-        for i in 0..n {
-            if !seen[i] {
+        for (i, &was_seen) in seen.iter().enumerate() {
+            if !was_seen {
                 order.push(i);
             }
         }

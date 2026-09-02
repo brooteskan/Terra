@@ -5,8 +5,8 @@ use terra_app::ui::{
     all_tools, tools_for_workspace, workspace_definition, UiState, WorkspaceId, WorkspaceMode,
 };
 use terra_core::document::TerrainDocument;
-use terra_core::eval::EvalScheduler;
 use terra_core::layer::{LayerKind, MaterialsParams};
+use terra_cpu_eval::EvalScheduler;
 
 fn selection_snapshot(
     doc: &TerrainDocument,

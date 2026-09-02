@@ -1,4 +1,4 @@
-use super::TerrainTileKey;
+use super::{TerrainContentStamp, TerrainTileKey};
 use crate::heightfield::TileId;
 use crate::layer::LayerId;
 use std::collections::HashMap;
@@ -25,14 +25,23 @@ pub struct ResidentTile {
     pub bytes: u64,
     pub revision: u64,
     pub input_revision_hash: u64,
+    /// Full semantic identity for exact current-content queries. Legacy inserts
+    /// leave this unset and continue to use revision/hash compatibility checks.
+    pub content: Option<TerrainContentStamp>,
     pub last_used_tick: u64,
     pub pin_count: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TileCacheEviction {
+    pub key: TerrainTileKey,
+    pub handle: TilePageHandle,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TileCacheInsert {
     pub handle: TilePageHandle,
-    pub evicted: Vec<TerrainTileKey>,
+    pub evicted: Vec<TileCacheEviction>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,6 +136,17 @@ impl TileResidencyCache {
         revision: u64,
         input_revision_hash: u64,
     ) -> Result<TileCacheInsert, TileCacheError> {
+        self.insert_with_content(key, bytes, revision, input_revision_hash, None)
+    }
+
+    pub fn insert_with_content(
+        &mut self,
+        key: TerrainTileKey,
+        bytes: u64,
+        revision: u64,
+        input_revision_hash: u64,
+        content: Option<TerrainContentStamp>,
+    ) -> Result<TileCacheInsert, TileCacheError> {
         if bytes > self.budget_bytes {
             return Err(TileCacheError::EntryExceedsBudget {
                 bytes,
@@ -161,6 +181,7 @@ impl TileResidencyCache {
             entry.bytes = bytes;
             entry.revision = revision;
             entry.input_revision_hash = input_revision_hash;
+            entry.content = content;
             entry.last_used_tick = self.tick;
             return Ok(TileCacheInsert {
                 handle: entry.handle,
@@ -175,12 +196,19 @@ impl TileResidencyCache {
                 bytes,
                 revision,
                 input_revision_hash,
+                content,
                 last_used_tick: self.tick,
                 pin_count: 0,
             },
         );
         self.used_bytes = self.used_bytes.saturating_add(bytes);
         Ok(TileCacheInsert { handle, evicted })
+    }
+
+    pub fn is_current(&self, key: &TerrainTileKey, content: TerrainContentStamp) -> bool {
+        self.entries
+            .get(key)
+            .is_some_and(|entry| entry.content == Some(content))
     }
 
     pub fn remove(&mut self, key: &TerrainTileKey) -> bool {
@@ -266,12 +294,13 @@ impl TileResidencyCache {
         victims
     }
 
-    fn evict(&mut self, keys: Vec<TerrainTileKey>) -> Vec<TerrainTileKey> {
+    fn evict(&mut self, keys: Vec<TerrainTileKey>) -> Vec<TileCacheEviction> {
         keys.into_iter()
-            .filter(|key| {
-                let removed = self.remove(key);
-                self.evictions += u64::from(removed);
-                removed
+            .filter_map(|key| {
+                let handle = self.entries.get(&key)?.handle;
+                self.remove(&key);
+                self.evictions = self.evictions.saturating_add(1);
+                Some(TileCacheEviction { key, handle })
             })
             .collect()
     }
@@ -332,9 +361,13 @@ mod tests {
         let b = key(layer, 1);
         let c = key(layer, 2);
         cache.insert(a.clone(), 8, 1, 1).unwrap();
-        cache.insert(b.clone(), 8, 1, 1).unwrap();
+        let bh = cache.insert(b.clone(), 8, 1, 1).unwrap().handle;
         cache.get(&a);
-        assert_eq!(cache.insert(c, 8, 1, 1).unwrap().evicted, vec![b]);
+        assert_eq!(
+            cache.insert(c, 8, 1, 1).unwrap().evicted,
+            vec![TileCacheEviction { key: b, handle: bh }]
+        );
+        assert_eq!(cache.resolve_handle(bh), None);
     }
 
     #[test]

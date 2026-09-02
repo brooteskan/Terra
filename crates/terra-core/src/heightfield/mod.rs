@@ -19,6 +19,15 @@ pub const DEFAULT_HALO: u32 = 2;
 /// `preview_resolution_for_world_size` when creating projects).
 pub const DEFAULT_PREVIEW_RES: u32 = 1024;
 
+/// Upper bound on samples along one edge (`width`, `height`, `tile_size`).
+/// Keeps `width * height` and halo-inflated tile strides inside `u32`/`usize`
+/// and keeps every `as i32` index cast non-negative. The UI caps resolution far
+/// lower (8192); this is the allocation-sanity ceiling, not a feature promise.
+pub const MAX_DIM: u32 = 32_768;
+
+/// Upper bound on halo (ghost) width per tile edge.
+pub const MAX_HALO: u32 = 32;
+
 /// World-space metrics for a regular grid DEM.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct HeightfieldMetrics {
@@ -36,8 +45,26 @@ pub struct HeightfieldMetrics {
     pub halo: u32,
 }
 
+/// Why a [`HeightfieldMetrics`] value violates its representation invariants.
+#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
+pub enum MetricsError {
+    #[error("width and height must be 1..={max} samples, got {width}x{height}", max = MAX_DIM)]
+    InvalidDimensions { width: u32, height: u32 },
+    #[error("tile size must be 1..={max}, got {0}", max = MAX_DIM)]
+    InvalidTileSize(u32),
+    #[error("halo must be <= {max}, got {0}", max = MAX_HALO)]
+    HaloTooLarge(u32),
+    #[error("world extent must be finite and positive, got {x} x {z} metres")]
+    InvalidWorldExtent { x: f32, z: f32 },
+}
+
 impl HeightfieldMetrics {
     pub fn new(width: u32, height: u32, world_size_x: f32, world_size_z: f32) -> Self {
+        // No validation here: `HeightfieldMetrics` is a shared carrier and some
+        // consumers (e.g. an empty `MaskField`) legitimately use 0x0 metrics as a
+        // sentinel. The invariant that matters — a tiled `Heightfield` cannot be
+        // built on invalid metrics — is asserted in `Heightfield::new`, and the
+        // deserialization/export/import boundaries call `validate` explicitly.
         Self {
             width,
             height,
@@ -46,6 +73,72 @@ impl HeightfieldMetrics {
             tile_size: DEFAULT_TILE_SIZE,
             halo: DEFAULT_HALO,
         }
+    }
+
+    /// Validate every representation invariant. Cheap and allocation-free; call
+    /// at each boundary where metrics arrive from deserialization or from a
+    /// user-controlled resolution, before any tiling, sampling, or allocation.
+    pub fn validate(&self) -> Result<(), MetricsError> {
+        if self.width == 0 || self.width > MAX_DIM || self.height == 0 || self.height > MAX_DIM {
+            return Err(MetricsError::InvalidDimensions {
+                width: self.width,
+                height: self.height,
+            });
+        }
+        if self.tile_size == 0 || self.tile_size > MAX_DIM {
+            return Err(MetricsError::InvalidTileSize(self.tile_size));
+        }
+        if self.halo > MAX_HALO {
+            return Err(MetricsError::HaloTooLarge(self.halo));
+        }
+        if !self.world_size_x.is_finite()
+            || self.world_size_x <= 0.0
+            || !self.world_size_z.is_finite()
+            || self.world_size_z <= 0.0
+        {
+            return Err(MetricsError::InvalidWorldExtent {
+                x: self.world_size_x,
+                z: self.world_size_z,
+            });
+        }
+        Ok(())
+    }
+
+    /// Fallible sibling of [`Self::new`]: the validated metrics, or the first
+    /// invariant they violate.
+    pub fn try_new(
+        width: u32,
+        height: u32,
+        world_size_x: f32,
+        world_size_z: f32,
+    ) -> Result<Self, MetricsError> {
+        let metrics = Self {
+            width,
+            height,
+            world_size_x,
+            world_size_z,
+            tile_size: DEFAULT_TILE_SIZE,
+            halo: DEFAULT_HALO,
+        };
+        metrics.validate()?;
+        Ok(metrics)
+    }
+
+    /// The same world span and halo resampled to a square `resolution`, with the
+    /// interior tile size capped to that resolution. This is the single
+    /// derivation shared by export, the background eval worker, and interactive
+    /// preview; the result is validated before it is returned.
+    pub fn at_resolution(&self, resolution: u32) -> Result<Self, MetricsError> {
+        let derived = Self {
+            width: resolution,
+            height: resolution,
+            world_size_x: self.world_size_x,
+            world_size_z: self.world_size_z,
+            tile_size: self.tile_size.min(resolution),
+            halo: self.halo,
+        };
+        derived.validate()?;
+        Ok(derived)
     }
 
     pub fn preview_default() -> Self {
@@ -106,6 +199,10 @@ pub struct Heightfield {
 
 impl Heightfield {
     pub fn new(metrics: HeightfieldMetrics) -> Self {
+        debug_assert!(
+            metrics.validate().is_ok(),
+            "Heightfield::new built from invalid metrics: {metrics:?}"
+        );
         let n = metrics.tile_count() as usize;
         let mut tiles = Vec::with_capacity(n);
         for tz in 0..metrics.tiles_z() {
@@ -148,6 +245,15 @@ impl Heightfield {
 
     pub fn tiles_mut(&mut self) -> &mut [HeightTile] {
         &mut self.tiles
+    }
+
+    /// Resident sample bytes across all tiles (interior + halo `f32`s). Excludes
+    /// the fixed per-tile/-field struct overhead; used to size in-memory caches.
+    pub fn resident_bytes(&self) -> usize {
+        self.tiles
+            .iter()
+            .map(|t| std::mem::size_of_val(t.data()))
+            .sum()
     }
 
     fn tile_index(&self, id: TileId) -> Option<usize> {
@@ -281,7 +387,7 @@ impl Heightfield {
     pub fn map_mut<F: Fn(f32) -> f32 + Sync>(&mut self, f: F) {
         use rayon::prelude::*;
         self.tiles.par_iter_mut().for_each(|tile| {
-            tile.map_interior(|v| f(v));
+            tile.map_interior(&f);
         });
     }
 
@@ -363,5 +469,175 @@ mod tests {
         let mut hf = hf;
         hf.set(299, 299, 7.0);
         assert_eq!(hf.get(299, 299), 7.0);
+    }
+
+    fn valid() -> HeightfieldMetrics {
+        HeightfieldMetrics {
+            width: 16,
+            height: 16,
+            world_size_x: 16.0,
+            world_size_z: 16.0,
+            tile_size: 16,
+            halo: 2,
+        }
+    }
+
+    #[test]
+    fn representative_valid_metrics_pass_validation() {
+        assert!(HeightfieldMetrics::preview_default().validate().is_ok());
+        assert!(HeightfieldMetrics::new(64, 64, 128.0, 128.0)
+            .validate()
+            .is_ok());
+        // The historical struct-literal shape used across the crate and fixtures.
+        let m = HeightfieldMetrics {
+            width: 300,
+            height: 300,
+            world_size_x: 1000.0,
+            world_size_z: 1000.0,
+            tile_size: 256,
+            halo: 2,
+        };
+        assert!(m.validate().is_ok());
+        // halo == 0 is a supported (render preview) configuration.
+        assert!(HeightfieldMetrics { halo: 0, ..valid() }.validate().is_ok());
+    }
+
+    #[test]
+    fn zero_dimensions_are_rejected() {
+        assert_eq!(
+            HeightfieldMetrics {
+                width: 0,
+                ..valid()
+            }
+            .validate(),
+            Err(MetricsError::InvalidDimensions {
+                width: 0,
+                height: 16
+            })
+        );
+        assert_eq!(
+            HeightfieldMetrics {
+                height: 0,
+                ..valid()
+            }
+            .validate(),
+            Err(MetricsError::InvalidDimensions {
+                width: 16,
+                height: 0
+            })
+        );
+    }
+
+    #[test]
+    fn zero_tile_size_is_rejected_before_div_ceil_would_panic() {
+        assert_eq!(
+            HeightfieldMetrics {
+                tile_size: 0,
+                ..valid()
+            }
+            .validate(),
+            Err(MetricsError::InvalidTileSize(0))
+        );
+    }
+
+    #[test]
+    fn oversized_dimensions_tile_and_halo_are_rejected() {
+        let over = MAX_DIM + 1;
+        assert_eq!(
+            HeightfieldMetrics {
+                width: over,
+                ..valid()
+            }
+            .validate(),
+            Err(MetricsError::InvalidDimensions {
+                width: over,
+                height: 16
+            })
+        );
+        assert_eq!(
+            HeightfieldMetrics {
+                tile_size: over,
+                ..valid()
+            }
+            .validate(),
+            Err(MetricsError::InvalidTileSize(over))
+        );
+        assert_eq!(
+            HeightfieldMetrics {
+                halo: MAX_HALO + 1,
+                ..valid()
+            }
+            .validate(),
+            Err(MetricsError::HaloTooLarge(MAX_HALO + 1))
+        );
+    }
+
+    #[test]
+    fn non_finite_and_non_positive_world_extents_are_rejected() {
+        // NaN breaks `assert_eq!` (NaN != NaN), so match the variant instead.
+        for (x, z) in [
+            (0.0, 16.0),
+            (-1.0, 16.0),
+            (16.0, 0.0),
+            (16.0, -1.0),
+            (f32::NAN, 16.0),
+            (f32::INFINITY, 16.0),
+            (16.0, f32::NEG_INFINITY),
+        ] {
+            let m = HeightfieldMetrics {
+                world_size_x: x,
+                world_size_z: z,
+                ..valid()
+            };
+            assert!(
+                matches!(m.validate(), Err(MetricsError::InvalidWorldExtent { .. })),
+                "expected rejection for world extents {x} x {z}"
+            );
+        }
+    }
+
+    #[test]
+    fn try_new_agrees_with_new_and_reports_the_first_violation() {
+        assert_eq!(
+            HeightfieldMetrics::try_new(64, 64, 128.0, 128.0),
+            Ok(HeightfieldMetrics::new(64, 64, 128.0, 128.0))
+        );
+        assert_eq!(
+            HeightfieldMetrics::try_new(0, 64, 128.0, 128.0),
+            Err(MetricsError::InvalidDimensions {
+                width: 0,
+                height: 64
+            })
+        );
+    }
+
+    #[test]
+    fn at_resolution_caps_tile_size_and_carries_world_span() {
+        let base = HeightfieldMetrics {
+            width: 1024,
+            height: 1024,
+            world_size_x: 4096.0,
+            world_size_z: 2048.0,
+            tile_size: 256,
+            halo: 2,
+        };
+        let down = base.at_resolution(128).expect("128 is valid");
+        assert_eq!((down.width, down.height), (128, 128));
+        assert_eq!(down.tile_size, 128, "tile size caps to the resolution");
+        assert_eq!((down.world_size_x, down.world_size_z), (4096.0, 2048.0));
+        assert_eq!(down.halo, 2);
+        // Above the base tile size, tile size is unchanged.
+        assert_eq!(
+            base.at_resolution(512).expect("512 is valid").tile_size,
+            256
+        );
+        // A zero resolution is rejected, not silently produced.
+        assert_eq!(
+            base.at_resolution(0),
+            Err(MetricsError::InvalidDimensions {
+                width: 0,
+                height: 0
+            })
+        );
     }
 }

@@ -1,5 +1,7 @@
 //! LayerKind parameter editors.
 
+use std::f32::consts::TAU;
+
 use crate::ui::actions::PanelAction;
 use crate::ui::style::{self, FONT_SCALE, ROW_H};
 use crate::ui::EditorTool;
@@ -52,10 +54,22 @@ pub(crate) fn edit_kind(
             changed |= slider_f32(ui, "Fill height", &mut p.fill_height, -100.0, 500.0);
         }
         LayerKind::SculptStrokes(p) => {
-            label(
-                ui,
-                &format!("{} editable semantic stroke(s)", p.strokes.len()),
-            );
+            let disabled = p.strokes.iter().filter(|s| !s.enabled).count();
+            let count_label = if disabled > 0 {
+                format!(
+                    "{} stroke{} \u{00b7} {} disabled",
+                    p.strokes.len(),
+                    if p.strokes.len() == 1 { "" } else { "s" },
+                    disabled,
+                )
+            } else {
+                format!(
+                    "{} stroke{}",
+                    p.strokes.len(),
+                    if p.strokes.len() == 1 { "" } else { "s" },
+                )
+            };
+            label(ui, &count_label);
             changed |= slider_f32(ui, "Reconcile", &mut p.reconcile, 0.0, 1.0);
             if advanced {
                 label(
@@ -285,7 +299,7 @@ pub(crate) fn edit_kind(
             changed |= slider_f32(ui, "Min", &mut p.height_min, -200.0, 500.0);
             changed |= slider_f32(ui, "Max", &mut p.height_max, -200.0, 2000.0);
             if advanced {
-                changed |= slider_f32(ui, "Direction", &mut p.direction, 0.0, 6.28);
+                changed |= slider_f32(ui, "Direction", &mut p.direction, 0.0, TAU);
             }
         }
         LayerKind::NoiseValue(p) | LayerKind::NoisePerlin(p) | LayerKind::NoiseOpenSimplex(p) => {
@@ -392,7 +406,7 @@ pub(crate) fn edit_kind(
         LayerKind::Mountains(p) => {
             if advanced {
                 // Shape/Noise tabs own artist + fractal controls; Advanced is extras only.
-                changed |= slider_f32(ui, "Range Angle", &mut p.range_angle, 0.0, 6.28);
+                changed |= slider_f32(ui, "Range Angle", &mut p.range_angle, 0.0, TAU);
                 changed |= slider_f32(ui, "Offset X", &mut p.base.offset_x, -10000.0, 10000.0);
                 changed |= slider_f32(ui, "Offset Z", &mut p.base.offset_z, -10000.0, 10000.0);
                 changed |= slider_f32(ui, "Lacunarity", &mut p.base.lacunarity, 1.1, 4.0);
@@ -437,7 +451,7 @@ pub(crate) fn edit_kind(
                 changed |= seed_row(ui, "uplift_seed", &mut p.seed);
             }
             if advanced {
-                changed |= slider_f32(ui, "Range Angle", &mut p.range_angle, 0.0, 6.28);
+                changed |= slider_f32(ui, "Range Angle", &mut p.range_angle, 0.0, TAU);
                 changed |= slider_f32(ui, "Warp", &mut p.warp_strength, 0.0, 1.5);
             } else {
                 changed |= slider_f32(ui, "Uplift Height", &mut p.amplitude, 0.0, 1200.0);
@@ -1804,9 +1818,9 @@ pub(crate) fn edit_level_step_ex(
             curve.resize(bars, 1.0);
             changed = true;
         }
-        for i in 0..bars {
+        for (i, band) in curve.iter_mut().enumerate() {
             let label_s = format!("L{} Strength", i);
-            if slider_f32(ui, &label_s, &mut curve[i], 0.0, 2.0) {
+            if slider_f32(ui, &label_s, band, 0.0, 2.0) {
                 changed = true;
             }
         }

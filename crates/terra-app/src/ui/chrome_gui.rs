@@ -108,9 +108,7 @@ fn caption_icon_button(
     ui.icon_centered(
         rect,
         icon,
-        if hovered && is_close {
-            style::TEXT
-        } else if hovered {
+        if hovered {
             style::TEXT
         } else {
             style::TEXT_DIM
@@ -267,10 +265,7 @@ pub fn draw_menu_bar(
     } else {
         doc.name.as_str()
     };
-    let mut project_w = DrawList::text_width(project_name, FONT_SCALE)
-        .min(160.0)
-        .max(72.0)
-        + 36.0;
+    let mut project_w = DrawList::text_width(project_name, FONT_SCALE).clamp(72.0, 160.0) + 36.0;
     let mut project_r =
         Rect::from_pos_size(size_r.min_x - 14.0 - project_w, y, project_w, TOOLBAR_BTN_H);
 
@@ -364,7 +359,7 @@ pub fn draw_menu_bar(
         state.right_open = None;
     }
 
-    // Primary EXPORT CTA — file export is not ready yet.
+    // Primary EXPORT CTA opens the same field export dialog as File > Export.
     let build_id = Id::new("tb_build");
     let build_hovered = ui.pointer_in(build_r);
     if build_hovered {
@@ -374,7 +369,7 @@ pub fn draw_menu_bar(
         ui.state.active = Some(build_id);
     }
     if ui.input.primary_released && ui.state.is_active(build_id) && build_hovered {
-        ui_state.show_export_unsupported = true;
+        ui_state.show_export = true;
         state.right_open = None;
     }
     ui.panel_rounded(

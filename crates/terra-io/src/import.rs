@@ -7,6 +7,7 @@ pub fn import_heightmap_png(
     height_scale: f32,
     height_offset: f32,
 ) -> Result<Heightfield, IoError> {
+    metrics.validate()?;
     let img = image::open(path)?.to_luma16();
     let (iw, ih) = img.dimensions();
     let mut hf = Heightfield::zeros(metrics);
@@ -28,6 +29,7 @@ pub fn import_heightmap_raw(
     path: &std::path::Path,
     metrics: HeightfieldMetrics,
 ) -> Result<Heightfield, IoError> {
+    metrics.validate()?;
     let bytes = std::fs::read(path)?;
     let expected = (metrics.width * metrics.height) as usize * 4;
     if bytes.len() < expected {
@@ -38,8 +40,48 @@ pub fn import_heightmap_raw(
         )));
     }
     let mut data = Vec::with_capacity(expected / 4);
-    for chunk in bytes.chunks_exact(4).take(expected / 4) {
-        data.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    for chunk in bytes[..expected].as_chunks::<4>().0 {
+        data.push(f32::from_le_bytes(*chunk));
     }
     Ok(Heightfield::from_dense(metrics, &data))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn invalid_metrics() -> HeightfieldMetrics {
+        HeightfieldMetrics {
+            width: 0,
+            height: 16,
+            world_size_x: 16.0,
+            world_size_z: 16.0,
+            tile_size: 16,
+            halo: 2,
+        }
+    }
+
+    #[test]
+    fn png_import_rejects_invalid_metrics_before_touching_the_file() {
+        // Validation runs before any file access, so an otherwise-missing path
+        // still surfaces the metrics error rather than an IO or decode error.
+        let err = import_heightmap_png(
+            std::path::Path::new("terra-nonexistent-fixture.png"),
+            invalid_metrics(),
+            1.0,
+            0.0,
+        )
+        .expect_err("invalid metrics must be rejected");
+        assert!(matches!(err, IoError::Metrics(_)), "got: {err}");
+    }
+
+    #[test]
+    fn raw_import_rejects_invalid_metrics_before_touching_the_file() {
+        let err = import_heightmap_raw(
+            std::path::Path::new("terra-nonexistent-fixture.raw"),
+            invalid_metrics(),
+        )
+        .expect_err("invalid metrics must be rejected");
+        assert!(matches!(err, IoError::Metrics(_)), "got: {err}");
+    }
 }

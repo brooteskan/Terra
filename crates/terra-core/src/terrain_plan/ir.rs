@@ -1,0 +1,636 @@
+//! Logical fields, operations, and construction of a compiled terrain plan.
+
+use std::hash::{Hash, Hasher};
+
+use super::{
+    analysis::validate_and_analyze, ExpectedFieldKind, FieldSlot, PlanAnalysis,
+    PlanAuthoredDependency, PlanNodeSelection, PlanOpId, PlanOpSpan, PlanProvenance,
+    PlanStructureRevision, PlanStructureSignature, TerrainPlanStamp,
+};
+use crate::deps::{DepKind, NodeRef};
+use crate::field_data::FieldId;
+use crate::ids::{LayerId, OutputId};
+use crate::invalidation::{AuxReach, Reach};
+
+/// Semantic kind of one logical field. Physical representation belongs to a backend.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum LogicalFieldKind {
+    Height,
+    Auxiliary(FieldId),
+    Mask,
+}
+
+/// Provenance origin for a plan descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PlanOrigin {
+    Root,
+    Authored(NodeRef),
+}
+
+impl PlanOrigin {
+    pub const fn authored(self) -> Option<NodeRef> {
+        match self {
+            Self::Root => None,
+            Self::Authored(owner) => Some(owner),
+        }
+    }
+}
+
+/// Description of one logical field owned by the plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogicalField {
+    pub slot: FieldSlot,
+    pub kind: LogicalFieldKind,
+    pub origin: PlanOrigin,
+}
+
+/// Source used to initialize a working heightfield.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SeedSource {
+    Zero,
+    Copy(FieldSlot),
+    Selected(FieldSlot),
+}
+
+/// Height-composition equation selected by authored group semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GroupCompositeMode {
+    Standard,
+    BiomeHeightDelta,
+}
+
+/// One auxiliary field crossing an isolated-group boundary.
+///
+/// `parent` is absent when the field is first produced inside the group; backends
+/// treat that case as a zero-valued parent field before applying the group mask.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupAuxComposite {
+    pub field: FieldId,
+    pub parent: Option<FieldSlot>,
+    pub child: FieldSlot,
+    pub output: FieldSlot,
+}
+
+/// One operation in the backend-neutral ordered execution plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerrainOpKind {
+    Seed {
+        source: SeedSource,
+        output: FieldSlot,
+    },
+    EvaluateMask {
+        input_height: FieldSlot,
+        input_fields: Vec<FieldSlot>,
+        output_mask: FieldSlot,
+    },
+    RunLayerKernel {
+        layer: LayerId,
+        type_id: String,
+        input_height: FieldSlot,
+        input_fields: Vec<FieldSlot>,
+        output_candidate: FieldSlot,
+        output_fields: Vec<FieldSlot>,
+    },
+    CompositeLayer {
+        layer: LayerId,
+        base: FieldSlot,
+        candidate: FieldSlot,
+        mask: FieldSlot,
+        output: FieldSlot,
+    },
+    CompositeGroup {
+        group: LayerId,
+        parent: FieldSlot,
+        private_seed: FieldSlot,
+        child_output: FieldSlot,
+        mask: FieldSlot,
+        output: FieldSlot,
+        mode: GroupCompositeMode,
+    },
+    /// Publish one private auxiliary field across an isolated group boundary.
+    /// Keeping this separate from the height composite lets liveness discard
+    /// unobserved private fields independently.
+    CompositeAuxField {
+        group: LayerId,
+        mask: FieldSlot,
+        composite: GroupAuxComposite,
+    },
+    PublishOutput {
+        output: OutputId,
+        source: FieldSlot,
+    },
+}
+
+impl TerrainOpKind {
+    pub(crate) fn input_slots(&self) -> Vec<FieldSlot> {
+        match self {
+            Self::Seed { source, .. } => match source {
+                SeedSource::Zero => Vec::new(),
+                SeedSource::Copy(slot) | SeedSource::Selected(slot) => vec![*slot],
+            },
+            Self::EvaluateMask {
+                input_height,
+                input_fields,
+                ..
+            } => {
+                let mut slots = Vec::with_capacity(1 + input_fields.len());
+                slots.push(*input_height);
+                for field in input_fields {
+                    if !slots.contains(field) {
+                        slots.push(*field);
+                    }
+                }
+                slots
+            }
+            Self::RunLayerKernel {
+                input_height,
+                input_fields,
+                ..
+            } => {
+                let mut slots = Vec::with_capacity(1 + input_fields.len());
+                slots.push(*input_height);
+                for field in input_fields {
+                    if !slots.contains(field) {
+                        slots.push(*field);
+                    }
+                }
+                slots
+            }
+            Self::CompositeLayer {
+                base,
+                candidate,
+                mask,
+                ..
+            } => vec![*base, *candidate, *mask],
+            Self::CompositeGroup {
+                parent,
+                private_seed,
+                child_output,
+                mask,
+                ..
+            } => vec![*parent, *private_seed, *child_output, *mask],
+            Self::CompositeAuxField {
+                mask, composite, ..
+            } => {
+                let mut slots = Vec::with_capacity(3);
+                if let Some(parent) = composite.parent {
+                    slots.push(parent);
+                }
+                slots.extend([composite.child, *mask]);
+                slots
+            }
+            Self::PublishOutput { source, .. } => vec![*source],
+        }
+    }
+
+    pub(crate) fn output_slots(&self) -> Vec<FieldSlot> {
+        match self {
+            Self::Seed { output, .. } | Self::CompositeLayer { output, .. } => vec![*output],
+            Self::CompositeGroup { output, .. } => vec![*output],
+            Self::CompositeAuxField { composite, .. } => vec![composite.output],
+            Self::EvaluateMask { output_mask, .. } => vec![*output_mask],
+            Self::RunLayerKernel {
+                output_candidate,
+                output_fields,
+                ..
+            } => {
+                let mut slots = Vec::with_capacity(1 + output_fields.len());
+                slots.push(*output_candidate);
+                slots.extend(output_fields.iter().copied());
+                slots
+            }
+            Self::PublishOutput { .. } => Vec::new(),
+        }
+    }
+}
+
+/// Operation plus authored origin and resolved spatial reach.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerrainOp {
+    pub origin: PlanOrigin,
+    pub reach: Reach,
+    /// Reach of auxiliary outputs, independently of the height result.
+    /// Ignored for operations that do not produce auxiliary fields.
+    pub aux_reach: AuxReach,
+    pub kind: TerrainOpKind,
+}
+
+/// Runtime-derived, backend-neutral terrain evaluation plan.
+#[derive(Debug, Clone)]
+pub struct CompiledTerrainPlan {
+    stamp: TerrainPlanStamp,
+    structure_signature: PlanStructureSignature,
+    fields: Vec<LogicalField>,
+    operations: Vec<TerrainOp>,
+    provenance: PlanProvenance,
+    pub(crate) analysis: PlanAnalysis,
+    final_height: FieldSlot,
+}
+
+impl CompiledTerrainPlan {
+    pub const fn stamp(&self) -> TerrainPlanStamp {
+        self.stamp
+    }
+
+    pub const fn structure_signature(&self) -> PlanStructureSignature {
+        self.structure_signature
+    }
+
+    pub fn matches_structure_revision(&self, revision: PlanStructureRevision) -> bool {
+        self.stamp.structure_revision == revision
+    }
+
+    pub fn fields(&self) -> &[LogicalField] {
+        &self.fields
+    }
+
+    pub fn operations(&self) -> &[TerrainOp] {
+        &self.operations
+    }
+
+    pub fn field(&self, slot: FieldSlot) -> Option<&LogicalField> {
+        self.fields.get(slot.index())
+    }
+
+    pub fn operation(&self, id: PlanOpId) -> Option<&TerrainOp> {
+        self.operations.get(id.index())
+    }
+
+    pub(crate) fn operation_mut(&mut self, id: PlanOpId) -> Option<&mut TerrainOp> {
+        self.operations.get_mut(id.index())
+    }
+
+    pub const fn final_height(&self) -> FieldSlot {
+        self.final_height
+    }
+
+    pub const fn provenance(&self) -> &PlanProvenance {
+        &self.provenance
+    }
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum PlanBuildError {
+    #[error("field slot {slot} is outside the plan's {field_count} fields")]
+    InvalidFieldSlot { slot: usize, field_count: usize },
+    #[error("logical field slot {slot} has more than one producer")]
+    MultipleFieldProducers { slot: usize },
+    #[error("published output {output:?} is declared more than once")]
+    DuplicatePublishedOutput { output: OutputId },
+    #[error("logical field slot {slot} has no producer")]
+    UnproducedField { slot: usize, owner: Option<NodeRef> },
+    #[error("operation {operation:?} reads unproduced field slot {slot}")]
+    UnproducedFieldInput {
+        operation: PlanOpId,
+        owner: Option<NodeRef>,
+        slot: usize,
+    },
+    #[error("operation {consumer:?} reads field {field:?} before producer {producer:?} executes")]
+    UseBeforeProduce {
+        field: FieldSlot,
+        producer: PlanOpId,
+        consumer: PlanOpId,
+        owner: Option<NodeRef>,
+    },
+    #[error("terrain plan dependency cycle involves operations {operations:?}")]
+    DependencyCycle {
+        operations: Vec<PlanOpId>,
+        owners: Vec<NodeRef>,
+    },
+    #[error("operation {operation:?} field {field:?} has kind {actual:?}; expected {expected:?}")]
+    FieldKindMismatch {
+        operation: PlanOpId,
+        owner: Option<NodeRef>,
+        field: FieldSlot,
+        expected: ExpectedFieldKind,
+        actual: LogicalFieldKind,
+    },
+    #[error("final field slot {slot} has kind {actual:?}; expected height")]
+    InvalidFinalHeightKind {
+        slot: usize,
+        actual: LogicalFieldKind,
+    },
+}
+
+/// Construction helper used by the tree compiler and semantic fixtures.
+///
+/// It establishes contiguous IDs and basic slot/provenance integrity. Complete
+/// dependency and lifetime validation belongs to the later plan-validation phase.
+#[derive(Debug)]
+pub struct TerrainPlanBuilder {
+    stamp: TerrainPlanStamp,
+    fields: Vec<LogicalField>,
+    operations: Vec<TerrainOp>,
+    node_selection: Vec<(NodeRef, PlanNodeSelection)>,
+    owner_spans: Vec<(NodeRef, PlanOpSpan)>,
+    owner_fields: Vec<(NodeRef, FieldSlot)>,
+    output_owners: Vec<(OutputId, NodeRef)>,
+    dependencies: Vec<PlanAuthoredDependency>,
+}
+
+impl TerrainPlanBuilder {
+    pub fn new(stamp: TerrainPlanStamp) -> Self {
+        Self {
+            stamp,
+            fields: Vec::new(),
+            operations: Vec::new(),
+            node_selection: Vec::new(),
+            owner_spans: Vec::new(),
+            owner_fields: Vec::new(),
+            output_owners: Vec::new(),
+            dependencies: Vec::new(),
+        }
+    }
+
+    pub fn add_field(&mut self, kind: LogicalFieldKind, origin: PlanOrigin) -> FieldSlot {
+        let slot = FieldSlot::from_index(self.fields.len());
+        self.fields.push(LogicalField { slot, kind, origin });
+        slot
+    }
+
+    pub fn add_operation(&mut self, operation: TerrainOp) -> PlanOpId {
+        let id = PlanOpId::from_index(self.operations.len());
+        self.operations.push(operation);
+        id
+    }
+
+    pub fn operation_count(&self) -> usize {
+        self.operations.len()
+    }
+
+    pub fn record_node_selection(&mut self, owner: NodeRef, selection: PlanNodeSelection) {
+        self.node_selection.push((owner, selection));
+    }
+
+    pub fn record_owner_span(&mut self, owner: NodeRef, start: usize, end_exclusive: usize) {
+        if start >= end_exclusive {
+            return;
+        }
+        self.owner_spans.push((
+            owner,
+            PlanOpSpan {
+                start: PlanOpId::from_index(start),
+                end_exclusive,
+            },
+        ));
+    }
+
+    pub fn record_output_owner(&mut self, output: OutputId, owner: NodeRef) {
+        self.output_owners.push((output, owner));
+    }
+
+    pub fn record_owner_field(&mut self, owner: NodeRef, field: FieldSlot) {
+        if !self.owner_fields.contains(&(owner, field)) {
+            self.owner_fields.push((owner, field));
+        }
+    }
+
+    pub fn record_authored_dependency(
+        &mut self,
+        consumer: PlanOpId,
+        source: NodeRef,
+        kind: DepKind,
+    ) {
+        let dependency = PlanAuthoredDependency {
+            source,
+            consumer,
+            kind,
+        };
+        if !self.dependencies.contains(&dependency) {
+            self.dependencies.push(dependency);
+        }
+    }
+
+    pub fn finish(self, final_height: FieldSlot) -> Result<CompiledTerrainPlan, PlanBuildError> {
+        let field_count = self.fields.len();
+        check_slot(final_height, field_count)?;
+
+        let mut provenance = PlanProvenance::with_capacities(self.operations.len(), field_count);
+        for (owner, selection) in &self.node_selection {
+            provenance.record_node_selection(*owner, *selection);
+        }
+        for field in &self.fields {
+            provenance.record_field(field.slot, field.origin.authored());
+        }
+        for (owner, span) in &self.owner_spans {
+            provenance.record_span(*owner, *span);
+        }
+        for (owner, field) in &self.owner_fields {
+            provenance.record_owner_field(*owner, *field);
+        }
+        for dependency in &self.dependencies {
+            provenance.record_dependency(*dependency);
+        }
+        for (index, operation) in self.operations.iter().enumerate() {
+            let operation_id = PlanOpId::from_index(index);
+            provenance.record_operation(operation_id, operation.origin.authored());
+
+            for input in operation.kind.input_slots() {
+                check_slot(input, field_count)?;
+            }
+            for output in operation.kind.output_slots() {
+                check_slot(output, field_count)?;
+                if provenance.producer_of(output).is_some() {
+                    return Err(PlanBuildError::MultipleFieldProducers {
+                        slot: output.index(),
+                    });
+                }
+                provenance.record_producer(output, operation_id);
+            }
+            if let TerrainOpKind::PublishOutput { output, source } = &operation.kind {
+                let owner = self
+                    .output_owners
+                    .iter()
+                    .rev()
+                    .find_map(|(candidate, owner)| (*candidate == *output).then_some(*owner));
+                if !provenance.record_output(*output, *source, operation_id, owner) {
+                    return Err(PlanBuildError::DuplicatePublishedOutput { output: *output });
+                }
+            }
+        }
+
+        let analysis =
+            validate_and_analyze(&self.fields, &self.operations, &provenance, final_height)?;
+        let structure_signature = structure_signature(&self, final_height);
+        Ok(CompiledTerrainPlan {
+            stamp: self.stamp,
+            structure_signature,
+            fields: self.fields,
+            operations: self.operations,
+            provenance,
+            analysis,
+            final_height,
+        })
+    }
+}
+
+fn structure_signature(
+    builder: &TerrainPlanBuilder,
+    final_height: FieldSlot,
+) -> PlanStructureSignature {
+    let mut hasher = StablePlanHasher::default();
+    let fields = &builder.fields;
+    let operations = &builder.operations;
+    let node_selection = &builder.node_selection;
+    let owner_spans = &builder.owner_spans;
+    let owner_fields = &builder.owner_fields;
+    let output_owners = &builder.output_owners;
+    let dependencies = &builder.dependencies;
+    fields.len().hash(&mut hasher);
+    for field in fields {
+        field.slot.hash(&mut hasher);
+        field.kind.hash(&mut hasher);
+        field.origin.hash(&mut hasher);
+    }
+    operations.len().hash(&mut hasher);
+    for operation in operations {
+        operation.origin.hash(&mut hasher);
+        hash_operation_kind(&operation.kind, &mut hasher);
+    }
+    node_selection.len().hash(&mut hasher);
+    for (owner, selection) in node_selection {
+        owner.hash(&mut hasher);
+        selection.hash(&mut hasher);
+    }
+    owner_spans.len().hash(&mut hasher);
+    for (owner, span) in owner_spans {
+        owner.hash(&mut hasher);
+        span.start.hash(&mut hasher);
+        span.end_exclusive.hash(&mut hasher);
+    }
+    owner_fields.len().hash(&mut hasher);
+    for (owner, field) in owner_fields {
+        owner.hash(&mut hasher);
+        field.hash(&mut hasher);
+    }
+    output_owners.len().hash(&mut hasher);
+    for (output, owner) in output_owners {
+        output.hash(&mut hasher);
+        owner.hash(&mut hasher);
+    }
+    dependencies.len().hash(&mut hasher);
+    for dependency in dependencies {
+        dependency.hash(&mut hasher);
+    }
+    final_height.hash(&mut hasher);
+    PlanStructureSignature::from_hash(hasher.finish())
+}
+
+fn hash_operation_kind(kind: &TerrainOpKind, hasher: &mut impl Hasher) {
+    match kind {
+        TerrainOpKind::Seed { source, output } => {
+            0_u8.hash(hasher);
+            source.hash(hasher);
+            output.hash(hasher);
+        }
+        TerrainOpKind::EvaluateMask {
+            input_height,
+            input_fields,
+            output_mask,
+        } => {
+            1_u8.hash(hasher);
+            input_height.hash(hasher);
+            input_fields.hash(hasher);
+            output_mask.hash(hasher);
+        }
+        TerrainOpKind::RunLayerKernel {
+            layer,
+            type_id,
+            input_height,
+            input_fields,
+            output_candidate,
+            output_fields,
+        } => {
+            2_u8.hash(hasher);
+            layer.hash(hasher);
+            type_id.hash(hasher);
+            input_height.hash(hasher);
+            input_fields.hash(hasher);
+            output_candidate.hash(hasher);
+            output_fields.hash(hasher);
+        }
+        TerrainOpKind::CompositeLayer {
+            layer,
+            base,
+            candidate,
+            mask,
+            output,
+        } => {
+            3_u8.hash(hasher);
+            layer.hash(hasher);
+            base.hash(hasher);
+            candidate.hash(hasher);
+            mask.hash(hasher);
+            output.hash(hasher);
+        }
+        TerrainOpKind::CompositeGroup {
+            group,
+            parent,
+            private_seed,
+            child_output,
+            mask,
+            output,
+            mode,
+        } => {
+            4_u8.hash(hasher);
+            group.hash(hasher);
+            parent.hash(hasher);
+            private_seed.hash(hasher);
+            child_output.hash(hasher);
+            mask.hash(hasher);
+            output.hash(hasher);
+            mode.hash(hasher);
+        }
+        TerrainOpKind::CompositeAuxField {
+            group,
+            mask,
+            composite,
+        } => {
+            5_u8.hash(hasher);
+            group.hash(hasher);
+            mask.hash(hasher);
+            composite.field.hash(hasher);
+            composite.parent.hash(hasher);
+            composite.child.hash(hasher);
+            composite.output.hash(hasher);
+        }
+        TerrainOpKind::PublishOutput { output, source } => {
+            6_u8.hash(hasher);
+            output.hash(hasher);
+            source.hash(hasher);
+        }
+    }
+}
+
+/// Fixed FNV-1a rather than `DefaultHasher`, whose algorithm is not a stability contract.
+struct StablePlanHasher(u64);
+
+impl Default for StablePlanHasher {
+    fn default() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
+}
+
+impl Hasher for StablePlanHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 ^= u64::from(*byte);
+            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+}
+
+fn check_slot(slot: FieldSlot, field_count: usize) -> Result<(), PlanBuildError> {
+    if slot.index() < field_count {
+        Ok(())
+    } else {
+        Err(PlanBuildError::InvalidFieldSlot {
+            slot: slot.index(),
+            field_count,
+        })
+    }
+}

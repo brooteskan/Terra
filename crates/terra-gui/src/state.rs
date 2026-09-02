@@ -43,6 +43,8 @@ pub struct GuiState {
     pub open_combo: Option<Id>,
     /// Combo selection applied on the next `combo()` call (set while drawing the menu).
     pub combo_pick: Option<(Id, usize)>,
+    /// Vertical offsets for long combo menus, keyed by combo id.
+    pub combo_scroll: HashMap<u64, f32>,
     /// Previous frame's primary button (for edge detection).
     pub was_primary_down: bool,
     /// Previous frame's secondary (right) button (for edge detection).

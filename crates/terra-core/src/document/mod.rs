@@ -23,7 +23,7 @@ use std::collections::HashMap;
 /// authored identity and semantics. Persisted enum tags are additive (renames
 /// require aliases or migration), and every new persisted field requires a Serde
 /// default or an explicit migration. Writers always stamp this current version.
-pub const DOCUMENT_VERSION: u32 = 2;
+pub const DOCUMENT_VERSION: u32 = 3;
 
 /// Presentation lighting for the 3D viewport, saved with the project so a custom
 /// look is restored on load. Angles are degrees; strengths are renderer multipliers.
@@ -225,9 +225,7 @@ impl TerrainDocument {
             ops: Vec::new(),
             paint: Some({
                 let mut p = PaintBuffer::new(256, 256);
-                for s in &mut p.samples {
-                    *s = 1.0;
-                }
+                p.samples.fill(1.0);
                 p
             }),
             display_color: crate::mask::default_mask_display_color(),
@@ -421,6 +419,9 @@ impl TerrainDocument {
                 doc.version, DOCUMENT_VERSION
             )));
         }
+        doc.metrics.validate().map_err(|error| {
+            serde::de::Error::custom(format!("invalid heightfield metrics: {error}"))
+        })?;
         doc.normalize_wc_tree();
         Ok(doc)
     }
@@ -433,15 +434,6 @@ impl TerrainDocument {
     /// Domain hierarchy view from the single terrain stack.
     pub fn domain_view(&self) -> crate::domain::DomainView {
         crate::domain::DomainView::from_stack(&self.stack)
-    }
-
-    /// Evaluate final height from the single terrain stack.
-    pub fn evaluate_final_height(
-        &mut self,
-        ctx: &mut crate::eval::EvalContext,
-    ) -> Result<crate::Heightfield, crate::eval::EvalError> {
-        let mut evaluator = crate::eval::StackEvaluator::new();
-        evaluator.rebuild_all(&self.stack, ctx)
     }
 
     /// Add a layer via context-aware stack routing.
@@ -551,7 +543,7 @@ impl TerrainDocument {
             placement_id,
             biome_id,
         };
-        let res = self.preview_resolution.min(1024).max(64);
+        let res = self.preview_resolution.clamp(64, 1024);
         let paint = if self.sparse_paint.has_channel(key) {
             let samples = self.sparse_paint.bake_uv(key, res, res, world_x, world_z);
             crate::mask::PaintBuffer {

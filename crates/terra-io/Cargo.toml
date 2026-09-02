@@ -7,9 +7,15 @@ description = "Terrain import/export, GeoTIFF bridge, build packages"
 
 [dependencies]
 terra-core = { workspace = true }
+terra-cpu-eval = { workspace = true }
+terra-jobs = { workspace = true }
 image = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
 rayon = { workspace = true }
+blake3 = { workspace = true }
+
+[lints]
+workspace = true

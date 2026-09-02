@@ -290,11 +290,8 @@ pub fn hierarchy_add_actions(
         workspace_to_create(ui_state.active_workspace),
         ui_state.auto_switch_workspace_on_create,
     );
-    match owner {
-        CreateOwner::Biome(id) => {
-            ctx.active_biome = Some(id);
-        }
-        _ => {}
+    if let CreateOwner::Biome(id) = owner {
+        ctx.active_biome = Some(id);
     }
     available_kinds(&ctx)
         .into_iter()

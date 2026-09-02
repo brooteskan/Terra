@@ -5,16 +5,20 @@
 //! stream-power / river-carve oracles used by the erosion processors; their
 //! drainage prep builds on the geomorph [`crate::geomorph::FlowGraph`].
 
+mod params;
+
+pub use params::{RiverCarveParams, StreamPowerParams};
+
 use std::collections::VecDeque;
 
-use crate::fields::erodibility_at_strata_depth;
+use crate::geology::erodibility_at_strata_depth;
 use crate::geomorph::{
     accumulate_drainage_area, accumulate_drainage_area_d8, build_flow_graph, priority_flood_fill,
     D8Drainage, FlowModel, Precipitation,
 };
 use crate::heightfield::Heightfield;
-use crate::layer::{RiverCarveParams, Stratum, StreamPowerParams};
 use crate::mask::MaskField;
+use crate::material_schema::Stratum;
 
 /// Fill enclosed depressions to their lowest spill elevation using Priority-Flood.
 ///
@@ -320,13 +324,16 @@ fn max_local_slope(hf: &Heightfield, i: u32, j: u32) -> f32 {
 ///   `slope * ((dx + dz) / 2) * 4.0`, then `80.0`.
 ///
 /// The two K's are therefore not interchangeable — see the notes on
-/// [`crate::layer::StreamPowerParams`] and
+/// [`StreamPowerParams`] and
 /// [`crate::landscape_evolution::LandscapeEvolutionParams`]. The Tzathas analytical
 /// solver and the mass-wasting fluvial term are separate cited models that do not
 /// route through here; the GPU shader is a declared approximation (station C1).
 ///
 /// Returns `(rate, step)`: the un-capped incision rate (for the erosion aux) and
 /// the capped per-step incision depth.
+// Stream-power increment: nine independent physical scalars (discharge/slope/
+// k/m/n/softness/dt and the two caps); the flat form is standard for the
+// equation and a struct would group nothing. Kept flat.
 #[allow(clippy::too_many_arguments)]
 pub fn spe_increment(
     q_or_area: f32,
@@ -403,10 +410,10 @@ fn stream_power_erode_impl(
             } else {
                 // Lean flat-D8 path: bit-identical to the general graph (guarded
                 // by `flat_d8_drainage_matches_flow_graph`), reusing buffers.
-                if d8_cache.is_none() {
-                    d8_cache = Some(D8Drainage::build(&filled));
+                if let Some(cache) = d8_cache.as_mut() {
+                    cache.rebuild(&filled);
                 } else {
-                    d8_cache.as_mut().unwrap().rebuild(&filled);
+                    d8_cache = Some(D8Drainage::build(&filled));
                 }
                 let cache = d8_cache.as_ref().unwrap();
                 let acc_vec = accumulate_drainage_area_d8(cache, &Precipitation::uniform(1.0));

@@ -2,8 +2,8 @@ use super::{canonical_seed32, hash2};
 
 /// OpenSimplex-style 2D noise (simplified skew lattice). Approx \[-1, 1\].
 pub fn open_simplex2(x: f32, z: f32, seed: u64) -> f32 {
-    const F2: f32 = 0.366025403; // (sqrt(3)-1)/2
-    const G2: f32 = 0.211324865; // (3-sqrt(3))/6
+    const F2: f32 = 0.366_025_4; // (sqrt(3)-1)/2
+    const G2: f32 = 0.211_324_87; // (3-sqrt(3))/6
 
     let seed = canonical_seed32(seed);
     let s = (x + z) * F2;

@@ -39,9 +39,10 @@ impl Ord for FloodCell {
 }
 
 /// How enclosed depressions are resolved before routing.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum DepressionMode {
     /// Raise pits to spill elevation (Priority-Flood).
+    #[default]
     Fill,
     /// Carve a path from pit to spill (Lindsay-style breach).
     Breach(BreachParams),
@@ -49,12 +50,6 @@ pub enum DepressionMode {
     PreserveBasins(PreserveBasinsParams),
     /// Leave DEM unchanged (caller accepts sinks / flats).
     None,
-}
-
-impl Default for DepressionMode {
-    fn default() -> Self {
-        Self::Fill
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

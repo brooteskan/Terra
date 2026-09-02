@@ -2,16 +2,36 @@
 
 mod arid_landforms;
 mod filter_kernels;
+mod foundation_params;
 pub mod geology;
+mod hydro_params;
 mod morphology;
+mod shape_params;
+mod terrain_params;
+
+pub use crate::filter_params::{BlurParams, EffectFilterKind, EffectFilterParams};
+pub use foundation_params::{FlatParams, RampParams, SculptParams};
+pub use hydro_params::{
+    CoastalParams, FluidSimParams, RiverNetworkParams, RiverNode, SandSimParams,
+};
+pub use shape_params::{
+    PathNode, PathParams, PolygonHeightMode, PolygonHeightParams, ProceduralGenerator,
+    ProceduralShapeParams, Stamp2dParams, Stamp3dParams,
+};
+pub use terrain_params::{
+    CanyonParams, DomainWarpParams, DuneParams, FbmParams, ImportHeightmapParams, IslandArchetype,
+    IslandParams, MesaParams, MountainParams, PlateauParams, TerraceParams, UpliftParams,
+    VolcanoParams, VoronoiParams,
+};
 
 use crate::analyze;
-use crate::eval::EvalError;
 use crate::heightfield::{HeightTile, Heightfield, HeightfieldMetrics, TileId};
-use crate::layer::*;
 use crate::mask::{dist_point_segment, point_in_polygon, MaskField};
 use crate::noise::{self, domain_warp_fbm, fbm, ridged_mf, sample_worley};
+use crate::noise::{FractalNoiseType, NoiseParams, WorleyFeature, WorleyMetric, WorleyParams};
 use rayon::prelude::*;
+use terra_jobs::{try_par_fill, CancelToken};
+use thiserror::Error;
 
 pub fn flat(metrics: HeightfieldMetrics, height: f32) -> Heightfield {
     Heightfield::filled(metrics, height)
@@ -70,10 +90,17 @@ pub fn ramp(metrics: HeightfieldMetrics, p: &RampParams) -> Heightfield {
 
 pub fn noise_field(
     metrics: HeightfieldMetrics,
+    cancel: &CancelToken,
     p: &NoiseParams,
     kind: FractalNoiseType,
-) -> Heightfield {
-    fill_world(metrics, |x, z| {
+) -> Option<Heightfield> {
+    try_fill_world(metrics, cancel, noise_sampler(p, kind))
+}
+
+/// World-space sampler for [`noise_field`]. Shared with the tile-scoped entry
+/// ([`noise_field_tiles`]) so both paths evaluate identical arithmetic (#110).
+fn noise_sampler(p: &NoiseParams, kind: FractalNoiseType) -> impl Fn(f32, f32) -> f32 + Sync + '_ {
+    move |x, z| {
         if p.octaves <= 1 {
             noise::sample_noise(
                 kind,
@@ -84,25 +111,59 @@ pub fn noise_field(
         } else {
             fbm(kind, x, z, p)
         }
-    })
+    }
 }
 
-pub fn worley_field(metrics: HeightfieldMetrics, p: &WorleyParams) -> Heightfield {
-    fill_world(metrics, |x, z| sample_worley(x, z, p))
+pub fn worley_field(
+    metrics: HeightfieldMetrics,
+    cancel: &CancelToken,
+    p: &WorleyParams,
+) -> Option<Heightfield> {
+    try_fill_world(metrics, cancel, worley_sampler(p))
 }
 
-pub fn fbm_field(metrics: HeightfieldMetrics, p: &FbmParams) -> Heightfield {
-    fill_world(metrics, |x, z| fbm(p.noise, x, z, &p.base))
+/// World-space sampler for [`worley_field`] (see [`noise_sampler`]).
+fn worley_sampler(p: &WorleyParams) -> impl Fn(f32, f32) -> f32 + Sync + '_ {
+    move |x, z| sample_worley(x, z, p)
 }
 
-pub fn ridged_field(metrics: HeightfieldMetrics, p: &FbmParams) -> Heightfield {
-    fill_world(metrics, |x, z| ridged_mf(p.noise, x, z, &p.base))
+pub fn fbm_field(
+    metrics: HeightfieldMetrics,
+    cancel: &CancelToken,
+    p: &FbmParams,
+) -> Option<Heightfield> {
+    try_fill_world(metrics, cancel, fbm_sampler(p))
 }
 
-pub fn domain_warp_field(metrics: HeightfieldMetrics, p: &DomainWarpParams) -> Heightfield {
-    fill_world(metrics, |x, z| {
-        domain_warp_fbm(x, z, &p.base, p.warp_strength, p.warp_frequency)
-    })
+/// World-space sampler for [`fbm_field`] (see [`noise_sampler`]).
+fn fbm_sampler(p: &FbmParams) -> impl Fn(f32, f32) -> f32 + Sync + '_ {
+    move |x, z| fbm(p.noise, x, z, &p.base)
+}
+
+pub fn ridged_field(
+    metrics: HeightfieldMetrics,
+    cancel: &CancelToken,
+    p: &FbmParams,
+) -> Option<Heightfield> {
+    try_fill_world(metrics, cancel, ridged_sampler(p))
+}
+
+/// World-space sampler for [`ridged_field`] (see [`noise_sampler`]).
+fn ridged_sampler(p: &FbmParams) -> impl Fn(f32, f32) -> f32 + Sync + '_ {
+    move |x, z| ridged_mf(p.noise, x, z, &p.base)
+}
+
+pub fn domain_warp_field(
+    metrics: HeightfieldMetrics,
+    cancel: &CancelToken,
+    p: &DomainWarpParams,
+) -> Option<Heightfield> {
+    try_fill_world(metrics, cancel, domain_warp_sampler(p))
+}
+
+/// World-space sampler for [`domain_warp_field`] (see [`noise_sampler`]).
+fn domain_warp_sampler(p: &DomainWarpParams) -> impl Fn(f32, f32) -> f32 + Sync + '_ {
+    move |x, z| domain_warp_fbm(x, z, &p.base, p.warp_strength, p.warp_frequency)
 }
 
 pub fn terrace(input: &Heightfield, p: &TerraceParams) -> Heightfield {
@@ -122,25 +183,42 @@ pub fn terrace(input: &Heightfield, p: &TerraceParams) -> Heightfield {
 
 pub fn plateau(input: &Heightfield, p: &PlateauParams) -> Heightfield {
     let mut out = input.clone();
-    let soft = p.soft.max(1e-3);
-    out.map_mut(|h| {
-        if h < p.low {
-            let t = ((h - (p.low - soft)) / soft).clamp(0.0, 1.0);
-            (p.low - soft) + t * soft
-        } else if h > p.high {
-            let t = ((h - p.high) / soft).clamp(0.0, 1.0);
-            p.high + t * soft * 0.25
-        } else {
-            // Flatten toward mid plateau.
-            let mid = (p.low + p.high) * 0.5;
-            h * 0.25 + mid * 0.75
-        }
-    });
+    out.map_mut(|h| plateau_sample(p, h));
     out
 }
 
+/// One-sample plateau remap. Pure `f32 -> f32`, so the whole-field [`plateau`]
+/// pass and the tile-scoped recompute (#100 phase 2) share identical arithmetic.
+pub fn plateau_sample(p: &PlateauParams, h: f32) -> f32 {
+    let soft = p.soft.max(1e-3);
+    if h < p.low {
+        let t = ((h - (p.low - soft)) / soft).clamp(0.0, 1.0);
+        (p.low - soft) + t * soft
+    } else if h > p.high {
+        let t = ((h - p.high) / soft).clamp(0.0, 1.0);
+        p.high + t * soft * 0.25
+    } else {
+        // Flatten toward mid plateau.
+        let mid = (p.low + p.high) * 0.5;
+        h * 0.25 + mid * 0.75
+    }
+}
+
 /// Hard-cap mesa / butte with steep walls and soft talus skirt.
-pub fn mesa(metrics: HeightfieldMetrics, p: &MesaParams) -> Heightfield {
+pub fn mesa(
+    metrics: HeightfieldMetrics,
+    cancel: &CancelToken,
+    p: &MesaParams,
+) -> Option<Heightfield> {
+    try_fill_world(metrics, cancel, mesa_sampler(metrics, p))
+}
+
+/// World-space sampler for [`mesa`] (see [`noise_sampler`]). Metrics-derived
+/// footprint constants are hoisted once, exactly as the whole-field pass did.
+fn mesa_sampler(
+    metrics: HeightfieldMetrics,
+    p: &MesaParams,
+) -> impl Fn(f32, f32) -> f32 + Sync + '_ {
     let short_axis = metrics.world_size_x.min(metrics.world_size_z).max(1.0);
     let radius_m = p.radius.clamp(0.02, 1.0) * short_axis * 0.5;
     let cx = p.center_u.clamp(0.0, 1.0) * metrics.world_size_x;
@@ -152,7 +230,7 @@ pub fn mesa(metrics: HeightfieldMetrics, p: &MesaParams) -> Heightfield {
     let cap_noise = p.cap_noise.max(0.0);
     // Flat cap occupies most of the interior; remaining annulus is the cliff.
     let cap_r = radius_m * 0.82;
-    fill_world(metrics, |x, z| {
+    move |x, z| {
         let dx = x - cx;
         let dz = z - cz;
         let dist = (dx * dx + dz * dz).sqrt();
@@ -197,7 +275,7 @@ pub fn mesa(metrics: HeightfieldMetrics, p: &MesaParams) -> Heightfield {
                 );
         let talus = (1.0 - smooth01(t)).powf(1.22);
         (height * 0.13 * talus * talus_noise).max(0.0)
-    })
+    }
 }
 
 /// Height and semantic coastal fields produced by [`island`].
@@ -433,7 +511,19 @@ pub fn island(metrics: HeightfieldMetrics, p: &IslandParams) -> IslandResult {
     }
 }
 
-pub fn mountains(metrics: HeightfieldMetrics, p: &MountainParams) -> Heightfield {
+pub fn mountains(
+    metrics: HeightfieldMetrics,
+    cancel: &CancelToken,
+    p: &MountainParams,
+) -> Option<Heightfield> {
+    try_fill_world(metrics, cancel, mountains_sampler(metrics, p))
+}
+
+/// World-space sampler for [`mountains`] (see [`noise_sampler`]).
+fn mountains_sampler(
+    metrics: HeightfieldMetrics,
+    p: &MountainParams,
+) -> impl Fn(f32, f32) -> f32 + Sync + '_ {
     let world_scale = metrics.world_size_x.min(metrics.world_size_z).max(1.0);
     let amplitude = p.base.amplitude.max(0.0);
 
@@ -450,7 +540,7 @@ pub fn mountains(metrics: HeightfieldMetrics, p: &MountainParams) -> Heightfield
     detail_params.lacunarity = 2.15;
     detail_params.persistence = 0.52;
 
-    fill_world(metrics, |x, z| {
+    move |x, z| {
         let nx = x / metrics.world_size_x - 0.5;
         let nz = z / metrics.world_size_z - 0.5;
         let ca = p.range_angle.cos();
@@ -496,11 +586,23 @@ pub fn mountains(metrics: HeightfieldMetrics, p: &MountainParams) -> Heightfield
         // piling more positive noise onto every crest.
         let detail = (fine - 0.42) * 2.0 * p.crest_detail.max(0.0) * elev_t.powf(0.68) * range_mask;
         (primary + detail).max(0.0)
-    })
+    }
 }
 
 /// Radial cone + optional crater bowl (World Creator Landscape Volcano intent).
-pub fn volcano(metrics: HeightfieldMetrics, p: &VolcanoParams) -> Heightfield {
+pub fn volcano(
+    metrics: HeightfieldMetrics,
+    cancel: &CancelToken,
+    p: &VolcanoParams,
+) -> Option<Heightfield> {
+    try_fill_world(metrics, cancel, volcano_sampler(metrics, p))
+}
+
+/// World-space sampler for [`volcano`] (see [`noise_sampler`]).
+fn volcano_sampler(
+    metrics: HeightfieldMetrics,
+    p: &VolcanoParams,
+) -> impl Fn(f32, f32) -> f32 + Sync + '_ {
     let short_axis = metrics.world_size_x.min(metrics.world_size_z).max(1.0);
     let radius_m = p.radius.clamp(0.01, 1.0) * short_axis * 0.5;
     let cx = p.center_u.clamp(0.0, 1.0) * metrics.world_size_x;
@@ -510,7 +612,7 @@ pub fn volcano(metrics: HeightfieldMetrics, p: &VolcanoParams) -> Heightfield {
     let crater_r = (p.crater_radius.clamp(0.0, 0.95) * radius_m).max(0.0);
     let crater_d = p.crater_depth.max(0.0);
     let rough = p.roughness.max(0.0);
-    fill_world(metrics, |x, z| {
+    move |x, z| {
         let dx = x - cx;
         let dz = z - cz;
         let dist = (dx * dx + dz * dz).sqrt();
@@ -556,7 +658,7 @@ pub fn volcano(metrics: HeightfieldMetrics, p: &VolcanoParams) -> Heightfield {
             }
         }
         h.max(0.0)
-    })
+    }
 }
 
 /// Coherent ridge-corridor uplift with optional altitude-faded detail.
@@ -564,12 +666,24 @@ pub fn volcano(metrics: HeightfieldMetrics, p: &VolcanoParams) -> Heightfield {
 /// Primary structure is a warped corridor mask × low-frequency ridge profile.
 /// Detail fBm is scaled by local uplift so valleys stay open for drainage
 /// (Musgrave altitude-crossover *concept*, not a full multifractal implementation).
-pub fn uplift(metrics: HeightfieldMetrics, p: &UpliftParams) -> Heightfield {
+pub fn uplift(
+    metrics: HeightfieldMetrics,
+    cancel: &CancelToken,
+    p: &UpliftParams,
+) -> Option<Heightfield> {
+    try_fill_world(metrics, cancel, uplift_sampler(metrics, p))
+}
+
+/// World-space sampler for [`uplift`] (see [`noise_sampler`]).
+fn uplift_sampler(
+    metrics: HeightfieldMetrics,
+    p: &UpliftParams,
+) -> impl Fn(f32, f32) -> f32 + Sync + '_ {
     let amp = p.amplitude.max(0.0);
     let corr_w = p.corridor_width.max(1e-3);
     let fade = p.altitude_fade.clamp(0.0, 1.0);
     let seed = p.seed;
-    fill_world(metrics, |x, z| {
+    move |x, z| {
         // Low-frequency warp so corridors meander without breaking coherence.
         let wx = noise::perlin2(x * p.frequency * 0.35, z * p.frequency * 0.35, seed)
             * p.warp_strength
@@ -615,7 +729,7 @@ pub fn uplift(metrics: HeightfieldMetrics, p: &UpliftParams) -> Heightfield {
         // Detail: fBm attenuated in low-uplift cells so structure drains coherently.
         let detail_params = NoiseParams {
             seed: p.seed ^ 0xC0FFEE,
-            octaves: p.detail_octaves.max(1).min(8),
+            octaves: p.detail_octaves.clamp(1, 8),
             frequency: p.detail_frequency.max(1e-6),
             amplitude: p.detail_amplitude.max(0.0),
             lacunarity: 2.0,
@@ -633,7 +747,7 @@ pub fn uplift(metrics: HeightfieldMetrics, p: &UpliftParams) -> Heightfield {
         };
         let detail_scale = (1.0 - fade) + fade * elev_t;
         primary + detail * detail_scale
-    })
+    }
 }
 
 /// Procedural dunes: directional phasor/wave seed + limited aeolian relaxation.
@@ -641,15 +755,23 @@ pub fn uplift(metrics: HeightfieldMetrics, p: &UpliftParams) -> Heightfield {
 /// Fast interactive approximation. Prefer [`sand_simulation`] for progressive
 /// physical evolution. Morphology emerges from wind / supply / linearity —
 /// transverse, barchan-like, linear, and fields are not hardcoded meshes.
-pub fn dunes(metrics: HeightfieldMetrics, p: &DuneParams) -> Heightfield {
-    dunes_with_aux(metrics, p).0
+pub fn dunes(
+    metrics: HeightfieldMetrics,
+    cancel: &CancelToken,
+    p: &DuneParams,
+) -> Option<Heightfield> {
+    dunes_with_aux(metrics, cancel, p).map(|(height, _)| height)
 }
 
 /// Dunes generator plus shared sand/wind aux channels.
+///
+/// Only the bedrock basin fill is cancellable this phase; the aeolian evolve and
+/// soft-floor pass run to completion (out of scope for #101).
 pub fn dunes_with_aux(
     metrics: HeightfieldMetrics,
+    cancel: &CancelToken,
     p: &DuneParams,
-) -> (Heightfield, analyze::AeolianResult) {
+) -> Option<(Heightfield, analyze::AeolianResult)> {
     let scale = p.effective_scale();
     let height = p.effective_height();
     let crest = p.effective_crest_sharpness();
@@ -657,14 +779,14 @@ pub fn dunes_with_aux(
     let floor = (p.basin_floor.clamp(0.0, 1.0) * height).max(0.0);
 
     // Soft bedrock basin so interdunes read as sand-starved lows.
-    let bedrock_hf = fill_world(metrics, |x, z| {
+    let bedrock_hf = try_fill_world(metrics, cancel, |x, z| {
         let n = noise::perlin2(
             x * scale * 0.22,
             z * scale * 0.19,
             p.base.seed ^ 0xB0A7_D00D,
         );
         floor + (0.5 + 0.5 * n) * height * 0.08 - trough * (0.35 + 0.25 * n).max(0.0)
-    });
+    })?;
 
     let sand = seed_dune_sand(
         metrics,
@@ -692,7 +814,7 @@ pub fn dunes_with_aux(
         wind_warp: 0.25,
         linearity: p.linearity.clamp(0.0, 1.0),
     };
-    state.evolve(&transport, p.iterations.max(1).min(48));
+    state.evolve(&transport, p.iterations.clamp(1, 48));
     let mut result = state.into_result(1.0, &bedrock_hf);
     // Soft floor: lift only the deepest cells with a little noise so we never
     // create a broad exactly-flat interdune slab.
@@ -711,10 +833,14 @@ pub fn dunes_with_aux(
             }
         }
     }
-    (result.height.clone(), result)
+    Some((result.height.clone(), result))
 }
 
 /// Directional band-limited / phasor dune seed (sand thickness in meters).
+// Procedural seeder: metrics plus independent dune parameters (direction,
+// scale, height, supply, sharpness, linearity, seed), each a distinct scalar.
+// Kept flat.
+#[allow(clippy::too_many_arguments)]
 pub fn seed_dune_sand(
     metrics: HeightfieldMetrics,
     direction_deg: f32,
@@ -767,11 +893,23 @@ pub fn seed_dune_sand(
     sand
 }
 
-pub fn canyons(metrics: HeightfieldMetrics, p: &CanyonParams) -> Heightfield {
+pub fn canyons(
+    metrics: HeightfieldMetrics,
+    cancel: &CancelToken,
+    p: &CanyonParams,
+) -> Option<Heightfield> {
+    try_fill_world(metrics, cancel, canyons_sampler(metrics, p))
+}
+
+/// World-space sampler for [`canyons`] (see [`noise_sampler`]).
+fn canyons_sampler(
+    metrics: HeightfieldMetrics,
+    p: &CanyonParams,
+) -> impl Fn(f32, f32) -> f32 + Sync + '_ {
     let base_width = p.width.max(1e-3);
     let longitudinal_freq = 1.0 / (base_width * 11.0).max(1.0);
     let seed_phase = noise::canonical_seed32(p.seed) as f32;
-    fill_world(metrics, |x, z| {
+    move |x, z| {
         let broad = noise::perlin2(z * longitudinal_freq, seed_phase * 0.017, p.seed);
         let detail = noise::perlin2(
             z * longitudinal_freq * 3.1,
@@ -810,11 +948,20 @@ pub fn canyons(metrics: HeightfieldMetrics, p: &CanyonParams) -> Heightfield {
         let local_depth = p.depth.max(0.0) * (0.88 + depth_noise * 0.16).max(0.5);
         let strata = 0.96 + 0.04 * (q * 9.0 * std::f32::consts::TAU + wall_noise).sin();
         -local_depth * (wall * 0.78 + inner * 0.22) * strata
-    })
+    }
 }
 
-pub fn voronoi_regions(metrics: HeightfieldMetrics, p: &VoronoiParams) -> Heightfield {
-    fill_world(metrics, |x, z| {
+pub fn voronoi_regions(
+    metrics: HeightfieldMetrics,
+    cancel: &CancelToken,
+    p: &VoronoiParams,
+) -> Option<Heightfield> {
+    try_fill_world(metrics, cancel, voronoi_sampler(p))
+}
+
+/// World-space sampler for [`voronoi_regions`] (see [`noise_sampler`]).
+fn voronoi_sampler(p: &VoronoiParams) -> impl Fn(f32, f32) -> f32 + Sync + '_ {
+    move |x, z| {
         let w = sample_worley(
             x,
             z,
@@ -830,35 +977,237 @@ pub fn voronoi_regions(metrics: HeightfieldMetrics, p: &VoronoiParams) -> Height
             p.base.seed ^ 0xBEEF,
         );
         w * 0.25 + cell * p.height_per_cell * p.cell_jitter
+    }
+}
+
+// --- Tile-scoped generator entries (#110) ---
+//
+// Each mirrors the matching whole-field generator but fills only the interior of
+// the listed `tiles` in `out`, sharing the exact `*_sampler` closure so scoped
+// and whole-field fills are bit-identical. `out` is seeded by the caller (zeros
+// for these input-independent generators); values outside `tiles` are never read
+// by the scoped blend. Each returns `false` on cancellation (discard `out`).
+
+/// Tile-scoped [`noise_field`].
+pub fn noise_field_tiles(
+    out: &mut Heightfield,
+    tiles: &[TileId],
+    cancel: &CancelToken,
+    p: &NoiseParams,
+    kind: FractalNoiseType,
+) -> bool {
+    try_fill_tiles(out, tiles, cancel, noise_sampler(p, kind))
+}
+
+/// Tile-scoped [`worley_field`].
+pub fn worley_field_tiles(
+    out: &mut Heightfield,
+    tiles: &[TileId],
+    cancel: &CancelToken,
+    p: &WorleyParams,
+) -> bool {
+    try_fill_tiles(out, tiles, cancel, worley_sampler(p))
+}
+
+/// Tile-scoped [`fbm_field`].
+pub fn fbm_field_tiles(
+    out: &mut Heightfield,
+    tiles: &[TileId],
+    cancel: &CancelToken,
+    p: &FbmParams,
+) -> bool {
+    try_fill_tiles(out, tiles, cancel, fbm_sampler(p))
+}
+
+/// Tile-scoped [`ridged_field`].
+pub fn ridged_field_tiles(
+    out: &mut Heightfield,
+    tiles: &[TileId],
+    cancel: &CancelToken,
+    p: &FbmParams,
+) -> bool {
+    try_fill_tiles(out, tiles, cancel, ridged_sampler(p))
+}
+
+/// Tile-scoped [`domain_warp_field`].
+pub fn domain_warp_field_tiles(
+    out: &mut Heightfield,
+    tiles: &[TileId],
+    cancel: &CancelToken,
+    p: &DomainWarpParams,
+) -> bool {
+    try_fill_tiles(out, tiles, cancel, domain_warp_sampler(p))
+}
+
+/// Tile-scoped [`mesa`].
+pub fn mesa_tiles(
+    out: &mut Heightfield,
+    tiles: &[TileId],
+    cancel: &CancelToken,
+    p: &MesaParams,
+) -> bool {
+    let sampler = mesa_sampler(out.metrics, p);
+    try_fill_tiles(out, tiles, cancel, sampler)
+}
+
+/// Tile-scoped [`mountains`].
+pub fn mountains_tiles(
+    out: &mut Heightfield,
+    tiles: &[TileId],
+    cancel: &CancelToken,
+    p: &MountainParams,
+) -> bool {
+    let sampler = mountains_sampler(out.metrics, p);
+    try_fill_tiles(out, tiles, cancel, sampler)
+}
+
+/// Tile-scoped [`volcano`].
+pub fn volcano_tiles(
+    out: &mut Heightfield,
+    tiles: &[TileId],
+    cancel: &CancelToken,
+    p: &VolcanoParams,
+) -> bool {
+    let sampler = volcano_sampler(out.metrics, p);
+    try_fill_tiles(out, tiles, cancel, sampler)
+}
+
+/// Tile-scoped [`uplift`].
+pub fn uplift_tiles(
+    out: &mut Heightfield,
+    tiles: &[TileId],
+    cancel: &CancelToken,
+    p: &UpliftParams,
+) -> bool {
+    let sampler = uplift_sampler(out.metrics, p);
+    try_fill_tiles(out, tiles, cancel, sampler)
+}
+
+/// Tile-scoped [`canyons`].
+pub fn canyons_tiles(
+    out: &mut Heightfield,
+    tiles: &[TileId],
+    cancel: &CancelToken,
+    p: &CanyonParams,
+) -> bool {
+    let sampler = canyons_sampler(out.metrics, p);
+    try_fill_tiles(out, tiles, cancel, sampler)
+}
+
+/// Tile-scoped [`voronoi_regions`].
+pub fn voronoi_regions_tiles(
+    out: &mut Heightfield,
+    tiles: &[TileId],
+    cancel: &CancelToken,
+    p: &VoronoiParams,
+) -> bool {
+    try_fill_tiles(out, tiles, cancel, voronoi_sampler(p))
+}
+
+/// Failure loading an external heightmap image or OBJ mesh for a generator.
+///
+/// Generator-owned so `generators` need not depend on `eval`; the evaluator
+/// boundary maps this into its `EvalError` via `From`.
+#[derive(Debug, Error)]
+pub enum SourceImportError {
+    #[error("failed to load heightmap image \"{path}\": {message}")]
+    Image { path: String, message: String },
+    #[error("failed to read OBJ \"{path}\": {message}")]
+    ObjRead { path: String, message: String },
+    #[error("OBJ \"{path}\" has no vertices")]
+    ObjNoVertices { path: String },
+}
+
+/// Decoded, normalized height samples shared by CPU generators and GPU uploads.
+/// Keeping decoding here makes the CPU exporter the format/precision oracle.
+#[derive(Debug, Clone)]
+pub struct DecodedHeightmap {
+    pub width: u32,
+    pub height: u32,
+    pub samples: Vec<f32>,
+}
+
+impl DecodedHeightmap {
+    #[inline]
+    pub fn sample_nearest(&self, u: f32, v: f32) -> f32 {
+        if self.width == 0 || self.height == 0 {
+            return 0.0;
+        }
+        let x = ((u.clamp(0.0, 1.0) * self.width as f32) as u32).min(self.width - 1);
+        let y = ((v.clamp(0.0, 1.0) * self.height as f32) as u32).min(self.height - 1);
+        self.samples[(y * self.width + x) as usize]
+    }
+}
+
+/// Decode a source image exactly once into the normalized representation used
+/// by both CPU sampling and the GPU source-texture cache.
+pub fn load_heightmap(path: &str) -> Result<DecodedHeightmap, SourceImportError> {
+    let img = image::open(path).map_err(|e| SourceImportError::Image {
+        path: path.to_owned(),
+        message: e.to_string(),
+    })?;
+    let gray = img.to_luma16();
+    let (width, height) = gray.dimensions();
+    let samples = gray
+        .pixels()
+        .map(|pixel| pixel.0[0] as f32 / 65535.0)
+        .collect();
+    Ok(DecodedHeightmap {
+        width,
+        height,
+        samples,
     })
 }
 
 pub fn import_heightmap(
     metrics: HeightfieldMetrics,
     p: &ImportHeightmapParams,
-) -> Result<Heightfield, EvalError> {
+) -> Result<Heightfield, SourceImportError> {
     if p.path.is_empty() {
         return Ok(Heightfield::zeros(metrics));
     }
-    let img = image::open(&p.path).map_err(|e| EvalError::Io(e.to_string()))?;
-    let g = img.to_luma16();
-    let (iw, ih) = g.dimensions();
+    let source = load_heightmap(&p.path)?;
     let mut hf = Heightfield::zeros(metrics);
     for j in 0..metrics.height {
         for i in 0..metrics.width {
             let u = i as f32 / metrics.width as f32;
             let v = j as f32 / metrics.height as f32;
-            let x = ((u * iw as f32) as u32).min(iw - 1);
-            let y = ((v * ih as f32) as u32).min(ih - 1);
-            let pix = g.get_pixel(x, y).0[0] as f32 / 65535.0;
+            let pix = source.sample_nearest(u, v);
             hf.set(i, j, pix * p.height_scale + p.height_offset);
         }
     }
     Ok(hf)
 }
 
+/// Sample a heightmap through caller-provided destination-to-source UV mapping.
+/// Placement semantics stay at the evaluator boundary; this module remains
+/// independent of authoring-layer transform types.
+pub fn sample_heightmap_with(
+    metrics: HeightfieldMetrics,
+    p: &ImportHeightmapParams,
+    mut source_uv: impl FnMut(u32, u32) -> Option<(f32, f32)>,
+) -> Result<Heightfield, SourceImportError> {
+    if p.path.is_empty() {
+        return Ok(Heightfield::zeros(metrics));
+    }
+    let source = load_heightmap(&p.path)?;
+    let mut hf = Heightfield::zeros(metrics);
+    for j in 0..metrics.height {
+        for i in 0..metrics.width {
+            if let Some((u, v)) = source_uv(i, j) {
+                let pix = source.sample_nearest(u, v);
+                hf.set(i, j, pix * p.height_scale + p.height_offset);
+            }
+        }
+    }
+    Ok(hf)
+}
+
 /// 3D stamp: OBJ mesh→height, image heightmap, or procedural rock when empty/unreadable.
-pub fn stamp_3d(metrics: HeightfieldMetrics, p: &Stamp3dParams) -> Result<Heightfield, EvalError> {
+pub fn stamp_3d(
+    metrics: HeightfieldMetrics,
+    p: &Stamp3dParams,
+) -> Result<Heightfield, SourceImportError> {
     if p.path.is_empty() {
         return Ok(procedural_rock_stamp(metrics, p));
     }
@@ -909,8 +1258,11 @@ fn procedural_rock_stamp(metrics: HeightfieldMetrics, p: &Stamp3dParams) -> Heig
 fn stamp_3d_from_obj(
     metrics: HeightfieldMetrics,
     p: &Stamp3dParams,
-) -> Result<Heightfield, EvalError> {
-    let text = std::fs::read_to_string(&p.path).map_err(|e| EvalError::Io(e.to_string()))?;
+) -> Result<Heightfield, SourceImportError> {
+    let text = std::fs::read_to_string(&p.path).map_err(|e| SourceImportError::ObjRead {
+        path: p.path.clone(),
+        message: e.to_string(),
+    })?;
     let mut verts: Vec<[f32; 3]> = Vec::new();
     for line in text.lines() {
         let line = line.trim();
@@ -937,7 +1289,9 @@ fn stamp_3d_from_obj(
         verts.push([x, y, z]);
     }
     if verts.is_empty() {
-        return Err(EvalError::Io("OBJ has no vertices".into()));
+        return Err(SourceImportError::ObjNoVertices {
+            path: p.path.clone(),
+        });
     }
     let mut min_x = f32::INFINITY;
     let mut max_x = f32::NEG_INFINITY;
@@ -975,30 +1329,79 @@ fn stamp_3d_from_obj(
 /// Evaluate a WC-style procedural shape layer (generator picker).
 pub fn procedural_shape(
     metrics: HeightfieldMetrics,
-    p: &crate::layer::ProceduralShapeParams,
-) -> Heightfield {
-    use crate::layer::{FractalNoiseType, ProceduralGenerator};
+    cancel: &CancelToken,
+    p: &ProceduralShapeParams,
+) -> Option<Heightfield> {
     match p.generator {
-        ProceduralGenerator::Mountain => mountains(metrics, &p.mountain),
-        ProceduralGenerator::Hills => fbm_field(metrics, &p.hills),
+        ProceduralGenerator::Mountain => mountains(metrics, cancel, &p.mountain),
+        ProceduralGenerator::Hills => fbm_field(metrics, cancel, &p.hills),
         ProceduralGenerator::Plateau => {
-            let base = fbm_field(metrics, &p.hills);
-            plateau(&base, &p.plateau)
+            // The fBm base is cancellable; the plateau post-pass runs to
+            // completion (out of scope for #101).
+            let base = fbm_field(metrics, cancel, &p.hills)?;
+            Some(plateau(&base, &p.plateau))
         }
-        ProceduralGenerator::Mesa => mesa(metrics, &p.mesa),
-        ProceduralGenerator::Volcano => volcano(metrics, &p.volcano),
-        ProceduralGenerator::Dunes => dunes(metrics, &p.dunes),
-        ProceduralGenerator::Canyon => canyons(metrics, &p.canyon),
+        ProceduralGenerator::Mesa => mesa(metrics, cancel, &p.mesa),
+        ProceduralGenerator::Volcano => volcano(metrics, cancel, &p.volcano),
+        ProceduralGenerator::Dunes => dunes(metrics, cancel, &p.dunes),
+        ProceduralGenerator::Canyon => canyons(metrics, cancel, &p.canyon),
         ProceduralGenerator::Crater => {
+            // effect_filter is not fill_world-based; it stays uncancellable this
+            // phase and is covered coarsely by the between-layer check.
             let base = Heightfield::filled(metrics, 80.0);
-            effect_filter(&base, &p.crater)
+            Some(effect_filter(&base, &p.crater))
         }
-        ProceduralGenerator::Noise => noise_field(metrics, &p.noise, FractalNoiseType::Perlin),
+        ProceduralGenerator::Noise => {
+            noise_field(metrics, cancel, &p.noise, FractalNoiseType::Perlin)
+        }
+    }
+}
+
+/// Tile-scoped [`procedural_shape`] (#110).
+///
+/// Fills only `tiles` in `out`, dispatching to the matching `*_tiles` entry.
+/// Returns `None` for generator variants without a tile-sliced fill — `Dunes`
+/// (its aeolian evolve consumes the whole bedrock field) and `Crater` (its
+/// post-pass is an effect filter, not a per-sample fill) — so the caller falls
+/// back to a whole-field generate. `Some(false)` means a cancel tripped.
+pub fn procedural_shape_tiles(
+    out: &mut Heightfield,
+    tiles: &[TileId],
+    cancel: &CancelToken,
+    p: &ProceduralShapeParams,
+) -> Option<bool> {
+    match p.generator {
+        ProceduralGenerator::Mountain => Some(mountains_tiles(out, tiles, cancel, &p.mountain)),
+        ProceduralGenerator::Hills => Some(fbm_field_tiles(out, tiles, cancel, &p.hills)),
+        ProceduralGenerator::Plateau => {
+            // fBm base then the plateau remap over just the scope tiles, matching
+            // the whole-field `fbm_field` + `plateau()` composition.
+            if !fbm_field_tiles(out, tiles, cancel, &p.hills) {
+                return Some(false);
+            }
+            for &id in tiles {
+                if let Some(dst) = out.tile_mut(id) {
+                    dst.map_interior(|h| plateau_sample(&p.plateau, h));
+                }
+            }
+            Some(true)
+        }
+        ProceduralGenerator::Mesa => Some(mesa_tiles(out, tiles, cancel, &p.mesa)),
+        ProceduralGenerator::Volcano => Some(volcano_tiles(out, tiles, cancel, &p.volcano)),
+        ProceduralGenerator::Canyon => Some(canyons_tiles(out, tiles, cancel, &p.canyon)),
+        ProceduralGenerator::Noise => Some(noise_field_tiles(
+            out,
+            tiles,
+            cancel,
+            &p.noise,
+            FractalNoiseType::Perlin,
+        )),
+        ProceduralGenerator::Dunes | ProceduralGenerator::Crater => None,
     }
 }
 
 /// Closed polygon raise / carve (normalized UV vertices).
-pub fn polygon_height(input: &Heightfield, p: &crate::layer::PolygonHeightParams) -> Heightfield {
+pub fn polygon_height(input: &Heightfield, p: &PolygonHeightParams) -> Heightfield {
     let mut out = input.clone();
     if p.points.len() < 3 {
         return out;
@@ -1059,7 +1462,7 @@ pub fn polygon_height(input: &Heightfield, p: &crate::layer::PolygonHeightParams
 /// Halo exchange is intentionally a separate scheduler step.
 pub fn polygon_height_tile(
     input: &Heightfield,
-    p: &crate::layer::PolygonHeightParams,
+    p: &PolygonHeightParams,
     id: TileId,
 ) -> Option<HeightTile> {
     let mut out = input.tile(id)?.clone();
@@ -1099,10 +1502,8 @@ pub fn polygon_height_tile(
             }
             let h0 = input.get(i, j);
             let target = match p.mode {
-                crate::layer::PolygonHeightMode::RaiseBy => {
-                    h0 + if p.carve { -p.height.abs() } else { p.height }
-                }
-                crate::layer::PolygonHeightMode::SetElevation => {
+                PolygonHeightMode::RaiseBy => h0 + if p.carve { -p.height.abs() } else { p.height },
+                PolygonHeightMode::SetElevation => {
                     if p.carve {
                         h0 - p.height.abs()
                     } else {
@@ -1193,39 +1594,101 @@ pub fn blur(input: &Heightfield, p: &BlurParams) -> Heightfield {
 
 pub fn coastal(input: &Heightfield, p: &CoastalParams) -> Heightfield {
     let mut out = input.clone();
-    out.map_mut(|h| {
-        if p.flatten_below && h < p.sea_level {
-            if p.shelf_depth <= 0.0 {
-                p.sea_level
-            } else {
-                let depth = p.sea_level - h;
-                let slope_scale = p.beach_width.max(1e-3);
-                p.sea_level - p.shelf_depth * (1.0 - (-depth / slope_scale).exp())
-            }
-        } else if h < p.sea_level + p.beach_width {
-            let t = ((h - p.sea_level) / p.beach_width.max(1e-3)).clamp(0.0, 1.0);
-            // Smoothstep keeps the beach tangent gentle at sea level and inland.
-            let soft = t * t * (3.0 - 2.0 * t);
-            p.sea_level + soft * p.beach_width
-        } else {
-            h
-        }
-    });
+    out.map_mut(|h| coastal_sample(p, h));
     out
 }
 
-fn fill_world<F: Fn(f32, f32) -> f32 + Sync>(metrics: HeightfieldMetrics, f: F) -> Heightfield {
+/// One-sample coastal remap. Pure `f32 -> f32`, shared by the whole-field
+/// [`coastal`] pass and the tile-scoped recompute (#100 phase 2).
+pub fn coastal_sample(p: &CoastalParams, h: f32) -> f32 {
+    if p.flatten_below && h < p.sea_level {
+        if p.shelf_depth <= 0.0 {
+            p.sea_level
+        } else {
+            let depth = p.sea_level - h;
+            let slope_scale = p.beach_width.max(1e-3);
+            p.sea_level - p.shelf_depth * (1.0 - (-depth / slope_scale).exp())
+        }
+    } else if h < p.sea_level + p.beach_width {
+        let t = ((h - p.sea_level) / p.beach_width.max(1e-3)).clamp(0.0, 1.0);
+        // Smoothstep keeps the beach tangent gentle at sea level and inland.
+        let soft = t * t * (3.0 - 2.0 * t);
+        p.sea_level + soft * p.beach_width
+    } else {
+        h
+    }
+}
+
+/// Cancellable world-space fill.
+///
+/// Fills the heightfield row by row in parallel, checking `cancel` once per row,
+/// and returns `None` if cancellation trips before the fill completes. `f` is a
+/// pure function of world `(x, z)`, so the row chunking cannot change output.
+///
+/// The row-based shape is kept deliberately so #100's tile restriction
+/// ([`try_fill_tiles`]) shares the exact same per-row cancellable fill.
+fn try_fill_world<F: Fn(f32, f32) -> f32 + Sync>(
+    metrics: HeightfieldMetrics,
+    cancel: &CancelToken,
+    f: F,
+) -> Option<Heightfield> {
     let w = metrics.width;
-    let h = metrics.height;
-    let mut data = vec![0.0f32; (w * h) as usize];
-    data.par_iter_mut().enumerate().for_each(|(idx, v)| {
+    let mut data = vec![0.0f32; (w * metrics.height) as usize];
+    let filled = try_par_fill(cancel, &mut data, w as usize, |idx| {
         let i = (idx as u32) % w;
         let j = (idx as u32) / w;
-        let x = metrics.world_x(i);
-        let z = metrics.world_z(j);
-        *v = f(x, z);
+        f(metrics.world_x(i), metrics.world_z(j))
     });
-    Heightfield::from_dense(metrics, &data)
+    filled.then(|| Heightfield::from_dense(metrics, &data))
+}
+
+/// Cancellable tile-scoped world-space fill (#100 phase 3).
+///
+/// Overwrites only the interior samples of the listed `tiles` in `out`, computing
+/// each sample from the same world `(x, z)` closure as [`try_fill_world`] using
+/// the tile's *global* sample indices (`metrics.world_x`/`world_z`). World-space
+/// sampling is therefore exact: a scoped fill of any tile set is bit-identical to
+/// the whole-field fill restricted to those tiles, with no sub-field origin drift.
+///
+/// Each tile interior fills in parallel one interior row per chunk, checking
+/// `cancel` once per row (mirroring [`try_fill_world`]'s granularity). A cancel
+/// trip returns `false` promptly, leaving `out` partially written — the caller
+/// must discard it. Halos are intentionally left stale: refreshing the recomputed
+/// tiles' ghost rings is the scheduler's job (`refresh_halos_for`). Out-of-range
+/// tile ids are skipped.
+#[must_use]
+fn try_fill_tiles<F: Fn(f32, f32) -> f32 + Sync>(
+    out: &mut Heightfield,
+    tiles: &[TileId],
+    cancel: &CancelToken,
+    f: F,
+) -> bool {
+    let metrics = out.metrics;
+    let mut scratch: Vec<f32> = Vec::new();
+    for &id in tiles {
+        let Some(tile) = out.tile_mut(id) else {
+            continue;
+        };
+        let iw = tile.interior_width;
+        let ih = tile.interior_height;
+        let (ox, oz) = tile.interior_origin(&metrics);
+        scratch.clear();
+        scratch.resize((iw * ih) as usize, 0.0);
+        let filled = try_par_fill(cancel, &mut scratch, iw as usize, |idx| {
+            let lx = (idx as u32) % iw;
+            let lz = (idx as u32) / iw;
+            f(metrics.world_x(ox + lx), metrics.world_z(oz + lz))
+        });
+        if !filled {
+            return false;
+        }
+        for lz in 0..ih {
+            for lx in 0..iw {
+                tile.set_interior(lx, lz, scratch[(lz * iw + lx) as usize]);
+            }
+        }
+    }
+    true
 }
 
 fn mix_strength(
@@ -1263,7 +1726,7 @@ pub fn effect_filter(input: &Heightfield, p: &EffectFilterParams) -> Heightfield
             // (bilateral) — which by design keeps sharp features, including a
             // lone spike, intact and so is the wrong tool for reducing spikes.
             let mut h = input.clone();
-            for _ in 0..p.iterations.max(1).min(4) {
+            for _ in 0..p.iterations.clamp(1, 4) {
                 h = filter_kernels::box_blur(&h, p.radius.max(1));
             }
             h
@@ -1343,7 +1806,7 @@ pub fn effect_filter(input: &Heightfield, p: &EffectFilterParams) -> Heightfield
             let mut h = input.clone();
             let sigma_s = (p.radius.max(1) as f32) * 0.55;
             let sigma_r = p.amount.max(0.5);
-            for _ in 0..p.iterations.max(1).min(4) {
+            for _ in 0..p.iterations.clamp(1, 4) {
                 h = filter_kernels::bilateral(&h, p.radius.max(1), sigma_s, sigma_r);
             }
             h
@@ -1588,15 +2051,18 @@ pub fn path_stamp_tile(input: &Heightfield, p: &PathParams, id: TileId) -> Optio
     })
 }
 
-#[derive(Clone, Copy)]
-struct PathSample {
-    x: f32,
-    z: f32,
-    height: f32,
-    width: f32,
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PathSample {
+    pub x: f32,
+    pub z: f32,
+    pub height: f32,
+    pub width: f32,
 }
 
-fn path_samples(p: &PathParams, world_x: f32, world_z: f32) -> Vec<PathSample> {
+/// Tessellate an authored path into the exact world-space polyline consumed by
+/// [`path_stamp`]. GPU preview uploads this result rather than reimplementing the
+/// Catmull-Rom endpoint and adaptive-step rules in a second place.
+pub fn path_samples(p: &PathParams, world_x: f32, world_z: f32) -> Vec<PathSample> {
     let node = |index: usize| {
         let n = &p.nodes[index];
         PathSample {
@@ -1868,10 +2334,10 @@ pub fn sand_simulation_full(
     let mut state = analyze::AeolianState::from_height_and_sand(input, 0.0, Some(&sand));
     // Treat input height as bedrock + existing cover: peel authored sand off the DEM.
     let dense = input.to_dense();
-    for i in 0..dense.len() {
-        let s = state.sand[i].min(dense[i].max(0.0));
-        state.sand[i] = s;
-        state.bedrock[i] = (dense[i] - s).max(0.0);
+    for ((sand, bedrock), &d) in state.sand.iter_mut().zip(&mut state.bedrock).zip(&dense) {
+        let s = (*sand).min(d.max(0.0));
+        *sand = s;
+        *bedrock = (d - s).max(0.0);
     }
 
     let transport = analyze::AeolianTransportParams {
@@ -1880,7 +2346,7 @@ pub fn sand_simulation_full(
         transport_length: p.transport_length.max(0.5),
         repose_angle_deg: p.slope_angle_deg.clamp(12.0, 45.0),
         slab_size: (cover * 0.08).clamp(0.05, 1.5),
-        avalanche_iters: p.avalanche_iters.max(1).min(64),
+        avalanche_iters: p.avalanche_iters.clamp(1, 64),
         abrasion: p.abrasion.clamp(0.0, 1.0),
         reptation: p.reptation.clamp(0.0, 1.0),
         wind_warp: 0.4,
@@ -1963,6 +2429,171 @@ mod tests {
     }
 
     #[test]
+    fn tile_fill_matches_world_fill_on_scope_tiles() {
+        // A non-square field with a partial edge tile row/col exercises ragged tiles.
+        let metrics = HeightfieldMetrics {
+            width: 40,
+            height: 24,
+            world_size_x: 40.0,
+            world_size_z: 24.0,
+            tile_size: 16,
+            halo: 2,
+        };
+        let f = |x: f32, z: f32| (x * 0.37).sin() + (z * 0.21).cos() * 3.0 + x - z;
+        let whole = try_fill_world(metrics, &CancelToken::never(), f).expect("world fill");
+
+        // Fill a subset of tiles (including a partial edge tile) into a zero field;
+        // the scoped result must be bit-identical to the whole-field fill there.
+        let mut scoped = Heightfield::zeros(metrics);
+        let scope = [
+            TileId { tx: 0, tz: 0 },
+            TileId { tx: 2, tz: 1 }, // partial edge tile (interior 8x8)
+        ];
+        assert!(try_fill_tiles(
+            &mut scoped,
+            &scope,
+            &CancelToken::never(),
+            f
+        ));
+
+        for id in scope {
+            let tile = whole.tile(id).expect("scope tile exists");
+            let (ox, oz) = tile.interior_origin(&metrics);
+            for lz in 0..tile.interior_height {
+                for lx in 0..tile.interior_width {
+                    assert_eq!(
+                        scoped.get(ox + lx, oz + lz).to_bits(),
+                        whole.get(ox + lx, oz + lz).to_bits(),
+                        "scope tile {id:?} sample ({lx},{lz}) must match whole-field fill"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pre_cancelled_tile_fill_returns_false() {
+        let metrics = HeightfieldMetrics::new(32, 32, 32.0, 32.0);
+        let (token, flag) = CancelToken::flag();
+        flag.cancel();
+        let mut out = Heightfield::zeros(metrics);
+        let done = try_fill_tiles(&mut out, &[TileId { tx: 0, tz: 0 }], &token, |_, _| 1.0);
+        assert!(!done, "a pre-cancelled token must abort the fill");
+    }
+
+    #[test]
+    fn mid_fill_cancel_stops_tile_fill() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        // Many small tiles so a cancel tripped inside the first tile's fill still
+        // leaves the fill reporting cancellation (mirrors the terra-jobs proof).
+        let metrics = HeightfieldMetrics {
+            width: 256,
+            height: 256,
+            world_size_x: 256.0,
+            world_size_z: 256.0,
+            tile_size: 16,
+            halo: 2,
+        };
+        let mut out = Heightfield::zeros(metrics);
+        let scope: Vec<TileId> = (0..metrics.tiles_z())
+            .flat_map(|tz| (0..metrics.tiles_x()).map(move |tx| TileId { tx, tz }))
+            .collect();
+
+        let (token, flag) = CancelToken::flag();
+        let flag = Arc::new(flag);
+        let tripped = Arc::new(AtomicBool::new(false));
+        let f = {
+            let flag = Arc::clone(&flag);
+            let tripped = Arc::clone(&tripped);
+            move |x: f32, _z: f32| {
+                if x >= 4.0
+                    && tripped
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                {
+                    flag.cancel();
+                }
+                1.0
+            }
+        };
+        assert!(
+            !try_fill_tiles(&mut out, &scope, &token, f),
+            "a mid-fill cancel must report cancellation"
+        );
+    }
+
+    #[test]
+    fn import_heightmap_missing_file_reports_image_error_with_path() {
+        let metrics = HeightfieldMetrics::new(8, 8, 64.0, 64.0);
+        let p = ImportHeightmapParams {
+            path: "does/not/exist.png".into(),
+            ..ImportHeightmapParams::default()
+        };
+        let err = import_heightmap(metrics, &p).expect_err("missing image must error");
+        assert!(matches!(err, SourceImportError::Image { .. }));
+        assert!(
+            err.to_string().contains("does/not/exist.png"),
+            "message must keep the source path: {err}"
+        );
+    }
+
+    #[test]
+    fn import_heightmap_empty_path_yields_zero_field() {
+        let metrics = HeightfieldMetrics::new(8, 8, 64.0, 64.0);
+        let hf = import_heightmap(metrics, &ImportHeightmapParams::default())
+            .expect("empty path is not an import error");
+        assert!(field_bits(&hf).iter().all(|&bits| bits == 0.0f32.to_bits()));
+    }
+
+    #[test]
+    fn stamp_3d_from_obj_missing_file_reports_obj_read_error_with_path() {
+        let metrics = HeightfieldMetrics::new(8, 8, 64.0, 64.0);
+        let path = std::env::temp_dir().join(format!(
+            "terra_stamp3d_missing_{}.obj",
+            uuid::Uuid::new_v4()
+        ));
+        let p = Stamp3dParams {
+            path: path.to_string_lossy().into_owned(),
+            ..Stamp3dParams::default()
+        };
+        let err = stamp_3d_from_obj(metrics, &p).expect_err("missing OBJ must error");
+        assert!(matches!(err, SourceImportError::ObjRead { .. }));
+        assert!(
+            err.to_string().contains(p.path.as_str()),
+            "message must keep the source path: {err}"
+        );
+    }
+
+    #[test]
+    fn stamp_3d_from_obj_without_vertices_reports_no_vertices() {
+        let metrics = HeightfieldMetrics::new(8, 8, 64.0, 64.0);
+        let path =
+            std::env::temp_dir().join(format!("terra_stamp3d_empty_{}.obj", uuid::Uuid::new_v4()));
+        std::fs::write(&path, "# comment only\nvn 0 1 0\nvt 0 0\n").expect("write temp obj");
+        let p = Stamp3dParams {
+            path: path.to_string_lossy().into_owned(),
+            ..Stamp3dParams::default()
+        };
+        let err = stamp_3d_from_obj(metrics, &p).expect_err("vertexless OBJ must error");
+        let _ = std::fs::remove_file(&path);
+        assert!(matches!(err, SourceImportError::ObjNoVertices { .. }));
+        assert!(err.to_string().contains(p.path.as_str()));
+    }
+
+    #[test]
+    fn stamp_3d_swallows_source_failure_and_falls_back_to_procedural() {
+        let metrics = HeightfieldMetrics::new(8, 8, 64.0, 64.0);
+        let p = Stamp3dParams {
+            path: "does/not/exist.obj".into(),
+            ..Stamp3dParams::default()
+        };
+        let hf = stamp_3d(metrics, &p).expect("stamp_3d never surfaces the import error");
+        assert_eq!(hf.metrics.width, metrics.width);
+    }
+
+    #[test]
     fn high_seed_bits_change_generators_and_seeded_effect_filters() {
         let low = 7;
         let high = low + (1u64 << 32);
@@ -1982,8 +2613,8 @@ mod tests {
         let mut canyon_high = canyon_low.clone();
         canyon_high.seed = high;
         assert_ne!(
-            field_bits(&canyons(metrics, &canyon_low)),
-            field_bits(&canyons(metrics, &canyon_high))
+            field_bits(&canyons(metrics, &CancelToken::never(), &canyon_low).unwrap()),
+            field_bits(&canyons(metrics, &CancelToken::never(), &canyon_high).unwrap())
         );
 
         let input = Heightfield::filled(metrics, 25.0);
@@ -2073,7 +2704,7 @@ mod tests {
             soft: 0.1,
             seed: 1,
         };
-        let hf = mesa(metrics, &p);
+        let hf = mesa(metrics, &CancelToken::never(), &p).unwrap();
         let center = hf.get(32, 32);
         assert!(
             (center - 200.0).abs() < 1.0,
@@ -2096,8 +2727,12 @@ mod tests {
         linear.direction_deg = 0.0;
         let mut star = linear.clone();
         star.linearity = 0.1;
-        let a = dunes(metrics, &linear).to_dense();
-        let b = dunes(metrics, &star).to_dense();
+        let a = dunes(metrics, &CancelToken::never(), &linear)
+            .unwrap()
+            .to_dense();
+        let b = dunes(metrics, &CancelToken::never(), &star)
+            .unwrap()
+            .to_dense();
         // Cross-wind variance along a column should differ when linearity changes.
         let col_var = |data: &[f32]| {
             let mut sum = 0.0f32;
@@ -2137,7 +2772,7 @@ mod tests {
     fn mountains_keep_continuous_crests_without_saturated_plateaus() {
         let metrics = HeightfieldMetrics::new(128, 128, 4096.0, 4096.0);
         let p = MountainParams::default();
-        let hf = mountains(metrics, &p);
+        let hf = mountains(metrics, &CancelToken::never(), &p).unwrap();
         let dense = hf.to_dense();
         let (min_h, max_h) = hf.min_max();
         assert!(
@@ -2159,7 +2794,7 @@ mod tests {
     fn volcano_has_a_crater_below_an_irregular_rim() {
         let metrics = HeightfieldMetrics::new(129, 129, 4096.0, 4096.0);
         let p = VolcanoParams::default();
-        let hf = volcano(metrics, &p);
+        let hf = volcano(metrics, &CancelToken::never(), &p).unwrap();
         let center = hf.get(64, 64);
         let max_h = hf.to_dense().into_iter().fold(f32::NEG_INFINITY, f32::max);
         assert!(
@@ -2171,7 +2806,7 @@ mod tests {
     #[test]
     fn dunes_and_canyons_do_not_repeat_one_flat_cross_section() {
         let dune_metrics = HeightfieldMetrics::new(128, 128, 2048.0, 2048.0);
-        let dune_hf = dunes(dune_metrics, &DuneParams::default());
+        let dune_hf = dunes(dune_metrics, &CancelToken::never(), &DuneParams::default()).unwrap();
         let dense = dune_hf.to_dense();
         let min_h = dense.iter().copied().fold(f32::INFINITY, f32::min);
         let floor_cells = dense.iter().filter(|&&h| (h - min_h).abs() < 1e-4).count();
@@ -2182,7 +2817,7 @@ mod tests {
 
         let canyon_metrics = HeightfieldMetrics::new(160, 128, 3200.0, 3200.0);
         let p = CanyonParams::default();
-        let canyon = canyons(canyon_metrics, &p);
+        let canyon = canyons(canyon_metrics, &CancelToken::never(), &p).unwrap();
         let mut widths = Vec::new();
         let mut centers = Vec::new();
         for j in 0..canyon_metrics.height {

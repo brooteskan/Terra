@@ -4,10 +4,11 @@
 //! GPU preview may skip height-affecting work, while climate AuxMaps are baked
 //! on CPU and uploaded as R32Float for overlays.
 
-use crate::analyze::jump_flood_distance;
 use crate::heightfield::Heightfield;
-use crate::layer::{BiomeBand, BiomesParams, OPEN_HEIGHT_MAX, OPEN_HEIGHT_MIN};
 use crate::mask::MaskField;
+pub use crate::material_schema::default_climate_bands;
+use crate::material_schema::{BiomeBand, BiomesParams};
+use crate::spatial_kernels::jump_flood_distance;
 
 /// Packed climate / biome output maps (all values typically in \[0,1\]).
 #[derive(Debug, Clone)]
@@ -201,6 +202,9 @@ pub fn classify_biomes(
     out
 }
 
+// Predicate over a climate sample: the band plus six independent scalar
+// channels (height/wetness/temp/rain/snow/soil) and a use-climate flag. Kept flat.
+#[allow(clippy::too_many_arguments)]
 fn band_matches(
     band: &BiomeBand,
     h: f32,
@@ -267,122 +271,4 @@ fn angle_diff(a: f32, b: f32) -> f32 {
         d -= 360.0;
     }
     d
-}
-
-/// Default climate-aware biome LUT used by [`BiomesParams::default`].
-pub fn default_climate_bands() -> Vec<BiomeBand> {
-    vec![
-        BiomeBand {
-            name: "Desert".into(),
-            id: 1,
-            min_height: OPEN_HEIGHT_MIN,
-            max_height: OPEN_HEIGHT_MAX,
-            min_wetness: 0.0,
-            max_wetness: 1.0,
-            min_temp: 0.45,
-            max_temp: 1.0,
-            min_precip: 0.0,
-            max_precip: 0.28,
-            min_snow: 0.0,
-            max_snow: 0.15,
-            min_soil_moisture: 0.0,
-            max_soil_moisture: 0.35,
-        },
-        BiomeBand {
-            name: "Grassland".into(),
-            id: 2,
-            min_height: OPEN_HEIGHT_MIN,
-            max_height: OPEN_HEIGHT_MAX,
-            min_wetness: 0.0,
-            max_wetness: 1.0,
-            min_temp: 0.35,
-            max_temp: 0.85,
-            min_precip: 0.22,
-            max_precip: 0.55,
-            min_snow: 0.0,
-            max_snow: 0.25,
-            min_soil_moisture: 0.0,
-            max_soil_moisture: 1.0,
-        },
-        BiomeBand {
-            name: "Temperate Forest".into(),
-            id: 3,
-            min_height: OPEN_HEIGHT_MIN,
-            max_height: OPEN_HEIGHT_MAX,
-            min_wetness: 0.0,
-            max_wetness: 1.0,
-            min_temp: 0.28,
-            max_temp: 0.75,
-            min_precip: 0.45,
-            max_precip: 1.0,
-            min_snow: 0.0,
-            max_snow: 0.35,
-            min_soil_moisture: 0.15,
-            max_soil_moisture: 1.0,
-        },
-        BiomeBand {
-            name: "Wetland".into(),
-            id: 4,
-            min_height: OPEN_HEIGHT_MIN,
-            max_height: OPEN_HEIGHT_MAX,
-            min_wetness: 0.0,
-            max_wetness: 1.0,
-            min_temp: 0.2,
-            max_temp: 0.9,
-            min_precip: 0.35,
-            max_precip: 1.0,
-            min_snow: 0.0,
-            max_snow: 0.2,
-            min_soil_moisture: 0.65,
-            max_soil_moisture: 1.0,
-        },
-        BiomeBand {
-            name: "Boreal".into(),
-            id: 5,
-            min_height: OPEN_HEIGHT_MIN,
-            max_height: OPEN_HEIGHT_MAX,
-            min_wetness: 0.0,
-            max_wetness: 1.0,
-            min_temp: 0.12,
-            max_temp: 0.4,
-            min_precip: 0.25,
-            max_precip: 1.0,
-            min_snow: 0.0,
-            max_snow: 0.7,
-            min_soil_moisture: 0.0,
-            max_soil_moisture: 1.0,
-        },
-        BiomeBand {
-            name: "Alpine".into(),
-            id: 6,
-            min_height: OPEN_HEIGHT_MIN,
-            max_height: OPEN_HEIGHT_MAX,
-            min_wetness: 0.0,
-            max_wetness: 1.0,
-            min_temp: 0.0,
-            max_temp: 0.28,
-            min_precip: 0.0,
-            max_precip: 1.0,
-            min_snow: 0.35,
-            max_snow: 1.0,
-            min_soil_moisture: 0.0,
-            max_soil_moisture: 1.0,
-        },
-        BiomeBand {
-            name: "Coast".into(),
-            id: 7,
-            min_height: OPEN_HEIGHT_MIN,
-            max_height: 25.0,
-            min_wetness: 0.0,
-            max_wetness: 1.0,
-            min_temp: 0.25,
-            max_temp: 1.0,
-            min_precip: 0.2,
-            max_precip: 1.0,
-            min_snow: 0.0,
-            max_snow: 0.2,
-            min_soil_moisture: 0.0,
-            max_soil_moisture: 1.0,
-        },
-    ]
 }

@@ -68,8 +68,8 @@ pub fn evolve_iterative(
 
         // Discharge Q ≈ rain × drainage area.
         let mut q = vec![0.0f32; n];
-        for idx in 0..n {
-            q[idx] = (cache.accumulation[idx] * cell_area * area_scale).max(cell_area);
+        for (q_cell, &accum) in q.iter_mut().zip(&cache.accumulation) {
+            *q_cell = (accum * cell_area * area_scale).max(cell_area);
         }
 
         let mut max_delta = 0.0f32;
@@ -152,7 +152,7 @@ fn slope_to_receiver(z: &Heightfield, i: usize, j: usize, cache: &DrainageCache)
         let di = ri as i32 - i as i32;
         let dj = rj as i32 - j as i32;
         let dist = if di != 0 && dj != 0 {
-            ((dx * dx + dz * dz) as f32).sqrt()
+            (dx * dx + dz * dz).sqrt()
         } else if di != 0 {
             dx
         } else {
@@ -169,7 +169,7 @@ fn slope_to_receiver(z: &Heightfield, i: usize, j: usize, cache: &DrainageCache)
             continue;
         }
         let dist = if di != 0 && dj != 0 {
-            ((dx * dx + dz * dz) as f32).sqrt()
+            (dx * dx + dz * dz).sqrt()
         } else if di != 0 {
             dx
         } else {

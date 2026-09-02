@@ -1,8 +1,9 @@
-use crate::fields::{erodibility_at_strata_depth, stability_at_strata_depth};
-use crate::generators::geology::strata_depth_m;
+use crate::geology::{erodibility_at_strata_depth, stability_at_strata_depth, strata_depth_m};
 use crate::heightfield::Heightfield;
-use crate::layer::{BedGeometry, HydraulicErosionParams, Stratum, ThermalErosionParams};
 use crate::mask::MaskField;
+use crate::material_schema::{BedGeometry, Stratum};
+
+use super::{HydraulicErosionParams, ThermalErosionParams};
 
 /// Thermal erosion via talus-angle redistribution (CPU reference).
 /// Returns (height, erosion_mask, deposition_mask).
@@ -905,6 +906,10 @@ fn add_bilinear(
     amount
 }
 
+// Hot droplet-erosion kernel: height/erosion buffers + hardness field + grid
+// dims + brush position/radius/amount, each a distinct scalar. Flat is the
+// idiomatic, hot-path form. Kept flat.
+#[allow(clippy::too_many_arguments)]
 fn erode_particle_brush(
     heights: &mut [f32],
     erosion: &mut [f32],

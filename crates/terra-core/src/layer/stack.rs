@@ -6,10 +6,27 @@ use crate::mask::Distribution;
 use serde::{Deserialize, Serialize};
 
 /// Nested group or single layer in the stack (bottom → top order in Vec).
+// The `Layer` payload is intrinsic per-node document data and the common case, so
+// boxing it would only add an allocation per node without shrinking the footprint.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum StackNode {
     Layer(Layer),
     Group(LayerGroup),
+}
+
+impl StackNode {
+    /// Whether this node is, or contains, an authored solo layer.
+    ///
+    /// Enabled state is intentionally ignored. Solo filtering is selected at a
+    /// sibling boundary before disabled nodes are treated as identity work, which
+    /// matches the authoritative tree evaluator.
+    pub fn contains_solo(&self) -> bool {
+        match self {
+            Self::Layer(layer) => layer.common.solo,
+            Self::Group(group) => group.children.iter().any(Self::contains_solo),
+        }
+    }
 }
 
 /// Composition unit: children evaluate as a subtree, then (for isolated groups)
@@ -469,7 +486,7 @@ impl LayerStack {
 
     /// Flatten to layers in bottom→top evaluation order, skipping disabled groups.
     ///
-    /// Prefer tree evaluation ([`crate::eval::StackEvaluator`]) when groups are scoped;
+    /// Prefer CPU tree evaluation when groups are scoped;
     /// flatten remains useful for leaf iteration, dirty ids, and GPU approximate paths.
     pub fn flatten_layers(&self) -> Vec<&Layer> {
         let mut out = Vec::new();
@@ -572,7 +589,7 @@ impl LayerStack {
     /// Scoped groups compose their children as a unit, while solo mode filters sibling
     /// nodes at each tree level. Neither contract can be represented by a flattened suffix.
     pub fn requires_tree_evaluation(&self) -> bool {
-        self.has_scoped_groups() || self.flatten_layers().iter().any(|layer| layer.common.solo)
+        self.has_scoped_groups() || self.nodes.iter().any(StackNode::contains_solo)
     }
 
     pub fn index_of(&self, id: LayerId) -> Option<usize> {
@@ -863,10 +880,8 @@ fn contains_id(nodes: &[StackNode], id: LayerId) -> bool {
         match n {
             StackNode::Layer(l) if l.id() == id => return true,
             StackNode::Group(g) if g.id == id => return true,
-            StackNode::Group(g) => {
-                if contains_id(&g.children, id) {
-                    return true;
-                }
+            StackNode::Group(g) if contains_id(&g.children, id) => {
+                return true;
             }
             _ => {}
         }

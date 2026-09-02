@@ -147,8 +147,8 @@ impl LevelStepSettings {
         }
         let n = levels.len();
         let keep = match quality {
-            crate::quality::PreviewQuality::Draft => (n + 2) / 3,
-            crate::quality::PreviewQuality::Medium => (2 * n + 2) / 3,
+            crate::quality::PreviewQuality::Draft => n.div_ceil(3),
+            crate::quality::PreviewQuality::Medium => (2 * n).div_ceil(3),
             crate::quality::PreviewQuality::Full | crate::quality::PreviewQuality::Export => n,
         }
         .max(1)
@@ -186,9 +186,8 @@ impl LevelStepSettings {
         // a coarser grid; values below one retain more fine structure.
         let precision = self.precision.clamp(0.25, 4.0);
         for level in &mut levels {
-            level.resolution = ((level.resolution as f32 / precision).round() as u32)
-                .max(32)
-                .min(16_384);
+            level.resolution =
+                ((level.resolution as f32 / precision).round() as u32).clamp(32, 16_384);
         }
         levels.dedup_by(|a, b| a.resolution == b.resolution);
 

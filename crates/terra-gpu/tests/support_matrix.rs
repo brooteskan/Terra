@@ -1,15 +1,96 @@
-use terra_core::eval::{EvalContext, StackEvaluator};
 use terra_core::heightfield::HeightfieldMetrics;
 use terra_core::layer::{
-    BlendMode, EffectFilterKind, EffectFilterParams, FbmParams, FlatParams, FractalNoiseType,
-    Layer, LayerKind, LayerStack, LayerTypeRegistry, NoiseParams,
+    BindingSource, BiomesParams, BlendMode, CanyonParams, DomainWarpParams, DuneParams,
+    EffectFilterKind, EffectFilterParams, FbmParams, FlatParams, FractalNoiseType,
+    ImportHeightmapParams, IslandParams, Layer, LayerKind, LayerStack, LayerTypeRegistry,
+    MesaParams, MountainParams, MultiScaleAmplifyParams, NoiseParams, ParamBinding, PathNode,
+    PathParams, PlateauParams, PolygonHeightMode, PolygonHeightParams, ProceduralGenerator,
+    ProceduralShapeParams, RiverCarveParams, Stamp2dParams, Stamp3dParams, StreamPowerParams,
+    UpliftParams, VolcanoParams, VoronoiParams,
 };
-use terra_gpu::{compile_gpu_graph, layer_gpu_supported, GpuKernel};
+use terra_core::mask::{MaskAsset, MaskId, MaskOp, MaskRef, MaskSource};
+use terra_cpu_eval::{EvalContext, StackEvaluator};
+use terra_gpu::{
+    compile_gpu_graph, layer_gpu_supported, GpuDirtyPolicy, GpuFallbackCode, GpuKernel,
+};
 
 fn graph_for(layer: Layer) -> terra_gpu::GpuComputeGraph {
     let mut stack = LayerStack::new();
     stack.push(layer);
     compile_gpu_graph(&stack, &[])
+}
+
+#[test]
+fn configuration_gates_publish_stable_fallback_codes() {
+    let reason_for = |layer: Layer| {
+        graph_for(layer)
+            .cpu_fallback
+            .expect("configuration must have a CPU boundary")
+            .reason
+            .code
+    };
+
+    let mut bound = Layer::new("bound", LayerKind::Flat(FlatParams::default()));
+    bound
+        .common
+        .param_bindings
+        .push(ParamBinding::new("opacity", BindingSource::Constant(0.5)));
+    assert_eq!(reason_for(bound), GpuFallbackCode::ParameterBinding);
+
+    let derived_seed_overflow = Layer::new(
+        "seed overflow",
+        LayerKind::NoisePerlin(NoiseParams {
+            seed: u64::from(u32::MAX),
+            octaves: 2,
+            ..NoiseParams::default()
+        }),
+    );
+    assert_eq!(
+        reason_for(derived_seed_overflow),
+        GpuFallbackCode::SeedRange
+    );
+
+    let unsupported_options = Layer::new(
+        "unsupported fractal options",
+        LayerKind::Fbm(FbmParams {
+            noise: FractalNoiseType::OpenSimplex,
+            ..FbmParams::default()
+        }),
+    );
+    assert_eq!(
+        reason_for(unsupported_options),
+        GpuFallbackCode::UnsupportedOptions
+    );
+
+    let mut asset = MaskAsset::new(MaskId::new(), "wide blur", MaskSource::Constant(0.5));
+    asset.ops.push(MaskOp::Blur { radius: 17 });
+    let mut masked = Layer::new("masked", LayerKind::Flat(FlatParams::default()));
+    masked.common.masks.push(MaskRef::new(asset.id));
+    let mut stack = LayerStack::new();
+    stack.push(masked);
+    let graph = compile_gpu_graph(&stack, &[asset]);
+    assert_eq!(
+        graph.cpu_fallback.expect("mask fallback").reason.code,
+        GpuFallbackCode::MaskOperations
+    );
+}
+
+#[test]
+fn heightmap_assets_have_explicit_kernel_and_stamp3d_boundary() {
+    for kind in [
+        LayerKind::ImportHeightmap(ImportHeightmapParams::default()),
+        LayerKind::Stamp2d(Stamp2dParams::default()),
+    ] {
+        let graph = graph_for(Layer::new("raster", kind));
+        assert!(graph.fully_gpu());
+        assert_eq!(
+            graph.plans[0].expect("raster plan").kernel,
+            GpuKernel::HeightmapSample
+        );
+    }
+    let stamp3d = Layer::new("3d", LayerKind::Stamp3d(Stamp3dParams::default()));
+    assert!(!layer_gpu_supported(&stamp3d, &[]));
+    assert_eq!(graph_for(stamp3d).cpu_from, Some(0));
 }
 
 #[test]
@@ -27,17 +108,179 @@ fn every_builtin_default_has_consistent_public_support_graph_and_kernel() {
             meta.type_id
         );
         if supported {
-            let [pass] = graph.passes.as_slice() else {
-                panic!("{} must compile to exactly one pass", meta.type_id);
+            let [Some(plan)] = graph.plans.as_slice() else {
+                panic!("{} must compile to exactly one GPU plan", meta.type_id);
             };
             assert!(
-                pass.kernel.matches_layer_kind(&layer.kind),
+                plan.kernel.matches_layer_kind(&layer.kind),
                 "{} selected incompatible {:?}",
                 meta.type_id,
-                pass.kernel
+                plan.kernel
             );
         }
     }
+}
+
+#[test]
+fn authored_shape_layers_have_explicit_gpu_configuration_boundaries() {
+    let path = Layer::new(
+        "path",
+        LayerKind::Path(PathParams {
+            nodes: vec![
+                PathNode {
+                    u: 0.1,
+                    v: 0.2,
+                    height: 2.0,
+                    width: 1.0,
+                },
+                PathNode {
+                    u: 0.8,
+                    v: 0.7,
+                    height: 4.0,
+                    width: 0.8,
+                },
+            ],
+            ..PathParams::default()
+        }),
+    );
+    let path_graph = graph_for(path);
+    assert!(path_graph.fully_gpu());
+    assert_eq!(
+        path_graph.plans[0].expect("path plan").kernel,
+        GpuKernel::Path
+    );
+
+    let polygon = Layer::new(
+        "polygon",
+        LayerKind::PolygonHeight(PolygonHeightParams {
+            points: vec![[0.1, 0.1], [0.8, 0.2], [0.5, 0.9]],
+            mode: PolygonHeightMode::SetElevation,
+            carve: true,
+            ..PolygonHeightParams::default()
+        }),
+    );
+    let polygon_graph = graph_for(polygon);
+    assert!(polygon_graph.fully_gpu());
+    assert_eq!(
+        polygon_graph.plans[0].expect("polygon plan").kernel,
+        GpuKernel::PolygonHeight
+    );
+
+    for &generator in ProceduralGenerator::ALL {
+        let layer = Layer::new(
+            generator.label(),
+            LayerKind::ProceduralShape(ProceduralShapeParams::with_generator(generator)),
+        );
+        let supported = generator != ProceduralGenerator::Dunes;
+        assert_eq!(layer_gpu_supported(&layer, &[]), supported, "{generator:?}");
+        let graph = graph_for(layer);
+        assert_eq!(graph.fully_gpu(), supported, "{generator:?}");
+        if supported {
+            assert_eq!(
+                graph.plans[0].expect("procedural plan").kernel,
+                GpuKernel::ProceduralShape
+            );
+        }
+    }
+
+    let rejected = [
+        Layer::new(
+            "non-finite path",
+            LayerKind::Path(PathParams {
+                width: f32::NAN,
+                ..PathParams::default()
+            }),
+        ),
+        Layer::new(
+            "overflowing path seed",
+            LayerKind::Path(PathParams {
+                noise_strength: 1.0,
+                seed: u64::from(u32::MAX) + 1,
+                ..PathParams::default()
+            }),
+        ),
+        Layer::new(
+            "non-finite polygon",
+            LayerKind::PolygonHeight(PolygonHeightParams {
+                height: f32::NAN,
+                ..PolygonHeightParams::default()
+            }),
+        ),
+        Layer::new(
+            "iterative crater",
+            LayerKind::ProceduralShape(ProceduralShapeParams {
+                crater: EffectFilterParams {
+                    iterations: 2,
+                    ..EffectFilterParams::crater()
+                },
+                generator: ProceduralGenerator::Crater,
+                ..ProceduralShapeParams::default()
+            }),
+        ),
+    ];
+    for layer in rejected {
+        assert!(!layer_gpu_supported(&layer, &[]), "{}", layer.common.name);
+        assert_eq!(graph_for(layer).cpu_from, Some(0));
+    }
+}
+
+#[test]
+fn carved_path_is_demoted_only_when_later_wetness_is_observable() {
+    let make_path = |carve| {
+        Layer::new(
+            "path",
+            LayerKind::Path(PathParams {
+                carve,
+                nodes: vec![
+                    PathNode {
+                        u: 0.1,
+                        v: 0.2,
+                        height: 2.0,
+                        width: 1.0,
+                    },
+                    PathNode {
+                        u: 0.8,
+                        v: 0.7,
+                        height: 4.0,
+                        width: 0.8,
+                    },
+                ],
+                ..PathParams::default()
+            }),
+        )
+    };
+
+    let mut no_consumer = LayerStack::new();
+    no_consumer.push(make_path(true));
+    no_consumer.push(Layer::new(
+        "flat",
+        LayerKind::Flat(FlatParams { height: 1.0 }),
+    ));
+    assert!(compile_gpu_graph(&no_consumer, &[]).plans[0].is_some());
+
+    let mut consumer = LayerStack::new();
+    consumer.push(make_path(true));
+    consumer.push(Layer::new(
+        "biomes",
+        LayerKind::Biomes(BiomesParams::default()),
+    ));
+    let graph = compile_gpu_graph(&consumer, &[]);
+    assert!(graph.plans[0].is_none());
+    assert_eq!(graph.cpu_from, Some(0));
+    assert_eq!(
+        graph.cpu_fallback.expect("aux boundary").reason.code,
+        GpuFallbackCode::AuxiliaryDependency
+    );
+
+    let mut raise_only = LayerStack::new();
+    raise_only.push(make_path(false));
+    raise_only.push(Layer::new(
+        "biomes",
+        LayerKind::Biomes(BiomesParams::default()),
+    ));
+    let graph = compile_gpu_graph(&raise_only, &[]);
+    assert!(graph.plans[0].is_some());
+    assert_eq!(graph.cpu_from, Some(1));
 }
 
 #[test]
@@ -51,13 +294,235 @@ fn every_effect_filter_variant_has_an_explicit_executable_plan() {
             }),
         );
         let graph = graph_for(layer);
-        let supported = matches!(kind, EffectFilterKind::Smooth | EffectFilterKind::Inflate);
+        let supported = matches!(
+            kind,
+            EffectFilterKind::Smooth
+                | EffectFilterKind::Inflate
+                | EffectFilterKind::Denoise
+                | EffectFilterKind::AddSet
+                | EffectFilterKind::Deflate
+                | EffectFilterKind::Curve
+                | EffectFilterKind::Cutoff
+                | EffectFilterKind::TerraceSimple
+                | EffectFilterKind::Shore
+                | EffectFilterKind::Blocks
+                | EffectFilterKind::ZeroEdge
+                | EffectFilterKind::Squeeze
+                | EffectFilterKind::DirectionalBlur
+                | EffectFilterKind::AngleBlur
+                | EffectFilterKind::Swirl
+                | EffectFilterKind::Crater
+                | EffectFilterKind::Distortion
+                | EffectFilterKind::Balloon
+                | EffectFilterKind::NoisePerlin
+                | EffectFilterKind::NoiseValue
+                | EffectFilterKind::NoiseWhite
+                | EffectFilterKind::NoiseWave
+                | EffectFilterKind::ScatterDetail
+                | EffectFilterKind::NoiseBillow
+                | EffectFilterKind::NoiseRidged
+                | EffectFilterKind::Ridged
+                | EffectFilterKind::Rugged
+                | EffectFilterKind::Hexagons
+                | EffectFilterKind::TerraceSteep
+        );
         assert_eq!(graph.fully_gpu(), supported, "{}", kind.label());
         if supported {
-            assert_eq!(graph.passes[0].kernel, GpuKernel::EffectFilter);
+            let plan = graph.plans[0].expect("supported filter retains a plan");
+            assert_eq!(plan.kernel, GpuKernel::EffectFilter);
+            let expected_policy = match kind {
+                EffectFilterKind::Curve
+                | EffectFilterKind::Cutoff
+                | EffectFilterKind::TerraceSimple
+                | EffectFilterKind::ZeroEdge
+                | EffectFilterKind::Squeeze
+                | EffectFilterKind::Swirl
+                | EffectFilterKind::Distortion
+                | EffectFilterKind::Hexagons
+                | EffectFilterKind::TerraceSteep => GpuDirtyPolicy::FullField,
+                _ => GpuDirtyPolicy::Local,
+            };
+            assert_eq!(plan.dirty_policy, expected_policy, "{}", kind.label());
         } else {
             assert_eq!(graph.cpu_from, Some(0));
         }
+    }
+
+    let spike = Layer::new(
+        "spike removal radius one",
+        LayerKind::EffectFilter(EffectFilterParams::spike_removal()),
+    );
+    let graph = graph_for(spike);
+    assert!(graph.fully_gpu());
+    assert_eq!(
+        graph.plans[0].expect("spike plan").dirty_policy,
+        GpuDirtyPolicy::Local
+    );
+
+    let unsupported_spike = Layer::new(
+        "spike removal radius two",
+        LayerKind::EffectFilter(EffectFilterParams {
+            radius: 2,
+            ..EffectFilterParams::spike_removal()
+        }),
+    );
+    assert!(!graph_for(unsupported_spike).fully_gpu());
+
+    let overflowing_noise = Layer::new(
+        "overflowing billow seed stream",
+        LayerKind::EffectFilter(EffectFilterParams {
+            seed: u64::from(u32::MAX) - 100,
+            ..EffectFilterParams::noise_billow()
+        }),
+    );
+    assert!(!graph_for(overflowing_noise).fully_gpu());
+
+    let oversized_radius = Layer::new(
+        "oversized directional radius",
+        LayerKind::EffectFilter(EffectFilterParams {
+            radius: terra_gpu::EFFECT_FILTER_MAX_RADIUS + 1,
+            ..EffectFilterParams::directional_blur()
+        }),
+    );
+    assert!(!graph_for(oversized_radius).fully_gpu());
+
+    let overflowing_warp_seed = Layer::new(
+        "overflowing warp seed",
+        LayerKind::EffectFilter(EffectFilterParams {
+            seed: u64::from(u32::MAX),
+            warp_strength: 1.0,
+            ..EffectFilterParams::noise_wave()
+        }),
+    );
+    assert!(!graph_for(overflowing_warp_seed).fully_gpu());
+
+    for params in [
+        EffectFilterParams {
+            sea_level: 12.0,
+            ..EffectFilterParams::border_blend()
+        },
+        EffectFilterParams {
+            sea_level: 12.0,
+            ..EffectFilterParams::flatten_filter()
+        },
+    ] {
+        let graph = graph_for(Layer::new(
+            "absolute target",
+            LayerKind::EffectFilter(params),
+        ));
+        assert!(graph.fully_gpu());
+        assert_eq!(
+            graph.plans[0].expect("absolute plan").dirty_policy,
+            GpuDirtyPolicy::Local
+        );
+    }
+}
+
+#[test]
+fn river_carve_defaults_and_configuration_boundaries_are_explicit() {
+    let default = Layer::new("river", LayerKind::RiverCarve(RiverCarveParams::default()));
+    let graph = graph_for(default);
+    assert!(graph.fully_gpu());
+    let plan = graph.plans[0].expect("RiverCarve plan");
+    assert_eq!(plan.kernel, GpuKernel::RiverCarve);
+    assert_eq!(plan.dirty_policy, GpuDirtyPolicy::FullField);
+
+    let unsupported = [
+        RiverCarveParams {
+            guide: MaskSource::Wetness,
+            ..RiverCarveParams::default()
+        },
+        RiverCarveParams {
+            bank_smooth: 3.0,
+            ..RiverCarveParams::default()
+        },
+        RiverCarveParams {
+            accumulation_threshold: 0.0,
+            ..RiverCarveParams::default()
+        },
+    ];
+    for params in unsupported {
+        let layer = Layer::new("unsupported river", LayerKind::RiverCarve(params));
+        assert!(!layer_gpu_supported(&layer, &[]));
+        assert_eq!(graph_for(layer).cpu_from, Some(0));
+    }
+}
+
+#[test]
+fn stream_power_defaults_and_configuration_boundaries_are_explicit() {
+    let default = Layer::new(
+        "stream power",
+        LayerKind::StreamPowerErosion(StreamPowerParams::default()),
+    );
+    let graph = graph_for(default);
+    assert!(graph.fully_gpu());
+    let plan = graph.plans[0].expect("StreamPower plan");
+    assert_eq!(plan.kernel, GpuKernel::StreamPower);
+    assert_eq!(plan.dirty_policy, GpuDirtyPolicy::FullField);
+    assert_eq!(plan.halo_texels, 0);
+
+    let unsupported = [
+        StreamPowerParams {
+            hardness_source: MaskSource::Hardness,
+            ..StreamPowerParams::default()
+        },
+        StreamPowerParams {
+            dendritic_seed: 0.2,
+            ..StreamPowerParams::default()
+        },
+        StreamPowerParams {
+            refill_each_iter: true,
+            ..StreamPowerParams::default()
+        },
+        StreamPowerParams {
+            level_count: 1,
+            ..StreamPowerParams::default()
+        },
+        StreamPowerParams {
+            dt: f32::NAN,
+            ..StreamPowerParams::default()
+        },
+    ];
+    for params in unsupported {
+        let layer = Layer::new(
+            "unsupported stream power",
+            LayerKind::StreamPowerErosion(params),
+        );
+        assert!(!layer_gpu_supported(&layer, &[]));
+        assert_eq!(graph_for(layer).cpu_from, Some(0));
+    }
+}
+
+#[test]
+fn multi_scale_amplify_defaults_and_configuration_boundaries_are_explicit() {
+    let default = Layer::new(
+        "multi scale",
+        LayerKind::MultiScaleAmplify(MultiScaleAmplifyParams::default()),
+    );
+    let graph = graph_for(default);
+    assert!(graph.fully_gpu());
+    let plan = graph.plans[0].expect("MultiScaleAmplify plan");
+    assert_eq!(plan.kernel, GpuKernel::MultiScaleAmplify);
+    assert_eq!(plan.dirty_policy, GpuDirtyPolicy::FullField);
+    assert_eq!(plan.halo_texels, 0);
+
+    for params in [
+        MultiScaleAmplifyParams {
+            hardness_source: MaskSource::Hardness,
+            ..MultiScaleAmplifyParams::default()
+        },
+        MultiScaleAmplifyParams {
+            ridge_lock: MaskSource::Wetness,
+            ..MultiScaleAmplifyParams::default()
+        },
+        MultiScaleAmplifyParams {
+            thermal_strength: f32::NAN,
+            ..MultiScaleAmplifyParams::default()
+        },
+    ] {
+        let layer = Layer::new("unsupported amplify", LayerKind::MultiScaleAmplify(params));
+        assert!(!layer_gpu_supported(&layer, &[]));
+        assert_eq!(graph_for(layer).cpu_from, Some(0));
     }
 }
 
@@ -76,7 +541,8 @@ fn fractal_noise_variants_and_blend_modes_are_explicitly_classified() {
                     ..FbmParams::default()
                 }),
             );
-            assert!(!layer_gpu_supported(&layer, &[]), "{noise:?}");
+            let supported = matches!(noise, FractalNoiseType::Value | FractalNoiseType::Perlin);
+            assert_eq!(layer_gpu_supported(&layer, &[]), supported, "{noise:?}");
         }
     }
 
@@ -90,16 +556,142 @@ fn fractal_noise_variants_and_blend_modes_are_explicitly_classified() {
         (BlendMode::Min, true),
         (BlendMode::Max, true),
         (BlendMode::Overlay, true),
-        (BlendMode::HeightBlend, false),
-        (BlendMode::SmoothMaximum, false),
-        (BlendMode::SmoothMinimum, false),
-        (BlendMode::SmoothUnion, false),
-        (BlendMode::SmoothSubtraction, false),
+        (BlendMode::HeightBlend, true),
+        (BlendMode::SmoothMaximum, true),
+        (BlendMode::SmoothMinimum, true),
+        (BlendMode::SmoothUnion, true),
+        (BlendMode::SmoothSubtraction, true),
     ] {
         let mut layer = Layer::new("blend", LayerKind::Flat(FlatParams { height: 2.0 }));
         layer.common.blend = blend;
         assert_eq!(layer_gpu_supported(&layer, &[]), supported, "{blend:?}");
     }
+}
+
+#[test]
+fn noise_family_defaults_and_seed_stream_boundaries_are_explicit() {
+    let defaults = [
+        Layer::new("perlin", LayerKind::NoisePerlin(NoiseParams::default())),
+        Layer::new("fbm", LayerKind::Fbm(FbmParams::default())),
+        Layer::new("ridged", LayerKind::Ridged(FbmParams::default())),
+        Layer::new(
+            "domain warp",
+            LayerKind::DomainWarp(DomainWarpParams::default()),
+        ),
+        Layer::new(
+            "voronoi regions",
+            LayerKind::VoronoiRegions(VoronoiParams::default()),
+        ),
+    ];
+    for layer in defaults {
+        let graph = graph_for(layer.clone());
+        assert!(graph.fully_gpu(), "{}", layer.common.name);
+        assert_eq!(graph.plans[0].expect("noise plan").kernel, GpuKernel::Noise);
+    }
+
+    let mut height_blend = Layer::new(
+        "warped height blend",
+        LayerKind::DomainWarp(DomainWarpParams::default()),
+    );
+    height_blend.common.blend = BlendMode::HeightBlend;
+    assert!(layer_gpu_supported(&height_blend, &[]));
+    assert_eq!(graph_for(height_blend).cpu_from, None);
+
+    let near_limit = u64::from(u32::MAX) - 100;
+    let rejected = [
+        Layer::new(
+            "perlin overflow",
+            LayerKind::NoisePerlin(NoiseParams {
+                seed: near_limit,
+                octaves: 2,
+                ..NoiseParams::default()
+            }),
+        ),
+        Layer::new(
+            "fbm overflow",
+            LayerKind::Fbm(FbmParams {
+                base: NoiseParams {
+                    seed: near_limit,
+                    octaves: 2,
+                    ..NoiseParams::default()
+                },
+                ..FbmParams::default()
+            }),
+        ),
+        Layer::new(
+            "ridged overflow",
+            LayerKind::Ridged(FbmParams {
+                base: NoiseParams {
+                    seed: near_limit,
+                    octaves: 2,
+                    ..NoiseParams::default()
+                },
+                ..FbmParams::default()
+            }),
+        ),
+        Layer::new(
+            "warp overflow",
+            LayerKind::DomainWarp(DomainWarpParams {
+                base: NoiseParams {
+                    seed: u64::from(u32::MAX),
+                    octaves: 1,
+                    ..NoiseParams::default()
+                },
+                ..DomainWarpParams::default()
+            }),
+        ),
+        Layer::new(
+            "too many perlin octaves",
+            LayerKind::NoisePerlin(NoiseParams {
+                octaves: 13,
+                ..NoiseParams::default()
+            }),
+        ),
+        Layer::new(
+            "voronoi seed overflow",
+            LayerKind::VoronoiRegions(VoronoiParams {
+                base: NoiseParams {
+                    seed: u64::from(u32::MAX) + 1,
+                    ..NoiseParams::default()
+                },
+                ..VoronoiParams::default()
+            }),
+        ),
+    ];
+    for layer in rejected {
+        assert!(!layer_gpu_supported(&layer, &[]), "{}", layer.common.name);
+        assert_eq!(graph_for(layer).cpu_from, Some(0));
+    }
+}
+
+#[test]
+fn shape_family_defaults_and_island_archetypes_are_explicitly_supported() {
+    let layers = [
+        Layer::new("mountains", LayerKind::Mountains(MountainParams::default())),
+        Layer::new("dunes", LayerKind::Dunes(DuneParams::default())),
+        Layer::new("canyons", LayerKind::Canyons(CanyonParams::default())),
+        Layer::new("mesa", LayerKind::Mesa(MesaParams::default())),
+        Layer::new("volcano", LayerKind::Volcano(VolcanoParams::default())),
+        Layer::new("uplift", LayerKind::Uplift(UpliftParams::default())),
+        Layer::new("plateau", LayerKind::Plateau(PlateauParams::default())),
+        Layer::new("volcanic", LayerKind::Island(IslandParams::default())),
+        Layer::new(
+            "archipelago",
+            LayerKind::Island(IslandParams::archipelago()),
+        ),
+        Layer::new("atoll", LayerKind::Island(IslandParams::atoll())),
+    ];
+    for layer in layers {
+        let graph = graph_for(layer.clone());
+        assert!(graph.fully_gpu(), "{}", layer.common.name);
+        assert_eq!(graph.plans[0].expect("shape plan").kernel, GpuKernel::Shape);
+    }
+
+    let mut custom_transport = DuneParams::default();
+    custom_transport.iterations += 1;
+    let layer = Layer::new("custom dune transport", LayerKind::Dunes(custom_transport));
+    assert!(!layer_gpu_supported(&layer, &[]));
+    assert_eq!(graph_for(layer).cpu_from, Some(0));
 }
 
 #[test]
@@ -134,8 +726,11 @@ fn first_unsupported_configuration_owns_cpu_from() {
 
     let graph = compile_gpu_graph(&stack, &[]);
     assert_eq!(graph.cpu_from, Some(1));
-    assert_eq!(graph.passes.len(), 1);
-    assert_eq!(graph.passes[0].flat_index, 0);
+    // Supported layers below and above the CPU boundary keep plans; only the
+    // unsupported owner at index 1 is None.
+    assert!(graph.plans[0].is_some());
+    assert!(graph.plans[1].is_none());
+    assert!(graph.plans[2].is_some());
 }
 
 #[test]

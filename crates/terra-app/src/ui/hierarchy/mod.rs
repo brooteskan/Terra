@@ -7,8 +7,8 @@ use crate::ui::actions::PanelAction;
 use crate::ui::hierarchy_view::{
     self, advanced_placement_id, biome_section_artist_label, biome_summary_meta,
     concept_for_category, concept_for_top_level, concept_row_id, mask_stack_row_id,
-    sim_status_label, world_rule_entity_meta, world_rules_meta, ArtistConcept, TERRAIN_ROOT,
-    TERRAIN_SCOPE_KEY,
+    sim_status_label, stroke_row_id, world_rule_entity_meta, world_rules_meta, ArtistConcept,
+    TERRAIN_ROOT, TERRAIN_SCOPE_KEY,
 };
 use crate::ui::style::{
     self, FONT_SCALE, LAYER_ROW_H, LAYER_ROW_H_COMPACT, LAYER_THUMB_SZ, PAD, TYPE_BODY,
@@ -137,6 +137,12 @@ impl LayerPresentationState {
     }
 }
 
+#[derive(Debug, Clone)]
+pub enum ContextMenuTarget {
+    Entity(LayerId),
+    Stroke { layer: LayerId, index: usize },
+}
+
 #[derive(Debug)]
 pub struct LayersGuiState {
     pub scroll_y: f32,
@@ -144,7 +150,7 @@ pub struct LayersGuiState {
     pub drag_from: Option<LayerDragSource>,
     /// Cursor hint from the last layers draw (Grab / Grabbing while DnD).
     pub cursor_hint: crate::ui::UiCursor,
-    pub context_menu: Option<(LayerId, f32, f32)>,
+    pub context_menu: Option<(ContextMenuTarget, f32, f32)>,
     /// Inline rename target in the layers list (`None` when not editing).
     pub rename_id: Option<LayerId>,
     pub presentation: LayerPresentationState,
@@ -186,6 +192,152 @@ impl LayersGuiState {
             seed_collapsed_defaults(doc, self);
         }
     }
+
+    /// Expand the hierarchy path that owns the document's current stack selection.
+    ///
+    /// New tools are selected immediately so their inspector opens.  Since newly
+    /// discovered folders default to collapsed, the selection would otherwise be
+    /// valid but invisible under Biomes -> biome -> Filters until every ancestor was
+    /// opened manually.
+    pub fn reveal_selection(&mut self, doc: &TerrainDocument) {
+        let Some(selected) = doc.selected else {
+            return;
+        };
+        seed_collapsed_defaults(doc, self);
+
+        let mut group_path = Vec::new();
+        let Some(concept) = concept_and_group_path_for_id(doc, selected, &mut group_path) else {
+            return;
+        };
+        let concept_id = concept_row_id(TERRAIN_SCOPE_KEY, concept);
+        self.presentation
+            .collapsed_groups
+            .retain(|id| *id != concept_id && !group_path.contains(id));
+
+        // The selected filter's canonical path is near the top of the Biomes tree.
+        // Returning there also prevents an expanded row from remaining off-screen
+        // after the user created it while scrolled elsewhere.
+        self.scroll_y = 0.0;
+    }
+
+    /// Expand populated biome branches when a project is opened.
+    ///
+    /// Collapse state is editor-only and is reset on every load.  Keeping all
+    /// biome containers collapsed makes persisted filters effectively invisible
+    /// whenever the saved selection belongs to Shape or another concept.
+    pub fn reveal_populated_biome_sections(&mut self, doc: &TerrainDocument) {
+        seed_collapsed_defaults(doc, self);
+        let mut populated_groups = Vec::new();
+        if collect_populated_biome_group_ids(&doc.stack.nodes, &mut populated_groups) {
+            let biomes = concept_row_id(TERRAIN_SCOPE_KEY, ArtistConcept::Biomes);
+            self.presentation
+                .collapsed_groups
+                .retain(|id| *id != biomes && !populated_groups.contains(id));
+        }
+    }
+}
+
+fn collect_populated_biome_group_ids(nodes: &[StackNode], out: &mut Vec<LayerId>) -> bool {
+    let mut found = false;
+    for node in nodes {
+        let StackNode::Group(group) = node else {
+            continue;
+        };
+        if group.is_biome() {
+            found |= collect_nonempty_group_ids(group, out);
+        } else {
+            found |= collect_populated_biome_group_ids(&group.children, out);
+        }
+    }
+    found
+}
+
+fn collect_nonempty_group_ids(
+    group: &terra_core::layer::LayerGroup,
+    out: &mut Vec<LayerId>,
+) -> bool {
+    let mut has_authored_content = false;
+    for child in &group.children {
+        match child {
+            StackNode::Layer(_) => has_authored_content = true,
+            StackNode::Group(child_group) => {
+                has_authored_content |= collect_nonempty_group_ids(child_group, out);
+            }
+        }
+    }
+    if has_authored_content {
+        out.push(group.id);
+    }
+    has_authored_content
+}
+
+fn concept_and_group_path_for_id(
+    doc: &TerrainDocument,
+    target: LayerId,
+    group_path: &mut Vec<LayerId>,
+) -> Option<ArtistConcept> {
+    for node in &doc.stack.nodes {
+        let mut candidate_path = Vec::new();
+        if !collect_group_path(node, target, &mut candidate_path) {
+            continue;
+        }
+        *group_path = candidate_path;
+        return Some(match node {
+            StackNode::Group(group)
+                if matches!(
+                    group.group_kind,
+                    terra_core::layer::GroupKind::CategoryFolder
+                ) || (matches!(group.group_kind, terra_core::layer::GroupKind::Generic)
+                    && group.category.is_some()) =>
+            {
+                let selected_is_in_biome = group.children.iter().any(|child| {
+                    matches!(child, StackNode::Group(child_group) if child_group.is_biome())
+                        && node_contains_id(child, target)
+                });
+                if selected_is_in_biome {
+                    ArtistConcept::Biomes
+                } else {
+                    group
+                        .category
+                        .map(concept_for_category)
+                        .unwrap_or(ArtistConcept::Shape)
+                }
+            }
+            _ => concept_for_top_level(node, false),
+        });
+    }
+    None
+}
+
+fn collect_group_path(node: &StackNode, target: LayerId, out: &mut Vec<LayerId>) -> bool {
+    match node {
+        StackNode::Layer(layer) => layer.id() == target,
+        StackNode::Group(group) => {
+            if group.id == target {
+                return true;
+            }
+            for child in &group.children {
+                if collect_group_path(child, target, out) {
+                    out.push(group.id);
+                    return true;
+                }
+            }
+            false
+        }
+    }
+}
+
+fn node_contains_id(node: &StackNode, target: LayerId) -> bool {
+    match node {
+        StackNode::Layer(layer) => layer.id() == target,
+        StackNode::Group(group) => {
+            group.id == target
+                || group
+                    .children
+                    .iter()
+                    .any(|child| node_contains_id(child, target))
+        }
+    }
 }
 
 fn seed_collapsed_defaults(doc: &TerrainDocument, state: &mut LayersGuiState) {
@@ -221,7 +373,13 @@ fn collect_group_collapse_ids(nodes: &[StackNode], out: &mut Vec<LayerId>) {
                 }
                 collect_group_collapse_ids(&g.children, out);
             }
-            StackNode::Layer(_) => {}
+            StackNode::Layer(l) => {
+                if let LayerKind::SculptStrokes(p) = &l.kind {
+                    if !p.strokes.is_empty() {
+                        out.push(l.id());
+                    }
+                }
+            }
         }
     }
 }
@@ -267,15 +425,15 @@ fn rename_caret_visible() -> bool {
 }
 
 #[inline]
-fn row_can_collapse(role: TreeRole) -> bool {
+fn row_can_collapse(row: &LayerRow) -> bool {
     matches!(
-        role,
+        row.role,
         TreeRole::Biome
             | TreeRole::BiomeSection
             | TreeRole::Group
             | TreeRole::ConceptFolder
             | TreeRole::AdvancedSection
-    )
+    ) || (row.role == TreeRole::Layer && row.child_count > 0)
 }
 
 #[inline]
@@ -293,7 +451,8 @@ fn toggle_row_collapse(state: &mut LayersGuiState, role: TreeRole, id: LayerId) 
         | TreeRole::BiomeSection
         | TreeRole::Group
         | TreeRole::ConceptFolder
-        | TreeRole::AdvancedSection => {
+        | TreeRole::AdvancedSection
+        | TreeRole::Layer => {
             state.presentation.toggle_collapsed(id);
         }
         _ => {}
@@ -530,6 +689,7 @@ pub fn draw_layers_gui(
                         row_data.id.0,
                     ))
             }
+            TreeRole::Stroke => ui_state.selected_stroke == row_data.stroke,
             _ => doc.selected == Some(row_data.id),
         };
 
@@ -582,7 +742,11 @@ pub fn draw_layers_gui(
         } else if selected
             && matches!(
                 row_data.role,
-                TreeRole::Layer | TreeRole::Foundation | TreeRole::Group | TreeRole::Biome
+                TreeRole::Layer
+                    | TreeRole::Foundation
+                    | TreeRole::Group
+                    | TreeRole::Biome
+                    | TreeRole::Stroke
             )
         {
             ui.panel_rounded(row, style::SELECTED_BG, style::RADIUS_SM);
@@ -605,7 +769,7 @@ pub fn draw_layers_gui(
         let mut cursor_x = row.min_x + LIST_INSET + indent;
 
         // Lead: optional grip (drag) + optional chevron (collapse).
-        let can_collapse = row_can_collapse(row_data.role);
+        let can_collapse = row_can_collapse(&row_data);
         let can_drag = row_is_draggable(row_data.role, row_data.is_base);
         let mut collapse_toggled = false;
 
@@ -893,7 +1057,11 @@ pub fn draw_layers_gui(
         // Region / layer visibility.
         let show_eye = matches!(
             row_data.role,
-            TreeRole::Foundation | TreeRole::Layer | TreeRole::Biome | TreeRole::Group
+            TreeRole::Foundation
+                | TreeRole::Layer
+                | TreeRole::Biome
+                | TreeRole::Group
+                | TreeRole::Stroke
         ) && !row_data.is_base;
         if show_eye {
             rx -= CTRL_SLOT;
@@ -914,10 +1082,18 @@ pub fn draw_layers_gui(
                 icon,
                 eye,
             ) {
-                actions.push(PanelAction::SetEnabled {
-                    id: row_data.id,
-                    enabled: !row_data.enabled,
-                });
+                if let Some((layer, index)) = row_data.stroke {
+                    actions.push(PanelAction::SetStrokeEnabled {
+                        layer,
+                        index,
+                        enabled: !row_data.enabled,
+                    });
+                } else {
+                    actions.push(PanelAction::SetEnabled {
+                        id: row_data.id,
+                        enabled: !row_data.enabled,
+                    });
+                }
             }
         }
 
@@ -1096,6 +1272,11 @@ pub fn draw_layers_gui(
                         actions.push(PanelAction::Select(row_data.id));
                         actions.push(PanelAction::SetActiveBiome(row_data.id));
                     }
+                    TreeRole::Stroke => {
+                        if let Some((layer, index)) = row_data.stroke {
+                            actions.push(PanelAction::SelectStroke { layer, index });
+                        }
+                    }
                     _ => {
                         actions.push(PanelAction::Select(row_data.id));
                     }
@@ -1143,9 +1324,7 @@ pub fn draw_layers_gui(
         } else {
             FONT_SCALE * TYPE_BODY
         };
-        let name_color = if dragging_this {
-            style::TEXT_MUTED
-        } else if is_section {
+        let name_color = if dragging_this || is_section {
             style::TEXT_MUTED
         } else if row_dimmed_for_workspace(ui_state, &row_data) {
             style::TEXT_DISABLED
@@ -1251,10 +1430,18 @@ pub fn draw_layers_gui(
                     | TreeRole::MaskAsset
                     | TreeRole::WorldRuleEntity
                     | TreeRole::SimulationScenarioEntity
+                    | TreeRole::Stroke
             )
         {
             if let Some((px, py)) = ui.input.pointer {
-                if can_rename
+                if row_data.role == TreeRole::Stroke {
+                    if let Some((layer, index)) = row_data.stroke {
+                        actions.push(PanelAction::SelectStroke { layer, index });
+                        state.context_menu =
+                            Some((ContextMenuTarget::Stroke { layer, index }, px, py));
+                        state.add_menu_open = false;
+                    }
+                } else if can_rename
                     || matches!(
                         row_data.role,
                         TreeRole::Layer | TreeRole::Foundation | TreeRole::Group | TreeRole::Biome
@@ -1267,7 +1454,7 @@ pub fn draw_layers_gui(
                     if matches!(row_data.role, TreeRole::MaskAsset) {
                         actions.push(PanelAction::SelectMask(MaskId(row_data.id.0)));
                     }
-                    state.context_menu = Some((row_data.id, px, py));
+                    state.context_menu = Some((ContextMenuTarget::Entity(row_data.id), px, py));
                     state.add_menu_open = false;
                 }
             }
@@ -1314,9 +1501,9 @@ pub fn draw_layers_gui(
         state.cursor_hint = crate::ui::UiCursor::Grab;
     }
 
-    if let Some((cid, mx, my)) = state.context_menu {
+    if let Some((ref target, mx, my)) = state.context_menu.clone() {
         ui.with_menu_input(|ui| {
-            draw_layer_context_menu(ui, doc, ui_state, cid, mx, my, state, &mut actions);
+            draw_layer_context_menu(ui, doc, ui_state, target, mx, my, state, &mut actions);
         });
     }
 
@@ -1530,6 +1717,7 @@ fn blank_row(
         workspace_badge: String::new(),
         select_as: None,
         list_reversed: false,
+        stroke: None,
     }
 }
 
@@ -1557,27 +1745,44 @@ fn collect_rows(
         doc,
         &doc.stack,
         1,
-        collapsed,
-        doc.active_biome,
-        &doc.biome_library,
-        outdated,
+        RowCtx {
+            collapsed,
+            active_biome: doc.active_biome,
+            biome_library: &doc.biome_library,
+            outdated,
+        },
         &mut out,
     );
     out
 }
 // Folder order is driven by ArtistConcept::region_order / world_order.
 
+/// Immutable context threaded through the flat-row builders
+/// ([`emit_concept_stack`], [`walk_node_flat`], [`emit_biome_sections_ordered`]).
+/// Bundles the four read-only lookups every level needs so they stop travelling
+/// as a repeated four-argument tail; the mutable `out` accumulator stays a
+/// separate parameter. `Copy`, so recursive calls just pass it along.
+#[derive(Clone, Copy)]
+struct RowCtx<'a> {
+    collapsed: &'a [LayerId],
+    active_biome: Option<LayerId>,
+    biome_library: &'a terra_core::biome_definition::BiomeLibrary,
+    outdated: &'a [LayerId],
+}
+
 /// Emit stack nodes bucketed into WC terrain concept folders.
 fn emit_concept_stack(
     doc: &TerrainDocument,
     stack: &LayerStack,
     depth: u8,
-    collapsed: &[LayerId],
-    active_biome: Option<LayerId>,
-    biome_library: &terra_core::biome_definition::BiomeLibrary,
-    outdated: &[LayerId],
+    ctx: RowCtx,
     out: &mut Vec<LayerRow>,
 ) {
+    let RowCtx {
+        collapsed,
+        outdated,
+        ..
+    } = ctx;
     let order = ArtistConcept::terrain_order();
 
     let mut buckets: Vec<(ArtistConcept, Vec<(usize, &StackNode)>)> =
@@ -1660,11 +1865,8 @@ fn emit_concept_stack(
                     0,
                     child_depth,
                     *root_idx,
-                    collapsed,
-                    active_biome,
-                    biome_library,
                     Some(concept),
-                    outdated,
+                    ctx,
                     out,
                 );
                 for row in &mut out[before..] {
@@ -1678,11 +1880,8 @@ fn emit_concept_stack(
                     0,
                     child_depth,
                     *root_idx,
-                    collapsed,
-                    active_biome,
-                    biome_library,
                     Some(concept),
-                    outdated,
+                    ctx,
                     out,
                 );
             }
@@ -1830,13 +2029,16 @@ fn walk_node_flat(
     i: usize,
     depth: u8,
     root_idx: usize,
-    collapsed: &[LayerId],
-    active_biome: Option<LayerId>,
-    biome_library: &terra_core::biome_definition::BiomeLibrary,
     parent_concept: Option<ArtistConcept>,
-    outdated: &[LayerId],
+    ctx: RowCtx,
     out: &mut Vec<LayerRow>,
 ) {
+    let RowCtx {
+        collapsed,
+        active_biome,
+        biome_library,
+        outdated,
+    } = ctx;
     match &nodes[i] {
         StackNode::Layer(layer) => {
             let mut row = layer_row(layer, root_idx, depth);
@@ -1854,7 +2056,43 @@ fn walk_node_flat(
                     "World",
                 );
             }
+            let stroke_children = if let LayerKind::SculptStrokes(p) = &layer.kind {
+                if p.strokes.is_empty() {
+                    None
+                } else {
+                    row.child_count = p.strokes.len();
+                    row.collapsed = collapsed.contains(&layer.id());
+                    Some((layer.id(), &p.strokes))
+                }
+            } else {
+                None
+            };
             out.push(row);
+            if let Some((layer_id, strokes)) = stroke_children {
+                if !collapsed.contains(&layer_id) {
+                    let mut kind_counts: std::collections::HashMap<&str, usize> =
+                        std::collections::HashMap::new();
+                    for (si, stroke) in strokes.iter().enumerate() {
+                        let label = stroke.kind.label();
+                        let count = kind_counts.entry(label).or_insert(0);
+                        *count += 1;
+                        let name = if *count == 1 {
+                            label.to_string()
+                        } else {
+                            format!("{} {}", label, count)
+                        };
+                        let row_id = stroke_row_id(layer_id, si);
+                        let mut srow =
+                            blank_row(row_id, name, depth + 1, TreeRole::Stroke, root_idx);
+                        srow.enabled = stroke.enabled;
+                        srow.type_icon = Icon::Pencil;
+                        srow.domain_role = Some(DomainRole::ShapeLayer);
+                        srow.stroke = Some((layer_id, si));
+                        srow.is_layer = true;
+                        out.push(srow);
+                    }
+                }
+            }
         }
         StackNode::Group(g) => {
             let is_category = matches!(g.group_kind, terra_core::layer::GroupKind::CategoryFolder)
@@ -1863,18 +2101,7 @@ fn walk_node_flat(
 
             if is_category {
                 for ci in (0..g.children.len()).rev() {
-                    walk_node_flat(
-                        &g.children,
-                        ci,
-                        depth,
-                        root_idx,
-                        collapsed,
-                        active_biome,
-                        biome_library,
-                        parent_concept,
-                        outdated,
-                        out,
-                    );
+                    walk_node_flat(&g.children, ci, depth, root_idx, parent_concept, ctx, out);
                 }
                 return;
             }
@@ -1905,11 +2132,8 @@ fn walk_node_flat(
                     g,
                     root_idx,
                     depth.saturating_add(1),
-                    collapsed,
-                    active_biome,
-                    biome_library,
                     parent_concept,
-                    outdated,
+                    ctx,
                     out,
                 );
                 emit_advanced_placement(g, root_idx, depth, collapsed, out);
@@ -1922,11 +2146,8 @@ fn walk_node_flat(
                     ci,
                     child_depth,
                     root_idx,
-                    collapsed,
-                    active_biome,
-                    biome_library,
                     parent_concept,
-                    outdated,
+                    ctx,
                     out,
                 );
             }
@@ -1939,11 +2160,8 @@ fn emit_biome_sections_ordered(
     biome: &terra_core::layer::LayerGroup,
     root_idx: usize,
     depth: u8,
-    collapsed: &[LayerId],
-    active_biome: Option<LayerId>,
-    biome_library: &terra_core::biome_definition::BiomeLibrary,
     parent_concept: Option<ArtistConcept>,
-    outdated: &[LayerId],
+    ctx: RowCtx,
     out: &mut Vec<LayerRow>,
 ) {
     // Non-section children first (rare), then canonical section order.
@@ -1959,11 +2177,8 @@ fn emit_biome_sections_ordered(
                 ci,
                 depth,
                 root_idx,
-                collapsed,
-                active_biome,
-                biome_library,
                 parent_concept,
-                outdated,
+                ctx,
                 out,
             );
         }
@@ -1983,11 +2198,8 @@ fn emit_biome_sections_ordered(
             ci,
             depth,
             root_idx,
-            collapsed,
-            active_biome,
-            biome_library,
             parent_concept,
-            outdated,
+            ctx,
             out,
         );
     }
@@ -2100,6 +2312,7 @@ fn layer_row(layer: &terra_core::layer::Layer, idx: usize, depth: u8) -> LayerRo
         workspace_badge: String::new(),
         select_as: None,
         list_reversed: false,
+        stroke: None,
     }
 }
 
@@ -2170,6 +2383,7 @@ fn group_row(
         workspace_badge: String::new(),
         select_as: None,
         list_reversed: false,
+        stroke: None,
     }
 }
 
@@ -2191,6 +2405,8 @@ enum TreeRole {
     WorldRuleEntity,
     /// First-class Simulation Scenario row.
     SimulationScenarioEntity,
+    /// Per-stroke child of a SculptStrokes layer.
+    Stroke,
 }
 
 /// Soft hierarchy emphasis — dim only; never hide or block selection/editing.
@@ -2272,6 +2488,8 @@ struct LayerRow {
     select_as: Option<LayerId>,
     /// Folder children render reverse of document order (Shape / Mask / Sims).
     list_reversed: bool,
+    /// Per-stroke row target: (parent layer, vec index).
+    stroke: Option<(LayerId, usize)>,
 }
 
 fn resolve_biome_swatch_color(
@@ -2291,16 +2509,27 @@ fn resolve_biome_swatch_color(
     }
     terra_core::layer::palette_preview_color(g.id.0.as_u128())
 }
+// egui context-menu builder: ui + doc/ui_state + the layer id and cursor
+// position + the state/action sink it mutates, each used once. Kept flat.
+#[allow(clippy::too_many_arguments)]
 fn draw_layer_context_menu(
     ui: &mut GuiContext<'_>,
     doc: &TerrainDocument,
     _ui_state: &UiState,
-    id: LayerId,
+    target: &ContextMenuTarget,
     x: f32,
     y: f32,
     state: &mut LayersGuiState,
     actions: &mut Vec<PanelAction>,
 ) {
+    if let ContextMenuTarget::Stroke { layer, index } = target {
+        draw_stroke_context_menu(ui, doc, *layer, *index, x, y, state, actions);
+        return;
+    }
+    let ContextMenuTarget::Entity(id) = target else {
+        return;
+    };
+    let id = *id;
     let group = doc.stack.find_group(id);
     let layer = doc.stack.find(id);
     let is_base = layer.is_some_and(|l| l.kind.is_sculpt_base());
@@ -2353,7 +2582,7 @@ fn draw_layer_context_menu(
             ("cache", "Toggle Cache"),
         ]);
     }
-    if is_mask
+    if (is_mask
         || group.is_some_and(|g| {
             !g.is_biome()
                 && !matches!(
@@ -2361,11 +2590,10 @@ fn draw_layer_context_menu(
                     terra_core::layer::GroupKind::BiomeSection(_)
                         | terra_core::layer::GroupKind::CategoryFolder
                 )
-        })
+        }))
+        && !items.iter().any(|(k, _)| *k == "del")
     {
-        if !items.iter().any(|(k, _)| *k == "del") {
-            items.push(("del", "Delete"));
-        }
+        items.push(("del", "Delete"));
     }
     items.push(("close", "Close"));
 
@@ -2462,6 +2690,82 @@ fn draw_layer_context_menu(
     ui.end_overlay();
 }
 
+#[allow(clippy::too_many_arguments)]
+fn draw_stroke_context_menu(
+    ui: &mut GuiContext<'_>,
+    doc: &TerrainDocument,
+    layer: LayerId,
+    index: usize,
+    x: f32,
+    y: f32,
+    state: &mut LayersGuiState,
+    actions: &mut Vec<PanelAction>,
+) {
+    let stroke_enabled = doc
+        .stack
+        .find(layer)
+        .and_then(|l| {
+            if let LayerKind::SculptStrokes(p) = &l.kind {
+                p.strokes.get(index).map(|s| s.enabled)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(true);
+    let items: Vec<(&str, &str)> = vec![
+        ("enable", if stroke_enabled { "Disable" } else { "Enable" }),
+        ("del", "Delete"),
+        ("close", "Close"),
+    ];
+    let w = 160.0;
+    let h = items.len() as f32 * 24.0 + 8.0;
+    let menu = Rect::from_pos_size(
+        x.min(ui.screen_w - w - 4.0).max(4.0),
+        y.min(ui.screen_h - h - 4.0).max(4.0),
+        w,
+        h,
+    );
+    ui.begin_overlay();
+    ui.panel_rounded(menu, style::POPUP_BG, style::RADIUS_SM);
+    ui.state.set_hot(Id::new("__stroke_ctx"));
+    let mut iy = menu.min_y + 4.0;
+    for (key, label) in &items {
+        let row = Rect::from_pos_size(menu.min_x + 4.0, iy, w - 8.0, 22.0);
+        let hovered = ui.pointer_in(row);
+        if hovered {
+            ui.panel_rounded(row, style::HOVER_BG, 3.0);
+        }
+        ui.label_at(
+            row.min_x + 8.0,
+            row.min_y + 4.0,
+            label,
+            style::TEXT,
+            FONT_SCALE * TYPE_BODY,
+        );
+        if hovered && ui.input.primary_released {
+            match *key {
+                "enable" => {
+                    actions.push(PanelAction::SetStrokeEnabled {
+                        layer,
+                        index,
+                        enabled: !stroke_enabled,
+                    });
+                }
+                "del" => {
+                    actions.push(PanelAction::DeleteStroke { layer, index });
+                }
+                _ => {}
+            }
+            state.context_menu = None;
+        }
+        iy += 24.0;
+    }
+    if (ui.input.primary_pressed || ui.input.secondary_pressed) && !ui.pointer_in(menu) {
+        state.context_menu = None;
+    }
+    ui.end_overlay();
+}
+
 fn rename_widget_id(id: LayerId) -> Id {
     Id::new("lrename").child(&format!("{id:?}"))
 }
@@ -2508,7 +2812,8 @@ fn row_can_rename(doc: &TerrainDocument, row: &LayerRow) -> bool {
         | TreeRole::MaskStack
         | TreeRole::AdvancedSection
         | TreeRole::SectionLabel
-        | TreeRole::Foundation => false,
+        | TreeRole::Foundation
+        | TreeRole::Stroke => false,
     }
 }
 
@@ -2670,6 +2975,7 @@ pub fn hierarchy_presentation_snapshot(
                 TreeRole::AdvancedSection => "advanced",
                 TreeRole::WorldRuleEntity => "world_rule",
                 TreeRole::SimulationScenarioEntity => "simulation_scenario",
+                TreeRole::Stroke => "stroke",
             };
             (r.id, r.name, role, r.depth, r.concept)
         })
@@ -2715,6 +3021,71 @@ mod hierarchy_tests {
             rows.iter()
                 .any(|r| r.name == "Terrain" && r.role == TreeRole::SectionLabel),
             "Terrain root required"
+        );
+    }
+
+    #[test]
+    fn reveal_selection_expands_new_filter_hierarchy_path() {
+        let mut doc = TerrainDocument::new_default();
+        let filter = terra_core::layer::Layer::new(
+            "Selected Crater",
+            LayerKind::EffectFilter(terra_core::layer::EffectFilterParams::crater()),
+        );
+        let filter_id = filter.id();
+        doc.stack.push_routed(filter, doc.active_biome, false);
+        doc.selected = Some(filter_id);
+
+        let mut state = default_state();
+        state.reset_collapse_for_project(Some(&doc));
+        assert!(
+            !hierarchy_presentation_snapshot(&doc, &state)
+                .iter()
+                .any(|row| row.0 == filter_id),
+            "the collapsed project starts with the selected filter hidden"
+        );
+
+        state.reveal_selection(&doc);
+
+        let rows = hierarchy_presentation_snapshot(&doc, &state);
+        let filter_row = rows
+            .iter()
+            .find(|row| row.0 == filter_id)
+            .expect("selected filter should be revealed in Layers");
+        assert_eq!(filter_row.1, "Selected Crater");
+        assert_eq!(filter_row.2, "layer");
+        assert_eq!(filter_row.4, Some(ArtistConcept::Biomes));
+    }
+
+    #[test]
+    fn project_open_reveals_filters_when_a_shape_layer_is_selected() {
+        let mut doc = TerrainDocument::new_default();
+        let shape_id = doc
+            .stack
+            .layer_ids()
+            .into_iter()
+            .next()
+            .expect("default shape layer");
+        let filter = terra_core::layer::Layer::new(
+            "Persisted Crater",
+            LayerKind::EffectFilter(terra_core::layer::EffectFilterParams::crater()),
+        );
+        let filter_id = filter.id();
+        doc.stack.push_routed(filter, doc.active_biome, false);
+        doc.selected = Some(shape_id);
+
+        let mut state = default_state();
+        state.reset_collapse_for_project(Some(&doc));
+        state.reveal_populated_biome_sections(&doc);
+        state.reveal_selection(&doc);
+
+        let rows = hierarchy_presentation_snapshot(&doc, &state);
+        assert!(
+            rows.iter().any(|row| row.0 == shape_id),
+            "saved shape selection should still be revealed"
+        );
+        assert!(
+            rows.iter().any(|row| row.0 == filter_id),
+            "persisted filter should remain discoverable when it is not selected"
         );
     }
 

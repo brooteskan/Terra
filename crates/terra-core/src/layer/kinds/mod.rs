@@ -1,7 +1,7 @@
 //! All layer parameter kinds. Extended across phases; serde-stable via enum.
 //!
-//! Param structs are split by family under this module; [`LayerKind`] stays here
-//! so serde variant names/tags remain stable.
+//! Param structs live with their algorithm or schema owners and are re-exported
+//! here; [`LayerKind`] stays here so serde variant names/tags remain stable.
 
 mod erosion;
 mod filters;
@@ -32,6 +32,10 @@ pub use crate::landscape_evolution::{
 };
 use serde::{Deserialize, Serialize};
 
+// Per-variant payloads are the intrinsic, serialized parameter blocks for each layer
+// type; the size spread is inherent to the data model. Boxing a subset would spread
+// deref/`Box::new` churn across every match site for no real gain.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LayerKind {
     // Artist foundation — painted height buffer (always bottom in default docs)

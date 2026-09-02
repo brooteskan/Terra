@@ -25,9 +25,16 @@ struct FrameUniforms {
     shadow: vec4<f32>,
     // Raster shading: x=ambient_strength, y=shadow_strength, z=fog_strength, w=unused
     raster: vec4<f32>,
+    // Complete streamed-content identity: document/plan then output/content halves.
+    stream2: vec4<u32>,
+    stream3: vec4<u32>,
+    // x=level_count, y=target_level, z=current_frame_lo bits, w=transition_frames
+    stream4: vec4<u32>,
+    // x=terminal monolithic allowed, y=debug mode
+    stream5: vec4<f32>,
 };
 
-/// Physical page-table row (must match `GpuPageTableEntry`, 48 bytes).
+/// Physical page-table row (must match `GpuPageTableEntry`).
 struct PageTableEntry {
     key_hash_lo: u32,
     key_hash_hi: u32,
@@ -39,8 +46,30 @@ struct PageTableEntry {
     width: u32,
     height: u32,
     halo: u32,
-    revision_lo: u32,
-    revision_hi: u32,
+    document_revision_lo: u32,
+    document_revision_hi: u32,
+    plan_revision_lo: u32,
+    plan_revision_hi: u32,
+    output_revision_lo: u32,
+    output_revision_hi: u32,
+    content_revision_lo: u32,
+    content_revision_hi: u32,
+    published_frame_lo: u32,
+    published_frame_hi: u32,
+};
+
+struct VirtualPageEntry {
+    physical_slot: u32,
+    generation: u32,
+    valid: u32,
+    pad: u32,
+};
+
+struct TerrainLevelEntry {
+    resolution: u32,
+    tiles_x: u32,
+    tiles_z: u32,
+    metadata_offset: u32,
 };
 
 
@@ -72,6 +101,8 @@ struct MaterialPalette {
 @group(0) @binding(16) var<storage, read> page_table: array<PageTableEntry>;
 @group(0) @binding(17) var shadow_map: texture_depth_2d;
 @group(0) @binding(18) var shadow_samp: sampler_comparison;
+@group(0) @binding(19) var<storage, read> virtual_page_table: array<VirtualPageEntry>;
+@group(0) @binding(20) var<storage, read> terrain_levels: array<TerrainLevelEntry>;
 
 struct VsIn {
     @location(0) uv: vec2<f32>,
@@ -173,44 +204,159 @@ fn sample_height_monolithic(uv: vec2<f32>) -> f32 {
     return textureLoad(height_tex, vec2<i32>(x, y), 0).r;
 }
 
-fn find_tile_page(level: u32, tile_x: u32, tile_z: u32) -> i32 {
-    let max_pages = u32(max(u.stream.w, 1.0));
-    for (var i = 0u; i < max_pages; i = i + 1u) {
-        let e = page_table[i];
-        if (e.valid != 0u && e.level == level && e.tile_x == tile_x && e.tile_z == tile_z) {
-            return i32(i);
-        }
-    }
-    return -1;
+const STREAM_EXACT: u32 = 0u;
+const STREAM_ANCESTOR: u32 = 1u;
+const STREAM_TERMINAL: u32 = 2u;
+const STREAM_BLEND: u32 = 3u;
+
+struct ResolvedHeightSample {
+    height: f32,
+    sample_class: u32,
+    level: u32,
+};
+
+fn page_identity_current(e: PageTableEntry) -> bool {
+    return e.document_revision_lo == u.stream2.x
+        && e.document_revision_hi == u.stream2.y
+        && e.plan_revision_lo == u.stream2.z
+        && e.plan_revision_hi == u.stream2.w
+        && e.output_revision_lo == u.stream3.x
+        && e.output_revision_hi == u.stream3.y
+        && e.content_revision_lo == u.stream3.z
+        && e.content_revision_hi == u.stream3.w;
 }
 
-fn sample_height_streamed_point(sx: f32, sy: f32) -> f32 {
-    let tile_size = max(u.stream.y, 1.0);
-    let halo = u.stream.z;
-    let level = u32(u.shadow.z);
-    let tx = u32(floor(sx / tile_size));
-    let tz = u32(floor(sy / tile_size));
-    let page = find_tile_page(level, tx, tz);
-    if (page < 0) {
-        let dim = textureDimensions(height_tex);
-        let x = i32(clamp(sx, 0.0, f32(dim.x - 1u)));
-        let y = i32(clamp(sy, 0.0, f32(dim.y - 1u)));
-        return textureLoad(height_tex, vec2<i32>(x, y), 0).r;
+fn lookup_tile_page(level: u32, tile_x: u32, tile_z: u32) -> i32 {
+    let level_count = u.stream4.x;
+    if (level >= level_count) { return -1; }
+    let level_info = terrain_levels[level];
+    if (tile_x >= level_info.tiles_x || tile_z >= level_info.tiles_z) { return -1; }
+    let virtual_index = level_info.metadata_offset + tile_z * level_info.tiles_x + tile_x;
+    let mapping = virtual_page_table[virtual_index];
+    let max_pages = u32(max(u.stream.w, 1.0));
+    if (mapping.valid == 0u || mapping.physical_slot >= max_pages) { return -1; }
+    let e = page_table[mapping.physical_slot];
+    if (e.valid == 0u || e.generation != mapping.generation
+        || e.level != level || e.tile_x != tile_x || e.tile_z != tile_z
+        || !page_identity_current(e)) {
+        return -1;
     }
+    return i32(mapping.physical_slot);
+}
+
+fn sample_page_bilinear(page: u32, uv: vec2<f32>) -> f32 {
+    let e = page_table[page];
+    let level_info = terrain_levels[e.level];
+    let last = f32(max(level_info.resolution, 1u) - 1u);
+    let p = clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)) * last;
+    let tile_size = max(u.stream.y, 1.0);
+    let local = p - vec2<f32>(f32(e.tile_x), f32(e.tile_z)) * tile_size
+        + vec2<f32>(f32(e.halo));
+    let limit = vec2<i32>(
+        i32(e.width + e.halo * 2u - 1u),
+        i32(e.height + e.halo * 2u - 1u),
+    );
+    let p0 = clamp(vec2<i32>(floor(local)), vec2<i32>(0), limit);
+    let p1 = min(p0 + vec2<i32>(1), limit);
+    let f = fract(local);
+    let h00 = textureLoad(tile_atlas, p0, i32(page), 0).r;
+    let h10 = textureLoad(tile_atlas, vec2<i32>(p1.x, p0.y), i32(page), 0).r;
+    let h01 = textureLoad(tile_atlas, vec2<i32>(p0.x, p1.y), i32(page), 0).r;
+    let h11 = textureLoad(tile_atlas, p1, i32(page), 0).r;
+    return mix(mix(h00, h10, f.x), mix(h01, h11, f.x), f.y);
+}
+
+fn resolve_from_level(uv: vec2<f32>, start_level: i32) -> ResolvedHeightSample {
+    let c = clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0));
+    let target_level = u.stream4.y;
+    var level = start_level;
+    loop {
+        if (level < 0) { break; }
+        let li = u32(level);
+        let level_info = terrain_levels[li];
+        let last = f32(max(level_info.resolution, 1u) - 1u);
+        let p = c * last;
+        let tile_size = max(u.stream.y, 1.0);
+        let tx = min(u32(floor(p.x / tile_size)), level_info.tiles_x - 1u);
+        let tz = min(u32(floor(p.y / tile_size)), level_info.tiles_z - 1u);
+        let page = lookup_tile_page(li, tx, tz);
+        if (page >= 0) {
+            return ResolvedHeightSample(
+                sample_page_bilinear(u32(page), c),
+                select(STREAM_ANCESTOR, STREAM_EXACT, li == target_level),
+                li,
+            );
+        }
+        level = level - 1;
+    }
+    return ResolvedHeightSample(sample_height_monolithic(c), STREAM_TERMINAL, 0u);
+}
+
+fn page_edge_weight(page: u32, uv: vec2<f32>) -> f32 {
+    let e = page_table[page];
+    let level_info = terrain_levels[e.level];
+    let last = f32(max(level_info.resolution, 1u) - 1u);
+    let p = clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)) * last;
+    let tile_size = max(u.stream.y, 1.0);
+    let local = p - vec2<f32>(f32(e.tile_x), f32(e.tile_z)) * tile_size;
+    let band = 4.0;
+    var weight = 1.0;
+    if (e.tile_x > 0u && lookup_tile_page(e.level, e.tile_x - 1u, e.tile_z) < 0) {
+        weight = min(weight, smoothstep(0.0, band, local.x));
+    }
+    if (e.tile_x + 1u < level_info.tiles_x
+        && lookup_tile_page(e.level, e.tile_x + 1u, e.tile_z) < 0) {
+        weight = min(weight, smoothstep(0.0, band, f32(e.width - 1u) - local.x));
+    }
+    if (e.tile_z > 0u && lookup_tile_page(e.level, e.tile_x, e.tile_z - 1u) < 0) {
+        weight = min(weight, smoothstep(0.0, band, local.y));
+    }
+    if (e.tile_z + 1u < level_info.tiles_z
+        && lookup_tile_page(e.level, e.tile_x, e.tile_z + 1u) < 0) {
+        weight = min(weight, smoothstep(0.0, band, f32(e.height - 1u) - local.y));
+    }
+    return weight;
+}
+
+fn resolve_height_streamed(uv: vec2<f32>) -> ResolvedHeightSample {
+    let target_level = i32(u.stream4.y);
+    let selected = resolve_from_level(uv, target_level);
+    if (selected.sample_class == STREAM_TERMINAL || selected.level == 0u) {
+        return selected;
+    }
+    let level_info = terrain_levels[selected.level];
+    let p = clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0))
+        * f32(max(level_info.resolution, 1u) - 1u);
+    let tile_size = max(u.stream.y, 1.0);
+    let tx = min(u32(floor(p.x / tile_size)), level_info.tiles_x - 1u);
+    let tz = min(u32(floor(p.y / tile_size)), level_info.tiles_z - 1u);
+    let page = lookup_tile_page(selected.level, tx, tz);
+    if (page < 0) { return selected; }
     let e = page_table[u32(page)];
-    let local_x = sx - f32(tx) * tile_size;
-    let local_z = sy - f32(tz) * tile_size;
-    let lx = i32(clamp(floor(local_x + halo), 0.0, f32(e.width + e.halo * 2u - 1u)));
-    let lz = i32(clamp(floor(local_z + halo), 0.0, f32(e.height + e.halo * 2u - 1u)));
-    return textureLoad(tile_atlas, vec2<i32>(lx, lz), page, 0).r;
+    let current_frame = u.stream4.z;
+    let transition_frames = f32(max(u.stream4.w, 1u));
+    let time_weight = select(
+        smoothstep(
+            0.0,
+            1.0,
+            f32(current_frame - e.published_frame_lo) / transition_frames,
+        ),
+        1.0,
+        u.stream4.w == 0u,
+    );
+    let weight = min(time_weight, page_edge_weight(u32(page), uv));
+    if (weight >= 0.999) { return selected; }
+    let ancestor = resolve_from_level(uv, i32(selected.level) - 1);
+    return ResolvedHeightSample(
+        mix(ancestor.height, selected.height, weight),
+        select(STREAM_BLEND, STREAM_TERMINAL, ancestor.sample_class == STREAM_TERMINAL),
+        selected.level,
+    );
 }
 
 fn sample_height_uv(uv: vec2<f32>) -> f32 {
     if (u.stream.x > 0.5) {
-        let tw = max(u.grid.x - 1.0, 1.0);
-        let th = max(u.grid.y - 1.0, 1.0);
-        let c = clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0));
-        return sample_height_streamed_point(c.x * tw, c.y * th);
+        return resolve_height_streamed(uv).height;
     }
     return sample_height_monolithic(uv);
 }
@@ -298,18 +444,15 @@ fn height_ao(uv: vec2<f32>, h: f32) -> f32 {
 }
 
 fn sample_height_bilinear(uv: vec2<f32>) -> f32 {
+    let uvc = clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0));
+    if (u.stream.x > 0.5) {
+        return resolve_height_streamed(uvc).height;
+    }
     let dim = textureDimensions(height_tex);
-    let p = clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)) * vec2<f32>(dim - vec2<u32>(1u));
+    let p = uvc * vec2<f32>(dim - vec2<u32>(1u));
     let p0 = vec2<i32>(floor(p));
     let p1 = min(p0 + vec2<i32>(1), vec2<i32>(dim) - vec2<i32>(1));
     let f = fract(p);
-    if (u.stream.x > 0.5) {
-        let h00 = sample_height_streamed_point(f32(p0.x), f32(p0.y));
-        let h10 = sample_height_streamed_point(f32(p1.x), f32(p0.y));
-        let h01 = sample_height_streamed_point(f32(p0.x), f32(p1.y));
-        let h11 = sample_height_streamed_point(f32(p1.x), f32(p1.y));
-        return mix(mix(h00, h10, f.x), mix(h01, h11, f.x), f.y);
-    }
     let h00 = textureLoad(height_tex, p0, 0).r;
     let h10 = textureLoad(height_tex, vec2<i32>(p1.x, p0.y), 0).r;
     let h01 = textureLoad(height_tex, vec2<i32>(p0.x, p1.y), 0).r;
@@ -457,6 +600,24 @@ fn fs_main(i: VsOut) -> @location(0) vec4<f32> {
         if (d < u.viz.w) {
             discard;
         }
+    }
+    if (u.stream.x > 0.5 && u.stream5.y > 0.5 && i.face < 0.5) {
+        let resolved = resolve_height_streamed(clamp(i.terrain_uv, vec2<f32>(0.0), vec2<f32>(1.0)));
+        if (resolved.sample_class == STREAM_EXACT) {
+            return vec4<f32>(0.10, 0.85, 0.25, 1.0);
+        }
+        if (resolved.sample_class == STREAM_ANCESTOR) {
+            return vec4<f32>(0.95, 0.65, 0.10, 1.0);
+        }
+        if (resolved.sample_class == STREAM_BLEND) {
+            return vec4<f32>(0.15, 0.55, 0.95, 1.0);
+        }
+        // Root-required mode makes a terminal sample intentionally conspicuous.
+        return select(
+            vec4<f32>(1.0, 0.0, 0.8, 1.0),
+            vec4<f32>(0.75, 0.2, 0.95, 1.0),
+            u.stream5.x > 0.5,
+        );
     }
     // Slab sides / underside — World Creator–style light cliff faces.
     if (i.face > 0.5) {

@@ -1,4 +1,4 @@
-﻿use terra_core::layer::*;
+use terra_core::layer::*;
 use terra_core::WorldTemplate;
 
 #[derive(Debug, Clone)]
@@ -1975,8 +1975,8 @@ mod tests {
             for layer in layers {
                 stack.push(layer);
             }
-            let mut evaluator = terra_core::eval::StackEvaluator::new();
-            let mut context = terra_core::eval::EvalContext::new(metrics);
+            let mut evaluator = terra_cpu_eval::StackEvaluator::new();
+            let mut context = terra_cpu_eval::EvalContext::new(metrics);
             let height = evaluator
                 .rebuild_all(&stack, &mut context)
                 .unwrap_or_else(|error| panic!("{name} failed to evaluate: {error}"));
@@ -2029,9 +2029,9 @@ mod tests {
         for layer in layers {
             stack.push(layer);
         }
-        let mut evaluator = terra_core::eval::StackEvaluator::new();
-        let mut context = terra_core::eval::EvalContext::new(metrics);
-        context.quality = terra_core::eval::PreviewQuality::Full;
+        let mut evaluator = terra_cpu_eval::StackEvaluator::new();
+        let mut context = terra_cpu_eval::EvalContext::new(metrics);
+        context.quality = terra_core::quality::PreviewQuality::Full;
         let height = evaluator
             .rebuild_all(&stack, &mut context)
             .expect("island evaluates");

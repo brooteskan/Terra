@@ -40,8 +40,10 @@ pub mod gpu_timing;
 pub mod grid;
 pub mod guides;
 pub mod height_gpu;
+mod integrity_probe;
 pub mod overhang;
 pub mod path_tracer;
+pub mod presentation_transition;
 pub mod progressive;
 pub mod render_quality;
 pub mod retirement;
@@ -55,19 +57,23 @@ pub use adaptive_sampling::{AdaptiveSamplingState, TileState, VarianceTileSummar
 pub use backends::{
     GBufferViews, HdrFrame, PresentationBackendId, ProgressivePostPipeline, ProgressivePtOutput,
 };
-pub use brush::{pick_terrain_uv, pick_terrain_uv_on_surface, BrushGizmo, BrushOverlay};
+pub use brush::{pick_terrain_uv, pick_terrain_uv_on_surface, BrushOverlay, SurfacePick};
 pub use camera::OrbitCamera;
 pub use clipmap::{
-    plan_resident_tiles, projected_error_px, ClipmapConfig, ClipmapPresentPlan, ClipmapRingDraw,
-    ClipmapRingLevel, ResidentTileSelection, ViewportTilePlan, WorldGridConfig,
+    ClipmapConfig, ClipmapPresentPlan, ClipmapRingDraw, ClipmapRingLevel, WorldGridConfig,
 };
 pub use frame_graph::{FrameGraph, FrameSchedule, PassKind};
-pub use gpu_timing::GpuTimings;
+pub use gpu_timing::{GpuPresentationTraceContext, GpuTimings};
 pub use grid::TerrainGrid;
 pub use guides::{GuideOverlay, GuideState};
-pub use height_gpu::HeightGpu;
+pub use height_gpu::{AuxMaps, HeightGpu, HeightPresentGeom};
+pub use integrity_probe::TerrainIntegrityProbeResult;
 pub use overhang::OverhangOverlay;
 pub use path_tracer::{PathTraceUniforms, PathTracer};
+pub use presentation_transition::{
+    PresentedTerrainBaseline, TerrainPresentationDecisionCode, TerrainPresentationExpectations,
+    TerrainPresentationMode, TerrainPresentationRecord, TerrainTransitionDiagnosticCode,
+};
 pub use render_quality::{
     QualityPreset, RenderQualityConfig, ViewportQualityManager, ViewportRendererMode,
 };
@@ -82,7 +88,6 @@ use terra_core::heightfield::Heightfield;
 use terra_core::layer::MaterialsParams;
 use terra_core::mask::MaskField;
 use terra_core::tiling::SampleRect;
-use terra_core::{FieldId, NormalizedRect, TerrainPyramid};
 use thiserror::Error;
 use winit::window::Window;
 
@@ -123,6 +128,40 @@ struct FrameUniforms {
     shadow: [f32; 4],
     /// Raster shading controls: x=ambient_strength, y=shadow_strength, z=fog_strength, w=unused
     raster: [f32; 4],
+    /// Document and plan revision halves for complete streamed-content identity.
+    stream2: [u32; 4],
+    /// Output/content revision halves, bitcast as raw u32 values.
+    stream3: [u32; 4],
+    /// x=level_count, y=target_level, z=current_frame_lo bits, w=transition_frames.
+    stream4: [u32; 4],
+    /// x=terminal monolithic allowed, y=stream debug mode, z/w reserved.
+    stream5: [f32; 4],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TerrainTerminalFallback {
+    #[default]
+    RootRequired,
+    MonolithicMigration,
+}
+
+/// Complete shader-facing tile-stream resource set. Demand is deliberately not
+/// represented here: rendered selection comes only from these GPU tables.
+pub struct TerrainTileStreamResources {
+    pub atlas_view: wgpu::TextureView,
+    pub physical_page_table: wgpu::Buffer,
+    pub virtual_page_table: wgpu::Buffer,
+    pub level_table: wgpu::Buffer,
+    pub tile_size: u32,
+    pub halo: u32,
+    pub max_pages: u32,
+    pub level_count: u32,
+    pub target_level: u8,
+    pub target_resolution: u32,
+    pub content: terra_core::TerrainContentStamp,
+    pub transition_frames: u32,
+    pub terminal_fallback: TerrainTerminalFallback,
+    pub enable: bool,
 }
 
 /// Viewport false-color / analysis shading (mode bar).
@@ -209,6 +248,15 @@ impl MaterialPalette {
 /// wgpu/Vulkan drivers often expect uniform bindings sized to 256-byte alignment.
 const FRAME_UNIFORM_BUF_SIZE: u64 = 512;
 
+#[derive(Clone, Copy)]
+struct GpuPresentationAttempt {
+    requested_mode: TerrainPresentationMode,
+    actual_mode: TerrainPresentationMode,
+    requested_rect: Option<SampleRect>,
+    actual_rect: Option<SampleRect>,
+    coherent_before: bool,
+}
+
 pub struct TerrainRenderer {
     /// Presentation surface. `None` for headless renderers built via `new_headless`.
     ///
@@ -256,14 +304,13 @@ pub struct TerrainRenderer {
     pub last_upload_us: u64,
     /// Last resolved GPU pass timings (0 when TIMESTAMP_QUERY unavailable).
     pub last_gpu_timings: GpuTimings,
+    pending_presentation_trace: GpuPresentationTraceContext,
+    presentation_baseline: Option<PresentedTerrainBaseline>,
+    last_presentation_record: Option<TerrainPresentationRecord>,
+    presentation_slot_epoch: u64,
+    integrity_probe: Option<integrity_probe::TerrainIntegrityProbe>,
     /// Terrain mesh resolution drawn last frame (profiler).
     pub last_grid_resolution: u32,
-    /// Desired visible pages resident at the requested pyramid level.
-    pub last_tile_plan_exact: usize,
-    /// Desired visible pages currently covered by a coarser resident ancestor.
-    pub last_tile_plan_fallback: usize,
-    /// Desired visible pages with no resident ancestor yet.
-    pub last_tile_plan_missing: usize,
     /// After first height present, leave orbit target alone so uploads don't fight the user.
     camera_framed: bool,
     /// Sculpt / mask brush ring drawn on the height surface.
@@ -313,11 +360,19 @@ pub struct TerrainRenderer {
     tile_atlas_texture: wgpu::Texture,
     tile_atlas_view: wgpu::TextureView,
     page_table_buf: wgpu::Buffer,
+    virtual_page_table_buf: wgpu::Buffer,
+    tile_level_table_buf: wgpu::Buffer,
     use_tile_stream: bool,
     tile_stream_tile_size: f32,
     tile_stream_halo: f32,
     tile_stream_max_pages: f32,
-    tile_stream_level: f32,
+    tile_stream_level_count: u32,
+    tile_stream_target_level: u8,
+    tile_stream_target_resolution: u32,
+    tile_stream_content: terra_core::TerrainContentStamp,
+    tile_stream_transition_frames: u32,
+    tile_stream_terminal_fallback: TerrainTerminalFallback,
+    tile_stream_debug_mode: u32,
 }
 
 /// Environment lighting used for Lit viewport presentation.
@@ -406,8 +461,7 @@ pub async fn init_gpu(
     // Path tracer uses 4 storage textures; request headroom when the adapter allows it.
     limits.max_storage_textures_per_shader_stage = adapter_limits
         .max_storage_textures_per_shader_stage
-        .max(4)
-        .min(16);
+        .clamp(4, 16);
     limits.max_storage_buffers_per_shader_stage = adapter_limits
         .max_storage_buffers_per_shader_stage
         .max(limits.max_storage_buffers_per_shader_stage);
@@ -477,6 +531,127 @@ pub async fn init_gpu(
     ))
 }
 
+impl SurfaceTarget {
+    /// Hand the surface to the main thread as a [`PendingSurface`] so the
+    /// renderer's pipelines can be built off-thread (see [`TerrainRenderer::new_detached`])
+    /// while the main thread keeps presenting splash frames. The surface must
+    /// stay on the thread that presents; only `config`/`size` cross to the worker.
+    pub fn into_pending(self) -> PendingSurface {
+        PendingSurface {
+            surface: self.surface,
+            config: self.config,
+            size: self.size,
+        }
+    }
+}
+
+/// The window surface held on the main thread during startup, decoupled from the
+/// renderer whose pipelines are compiling on a worker.
+///
+/// This is the seam that keeps the window responsive while shaders build: the
+/// surface (which must be presented from the thread that owns the window) stays
+/// here so the app can animate a splash via [`Self::present_splash`], while the
+/// heavy [`TerrainRenderer::new_detached`] runs elsewhere. When that returns,
+/// [`Self::attach`] hands the surface to the finished renderer.
+pub struct PendingSurface {
+    surface: wgpu::Surface<'static>,
+    config: wgpu::SurfaceConfiguration,
+    size: winit::dpi::PhysicalSize<u32>,
+}
+
+impl PendingSurface {
+    /// Surface configuration the detached renderer must be built for (format,
+    /// size, present/alpha modes). Clone it to hand to the worker.
+    pub fn config(&self) -> &wgpu::SurfaceConfiguration {
+        &self.config
+    }
+
+    /// Physical size the surface was configured at.
+    pub fn size(&self) -> winit::dpi::PhysicalSize<u32> {
+        self.size
+    }
+
+    /// Present one splash frame: clear the swapchain to `clear`, let `overlay`
+    /// draw over the acquired view, then present — without consuming the surface.
+    ///
+    /// Cosmetic, so a failed surface acquire (e.g. transient `Outdated` during a
+    /// resize) is logged and skipped, never fatal.
+    pub fn present_splash(
+        &self,
+        ctx: &GpuContext,
+        clear: [f32; 3],
+        overlay: impl FnOnce(&wgpu::TextureView),
+    ) {
+        let frame = match self.surface.get_current_texture() {
+            Ok(frame) => frame,
+            Err(err) => {
+                log::warn!("splash: surface acquire failed, skipping: {err}");
+                return;
+            }
+        };
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("splash-clear"),
+            });
+        {
+            // Clear pass: the GUI renderer draws with LoadOp::Load, so the
+            // attachment must be defined before it runs (freshly acquired
+            // swapchain contents are otherwise undefined).
+            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("splash-clear"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: clear[0] as f64,
+                            g: clear[1] as f64,
+                            b: clear[2] as f64,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+        }
+        ctx.queue.submit(std::iter::once(encoder.finish()));
+        overlay(&view);
+        frame.present();
+    }
+
+    /// Attach this surface to a renderer that was built detached (surface `None`)
+    /// on a worker thread, finishing it into a windowed renderer. Reconfigures
+    /// the surface against the renderer's device to be safe.
+    pub fn attach(self, renderer: &mut TerrainRenderer) {
+        self.surface.configure(&renderer.device, &self.config);
+        renderer.config = self.config;
+        renderer.size = self.size;
+        renderer.surface = Some(self.surface);
+    }
+}
+
+impl TerrainRenderer {
+    /// Build every device-only pipeline and render target for a *windowed*
+    /// renderer, but without the surface — so this (the expensive shader/pipeline
+    /// compile) can run on a worker thread while the main thread animates the
+    /// startup splash. Pass `config`/`size` cloned from the [`PendingSurface`];
+    /// finish on the main thread with [`PendingSurface::attach`].
+    pub fn new_detached(
+        ctx: &GpuContext,
+        config: wgpu::SurfaceConfiguration,
+        size: winit::dpi::PhysicalSize<u32>,
+    ) -> Self {
+        Self::init(ctx.device.clone(), ctx.queue.clone(), None, config, size)
+    }
+}
+
 impl TerrainRenderer {
     /// Build the windowed renderer from the app-owned [`GpuContext`] and the
     /// [`SurfaceTarget`] that [`init_gpu`] produced together. The device and
@@ -495,6 +670,10 @@ impl TerrainRenderer {
     /// Current swapchain dimensions in physical pixels (each always ≥ 1).
     pub fn size(&self) -> (u32, u32) {
         (self.config.width, self.config.height)
+    }
+
+    pub fn set_presentation_trace_context(&mut self, context: GpuPresentationTraceContext) {
+        self.pending_presentation_trace = context;
     }
 
     /// Swapchain color format the surface was configured with.
@@ -545,6 +724,7 @@ impl TerrainRenderer {
         let format = config.format;
 
         log::info!("terra-render: compiling terrain shader/pipelines…");
+        terra_core::shader_progress::record_shader_compiled();
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("terrain"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/terrain.wgsl").into()),
@@ -737,10 +917,31 @@ impl TerrainRenderer {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 19,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 20,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
         let heights = HeightGpu::new(&device, 256);
+        let integrity_probe = integrity_probe::TerrainIntegrityProbe::try_new(&device);
         debug_assert!(std::mem::size_of::<FrameUniforms>() as u64 <= FRAME_UNIFORM_BUF_SIZE);
         let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("frame-u"),
@@ -763,8 +964,13 @@ impl TerrainRenderer {
         let (albedo_array, albedo_array_view, albedo_sampler) =
             create_albedo_array(&device, &queue);
 
-        let (tile_atlas_texture, tile_atlas_view, page_table_buf) =
-            create_dummy_tile_stream(&device);
+        let (
+            tile_atlas_texture,
+            tile_atlas_view,
+            page_table_buf,
+            virtual_page_table_buf,
+            tile_level_table_buf,
+        ) = create_dummy_tile_stream(&device);
         let shadow_map = shadows::ShadowMap::new(&device, heights.display_height_view(), true);
         let staging = staging::StagingRing::new(&device, 3, 4 * 1024 * 1024);
         let gpu_timer = gpu_timing::GpuTimestampTimer::try_new(&device, &queue);
@@ -779,6 +985,8 @@ impl TerrainRenderer {
             &albedo_sampler,
             &tile_atlas_view,
             &page_table_buf,
+            &virtual_page_table_buf,
+            &tile_level_table_buf,
             &shadow_map.view,
             &shadow_map.comparison_sampler,
         );
@@ -932,13 +1140,16 @@ impl TerrainRenderer {
                     &albedo_sampler,
                     &tile_atlas_view,
                     &page_table_buf,
+                    &virtual_page_table_buf,
+                    &tile_level_table_buf,
                     &shadow_map.view,
                     &shadow_map.comparison_sampler,
                 )
             })
             .collect();
         let camera = OrbitCamera::default();
-        let brush = BrushOverlay::new(&device, format);
+        let mut brush = BrushOverlay::new(&device, format);
+        brush.rebind_height(&device, heights.display_height_view());
         let guides = GuideOverlay::new(&device, format);
         let overhang = OverhangOverlay::new(&device, format);
         let vegetation = VegetationOverlay::new(&device, format);
@@ -984,10 +1195,12 @@ impl TerrainRenderer {
             ocean_pipeline,
             last_upload_us: 0,
             last_gpu_timings: GpuTimings::default(),
+            pending_presentation_trace: GpuPresentationTraceContext::default(),
+            presentation_baseline: None,
+            last_presentation_record: None,
+            presentation_slot_epoch: 0,
+            integrity_probe,
             last_grid_resolution: 0,
-            last_tile_plan_exact: 0,
-            last_tile_plan_fallback: 0,
-            last_tile_plan_missing: 0,
             camera_framed: false,
             brush,
             guides,
@@ -1013,16 +1226,28 @@ impl TerrainRenderer {
             tile_atlas_texture,
             tile_atlas_view,
             page_table_buf,
+            virtual_page_table_buf,
+            tile_level_table_buf,
             use_tile_stream: false,
             tile_stream_tile_size: 256.0,
             tile_stream_halo: 2.0,
             tile_stream_max_pages: 1.0,
-            tile_stream_level: 0.0,
+            tile_stream_level_count: 0,
+            tile_stream_target_level: 0,
+            tile_stream_target_resolution: 1,
+            tile_stream_content: terra_core::TerrainContentStamp::default(),
+            tile_stream_transition_frames: 8,
+            tile_stream_terminal_fallback: TerrainTerminalFallback::RootRequired,
+            tile_stream_debug_mode: 0,
         }
     }
 
     // (pipeline compile complete — logged via terrain shader message above)
 
+    // Assembles one wgpu bind group from eleven distinct GPU handles (buffers,
+    // views, samplers), each bound once by position to build the descriptor — a
+    // params struct would only relocate the same list. Kept flat.
+    #[allow(clippy::too_many_arguments)]
     fn make_bind_group(
         device: &wgpu::Device,
         layout: &wgpu::BindGroupLayout,
@@ -1033,6 +1258,8 @@ impl TerrainRenderer {
         albedo_sampler: &wgpu::Sampler,
         tile_atlas_view: &wgpu::TextureView,
         page_table_buf: &wgpu::Buffer,
+        virtual_page_table_buf: &wgpu::Buffer,
+        tile_level_table_buf: &wgpu::Buffer,
         shadow_view: &wgpu::TextureView,
         shadow_samp: &wgpu::Sampler,
     ) -> wgpu::BindGroup {
@@ -1115,6 +1342,14 @@ impl TerrainRenderer {
                 wgpu::BindGroupEntry {
                     binding: 18,
                     resource: wgpu::BindingResource::Sampler(shadow_samp),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 19,
+                    resource: virtual_page_table_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 20,
+                    resource: tile_level_table_buf.as_entire_binding(),
                 },
             ],
         })
@@ -1258,6 +1493,10 @@ impl TerrainRenderer {
             regions,
         );
         self.finish_height_present(t0);
+        // CPU ownership has no GPU output identity. Invalidate the typed GPU
+        // baseline so the next regional GPU request promotes to a full copy.
+        self.presentation_baseline = None;
+        self.last_presentation_record = None;
     }
 
     /// Upload authored tint, roughness, metalness, and optional albedo PNGs.
@@ -1293,37 +1532,18 @@ impl TerrainRenderer {
         wetness: Option<&MaskField>,
         vegetation: Option<&MaskField>,
     ) {
-        self.upload_aux_maps_ex(
-            materials, wetness, vegetation, None, None, None, None, None, None,
-        );
-    }
-
-    /// Upload materials/wetness/vegetation plus optional climate R32Float aux maps and flow.
-    pub fn upload_aux_maps_ex(
-        &mut self,
-        materials: Option<&MaskField>,
-        wetness: Option<&MaskField>,
-        vegetation: Option<&MaskField>,
-        temperature: Option<&MaskField>,
-        rainfall: Option<&MaskField>,
-        snow: Option<&MaskField>,
-        soil_moisture: Option<&MaskField>,
-        biomes: Option<&MaskField>,
-        flow: Option<&MaskField>,
-    ) {
-        self.heights.upload_aux_maps_ex(
-            &self.device,
-            &self.queue,
+        self.upload_aux_maps_ex(AuxMaps {
             materials,
             wetness,
             vegetation,
-            temperature,
-            rainfall,
-            snow,
-            soil_moisture,
-            biomes,
-            flow,
-        );
+            ..Default::default()
+        });
+    }
+
+    /// Upload materials/wetness/vegetation plus optional climate R32Float aux maps and flow.
+    pub fn upload_aux_maps_ex(&mut self, aux: AuxMaps) {
+        self.heights
+            .upload_aux_maps_ex(&self.device, &self.queue, aux);
         self.recreate_bind_group();
         self.notify_invalidation(InvalidationReason::MaterialChanged);
     }
@@ -1337,28 +1557,14 @@ impl TerrainRenderer {
     }
 
     /// Present a GPU-resident height texture (Wave C — no CPU readback).
-    pub fn present_gpu_height(
-        &mut self,
-        src: &wgpu::Texture,
-        width: u32,
-        height: u32,
-        world_size: (f32, f32),
-        height_range: (f32, f32),
-        dx: f32,
-        dz: f32,
-    ) {
-        self.present_gpu_height_region(src, width, height, world_size, height_range, dx, dz, None);
+    pub fn present_gpu_height(&mut self, src: &wgpu::Texture, geom: HeightPresentGeom) {
+        self.present_gpu_height_region(src, geom, None);
     }
 
     pub fn present_gpu_height_region(
         &mut self,
         src: &wgpu::Texture,
-        width: u32,
-        height: u32,
-        world_size: (f32, f32),
-        height_range: (f32, f32),
-        dx: f32,
-        dz: f32,
+        geom: HeightPresentGeom,
         region: Option<SampleRect>,
     ) {
         profiling::scope!("present_gpu_height");
@@ -1367,58 +1573,201 @@ impl TerrainRenderer {
             &self.device,
             &self.queue,
             src,
-            width,
-            height,
-            world_size,
-            height_range,
-            dx,
-            dz,
+            geom,
             region,
         );
         self.finish_height_present(t0);
     }
 
+    pub fn present_gpu_height_region_traced(
+        &mut self,
+        src: &wgpu::Texture,
+        geom: HeightPresentGeom,
+        region: Option<SampleRect>,
+        candidate: terra_gpu::output_identity::GpuTerrainOutputIdentity,
+        expected: TerrainPresentationExpectations,
+    ) -> TerrainPresentationRecord {
+        let coherent_before = self.heights.local_slots_coherent();
+        let full = SampleRect {
+            x: 0,
+            y: 0,
+            w: geom.width,
+            h: geom.height,
+        };
+        let requested_is_partial = region.is_some_and(|rect| rect != full);
+        let actual_mode = if requested_is_partial {
+            presentation_transition::recoverable_regional_presentation_mode(
+                candidate,
+                self.presentation_baseline,
+                expected,
+                coherent_before,
+            )
+        } else {
+            TerrainPresentationMode::FullCopy
+        };
+        let actual_rect = match actual_mode {
+            TerrainPresentationMode::RegionalCopy => region,
+            TerrainPresentationMode::FullCopy => Some(full),
+            TerrainPresentationMode::Shared | TerrainPresentationMode::CpuUpload => None,
+        };
+        // Passing the actual rect is essential when identity recovery promotes a
+        // coherent-but-stale local baseline: HeightGpu cannot infer that lineage
+        // gap from its texture-slot state alone.
+        self.present_gpu_height_region(src, geom, actual_rect);
+        let record = self.record_gpu_presentation(
+            candidate,
+            expected,
+            GpuPresentationAttempt {
+                requested_mode: if requested_is_partial {
+                    TerrainPresentationMode::RegionalCopy
+                } else {
+                    TerrainPresentationMode::FullCopy
+                },
+                actual_mode,
+                requested_rect: region,
+                actual_rect,
+                coherent_before,
+            },
+        );
+        if self.integrity_probe.is_some() {
+            let source_view = src.create_view(&wgpu::TextureViewDescriptor::default());
+            self.submit_integrity_probe(&source_view, record);
+        }
+        record
+    }
+
     /// Bind a GPU engine height texture directly when formats match (full field).
-    /// Partial [`SampleRect`] updates still copy through the double-buffer path.
+    /// Partial [`SampleRect`] updates still copy through the double-buffer path; the
+    /// first partial after sharing promotes once to a full GPU copy to establish a
+    /// renderer-local baseline, then later partials remain region-bounded.
     pub fn present_gpu_height_shared(
         &mut self,
         src: &wgpu::Texture,
         src_view: &wgpu::TextureView,
-        width: u32,
-        height: u32,
-        world_size: (f32, f32),
-        height_range: (f32, f32),
-        dx: f32,
-        dz: f32,
+        geom: HeightPresentGeom,
         region: Option<SampleRect>,
     ) {
         if region.is_some() {
-            self.present_gpu_height_region(
-                src,
-                width,
-                height,
-                world_size,
-                height_range,
-                dx,
-                dz,
-                region,
-            );
+            self.present_gpu_height_region(src, geom, region);
             return;
         }
         profiling::scope!("present_gpu_height_shared");
         let t0 = std::time::Instant::now();
-        self.heights.present_shared_height(
-            &self.device,
-            &self.queue,
-            src_view,
-            width,
-            height,
-            world_size,
-            height_range,
-            dx,
-            dz,
-        );
+        self.heights
+            .present_shared_height(&self.device, &self.queue, src_view, geom);
         self.finish_height_present(t0);
+    }
+
+    pub fn present_gpu_height_shared_traced(
+        &mut self,
+        src: &wgpu::Texture,
+        src_view: &wgpu::TextureView,
+        geom: HeightPresentGeom,
+        region: Option<SampleRect>,
+        candidate: terra_gpu::output_identity::GpuTerrainOutputIdentity,
+        expected: TerrainPresentationExpectations,
+    ) -> TerrainPresentationRecord {
+        if region.is_some() {
+            return self.present_gpu_height_region_traced(src, geom, region, candidate, expected);
+        }
+        let coherent_before = self.heights.local_slots_coherent();
+        self.present_gpu_height_shared(src, src_view, geom, None);
+        let record = self.record_gpu_presentation(
+            candidate,
+            expected,
+            GpuPresentationAttempt {
+                requested_mode: TerrainPresentationMode::Shared,
+                actual_mode: TerrainPresentationMode::Shared,
+                requested_rect: None,
+                actual_rect: None,
+                coherent_before,
+            },
+        );
+        self.submit_integrity_probe(src_view, record);
+        record
+    }
+
+    fn record_gpu_presentation(
+        &mut self,
+        candidate: terra_gpu::output_identity::GpuTerrainOutputIdentity,
+        expected: TerrainPresentationExpectations,
+        attempt: GpuPresentationAttempt,
+    ) -> TerrainPresentationRecord {
+        let baseline_before = self.presentation_baseline;
+        let shadow_diagnostic = presentation_transition::validate_transition_shadow(
+            candidate,
+            baseline_before,
+            expected,
+            attempt.actual_mode,
+        );
+        self.presentation_slot_epoch = self.presentation_slot_epoch.saturating_add(1);
+        let coherent_after = self.heights.local_slots_coherent();
+        let last_full_generation = if matches!(
+            attempt.actual_mode,
+            TerrainPresentationMode::Shared | TerrainPresentationMode::FullCopy
+        ) {
+            Some(candidate.generation)
+        } else {
+            baseline_before.and_then(|baseline| baseline.last_full_generation)
+        };
+        let baseline_after = PresentedTerrainBaseline {
+            identity: candidate,
+            mode: attempt.actual_mode,
+            complete: candidate.is_current_complete_final() && shadow_diagnostic.is_none(),
+            local_slots_coherent: coherent_after,
+            local_slot_epoch: self.presentation_slot_epoch,
+            last_full_generation,
+            height_lineage: candidate.output,
+            normal_lineage: candidate.output,
+        };
+        let record = TerrainPresentationRecord {
+            candidate,
+            expectations: expected,
+            baseline_before,
+            baseline_after,
+            requested_mode: attempt.requested_mode,
+            actual_mode: attempt.actual_mode,
+            requested_rect: attempt.requested_rect,
+            actual_rect: attempt.actual_rect,
+            local_slots_coherent_before: attempt.coherent_before,
+            local_slots_coherent_after: coherent_after,
+            decision: TerrainPresentationDecisionCode::Accepted,
+            shadow_diagnostic,
+        };
+        self.presentation_baseline = Some(baseline_after);
+        self.last_presentation_record = Some(record);
+        record
+    }
+
+    pub const fn presented_terrain_baseline(&self) -> Option<PresentedTerrainBaseline> {
+        self.presentation_baseline
+    }
+
+    pub const fn last_terrain_presentation_record(&self) -> Option<TerrainPresentationRecord> {
+        self.last_presentation_record
+    }
+
+    fn submit_integrity_probe(
+        &mut self,
+        source: &wgpu::TextureView,
+        record: TerrainPresentationRecord,
+    ) {
+        if let Some(probe) = self.integrity_probe.as_mut() {
+            probe.submit(
+                &self.device,
+                &self.queue,
+                source,
+                record.candidate,
+                record.actual_mode,
+                record.actual_rect,
+            );
+        }
+    }
+
+    pub fn poll_integrity_probes(&mut self) -> Vec<TerrainIntegrityProbeResult> {
+        self.integrity_probe
+            .as_mut()
+            .map_or_else(Vec::new, |probe| probe.poll(&self.device))
     }
 
     fn finish_height_present(&mut self, t0: std::time::Instant) {
@@ -1513,6 +1862,8 @@ impl TerrainRenderer {
     fn recreate_bind_group(&mut self) {
         self.shadow_map
             .recreate_bind_group(&self.device, self.heights.display_height_view());
+        self.brush
+            .rebind_height(&self.device, self.heights.display_height_view());
         self.bind_group = Self::make_bind_group(
             &self.device,
             &self.bind_group_layout,
@@ -1523,6 +1874,8 @@ impl TerrainRenderer {
             &self.albedo_sampler,
             &self.tile_atlas_view,
             &self.page_table_buf,
+            &self.virtual_page_table_buf,
+            &self.tile_level_table_buf,
             &self.shadow_map.view,
             &self.shadow_map.comparison_sampler,
         );
@@ -1541,6 +1894,8 @@ impl TerrainRenderer {
                     &self.albedo_sampler,
                     &self.tile_atlas_view,
                     &self.page_table_buf,
+                    &self.virtual_page_table_buf,
+                    &self.tile_level_table_buf,
                     &self.shadow_map.view,
                     &self.shadow_map.comparison_sampler,
                 )
@@ -1562,30 +1917,23 @@ impl TerrainRenderer {
         self.ring_uniform_bufs.truncate(self.ring_grids.len());
     }
 
-    /// Bind a live tile atlas + page table so the terrain shader can sample
-    /// resident pages (falling back to the monolithic height texture on misses).
-    ///
-    /// `atlas_view` / `page_table` must remain valid while streaming is enabled
-    /// (typically owned by `GpuTileAtlas` in the app).
-    pub fn set_tile_stream_resources(
-        &mut self,
-        atlas_view: wgpu::TextureView,
-        page_table: wgpu::Buffer,
-        tile_size: u32,
-        halo: u32,
-        max_pages: u32,
-        level: u8,
-        enable: bool,
-    ) {
-        self.tile_atlas_view = atlas_view;
-        self.page_table_buf = page_table;
-        self.tile_stream_tile_size = tile_size.max(1) as f32;
-        self.tile_stream_halo = halo as f32;
-        self.tile_stream_max_pages = max_pages.max(1) as f32;
-        self.tile_stream_level = level as f32;
-        // Streaming samples resident pages; the shader falls back to the monolithic
-        // height texture on page misses so presentation stays continuous.
-        self.use_tile_stream = enable;
+    /// Bind the atlas plus its dense virtual directory and immutable hierarchy.
+    /// Demand is intentionally absent: shader-visible page-table state selects data.
+    pub fn set_tile_stream_resources(&mut self, resources: TerrainTileStreamResources) {
+        self.tile_atlas_view = resources.atlas_view;
+        self.page_table_buf = resources.physical_page_table;
+        self.virtual_page_table_buf = resources.virtual_page_table;
+        self.tile_level_table_buf = resources.level_table;
+        self.tile_stream_tile_size = resources.tile_size.max(1) as f32;
+        self.tile_stream_halo = resources.halo as f32;
+        self.tile_stream_max_pages = resources.max_pages.max(1) as f32;
+        self.tile_stream_level_count = resources.level_count;
+        self.tile_stream_target_level = resources.target_level;
+        self.tile_stream_target_resolution = resources.target_resolution.max(1);
+        self.tile_stream_content = resources.content;
+        self.tile_stream_transition_frames = resources.transition_frames;
+        self.tile_stream_terminal_fallback = resources.terminal_fallback;
+        self.use_tile_stream = resources.enable;
         self.recreate_bind_group();
         self.notify_invalidation(InvalidationReason::TerrainChanged);
     }
@@ -1601,19 +1949,75 @@ impl TerrainRenderer {
         self.use_tile_stream
     }
 
+    /// Resolution of the pyramid level the currently-streamed pages were cut at,
+    /// mirrored into `FrameUniforms.stream2.zw`. Tests pin this to prove the shader
+    /// denormalizes streamed UVs against the page resolution rather than the
+    /// monolithic `tex_size` (the corner-artifact revert check).
+    pub fn tile_stream_res(&self) -> (u32, u32) {
+        (
+            self.tile_stream_target_resolution,
+            self.tile_stream_target_resolution,
+        )
+    }
+
+    /// The output revision the currently-streamed pages were stamped with, mirrored
+    /// into `FrameUniforms.stream2` and matched by the shader's stale-page gate
+    /// (`find_tile_page`). Tests pin this against `TerrainRuntime::output_revision`
+    /// to prove the sync path stamps one authoritative revision into both places.
+    pub fn tile_stream_revision(&self) -> u64 {
+        self.tile_stream_content.output_revision
+    }
+
+    pub fn set_tile_stream_debug_mode(&mut self, mode: u32) {
+        if self.tile_stream_debug_mode != mode {
+            self.tile_stream_debug_mode = mode;
+            self.notify_invalidation(InvalidationReason::TerrainChanged);
+        }
+    }
+
     pub fn set_shadows_enabled(&mut self, enable: bool) {
         self.shadow_map.set_enabled(enable);
         self.notify_invalidation(InvalidationReason::LightingChanged);
     }
 
-    pub fn set_brush_gizmo(&mut self, gizmo: Option<BrushGizmo>) {
-        self.brush.set_gizmo(gizmo);
+    pub fn request_brush_surface_pick(
+        &mut self,
+        cursor: (f32, f32),
+        screen: (f32, f32),
+        radius_uv: f32,
+        color: [f32; 4],
+    ) {
+        let aspect = self.config.width as f32 / self.config.height.max(1) as f32;
+        self.brush.request_surface_pick(
+            &self.device,
+            &self.queue,
+            &self.camera,
+            aspect,
+            cursor,
+            screen,
+            self.heights.world_size,
+            self.heights.height_range,
+            radius_uv,
+            color,
+        );
     }
 
-    /// Update brush ring mesh to match current gizmo + optional ring height samples.
-    pub fn sync_brush_geometry(&mut self, ring_heights: Option<&[f32]>) {
+    pub fn hide_brush_gizmo(&mut self) {
+        self.brush.hide(&self.queue);
+    }
+
+    pub fn poll_brush_surface_pick(&mut self) {
+        self.brush.poll(&self.device);
+    }
+
+    pub fn latest_brush_surface_pick(
+        &self,
+        cursor: (f32, f32),
+        screen: (f32, f32),
+    ) -> Option<SurfacePick> {
+        let aspect = self.config.width as f32 / self.config.height.max(1) as f32;
         self.brush
-            .sync_geometry(&self.queue, self.heights.world_size, ring_heights);
+            .latest_pick_for(&self.camera, aspect, cursor, screen)
     }
 
     /// Upload or clear the Phase J overhang / cave roof proxy mesh.
@@ -1656,6 +2060,8 @@ impl TerrainRenderer {
     /// Clear viewport GPU state that belongs to the previous document.
     pub fn reset_project_state(&mut self, world_size: (f32, f32), ocean_level: Option<f32>) {
         self.use_tile_stream = false;
+        self.presentation_baseline = None;
+        self.last_presentation_record = None;
         self.heights
             .reset_project_state(&self.device, &self.queue, world_size);
         // Empty vegetation overlay (no density → clear instances).
@@ -1733,23 +2139,6 @@ impl TerrainRenderer {
         self.progressive.samples()
     }
 
-    /// Reconcile the full-world footprint with the streamed terrain pyramid.
-    /// When tile-stream sampling is enabled, missing pages fall back to the
-    /// monolithic height texture; these counts describe streamed coverage.
-    pub fn update_visible_tile_plan(&mut self, pyramid: &TerrainPyramid) {
-        let visible = NormalizedRect::new(0.0, 0.0, 1.0, 1.0).expect("unit world rect");
-        let plan = plan_resident_tiles(
-            pyramid,
-            None,
-            &FieldId::Height,
-            pyramid.max_level(),
-            visible,
-        );
-        self.last_tile_plan_exact = plan.exact_tiles;
-        self.last_tile_plan_fallback = plan.fallback_tiles;
-        self.last_tile_plan_missing = plan.missing_tiles;
-    }
-
     /// Acquire the swapchain frame, render terrain into it, and return it
     /// **un-presented** for the caller to composite the GUI onto. This is the
     /// windowed entry point; the terrain half of the [frame seam](crate#frame-seam).
@@ -1803,6 +2192,7 @@ impl TerrainRenderer {
             "render_to_view target size must match the configured size; call resize() first"
         );
 
+        self.brush.poll(&self.device);
         self.scene_versions.begin_frame();
 
         let aspect = width as f32 / height.max(1) as f32;
@@ -1945,13 +2335,43 @@ impl TerrainRenderer {
             shadow: [
                 if self.shadow_map.enabled() { 1.0 } else { 0.0 },
                 0.0015,
-                self.tile_stream_level,
+                self.tile_stream_target_level as f32,
                 1.25,
             ],
             raster: [
                 self.lighting.ambient_strength,
                 self.lighting.shadow_strength,
                 self.lighting.fog_strength,
+                0.0,
+            ],
+            stream2: [
+                self.tile_stream_content.document_revision as u32,
+                (self.tile_stream_content.document_revision >> 32) as u32,
+                self.tile_stream_content.plan_revision as u32,
+                (self.tile_stream_content.plan_revision >> 32) as u32,
+            ],
+            stream3: [
+                self.tile_stream_content.output_revision as u32,
+                (self.tile_stream_content.output_revision >> 32) as u32,
+                self.tile_stream_content.content_revision as u32,
+                (self.tile_stream_content.content_revision >> 32) as u32,
+            ],
+            stream4: [
+                self.tile_stream_level_count,
+                u32::from(self.tile_stream_target_level),
+                self.global_frame_index as u32,
+                self.tile_stream_transition_frames,
+            ],
+            stream5: [
+                if self.tile_stream_terminal_fallback
+                    == TerrainTerminalFallback::MonolithicMigration
+                {
+                    1.0
+                } else {
+                    0.0
+                },
+                self.tile_stream_debug_mode as f32,
+                0.0,
                 0.0,
             ],
         };
@@ -1965,7 +2385,7 @@ impl TerrainRenderer {
         if let Some(timer) = self.gpu_timer.as_mut() {
             timer.poll_readback(&self.device);
             self.last_gpu_timings = timer.last();
-            timer.begin_frame();
+            timer.begin_frame(std::mem::take(&mut self.pending_presentation_trace));
         }
         self.staging.begin_frame();
 
@@ -2254,7 +2674,7 @@ impl TerrainRenderer {
                         }
                         self.vegetation.draw(&mut pass);
                         self.overhang.draw(&mut pass);
-                        self.brush.draw(&mut pass);
+                        self.brush.draw(&mut pass, true);
                         self.guides.draw(&mut pass);
                     }
                 }
@@ -2293,29 +2713,47 @@ impl TerrainRenderer {
             );
             if self.frame_graph.schedule.overlays {
                 self.frame_graph.mark(PassKind::Overlays);
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("progressive-overlay-pass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Load,
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                        view: &self.depth,
-                        depth_ops: Some(wgpu::Operations {
-                            load: wgpu::LoadOp::Load,
-                            store: wgpu::StoreOp::Store,
+                {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("progressive-guide-overlay-pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                            view: &self.depth,
+                            depth_ops: Some(wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            }),
+                            stencil_ops: None,
                         }),
-                        stencil_ops: None,
-                    }),
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                });
-                self.brush.draw(&mut pass);
-                self.guides.draw(&mut pass);
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                    });
+                    self.guides.draw(&mut pass);
+                }
+                {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("progressive-brush-overlay-pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                    });
+                    self.brush.draw(&mut pass, false);
+                }
             }
         }
 
@@ -2382,7 +2820,13 @@ const ALBEDO_TEX_SIZE: u32 = 256;
 
 fn create_dummy_tile_stream(
     device: &wgpu::Device,
-) -> (wgpu::Texture, wgpu::TextureView, wgpu::Buffer) {
+) -> (
+    wgpu::Texture,
+    wgpu::TextureView,
+    wgpu::Buffer,
+    wgpu::Buffer,
+    wgpu::Buffer,
+) {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("dummy-tile-atlas"),
         size: wgpu::Extent3d {
@@ -2404,11 +2848,23 @@ fn create_dummy_tile_stream(
     });
     let page_table = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("dummy-page-table"),
-        size: 48,
+        size: std::mem::size_of::<terra_gpu::GpuPageTableEntry>() as u64,
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    (texture, view, page_table)
+    let virtual_page_table = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("dummy-virtual-page-table"),
+        size: std::mem::size_of::<terra_gpu::GpuVirtualPageEntry>() as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let level_table = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("dummy-terrain-level-table"),
+        size: std::mem::size_of::<terra_gpu::GpuTerrainLevelEntry>() as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    (texture, view, page_table, virtual_page_table, level_table)
 }
 
 fn create_albedo_array(
@@ -2582,6 +3038,90 @@ mod shader_tests {
             .entry_points
             .iter()
             .any(|entry| entry.name == "fs_ocean"));
+    }
+
+    /// Return the `{ ... }` body of the first WGSL function named `name`.
+    fn fn_body<'a>(src: &'a str, name: &str) -> &'a str {
+        let sig = format!("fn {name}(");
+        let start = src
+            .find(&sig)
+            .unwrap_or_else(|| panic!("fn {name} not found in shader"));
+        let open = start
+            + src[start..]
+                .find('{')
+                .unwrap_or_else(|| panic!("fn {name} has no body brace"));
+        let mut depth = 0i32;
+        for (offset, byte) in src[open..].bytes().enumerate() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &src[open..=open + offset];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced braces in fn {name}");
+    }
+
+    /// Revert check for multilevel addressing: lookup is dense by virtual tile,
+    /// sampling uses the selected level's resolution, and no physical-page scan
+    /// can return as atlas capacity grows.
+    #[test]
+    fn streamed_sampling_uses_page_resolution_not_monolithic_grid() {
+        let source = include_str!("shaders/terrain.wgsl");
+
+        let lookup = fn_body(source, "lookup_tile_page");
+        assert!(
+            lookup.contains("metadata_offset") && lookup.contains("virtual_page_table"),
+            "lookup must directly index the dense virtual page table"
+        );
+        assert!(
+            !lookup.contains("for ("),
+            "lookup must not scan physical pages"
+        );
+
+        let page = fn_body(source, "sample_page_bilinear");
+        assert!(
+            page.contains("terrain_levels") && page.contains("resolution"),
+            "page sampling must denormalize with the selected level resolution"
+        );
+        assert!(
+            !page.contains("u.grid"),
+            "streamed page sampling must not scale by the monolithic grid"
+        );
+
+        let resolve = fn_body(source, "resolve_from_level");
+        assert!(
+            resolve.contains("level = level - 1") && resolve.contains("sample_height_monolithic"),
+            "resolution must walk resident ancestors before terminal fallback"
+        );
+    }
+
+    #[test]
+    fn streamed_debug_distinguishes_exact_ancestor_blend_and_terminal() {
+        let source = include_str!("shaders/terrain.wgsl");
+        for class in [
+            "STREAM_EXACT",
+            "STREAM_ANCESTOR",
+            "STREAM_BLEND",
+            "STREAM_TERMINAL",
+        ] {
+            assert!(
+                source.contains(class),
+                "missing stream sample class {class}"
+            );
+        }
+        let fragment = fn_body(source, "fs_main");
+        assert!(
+            fragment.contains("stream5.y")
+                && fragment.contains("STREAM_EXACT")
+                && fragment.contains("STREAM_ANCESTOR")
+                && fragment.contains("STREAM_BLEND"),
+            "debug rendering must expose the actual shader resolution class"
+        );
     }
 
     #[test]

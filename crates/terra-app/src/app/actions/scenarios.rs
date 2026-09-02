@@ -3,12 +3,15 @@ use crate::ui::PanelAction;
 use super::super::TerraApp;
 use super::ApplyCtx;
 
+// Returns the unhandled action on `Err` so the next handler in the chain can try it
+// (see actions/mod.rs); that payload is the intrinsic-size `PanelAction` (`LayerKind`).
+#[allow(clippy::result_large_err)]
 pub(crate) fn try_apply(
     app: &mut TerraApp,
     action: PanelAction,
     ctx: &mut ApplyCtx,
 ) -> Result<(), PanelAction> {
-    let result = match action {
+    match action {
         PanelAction::AddSimulationScenario { name } => {
             let scenario = terra_core::simulation_scenario::SimulationScenario::new(name);
             let index = app.session.document.simulation_scenarios.scenarios.len();
@@ -72,6 +75,7 @@ pub(crate) fn try_apply(
             app.scheduler
                 .evaluator
                 .mark_dirty_from_eval_stage(&preview, terra_core::EvalStage::SharedHydro);
+            app.track_worker_dirty_from_eval_stage(&preview, terra_core::EvalStage::SharedHydro);
             app.request_rebuild();
             app.ui_state.status = "Running simulation scenario".into();
             ctx.doc_mutated = true;
@@ -107,6 +111,7 @@ pub(crate) fn try_apply(
             app.scheduler
                 .evaluator
                 .mark_dirty_from_eval_stage(&preview, terra_core::EvalStage::SharedHydro);
+            app.track_worker_dirty_from_eval_stage(&preview, terra_core::EvalStage::SharedHydro);
             app.request_rebuild();
             ctx.doc_mutated = true;
         }
@@ -166,6 +171,10 @@ pub(crate) fn try_apply(
                 app.scheduler
                     .evaluator
                     .mark_dirty_from_eval_stage(&preview, terra_core::EvalStage::SharedHydro);
+                app.track_worker_dirty_from_eval_stage(
+                    &preview,
+                    terra_core::EvalStage::SharedHydro,
+                );
                 app.request_rebuild();
                 ctx.doc_mutated = true;
             }
@@ -277,6 +286,140 @@ pub(crate) fn try_apply(
         }
         other => return Err(other),
     };
-    let _ = result;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use terra_core::heightfield::{Heightfield, HeightfieldMetrics};
+    use terra_core::layer::{HydraulicErosionParams, Layer, LayerId, LayerKind, LayerStack};
+    use terra_core::simulation_scenario::{
+        ScenarioPassKind, SimulationScenario, SimulationScenarioId,
+    };
+    use terra_cpu_eval::CachedOutput;
+
+    /// A headless app whose stack is `Base(Flat) → Hydro(HydraulicErosion)` with a
+    /// scenario whose single pass is bound to the Hydro layer. Both layers start
+    /// clean in the UI-thread evaluator cache and the worker accumulators start
+    /// drained (the steady state right after a completed run), so any dirtying we
+    /// observe is caused solely by the action under test.
+    fn app_with_bound_scenario() -> (super::TerraApp, LayerId, SimulationScenarioId) {
+        let mut app = super::TerraApp::default();
+
+        let mut stack = LayerStack::new();
+        stack.push(Layer::new(
+            "Base",
+            LayerKind::Flat(terra_core::layer::FlatParams { height: 10.0 }),
+        ));
+        let hydro = Layer::new(
+            "Hydro",
+            LayerKind::HydraulicErosion(HydraulicErosionParams::default()),
+        );
+        let hydro_id = hydro.id();
+        stack.push(hydro);
+        app.session.document.stack = stack;
+
+        let mut scenario = SimulationScenario::new("Test");
+        let pass_id = scenario.add_pass(ScenarioPassKind::HydraulicErosion);
+        assert!(scenario.bind_pass_layer(pass_id, hydro_id));
+        let scen_id = scenario.id;
+        app.session
+            .document
+            .simulation_scenarios
+            .scenarios
+            .push(scenario);
+
+        // Seed both layers clean in the UI-thread evaluator cache.
+        let metrics = HeightfieldMetrics::new(4, 4, 4.0, 4.0);
+        for id in app.session.document.stack.layer_ids() {
+            app.scheduler.evaluator.cache.insert(
+                id,
+                CachedOutput {
+                    height: Heightfield::zeros(metrics),
+                    generation: 0,
+                    dirty: false,
+                    aux: HashMap::new(),
+                    strata: None,
+                },
+            );
+        }
+        // Steady state: the previous run's dirt was drained into a completed job.
+        app.worker_mark_all_dirty = false;
+        app.worker_dirty_from = None;
+
+        (app, hydro_id, scen_id)
+    }
+
+    /// The worker recomputes the Hydro layer only if it is told to: either the
+    /// whole field is dirty, or the suffix-dirty layer is at or below Hydro.
+    fn worker_would_recompute(app: &super::TerraApp, hydro_id: LayerId) -> bool {
+        if app.worker_mark_all_dirty {
+            return true;
+        }
+        let ids = app.session.document.stack.layer_ids();
+        match app.worker_dirty_from {
+            Some(from) => {
+                let from_idx = ids.iter().position(|x| *x == from);
+                let hydro_idx = ids.iter().position(|x| *x == hydro_id);
+                matches!((from_idx, hydro_idx), (Some(f), Some(h)) if f <= h)
+            }
+            None => false,
+        }
+    }
+
+    /// Baseline: Run sets `ctx.dirty_from` to the bound layer, so the worker is told
+    /// to recompute it. (Present so a regression that drops this is caught here too.)
+    #[test]
+    fn run_scenario_reaches_worker_for_bound_layer() {
+        let (mut app, hydro_id, scen_id) = app_with_bound_scenario();
+        app.apply_actions(vec![PanelAction::RunSimulationScenario(scen_id)]);
+        assert!(
+            worker_would_recompute(&app, hydro_id),
+            "Run must dirty the worker for the bound sim layer"
+        );
+    }
+
+    /// Rebuild dirties the UI-thread evaluator (SharedHydro stage) but leaves the
+    /// worker accumulators untouched, so the worker reuses its stale clean checkpoint
+    /// for the sim layer — the gap under investigation.
+    #[test]
+    fn rebuild_scenario_reaches_worker_for_bound_layer() {
+        let (mut app, hydro_id, scen_id) = app_with_bound_scenario();
+        app.apply_actions(vec![PanelAction::RebuildSimulationScenario(scen_id)]);
+
+        assert!(
+            app.scheduler.evaluator.cache.is_dirty(hydro_id),
+            "precondition: Rebuild dirties the UI-thread evaluator"
+        );
+        assert!(
+            worker_would_recompute(&app, hydro_id),
+            "Rebuild must dirty the worker for the bound sim layer, not just the UI evaluator"
+        );
+    }
+
+    /// Apply Outputs takes the same UI-only path as Rebuild.
+    #[test]
+    fn apply_outputs_reaches_worker_for_bound_layer() {
+        let (mut app, hydro_id, scen_id) = app_with_bound_scenario();
+        // A current snapshot must exist for apply_selected_outputs to act on.
+        if let Some(s) = app.session.document.simulation_scenarios.get_mut(scen_id) {
+            s.begin_run();
+            let _ = s.complete_run(1);
+        }
+        app.apply_actions(vec![PanelAction::ApplyScenarioOutputs {
+            id: scen_id,
+            snapshot: None,
+        }]);
+
+        assert!(
+            app.scheduler.evaluator.cache.is_dirty(hydro_id),
+            "precondition: Apply Outputs dirties the UI-thread evaluator"
+        );
+        assert!(
+            worker_would_recompute(&app, hydro_id),
+            "Apply Outputs must dirty the worker for the bound sim layer"
+        );
+    }
 }

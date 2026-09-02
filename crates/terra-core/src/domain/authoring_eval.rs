@@ -38,7 +38,7 @@ pub fn authoring_order_is_arbitrary() -> bool {
 
 /// Metadata order used for invalidation and optional explicit authoring sorts.
 ///
-/// This does not reorder [`crate::eval::StackEvaluator`] execution.
+/// This does not reorder CPU stack-evaluator execution.
 pub fn evaluation_eval_stage_order() -> &'static [EvalStage] {
     &[
         EvalStage::Blueprint,
@@ -120,16 +120,16 @@ fn diagnose_layer(layer: &crate::layer::Layer, out: &mut Vec<SoftDiagnostic>) {
         }
         LayerKind::HydraulicErosion(_)
         | LayerKind::ThermalErosion(_)
-        | LayerKind::StreamPowerErosion(_) => {
-            if !layer.common.enabled {
-                out.push(SoftDiagnostic::new(
-                    "simulation_disabled",
-                    format!(
-                        "Simulation '{}' is present but disabled.",
-                        layer.common.name
-                    ),
-                ));
-            }
+        | LayerKind::StreamPowerErosion(_)
+            if !layer.common.enabled =>
+        {
+            out.push(SoftDiagnostic::new(
+                "simulation_disabled",
+                format!(
+                    "Simulation '{}' is present but disabled.",
+                    layer.common.name
+                ),
+            ));
         }
         _ => {}
     }

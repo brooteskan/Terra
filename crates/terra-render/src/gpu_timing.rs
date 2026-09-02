@@ -20,6 +20,15 @@ pub struct GpuTimings {
     pub temporal_us: u64,
     pub denoise_us: u64,
     pub supported: bool,
+    pub source_frame: u64,
+    pub context: GpuPresentationTraceContext,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GpuPresentationTraceContext {
+    pub frame_id: u64,
+    pub generation: u64,
+    pub evaluation_id: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -43,6 +52,7 @@ struct FrameStampLayout {
 struct SlotState {
     submitted_frame: u64,
     layout: FrameStampLayout,
+    context: GpuPresentationTraceContext,
 }
 
 enum MapPending {
@@ -67,6 +77,7 @@ pub struct GpuTimestampTimer {
     next_query: u32,
     /// Pass pairs stamped this frame (resolved at end-of-frame).
     current: FrameStampLayout,
+    current_context: GpuPresentationTraceContext,
     last: GpuTimings,
     map_pending: MapPending,
 }
@@ -103,12 +114,14 @@ impl GpuTimestampTimer {
             slots: [SlotState {
                 submitted_frame: 0,
                 layout: FrameStampLayout::default(),
+                context: GpuPresentationTraceContext::default(),
             }; 2],
             write_idx: 0,
             frame: 0,
             period_ns: queue.get_timestamp_period(),
             next_query: 0,
             current: FrameStampLayout::default(),
+            current_context: GpuPresentationTraceContext::default(),
             last: GpuTimings {
                 supported: true,
                 ..Default::default()
@@ -121,10 +134,11 @@ impl GpuTimestampTimer {
         self.last
     }
 
-    pub fn begin_frame(&mut self) {
+    pub fn begin_frame(&mut self, context: GpuPresentationTraceContext) {
         self.frame = self.frame.wrapping_add(1);
         self.next_query = 0;
         self.current = FrameStampLayout::default();
+        self.current_context = context;
     }
 
     fn alloc_pair(&mut self) -> Option<(u32, u32)> {
@@ -268,6 +282,7 @@ impl GpuTimestampTimer {
         );
         self.slots[idx].submitted_frame = self.frame;
         self.slots[idx].layout = self.current;
+        self.slots[idx].context = self.current_context;
         self.write_idx = 1 - idx;
         self.current = FrameStampLayout::default();
         self.next_query = 0;
@@ -319,13 +334,17 @@ impl GpuTimestampTimer {
         let slice = buffer.slice(..u64::from(count) * 8);
         let data = slice.get_mapped_range();
         let stamps: Vec<u64> = data
-            .chunks_exact(8)
-            .map(|c| u64::from_le_bytes(c.try_into().unwrap_or([0; 8])))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|chunk| u64::from_le_bytes(*chunk))
             .collect();
         drop(data);
         buffer.unmap();
 
         let layout = self.slots[idx].layout;
+        let source_frame = self.slots[idx].submitted_frame;
+        let context = self.slots[idx].context;
         self.slots[idx].submitted_frame = 0;
 
         let to_us = |pair: PassPair| -> u64 {
@@ -346,6 +365,8 @@ impl GpuTimestampTimer {
         self.last.temporal_us = to_us(layout.temporal);
         self.last.denoise_us = to_us(layout.denoise);
         self.last.supported = true;
+        self.last.source_frame = source_frame;
+        self.last.context = context;
     }
 
     fn slot_is_writable(&self, idx: usize) -> bool {
@@ -376,10 +397,42 @@ impl GpuTimestampTimer {
 }
 
 pub fn requested_timestamp_features(adapter: &wgpu::Adapter) -> wgpu::Features {
-    let available = adapter.features();
+    timestamp_features_from_available(adapter.features())
+}
+
+fn timestamp_features_from_available(available: wgpu::Features) -> wgpu::Features {
     let mut features = wgpu::Features::empty();
     if available.contains(wgpu::Features::TIMESTAMP_QUERY) {
         features |= wgpu::Features::TIMESTAMP_QUERY;
     }
+    if available
+        .contains(wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS)
+    {
+        features |= wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+    }
     features
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timestamp_feature_request_is_limited_to_adapter_capabilities() {
+        assert_eq!(
+            timestamp_features_from_available(wgpu::Features::empty()),
+            wgpu::Features::empty()
+        );
+        assert_eq!(
+            timestamp_features_from_available(wgpu::Features::TIMESTAMP_QUERY),
+            wgpu::Features::TIMESTAMP_QUERY
+        );
+        assert_eq!(
+            timestamp_features_from_available(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS),
+            wgpu::Features::empty()
+        );
+        let both =
+            wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+        assert_eq!(timestamp_features_from_available(both), both);
+    }
 }

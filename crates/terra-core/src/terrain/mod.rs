@@ -1,18 +1,35 @@
-//! Final-output tile residency, viewport regions, and progressive refinement.
+//! Final-output tile streaming: the resolution ladder, the GPU-mirrored
+//! residency cache, and progressive refinement.
 
 mod cache;
+mod demand;
+mod domain;
+mod geometric_error;
 mod pyramid;
 mod refinement;
-mod region;
 mod runtime;
 mod tile;
+mod work;
 
 pub use cache::{
-    ResidentTile, TerrainCacheKey, TileCacheError, TileCacheInsert, TileCacheStats, TilePageHandle,
-    TileResidencyCache,
+    ResidentTile, TerrainCacheKey, TileCacheError, TileCacheEviction, TileCacheInsert,
+    TileCacheStats, TilePageHandle, TileResidencyCache,
 };
-pub use pyramid::{PyramidConfig, TerrainLevel, TerrainPyramid, TileRecord};
+pub use demand::{
+    conservative_geometric_errors, TerrainDemandClass, TerrainDemandConfig, TerrainDemandError,
+    TerrainDemandPlan, TerrainDemandPlanner, TerrainDemandView, TerrainTileDemand,
+};
+pub use domain::{
+    TerrainDomainError, TerrainEvaluationDomain, TerrainSampleExtent, TerrainWorldTransform,
+};
+pub use geometric_error::measure_tile_geometric_error;
+pub use pyramid::{
+    PyramidConfig, TerrainLevel, TerrainPyramid, TerrainTileExtent, TerrainTileRange,
+};
 pub use refinement::{EditorRefinementState, RefinementController, RefinementTimings};
-pub use region::{NormalizedRect, RegionSet};
 pub use runtime::TerrainRuntime;
 pub use tile::TerrainTileKey;
+pub use work::{
+    TerrainContentStamp, TerrainTileWorkBudget, TerrainTileWorkKey, TerrainTileWorkLease,
+    TerrainTileWorkRequest, TerrainTileWorkScheduler, TerrainTileWorkSource, TerrainTileWorkStats,
+};

@@ -3,21 +3,29 @@
 //! Interactive hard rules: GPU-resident heightfields, no UI-thread readback, no mesh rebuild,
 //! dirty-tile compute, incomplete GPU prefixes are never treated as finished Draft.
 
+pub mod compiled_plan;
 pub mod derivatives;
 pub mod effect_filter;
-pub mod engine;
 pub mod graph;
-pub mod memory;
+pub mod output_identity;
 pub mod parity;
+pub mod pyramid;
 pub mod tile_cache;
 
 pub use derivatives::{cpu_slope_oracle, run_derivative_gpu, GpuDerivativeMode};
-pub use engine::{GpuEvalResult, GpuTerrainEngine};
 pub use graph::{
-    compile_gpu_graph, expand_dirty_rect, layer_gpu_supported, GpuComputeGraph, GpuKernel, GpuPass,
-    GpuPassKind,
+    compile_gpu_graph, expand_dirty_rect, layer_gpu_supported, GpuComputeGraph, GpuDirtyPolicy,
+    GpuFallbackCode, GpuFallbackDiagnostic, GpuFallbackReason, GpuKernel, GpuLayerPlan,
+    BLUR_MAX_RADIUS, EFFECT_FILTER_MAX_RADIUS, RIVER_CARVE_MAX_RADIUS,
 };
-pub use tile_cache::{GpuPageTableEntry, GpuTileAtlas, GpuTileCacheError, GpuTileUpload};
+pub use pyramid::{
+    GpuHeightPyramid, GpuHeightPyramidMaterializer, GpuPyramidContentIdentity, GpuPyramidError,
+    GpuPyramidErrorReadback, GpuPyramidPlanningMetadata,
+};
+pub use tile_cache::{
+    GpuPageTableEntry, GpuTerrainLevelEntry, GpuTileAtlas, GpuTileCacheError, GpuTileUpload,
+    GpuVirtualPageEntry,
+};
 
 use thiserror::Error;
 
@@ -25,9 +33,18 @@ use thiserror::Error;
 pub enum GpuError {
     #[error("wgpu: {0}")]
     Wgpu(String),
-    /// Stack needs the CPU tree evaluator (scoped groups / unsupported layers).
-    #[error("cpu evaluation required")]
-    RequiresCpu,
+    /// Stack needs the CPU evaluator for a structured, user-visible reason.
+    #[error("cpu evaluation required: {0:?}")]
+    RequiresCpu(GpuFallbackReason),
+    #[error(
+        "compiled terrain plan revision {plan_revision} is stale; expected revision {expected_revision}"
+    )]
+    StalePlan {
+        plan_revision: u64,
+        expected_revision: u64,
+    },
+    #[error("failed to load source asset: {0}")]
+    SourceAsset(String),
 }
 
 pub fn readback_f32(

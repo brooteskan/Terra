@@ -7,7 +7,7 @@
 //! of each domain lives in the crate that defines it.
 
 use std::path::PathBuf;
-use std::sync::{mpsc, OnceLock};
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 use terra_gui::LayoutPrefs;
@@ -68,26 +68,18 @@ pub(crate) fn load_editor_prefs() -> EditorPrefs {
 }
 
 /// Queue editor-prefs persistence without placing filesystem latency on the render/UI thread.
-/// The worker drains queued snapshots before each write so splitter drags coalesce naturally.
+/// A [`terra_jobs::Debounced`] worker coalesces queued snapshots to the latest before each
+/// write, so a splitter drag's burst of saves collapses into a single file write.
 pub(crate) fn save_editor_prefs(prefs: &EditorPrefs) {
-    static TX: OnceLock<mpsc::Sender<EditorPrefs>> = OnceLock::new();
-    let tx = TX.get_or_init(|| {
-        let (tx, rx) = mpsc::channel::<EditorPrefs>();
-        std::thread::Builder::new()
-            .name("terra-layout-save".into())
-            .spawn(move || {
-                while let Ok(mut latest) = rx.recv() {
-                    while let Ok(newer) = rx.try_recv() {
-                        latest = newer;
-                    }
-                    let path = editor_prefs_path();
-                    if let Ok(json) = serde_json::to_vec_pretty(&latest) {
-                        let _ = std::fs::write(path, json);
-                    }
+    static SAVER: OnceLock<terra_jobs::Debounced<EditorPrefs>> = OnceLock::new();
+    SAVER
+        .get_or_init(|| {
+            terra_jobs::Debounced::spawn("terra-layout-save", |latest: EditorPrefs| {
+                let path = editor_prefs_path();
+                if let Ok(json) = serde_json::to_vec_pretty(&latest) {
+                    let _ = std::fs::write(path, json);
                 }
             })
-            .expect("spawn layout save worker");
-        tx
-    });
-    let _ = tx.send(prefs.clone());
+        })
+        .submit(prefs.clone());
 }

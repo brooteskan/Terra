@@ -13,7 +13,9 @@ use crate::ui::tool_catalog::{
 };
 use crate::ui::workspace::{workspace_definition, WorkspaceId};
 use crate::ui::{EditorTool, UiState};
+use terra_core::authoring::SculptStrokeKind;
 use terra_core::document::TerrainDocument;
+use terra_core::layer::{BrushEditable, EditSupport};
 use terra_core::mask::{MaskAsset, MaskId};
 use terra_gui::{Color, DrawList, GuiContext, Icon, Id, Rect};
 
@@ -404,6 +406,9 @@ fn draw_card_grid_prioritized(
     }
 }
 
+// egui card helper: ui + shared UiState/doc/action sink + id + tool + layout
+// rect + suggested flag, each used once to draw one card. Kept flat.
+#[allow(clippy::too_many_arguments)]
 fn tool_card_suggested(
     ui: &mut GuiContext<'_>,
     ui_state: &mut UiState,
@@ -418,6 +423,20 @@ fn tool_card_suggested(
         ui.panel_rounded(card, style::ACCENT_SOFT, style::RADIUS_SM);
     }
     tool_card(ui, ui_state, doc, actions, id, tool, card);
+}
+
+/// Foundation is the one selection that makes brush availability contextual.
+/// Other selections are not brush targets: arming a brush starts a Semantic
+/// Sculpt session, whose first dab creates a suitable layer.
+fn selected_foundation_brush_support(
+    doc: &TerrainDocument,
+    brush: Option<SculptStrokeKind>,
+) -> Option<EditSupport> {
+    let brush = brush?;
+    doc.selected
+        .and_then(|id| doc.stack.find(id))
+        .filter(|layer| layer.kind.is_sculpt_base())
+        .map(|layer| layer.brush_support(brush))
 }
 
 fn draw_group_header(ui: &mut GuiContext<'_>, state: &mut ToolsGuiState, group: ToolGroup) -> bool {
@@ -470,24 +489,29 @@ fn tool_card(
     card: Rect,
 ) {
     let hovered = ui.pointer_in(card);
-    let selected = match &tool.action {
-        ToolAction::Sculpt(t) => ui_state.editor_tool == *t,
-        ToolAction::BiomeBrush(brush) => {
-            ui_state.editor_tool == EditorTool::PaintBiome && ui_state.biome_paint_tool == *brush
-        }
-        ToolAction::AddLayer { name, .. } => {
-            ui_state.tool_drag.as_ref().is_some_and(|d| d.name == *name)
-        }
-        ToolAction::CreateBiome { .. } | ToolAction::AddMask { .. } | ToolAction::BakeSelected => {
-            false
-        }
-    };
+    let disabled = selected_foundation_brush_support(doc, tool.sculpt_stroke_kind())
+        == Some(EditSupport::Unsupported);
+    let interactive_hovered = hovered && !disabled;
+    let selected = !disabled
+        && match &tool.action {
+            ToolAction::Sculpt(t) => ui_state.editor_tool == *t,
+            ToolAction::BiomeBrush(brush) => {
+                ui_state.editor_tool == EditorTool::PaintBiome
+                    && ui_state.biome_paint_tool == *brush
+            }
+            ToolAction::AddLayer { name, .. } => {
+                ui_state.tool_drag.as_ref().is_some_and(|d| d.name == *name)
+            }
+            ToolAction::CreateBiome { .. }
+            | ToolAction::AddMask { .. }
+            | ToolAction::BakeSelected => false,
+        };
 
-    if hovered {
+    if interactive_hovered {
         ui.state.set_hot(id);
     }
 
-    if hovered && ui.input.primary_pressed {
+    if interactive_hovered && ui.input.primary_pressed {
         ui.state.active = Some(id);
         match &tool.action {
             ToolAction::AddLayer { name, kind } => {
@@ -505,7 +529,7 @@ fn tool_card(
         }
     }
 
-    if ui.input.primary_released && ui.state.is_active(id) && hovered {
+    if ui.input.primary_released && ui.state.is_active(id) && interactive_hovered {
         match &tool.action {
             ToolAction::Sculpt(editor_tool) => {
                 apply_sculpt_tool(ui_state, doc, actions, *editor_tool);
@@ -562,7 +586,9 @@ fn tool_card(
         }
     }
 
-    let bg = if selected {
+    let bg = if disabled {
+        style::SURFACE
+    } else if selected {
         style::SELECTED_BG
     } else if hovered {
         style::HOVER_BG
@@ -576,7 +602,9 @@ fn tool_card(
     let thumb_y = card.min_y + 8.0;
     let thumb_r = Rect::from_pos_size(thumb_x, thumb_y, thumb_s, thumb_s);
 
-    let icon_color = if selected {
+    let icon_color = if disabled {
+        style::TEXT_DISABLED
+    } else if selected {
         style::ACCENT
     } else {
         style::TEXT_DIM
@@ -594,7 +622,9 @@ fn tool_card(
 
     let label_y = thumb_r.max_y + 4.0;
     let label_scale = FONT_SCALE * TYPE_CAPTION;
-    let label_color = if selected {
+    let label_color = if disabled {
+        style::TEXT_DISABLED
+    } else if selected {
         style::TEXT
     } else {
         style::TEXT_DIM
@@ -612,7 +642,15 @@ fn tool_card(
     );
 
     if hovered {
-        ui.queue_tooltip(card, tool.label, tool.description, tool.shortcut);
+        if disabled {
+            let body = format!(
+                "{}\n\nNot supported by the selected Foundation layer.",
+                tool.description
+            );
+            ui.queue_tooltip(card, tool.label, &body, tool.shortcut);
+        } else {
+            ui.queue_tooltip(card, tool.label, tool.description, tool.shortcut);
+        }
     }
 }
 
@@ -661,6 +699,12 @@ fn apply_sculpt_tool(
     actions: &mut Vec<PanelAction>,
     tool: EditorTool,
 ) {
+    if selected_foundation_brush_support(doc, tool.sculpt_stroke_kind())
+        == Some(EditSupport::Unsupported)
+    {
+        ui_state.status = "That brush isn't supported by the selected Foundation layer.".into();
+        return;
+    }
     ui_state.set_editor_tool(tool);
     ui_state.tool_drag = None;
     if tool.is_move() {
@@ -678,7 +722,6 @@ fn apply_sculpt_tool(
             ui_state.shape_session_layer = None;
         }
         actions.push(PanelAction::SetEditorTool(tool));
-        return;
     } else if tool == EditorTool::PaintMask {
         let is_painted = |id: MaskId| {
             doc.masks
@@ -783,5 +826,58 @@ fn finish_tool_drag(
         if !ui.input.primary_down && !over_layers {
             ui_state.tool_drag = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use terra_core::layer::{FlatParams, Layer, LayerKind, LayerStack, SculptParams};
+
+    fn selected_document(kind: LayerKind) -> TerrainDocument {
+        let mut doc = TerrainDocument::default();
+        let layer = Layer::new("Selected", kind);
+        let id = layer.id();
+        doc.stack = LayerStack::new();
+        doc.stack.push(layer);
+        doc.selected = Some(id);
+        doc
+    }
+
+    #[test]
+    fn foundation_tool_support_is_contextual() {
+        let doc = selected_document(LayerKind::SculptBase(SculptParams::filled(8, 0.0)));
+        assert_eq!(
+            selected_foundation_brush_support(&doc, Some(SculptStrokeKind::Raise)),
+            Some(EditSupport::Native)
+        );
+        assert_eq!(
+            selected_foundation_brush_support(&doc, Some(SculptStrokeKind::Pinch)),
+            Some(EditSupport::Approximate)
+        );
+        assert_eq!(
+            selected_foundation_brush_support(&doc, Some(SculptStrokeKind::Terrace)),
+            Some(EditSupport::Unsupported)
+        );
+    }
+
+    #[test]
+    fn non_foundation_selections_leave_brushes_available_for_semantic_sculpt() {
+        let flat = selected_document(LayerKind::Flat(FlatParams::default()));
+        assert_eq!(
+            selected_foundation_brush_support(&flat, Some(SculptStrokeKind::Raise)),
+            None
+        );
+    }
+
+    #[test]
+    fn missing_selection_leaves_brushes_available_for_semantic_sculpt() {
+        let mut doc = TerrainDocument::default();
+        doc.selected = None;
+        assert_eq!(
+            selected_foundation_brush_support(&doc, Some(SculptStrokeKind::Raise)),
+            None
+        );
+        assert_eq!(selected_foundation_brush_support(&doc, None), None);
     }
 }

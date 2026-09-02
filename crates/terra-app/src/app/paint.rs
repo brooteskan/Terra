@@ -1,7 +1,7 @@
 use crate::ui::PanelAction;
 use terra_core::mask::bake_mask_assets;
 use terra_gui::GuiContext;
-use terra_render::{pick_terrain_uv_on_surface, BrushGizmo};
+use terra_render::pick_terrain_uv_on_surface;
 
 use super::{AppScreen, TerraApp};
 impl TerraApp {
@@ -42,28 +42,31 @@ impl TerraApp {
         self.modifiers_alt || !self.viewport_paint_active()
     }
 
+    /// Foundation is an explicit brush target; all other selections may begin a
+    /// new Semantic Sculpt session. Keep this runtime check in addition to the
+    /// disabled tool card so a brush armed before selecting Foundation cannot
+    /// redirect a stroke behind the artist's back.
+    fn active_sculpt_brush_available_for_selection(&self) -> bool {
+        use terra_core::layer::{BrushEditable, EditSupport};
+
+        let Some(brush) = self.ui_state.editor_tool.sculpt_stroke_kind() else {
+            return true;
+        };
+        self.session
+            .document
+            .selected
+            .and_then(|id| self.session.document.stack.find(id))
+            .filter(|layer| layer.kind.is_sculpt_base())
+            .is_none_or(|foundation| foundation.brush_support(brush) != EditSupport::Unsupported)
+    }
+
     /// True when left-drag should stamp Base heights or a mask.
     pub(crate) fn viewport_paint_active(&self) -> bool {
         if self.screen != AppScreen::Editor {
             return false;
         }
         if self.ui_state.editor_tool.is_sculpt() {
-            return self
-                .session
-                .document
-                .stack
-                .flatten_layers()
-                .iter()
-                .any(|l| l.kind.is_sculpt_base())
-                || self.session.document.selected.is_some_and(|id| {
-                    matches!(
-                        self.session.document.stack.find(id).map(|l| &l.kind),
-                        Some(
-                            terra_core::layer::LayerKind::SculptStrokes(_)
-                                | terra_core::layer::LayerKind::TerrainConstraints(_)
-                        )
-                    )
-                });
+            return self.active_sculpt_brush_available_for_selection();
         }
         if self.ui_state.editor_tool == crate::ui::EditorTool::PaintBiome {
             return self.session.document.active_biome.is_some();
@@ -85,14 +88,19 @@ impl TerraApp {
     }
 
     pub(crate) fn paint_at_cursor(&mut self) {
+        if self.ui_state.editor_tool.is_sculpt()
+            && !self.active_sculpt_brush_available_for_selection()
+        {
+            self.ui_state.status =
+                "That brush isn't supported by the selected Foundation layer.".into();
+            return;
+        }
         let Some((u, v)) = self.pick_paint_uv() else {
             return;
         };
 
         if let Some(shape_tool) = self.ui_state.editor_tool.shape_tool() {
             let Some(layer_id) = self.ensure_shape_history_target(shape_tool) else {
-                self.ui_state.status =
-                    "Could not create a Shape Layer â€” select a Region first.".into();
                 return;
             };
             self.ui_state.ensure_sculpt_defaults();
@@ -110,8 +118,10 @@ impl TerraApp {
             };
             let radius = self.ui_state.sculpt_radius;
             let target_height = match shape_tool {
-                terra_core::shape_history::ShapeTool::Flatten
-                | terra_core::shape_history::ShapeTool::HeightStamp
+                // HeightStamp / PlateauStamp stamp toward the height under the
+                // cursor. Flatten needs no target here — the sculpt kernel derives
+                // it from the mean of the terrain within the brush footprint.
+                terra_core::shape_history::ShapeTool::HeightStamp
                 | terra_core::shape_history::ShapeTool::PlateauStamp => {
                     // Sample approx from last height field centre if available.
                     self.last_height
@@ -178,21 +188,20 @@ impl TerraApp {
                 | crate::ui::EditorTool::Hardness
                 | crate::ui::EditorTool::Sediment
         ) {
-            let Some(layer_id) = self.ensure_shape_authoring_layer() else {
-                return;
-            };
             use terra_core::authoring::SculptStrokeKind;
             let stroke_kind = match self.ui_state.editor_tool {
                 crate::ui::EditorTool::Protect => SculptStrokeKind::Protect,
                 crate::ui::EditorTool::Hardness => SculptStrokeKind::Hardness,
                 _ => SculptStrokeKind::Sediment,
             };
+            let Some(layer_id) = self.ensure_shape_authoring_layer() else {
+                return;
+            };
             self.ui_state.ensure_sculpt_defaults();
             self.sculpt_stroke_active = true;
             let strength = self.ui_state.sculpt_strength.clamp(0.05, 1.0);
             let radius = self.ui_state.sculpt_radius;
-            let mut actions = Vec::new();
-            actions.push(PanelAction::PaintSculptStamp {
+            let actions = vec![PanelAction::PaintSculptStamp {
                 layer: layer_id,
                 u,
                 v,
@@ -200,7 +209,7 @@ impl TerraApp {
                 strength,
                 stroke_kind,
                 target_height: 0.0,
-            });
+            }];
             self.apply_actions(actions);
             self.last_paint_uv = Some((u, v));
             self.force_draft = true;
@@ -257,7 +266,7 @@ impl TerraApp {
                     if (fu - u).hypot(fv - v) < 0.025 && self.biome_polygon_points.len() >= 3 {
                         let pts = std::mem::take(&mut self.biome_polygon_points);
                         actions.push(PanelAction::BeginBiomePaintStroke { biome });
-                        let res = self.session.document.preview_resolution.min(8192).max(64);
+                        let res = self.session.document.preview_resolution.clamp(64, 8192);
                         if let Some(layer) = self.session.document.selected_placement_layer_mut() {
                             layer.fill_polygon(
                                 biome,
@@ -455,7 +464,6 @@ impl TerraApp {
 
     /// Push Draft heights to the GPU while a brush stroke is active.
     /// Call at most once per frame â€” stamps coalesce via `pending_eval`.
-
     pub(crate) fn commit_biome_polygon_fill(&mut self) {
         let Some(biome) = self.session.document.active_biome else {
             return;
@@ -466,7 +474,7 @@ impl TerraApp {
         let pts = std::mem::take(&mut self.biome_polygon_points);
         let strength = self.ui_state.sculpt_strength.clamp(0.05, 1.0);
         let erase = self.modifiers_alt;
-        let res = self.session.document.preview_resolution.min(8192).max(64);
+        let res = self.session.document.preview_resolution.clamp(64, 8192);
         self.session.document.ensure_placement_layer();
         self.apply_actions(vec![PanelAction::BeginBiomePaintStroke { biome }]);
         if let Some(layer) = self.session.document.selected_placement_layer_mut() {
@@ -480,7 +488,7 @@ impl TerraApp {
     }
 
     /// Raycast cursor onto the height surface â†’ terrain UV (same mapping as the brush gizmo).
-    pub(crate) fn pick_paint_uv(&self) -> Option<(f32, f32)> {
+    pub(crate) fn pick_paint_uv(&mut self) -> Option<(f32, f32)> {
         let (x, y) = self.cursor_logical()?;
         if !self.viewport_rect.contains(x, y) {
             return None;
@@ -490,13 +498,17 @@ impl TerraApp {
         if self.gui_wants_pointer && !self.sculpt_stroke_active {
             return None;
         }
-        let renderer = self.renderer.as_ref()?;
         let window = self.window.as_ref()?;
         let ppp = window.scale_factor() as f32;
+        let renderer = self.renderer.as_mut()?;
         let (surface_w, surface_h) = renderer.size();
         let screen_w = surface_w as f32 / ppp;
         let screen_h = surface_h as f32 / ppp;
         let aspect = surface_w as f32 / surface_h.max(1) as f32;
+        renderer.poll_brush_surface_pick();
+        if let Some(pick) = renderer.latest_brush_surface_pick((x, y), (screen_w, screen_h)) {
+            return Some(pick.uv);
+        }
         pick_terrain_uv_on_surface(
             &renderer.camera,
             aspect,
@@ -532,7 +544,6 @@ impl TerraApp {
 
     /// Click empty terrain to add a node. Existing Path/Polygon nodes can be
     /// dragged, Shift-dragged vertically, or Ctrl-clicked to delete.
-
     pub(crate) fn update_brush_gizmo(&mut self) {
         let show = self.viewport_paint_tool_armed()
             && self.cursor_in_viewport()
@@ -540,8 +551,7 @@ impl TerraApp {
             && !self.modifiers_alt;
         if !show {
             if let Some(renderer) = self.renderer.as_mut() {
-                renderer.set_brush_gizmo(None);
-                renderer.sync_brush_geometry(None);
+                renderer.hide_brush_gizmo();
             }
             return;
         }
@@ -553,34 +563,22 @@ impl TerraApp {
         } else {
             self.ui_state.sculpt_radius.max(0.02)
         };
-        let color = self.brush_gizmo_color();
-        let Some((u, v)) = self.pick_paint_uv() else {
-            if let Some(renderer) = self.renderer.as_mut() {
-                renderer.set_brush_gizmo(None);
-                renderer.sync_brush_geometry(None);
-            }
+        let Some((x, y)) = self.cursor_logical() else {
             return;
         };
-        let world = self
-            .renderer
-            .as_ref()
-            .map(|r| r.heights.world_size)
-            .unwrap_or((4096.0, 4096.0));
-        let ring_y = terra_render::BrushOverlay::sample_ring_heights(
-            self.last_height.as_ref(),
-            world,
-            u,
-            v,
-            radius,
-        );
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        let ppp = window.scale_factor() as f32;
+        let color = self.brush_gizmo_color();
         if let Some(renderer) = self.renderer.as_mut() {
-            renderer.set_brush_gizmo(Some(BrushGizmo {
-                u,
-                v,
-                radius_uv: radius,
+            let (surface_w, surface_h) = renderer.size();
+            renderer.request_brush_surface_pick(
+                (x, y),
+                (surface_w as f32 / ppp, surface_h as f32 / ppp),
+                radius,
                 color,
-            }));
-            renderer.sync_brush_geometry(Some(&ring_y));
+            );
         }
     }
 
@@ -594,7 +592,6 @@ impl TerraApp {
     }
 
     /// Execute keyboard bindings through the shared command IDs.
-
     pub(crate) fn commit_mask_paint_stroke(&mut self) {
         let Some((mask_id, before, w, h)) = self.mask_paint_stroke_before.take() else {
             return;
@@ -684,5 +681,36 @@ impl TerraApp {
         r.upload_placement_tint(1, 1, &[0, 0, 0, 0]);
         r.set_biome_tint_strength(0.0);
         self.mask_overlay_dirty = false;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TerraApp;
+    use crate::ui::EditorTool;
+    use terra_core::layer::{FlatParams, Layer, LayerKind, LayerStack, SculptParams};
+
+    fn app_with_selected_layer(kind: LayerKind) -> TerraApp {
+        let mut app = TerraApp::default();
+        let layer = Layer::new("Selected", kind);
+        let id = layer.id();
+        app.session.document.stack = LayerStack::new();
+        app.session.document.stack.push(layer);
+        app.session.document.selected = Some(id);
+        app
+    }
+
+    #[test]
+    fn runtime_gate_applies_only_to_selected_foundation() {
+        let mut foundation =
+            app_with_selected_layer(LayerKind::SculptBase(SculptParams::filled(8, 0.0)));
+        foundation.ui_state.editor_tool = EditorTool::Raise;
+        assert!(foundation.active_sculpt_brush_available_for_selection());
+        foundation.ui_state.editor_tool = EditorTool::Terrace;
+        assert!(!foundation.active_sculpt_brush_available_for_selection());
+
+        let mut flat = app_with_selected_layer(LayerKind::Flat(FlatParams::default()));
+        flat.ui_state.editor_tool = EditorTool::Terrace;
+        assert!(flat.active_sculpt_brush_available_for_selection());
     }
 }

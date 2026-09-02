@@ -1,7 +1,7 @@
 //! Internal dependency graph for validation, invalidation, and UI (not a node editor).
 
 use crate::layer::{LayerId, LayerStack, OutputId, StackNode};
-use crate::mask::{Distribution, MaskId};
+use crate::mask::{DistNode, DistNodeKind, Distribution, MaskAsset, MaskId, MaskSource};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -85,6 +85,7 @@ impl DependencyGraph {
         ) {
             for n in nodes {
                 match n {
+                    StackNode::Layer(l) if !l.common.enabled => {}
                     StackNode::Layer(l) => {
                         let me = NodeRef::Layer(l.id());
                         if let Some(p) = *prior {
@@ -137,6 +138,25 @@ impl DependencyGraph {
         }
         walk(&stack.nodes, &mut g, &mut prior, mask_ids);
         g
+    }
+
+    /// Build the authored dependency graph including mask assets whose source is
+    /// a named layer/group output. This is the validation graph used by the
+    /// terrain-plan compiler; the older `build_from_stack` entry remains for UI
+    /// callers that only have mask identities.
+    pub fn build_from_document(stack: &LayerStack, mask_assets: &[MaskAsset]) -> Self {
+        let mask_ids: Vec<_> = mask_assets.iter().map(|asset| asset.id).collect();
+        let mut graph = Self::build_from_stack(stack, &mask_ids);
+        for asset in mask_assets {
+            if let MaskSource::LayerOutput { output_id } = asset.source {
+                graph.add_edge(
+                    NodeRef::Output(output_id),
+                    NodeRef::Mask(asset.id),
+                    DepKind::NamedOutput,
+                );
+            }
+        }
+        graph
     }
 
     /// Detect cycles via Kahn topological sort; returns Ok(order) or Err(cycle).
@@ -251,6 +271,25 @@ fn collect_distribution_deps(
     // needs the missing edges in order to report broken project references.
     for entry in dist.iter() {
         g.add_edge(NodeRef::Mask(entry.mask.id), owner, DepKind::MaskRef);
+    }
+    for node in &dist.nodes {
+        collect_dist_node_deps(g, owner, node);
+    }
+}
+
+fn collect_dist_node_deps(g: &mut DependencyGraph, owner: NodeRef, node: &DistNode) {
+    let mask = match &node.kind {
+        DistNodeKind::MaskAsset { mask }
+        | DistNodeKind::Paint { mask }
+        | DistNodeKind::ImportedMask { mask }
+        | DistNodeKind::Distance { mask, .. } => Some(mask.id),
+        _ => None,
+    };
+    if let Some(mask) = mask {
+        g.add_edge(NodeRef::Mask(mask), owner, DepKind::MaskRef);
+    }
+    for child in &node.children {
+        collect_dist_node_deps(g, owner, child);
     }
 }
 

@@ -1,4 +1,6 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+#[cfg(any(target_os = "windows", target_os = "macos", unix))]
+use std::process::Command;
 
 use crate::ui::{
     project_template_by_id, resolve_workspace_command, CommandId, NewWorldSettings,
@@ -7,19 +9,44 @@ use crate::ui::{
 use terra_core::document::EditorSession;
 use terra_io::{save_project, ProjectIoResult};
 
+use super::logical_frame::FrameDeadlineKind;
+use super::logical_frame::FrameRequestReason;
 use super::{
     default_terra_projects_dir, document_from_world_settings, prepare_project_path,
     project_name_from_path, save_project_prefs, AppScreen, PendingProjectAction, TerraApp,
 };
-use terra_core::eval::PreviewQuality;
+use terra_core::quality::PreviewQuality;
+
+#[cfg(any(target_os = "windows", target_os = "macos", unix))]
+fn open_directory(path: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "windows")]
+    let program = "explorer.exe";
+    #[cfg(target_os = "macos")]
+    let program = "open";
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let program = "xdg-open";
+
+    Command::new(program).arg(path).spawn().map(|_| ())
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos", unix)))]
+fn open_directory(_path: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "opening directories is unsupported on this platform",
+    ))
+}
+
 impl TerraApp {
-    pub(crate) fn poll_project_io(&mut self) {
-        self.project_io.poll();
+    /// Drain a finished background save/load into the session and status line.
+    ///
+    /// The poll itself now happens in the [`terra_jobs::JobRegistry`] tick at the
+    /// top of `about_to_wait`; this only consumes what that pump surfaced — the
+    /// transient status string and the typed [`ProjectIoResult`].
+    pub(crate) fn drain_project_io(&mut self) {
         if let Some(status) = self.project_io.status() {
             self.ui_state.status = status.to_string();
-            if let Some(w) = &self.window {
-                w.request_redraw();
-            }
+            self.request_app_frame(FrameRequestReason::Completion);
         }
         let Some(result) = self.project_io.result.take() else {
             return;
@@ -44,17 +71,16 @@ impl TerraApp {
             }
             ProjectIoResult::Loaded { path, doc } => {
                 let name = doc.name.clone();
-                self.enter_editor(doc, Some(path.clone()), false);
+                self.enter_editor(*doc, Some(path.clone()), false);
                 self.project_prefs.push_recent(&path, &name);
                 save_project_prefs(&self.project_prefs);
                 self.ui_state.status = format!("Loaded {}", path.display());
             }
             ProjectIoResult::Failed { path, error } => {
                 self.pending_enter_after_save = None;
+                log::error!("{} failed: {error}", path.display());
                 self.ui_state.status = format!("{} failed: {error}", path.display());
-                if let Some(w) = &self.window {
-                    w.request_redraw();
-                }
+                self.request_app_frame(FrameRequestReason::Completion);
             }
         }
     }
@@ -68,9 +94,7 @@ impl TerraApp {
         self.sync_lighting_to_document();
         self.project_io
             .start_save(self.session.document.clone(), path);
-        if let Some(w) = &self.window {
-            w.request_redraw();
-        }
+        self.request_app_frame(FrameRequestReason::Completion);
     }
 
     /// Copy the editable viewport lighting into the document so File > Save persists it.
@@ -155,7 +179,7 @@ impl TerraApp {
         }
     }
 
-    pub(crate) fn remember_recent(&mut self, path: &PathBuf) {
+    pub(crate) fn remember_recent(&mut self, path: &Path) {
         self.project_prefs
             .push_recent(path, &self.session.document.name);
         save_project_prefs(&self.project_prefs);
@@ -190,9 +214,7 @@ impl TerraApp {
     pub(crate) fn request_project_action(&mut self, action: PendingProjectAction) {
         if self.screen == AppScreen::Editor && self.document_dirty {
             self.pending_project_action = Some(action);
-            if let Some(w) = &self.window {
-                w.request_redraw();
-            }
+            self.request_app_frame(FrameRequestReason::UiActions);
             return;
         }
         self.perform_project_action(action);
@@ -211,9 +233,7 @@ impl TerraApp {
         self.new_template_selected = "blank".into();
         self.new_world_settings = NewWorldSettings::default();
         self.show_new_template_picker = true;
-        if let Some(w) = &self.window {
-            w.request_redraw();
-        }
+        self.request_app_frame(FrameRequestReason::UiActions);
     }
 
     pub(crate) fn new_project_with_template(
@@ -230,9 +250,7 @@ impl TerraApp {
         let projects_root = default_terra_projects_dir();
         if let Err(error) = std::fs::create_dir_all(&projects_root) {
             self.ui_state.status = format!("Could not create projects folder: {error}");
-            if let Some(w) = &self.window {
-                w.request_redraw();
-            }
+            self.request_app_frame(FrameRequestReason::UiActions);
             return;
         }
 
@@ -250,9 +268,7 @@ impl TerraApp {
             Ok(path) => path,
             Err(error) => {
                 self.ui_state.status = format!("Could not create project folder: {error}");
-                if let Some(w) = &self.window {
-                    w.request_redraw();
-                }
+                self.request_app_frame(FrameRequestReason::UiActions);
                 return;
             }
         };
@@ -270,9 +286,7 @@ impl TerraApp {
             }
             Err(error) => {
                 self.ui_state.status = format!("Could not create project: {error}");
-                if let Some(w) = &self.window {
-                    w.request_redraw();
-                }
+                self.request_app_frame(FrameRequestReason::UiActions);
             }
         }
     }
@@ -296,9 +310,7 @@ impl TerraApp {
         }
         self.ui_state.status = "Loadingâ€¦".into();
         self.project_io.start_load(path);
-        if let Some(w) = &self.window {
-            w.request_redraw();
-        }
+        self.request_app_frame(FrameRequestReason::Completion);
     }
 
     pub(crate) fn enter_editor(
@@ -316,6 +328,7 @@ impl TerraApp {
         self.worker_refine_pending = false;
         self.force_draft = false;
         self.pending_eval = false;
+        self.pending_eval_immediate = false;
 
         // Fresh session (undo stacks, outdated sims, rebuild feedback) — same as a cold open.
         let world_size = (document.metrics.world_size_x, document.metrics.world_size_z);
@@ -337,17 +350,16 @@ impl TerraApp {
         // Editor chrome starts minimized on create/open.
         self.layers_gui
             .reset_collapse_for_project(Some(&self.session.document));
+        self.layers_gui
+            .reveal_populated_biome_sections(&self.session.document);
+        self.layers_gui.reveal_selection(&self.session.document);
         self.tools_gui.collapse_all_categories();
         self.inspector_gui.reset_expand_for_project();
 
         self.mark_all_layers_dirty();
-        self.request_rebuild();
-        self.pending_eval = false;
-        self.run_eval_step();
+        self.request_rebuild_immediate();
         self.refresh_window_title();
-        if let Some(w) = &self.window {
-            w.request_redraw();
-        }
+        self.request_app_frame(FrameRequestReason::RequiredEvaluation);
     }
 
     /// Drop GPU/CPU preview state so the next document cannot inherit the previous one.
@@ -357,6 +369,7 @@ impl TerraApp {
         world_size: (f32, f32),
         ocean_level: Option<f32>,
     ) {
+        self.supersede_gpu_refinement();
         self.last_height = None;
         self.scheduler.last_good = None;
         self.scheduler.last_aux.clear();
@@ -364,17 +377,33 @@ impl TerraApp {
         self.scheduler.last_layer_timings.clear();
         self.scheduler.quality = PreviewQuality::Draft;
         self.scheduler.evaluator.clear_project_caches();
+        self.aux_upload_fp = u64::MAX;
+        self.veg_upload_fp = u64::MAX;
+        self.overhang_upload_fp = u64::MAX;
+        self.placement_tint_dirty = true;
+        self.mask_overlay_dirty = true;
+        self.terrain_plan_cache = terra_core::terrain_plan::TerrainPlanCache::new();
+        self.pending_plan_edits = vec![terra_core::terrain_plan::TerrainEditClass::Structure];
+        self.pending_plan_invalidation = None;
 
         self.worker_dirty_from = None;
+        self.worker_dirty_region = None;
+        self.worker_cache_res = None;
         self.worker_mark_all_dirty = true;
+        self.pending_gpu_dirty_region = None;
+        self.deferred_full_field = None;
+        self.logical_frames
+            .clear_deadline(FrameDeadlineKind::FullFieldRefinement);
         self.needs_height_upload = false;
         self.preview_dirty = true;
         self.ui_state.refining = false;
+        self.ui_state.evaluation_failure = None;
+        self.ui_state.terrain_preview_freshness = crate::ui::TerrainPreviewFreshness::Current;
         self.ui_state.build_progress = None;
         self.ui_state.draft_displayed = false;
         self.ui_state.quality = PreviewQuality::Draft;
         self.ui_state.dirty_tile_ids.clear();
-        self.pending_tile_uploads.clear();
+        self.clear_terrain_tile_work();
 
         let metrics = self.session.document.metrics;
         self.terrain_runtime
@@ -392,13 +421,9 @@ impl TerraApp {
         if let Some(renderer) = self.renderer.as_mut() {
             renderer.reset_project_state(world_size, ocean_level);
         }
-        // Preserve the GPU allocation, but make all previous-document pages unreachable.
-        if let (Some(atlas), Some(gpu)) = (self.tile_atlas.as_mut(), self.gpu.as_ref()) {
-            atlas.clear(&gpu.queue);
-            self.ui_state
-                .profile
-                .update_tile_cache(atlas.residency().stats(), 0);
-        }
+        // Preserve the GPU allocation, but make all previous-document pages
+        // unreachable and stop streaming until the new document re-syncs.
+        self.retire_streamed_residency();
     }
 
     pub(crate) fn close_project(&mut self) {
@@ -407,6 +432,7 @@ impl TerraApp {
         self.eval_token = self.eval_token.wrapping_add(1);
         self.eval_worker.set_token(self.eval_token);
         self.pending_eval = false;
+        self.pending_eval_immediate = false;
         self.worker_refine_pending = false;
         self.force_draft = false;
         self.session = EditorSession::new();
@@ -418,9 +444,7 @@ impl TerraApp {
         self.screen = AppScreen::Home;
         self.ui_state.status = String::new();
         self.refresh_window_title();
-        if let Some(w) = &self.window {
-            w.request_redraw();
-        }
+        self.request_app_frame(FrameRequestReason::UiActions);
     }
 
     pub(crate) fn handle_home_actions(&mut self, actions: Vec<ProjectHomeAction>) {
@@ -433,6 +457,9 @@ impl TerraApp {
                 ProjectHomeAction::Open => {
                     self.project_home.notice = None;
                     self.request_project_action(PendingProjectAction::Open);
+                }
+                ProjectHomeAction::OpenLogs => {
+                    self.open_logs_folder();
                 }
                 ProjectHomeAction::Browse => {
                     self.project_home.notice = None;
@@ -448,6 +475,39 @@ impl TerraApp {
                 }
             }
         }
+    }
+
+    pub(crate) fn open_logs_folder(&mut self) {
+        self.project_home.notice = None;
+        let result = crate::logging::log_directory().and_then(|directory| {
+            std::fs::create_dir_all(&directory).map_err(|error| {
+                format!(
+                    "could not create log directory {}: {error}",
+                    directory.display()
+                )
+            })?;
+            open_directory(&directory).map_err(|error| {
+                format!(
+                    "could not open log directory {}: {error}",
+                    directory.display()
+                )
+            })?;
+            log::info!("opened log directory: {}", directory.display());
+            Ok(directory)
+        });
+
+        match result {
+            Ok(directory) => {
+                self.project_home.notice =
+                    Some(format!("Opened log folder: {}", directory.display()));
+            }
+            Err(error) => {
+                log::error!("{error}");
+                self.project_home.notice = Some(format!("Could not open logs: {error}"));
+                self.ui_state.status = error;
+            }
+        }
+        self.request_app_frame(FrameRequestReason::UiActions);
     }
 
     /// Folder picker: open a Terra project found inside the chosen directory.
@@ -488,9 +548,7 @@ impl TerraApp {
             dir.display()
         ));
         self.ui_state.status = format!("No project found in {}", dir.display());
-        if let Some(w) = &self.window {
-            w.request_redraw();
-        }
+        self.request_app_frame(FrameRequestReason::UiActions);
     }
 
     pub(crate) fn choose_export_directory(&mut self) {
@@ -501,7 +559,61 @@ impl TerraApp {
         self.ui_state.status = format!("Export directory: {}", path.display());
     }
 
+    pub(crate) fn finish_field_export(
+        &mut self,
+        result: Result<terra_io::FieldExportResult, terra_io::ExportError>,
+    ) {
+        self.finish_field_export_with(result, open_directory);
+    }
+
+    fn finish_field_export_with(
+        &mut self,
+        result: Result<terra_io::FieldExportResult, terra_io::ExportError>,
+        open_folder: impl FnOnce(&Path) -> std::io::Result<()>,
+    ) {
+        match result {
+            Ok(result) => {
+                self.ui_state.status = format!("Exported {} file(s)", result.paths.len());
+                if self.ui_state.open_export_folder_when_finished {
+                    // Use the completed job's actual destination: the user may
+                    // have selected a different directory while it was running.
+                    if let Some(directory) = result.paths.first().and_then(|path| path.parent()) {
+                        if let Err(error) = open_folder(directory) {
+                            log::warn!(
+                                "could not open export directory {}: {error}",
+                                directory.display()
+                            );
+                            self.ui_state
+                                .status
+                                .push_str(&format!("; could not open folder: {error}"));
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                log::error!("export failed: {error}");
+                self.ui_state.status = format!("Export failed: {error}");
+            }
+        }
+    }
+
     pub(crate) fn start_export(&mut self) {
+        if self.height_pyramid_export.is_busy() || !self.exporter.job.done {
+            self.ui_state.status = "Export already running".into();
+            return;
+        }
+        let available = match terra_io::exportable_fields(&self.session.document) {
+            Ok(fields) => fields,
+            Err(error) => {
+                self.ui_state.status = format!("Export unavailable: {error}");
+                return;
+            }
+        };
+        self.ui_state.export_options.retain_available(&available);
+        if self.ui_state.export_options.fields.is_empty() {
+            self.ui_state.status = "Select at least one field".into();
+            return;
+        }
         let path = if let Some(existing) = self.ui_state.export_path.clone() {
             std::path::PathBuf::from(existing)
         } else {
@@ -511,16 +623,14 @@ impl TerraApp {
             self.ui_state.export_path = Some(path.display().to_string());
             path
         };
-        if !self.exporter.job.done {
-            self.ui_state.status = "Export already running".into();
-            return;
-        }
-        // Bake sparse biome paint into masks before the export worker clones the doc.
-        self.session.document.sync_all_biome_paint_masks();
         self.terrain_runtime.refinement.begin_export();
         self.ui_state.export_progress = Some(0.0);
         self.ui_state.status = format!("Exporting to {}", path.display());
-        self.exporter.start(self.session.document.clone(), path);
+        self.exporter.start_fields(
+            self.session.document.clone(),
+            path,
+            self.ui_state.export_options.clone(),
+        );
     }
 
     /// Ensure a Shape history layer for the active sculpt tool.
@@ -531,6 +641,11 @@ impl TerraApp {
         use terra_core::shape_history::{
             create_shape_layer, resolve_shape_target, ShapeTargetDecision,
         };
+        // Track the layer selected before the brush resolves its target, so we
+        // can tell the artist when a stroke silently retargets or creates a layer
+        // (e.g. brushing with a generator like "Flat" selected redirects to a
+        // Sculpt-Strokes layer). Fires once per switch, not per stamp.
+        let prev_selected = self.session.document.selected;
         let decision = resolve_shape_target(
             &self.session.document.stack,
             self.session.document.selected,
@@ -546,16 +661,44 @@ impl TerraApp {
                     self.ui_state.shape_session_layer = Some(id);
                 }
                 self.session.document.selected = Some(id);
+                if prev_selected != Some(id) {
+                    let name = self
+                        .session
+                        .document
+                        .stack
+                        .find(id)
+                        .map(|l| l.common.name.clone())
+                        .unwrap_or_else(|| "Shape Layer".into());
+                    let msg = format!("Brush is painting on Shape Layer \"{name}\"");
+                    log::info!("{msg}");
+                    self.ui_state.status = msg;
+                }
                 Some(id)
             }
             ShapeTargetDecision::CreateNew { name, .. } => {
+                let display_name = name.clone();
                 let layer = create_shape_layer(name);
                 let id = layer.id();
                 self.session.document.stack.ensure_category_folders();
                 self.session.document.stack.push_routed(layer, None, false);
                 self.session.document.selected = Some(id);
                 self.ui_state.shape_session_layer = Some(id);
+                // The layer is created once at gesture start. Its first dab is a
+                // content edit, but the compiled plan must first observe the new
+                // topology; subsequent dabs reuse that single structural revision.
+                self.pending_plan_edits
+                    .push(terra_core::terrain_plan::TerrainEditClass::Structure);
+                let msg = format!("Created new Shape Layer \"{display_name}\" to paint on");
+                log::info!("{msg}");
+                self.ui_state.status = msg;
                 Some(id)
+            }
+            ShapeTargetDecision::UnavailableOnFoundation { tool, .. } => {
+                self.ui_state.status = format!(
+                    "{} isn't supported by the selected Foundation layer",
+                    tool.label()
+                );
+                None
             }
         }
     }
@@ -699,10 +842,17 @@ impl TerraApp {
             self.ui_state.status = "Undid biome paint stroke".into();
             return;
         }
-        if let Some(id) = self.session.history.undo(&mut self.session.document.stack) {
-            self.mark_dirty_from(id);
-        } else {
-            self.mark_all_layers_dirty();
+        match self.session.history.undo_document(
+            &mut self.session.document.stack,
+            &mut self.session.document.masks,
+        ) {
+            Some(terra_core::command::CommandImpact::Layer(id)) => self.mark_dirty_from(id),
+            Some(terra_core::command::CommandImpact::Masks) => {
+                self.mark_all_layers_dirty();
+                self.mask_overlay_dirty = true;
+                self.preview_dirty = true;
+            }
+            _ => self.mark_all_layers_dirty(),
         }
         self.mark_document_dirty();
         self.request_rebuild();
@@ -721,10 +871,17 @@ impl TerraApp {
             self.ui_state.status = "Redid Scenario edit".into();
             return;
         }
-        if let Some(id) = self.session.history.redo(&mut self.session.document.stack) {
-            self.mark_dirty_from(id);
-        } else {
-            self.mark_all_layers_dirty();
+        match self.session.history.redo_document(
+            &mut self.session.document.stack,
+            &mut self.session.document.masks,
+        ) {
+            Some(terra_core::command::CommandImpact::Layer(id)) => self.mark_dirty_from(id),
+            Some(terra_core::command::CommandImpact::Masks) => {
+                self.mark_all_layers_dirty();
+                self.mask_overlay_dirty = true;
+                self.preview_dirty = true;
+            }
+            _ => self.mark_all_layers_dirty(),
         }
         self.mark_document_dirty();
         self.request_rebuild();
@@ -734,9 +891,53 @@ impl TerraApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::PanelAction;
     use terra_core::{FieldId, Heightfield, HeightfieldMetrics, TerrainTileKey};
-    use terra_gpu::GpuTileAtlas;
+    use terra_gpu::{GpuPageTableEntry, GpuTileAtlas};
     use terra_render::{GpuContext, TerrainRenderer};
+
+    #[test]
+    fn export_completion_opens_only_the_successful_jobs_directory_when_enabled() {
+        let mut app = TerraApp::default();
+        let directory = std::env::temp_dir().join("Terra export with spaces");
+        let success = || {
+            Ok(terra_io::FieldExportResult {
+                paths: vec![
+                    directory.join("height.png"),
+                    directory.join("export_metadata.json"),
+                ],
+            })
+        };
+        app.finish_field_export_with(success(), |_| panic!("toggle is off"));
+        assert_eq!(app.ui_state.status, "Exported 2 file(s)");
+
+        app.ui_state.open_export_folder_when_finished = true;
+        app.ui_state.export_path = Some("a-different-export-folder".into());
+        let mut opened = None;
+        app.finish_field_export_with(success(), |path| {
+            opened = Some(path.to_path_buf());
+            Ok(())
+        });
+        assert_eq!(opened, Some(directory.clone()));
+        assert_eq!(app.ui_state.status, "Exported 2 file(s)");
+
+        app.finish_field_export_with(
+            Err(terra_io::IoError::Msg("write failed".into()).into()),
+            |_| panic!("failed exports must not open a folder"),
+        );
+        assert_eq!(app.ui_state.status, "Export failed: write failed");
+
+        app.finish_field_export_with(success(), |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "file manager unavailable",
+            ))
+        });
+        assert!(app
+            .ui_state
+            .status
+            .starts_with("Exported 2 file(s); could not open folder:"));
+    }
 
     #[test]
     fn new_world_settings_document_round_trips_material_bounds() {
@@ -749,6 +950,171 @@ mod tests {
         let normalized = loaded.to_json().expect("new-world document must resave");
         terra_core::document::TerrainDocument::from_json(&normalized)
             .expect("resaved new-world document must reload");
+    }
+
+    #[test]
+    fn blank_new_world_has_no_shape_constraints_or_reconstruction() {
+        let doc = document_from_world_settings("blank", 4_096.0, 0.0);
+        assert!(doc.shapes.shapes.is_empty());
+        assert!(doc.shapes.managed_constraints_layer.is_none());
+        assert!(doc.stack.flatten_layers().iter().all(|layer| !matches!(
+            layer.kind,
+            terra_core::LayerKind::TerrainConstraints(_)
+                | terra_core::LayerKind::GradientReconstruct(_)
+        )));
+        let base = doc
+            .stack
+            .flatten_layers()
+            .into_iter()
+            .find_map(|layer| match &layer.kind {
+                terra_core::LayerKind::SculptBase(params) => Some(params),
+                _ => None,
+            })
+            .expect("blank new world has a sculptable base");
+        assert!(!base.samples.is_empty());
+        assert!(base.samples.iter().all(|sample| *sample == 8.0));
+
+        let alpine = document_from_world_settings("alpine", 4_096.0, 0.0);
+        assert!(!alpine.shapes.shapes.is_empty());
+        assert!(alpine.shapes.managed_constraints_layer.is_some());
+        assert!(alpine
+            .stack
+            .flatten_layers()
+            .iter()
+            .any(|layer| matches!(&layer.kind, terra_core::LayerKind::TerrainConstraints(_))));
+    }
+
+    /// #145: a layer-creating brush changes topology once at gesture start; its
+    /// first and later dabs are runtime content patches on that retained plan.
+    #[test]
+    fn shape_layer_creation_compiles_once_and_continuing_dabs_do_not_recompile() {
+        use terra_core::authoring::SculptStrokeKind;
+        use terra_core::layer::LayerStack;
+        use terra_core::shape_history::ShapeTool;
+        use terra_core::terrain_plan::{TerrainEditClass, TerrainPlanCache};
+
+        let mut app = TerraApp::default();
+        app.session.document.stack = LayerStack::new();
+        app.session.document.selected = None;
+        app.pending_plan_edits.clear();
+        app.terrain_plan_cache = TerrainPlanCache::new();
+        let empty = app.session.document.preview_eval_stack();
+        app.terrain_plan_cache
+            .acquire(&empty, &app.session.document.masks)
+            .expect("prime empty authored topology");
+        app.terrain_plan_cache.stats_mut().reset();
+
+        let layer = app
+            .ensure_shape_history_target(ShapeTool::Raise)
+            .expect("Raise creates a Shape Layer");
+        assert_eq!(
+            app.pending_plan_edits
+                .iter()
+                .filter(|edit| matches!(edit, TerrainEditClass::Structure))
+                .count(),
+            1,
+            "gesture start records exactly one topology change"
+        );
+
+        let dab = |u| PanelAction::PaintSculptStamp {
+            layer,
+            u,
+            v: 0.5,
+            radius: 0.04,
+            strength: 8.0,
+            stroke_kind: SculptStrokeKind::Raise,
+            target_height: 0.0,
+        };
+        app.apply_actions(vec![dab(0.48)]);
+        let edits = std::mem::take(&mut app.pending_plan_edits);
+        let stack = app.session.document.preview_eval_stack();
+        app.terrain_plan_cache
+            .update(&stack, &app.session.document.masks, &edits)
+            .expect("compile the gesture-start topology");
+
+        for (previous, u) in [(0.48, 0.50), (0.50, 0.52)] {
+            app.last_paint_uv = Some((previous, 0.5));
+            app.apply_actions(vec![dab(u)]);
+            let edits = std::mem::take(&mut app.pending_plan_edits);
+            assert!(edits.iter().all(|edit| matches!(
+                edit,
+                TerrainEditClass::Content { owner, .. }
+                    if *owner == terra_core::deps::NodeRef::Layer(layer)
+            )));
+            let stack = app.session.document.preview_eval_stack();
+            app.terrain_plan_cache
+                .update(&stack, &app.session.document.masks, &edits)
+                .expect("patch continuing dab");
+        }
+
+        let stats = app.terrain_plan_cache.stats().snapshot();
+        assert_eq!(stats.plan_compiles, 1);
+        assert_eq!(stats.successful_compiles, 1);
+        assert_eq!(stats.plan_cache_hits, 2);
+        let terra_core::LayerKind::SculptStrokes(params) =
+            &app.session.document.stack.find(layer).unwrap().kind
+        else {
+            panic!("created target is not a stroke layer");
+        };
+        assert_eq!(params.strokes.len(), 1, "one continuing authored stroke");
+        assert_eq!(params.strokes[0].points.len(), 3, "three runtime dabs");
+    }
+
+    /// #145: Base painting is content-only even when the document contains an
+    /// authored tree, so repeated dabs retain the structural plan revision.
+    #[test]
+    fn base_dabs_in_tree_are_content_only_plan_cache_hits() {
+        use terra_core::authoring::SculptStrokeKind;
+        use terra_core::layer::{Layer, LayerGroup, LayerKind, LayerStack, SculptParams};
+        use terra_core::terrain_plan::{TerrainEditClass, TerrainPlanCache};
+
+        let mut app = TerraApp::default();
+        let base = Layer::new(
+            "Base",
+            LayerKind::SculptBase(SculptParams::filled(64, 12.0)),
+        );
+        let base_id = base.id();
+        let mut tree = LayerGroup::new("Tree");
+        tree.children
+            .push(terra_core::layer::StackNode::Layer(base));
+        app.session.document.stack = LayerStack::new();
+        app.session.document.stack.push_group(tree);
+        app.session.document.selected = Some(base_id);
+        app.pending_plan_edits.clear();
+        app.terrain_plan_cache = TerrainPlanCache::new();
+        let stack = app.session.document.preview_eval_stack();
+        app.terrain_plan_cache
+            .acquire(&stack, &app.session.document.masks)
+            .expect("prime tree plan");
+        let revision = app.terrain_plan_cache.structure_revision();
+        app.terrain_plan_cache.stats_mut().reset();
+
+        for u in [0.48, 0.50, 0.52] {
+            app.apply_actions(vec![PanelAction::PaintSculptStamp {
+                layer: base_id,
+                u,
+                v: 0.5,
+                radius: 0.04,
+                strength: 3.0,
+                stroke_kind: SculptStrokeKind::Raise,
+                target_height: 0.0,
+            }]);
+            let edits = std::mem::take(&mut app.pending_plan_edits);
+            assert!(edits.iter().all(|edit| matches!(
+                edit,
+                TerrainEditClass::Content { owner, .. }
+                    if *owner == terra_core::deps::NodeRef::Layer(base_id)
+            )));
+            let stack = app.session.document.preview_eval_stack();
+            app.terrain_plan_cache
+                .update(&stack, &app.session.document.masks, &edits)
+                .expect("patch Base dab");
+        }
+
+        let stats = app.terrain_plan_cache.stats().snapshot();
+        assert_eq!(app.terrain_plan_cache.structure_revision(), revision);
+        assert_eq!(stats.plan_compiles, 0);
+        assert_eq!(stats.plan_cache_hits, 3);
     }
 
     /// Revert check for #34: document reset must retain an empty atlas and the
@@ -781,10 +1147,12 @@ mod tests {
         };
         app.last_height = Some(Heightfield::filled(metrics, 1.0));
         app.queue_final_tile_uploads();
-        let (_, old_level, old_tile) = *app
-            .pending_tile_uploads
-            .front()
+        let old_pending = app
+            .terrain_tile_scheduler
+            .queued_requests()
+            .next()
             .expect("old document upload queued");
+        let (old_level, old_tile) = (old_pending.key.tile.level, old_pending.key.tile.tile);
         assert_eq!(app.upload_pending_terrain_tiles(), 1);
         let old_key = TerrainTileKey {
             layer: None,
@@ -798,14 +1166,6 @@ mod tests {
             .expect("atlas before reset")
             .lookup(&old_key)
             .expect("old page resident");
-        assert_eq!(
-            app.terrain_runtime
-                .pyramid
-                .record(&old_key)
-                .expect("pyramid mirrors uploaded page")
-                .handle,
-            old_handle
-        );
         assert!(app
             .renderer
             .as_ref()
@@ -825,20 +1185,28 @@ mod tests {
         );
         assert_eq!(atlas.residency().stats().resident_tiles, 0);
         assert_eq!(atlas.residency().resolve_handle(old_handle), None);
-        assert!(app.terrain_runtime.pyramid.record(&old_key).is_none());
-        assert!(app.pending_tile_uploads.is_empty());
+        assert!(app.terrain_tile_scheduler.is_empty());
         assert!(!app
             .renderer
             .as_ref()
             .expect("renderer")
             .tile_stream_enabled());
+        assert!(
+            atlas
+                .read_page_table_blocking(&gpu.device, &gpu.queue)
+                .iter()
+                .all(|entry| entry.valid == 0),
+            "reset must leave the GPU page table fully invalid"
+        );
 
         app.last_height = Some(Heightfield::filled(metrics, 2.0));
         app.queue_final_tile_uploads();
-        let (_, new_level, new_tile) = *app
-            .pending_tile_uploads
-            .front()
+        let new_pending = app
+            .terrain_tile_scheduler
+            .queued_requests()
+            .next()
             .expect("new document upload queued");
+        let (new_level, new_tile) = (new_pending.key.tile.level, new_pending.key.tile.tile);
         assert_eq!(app.upload_pending_terrain_tiles(), 1);
         let new_key = TerrainTileKey {
             layer: None,
@@ -848,21 +1216,401 @@ mod tests {
         };
         let atlas = app.tile_atlas.as_mut().expect("atlas after upload");
         let new_handle = atlas.lookup(&new_key).expect("new page resident");
-        assert_eq!(
-            app.terrain_runtime
-                .pyramid
-                .record(&new_key)
-                .expect("pyramid mirrors replacement page")
-                .handle,
-            new_handle
-        );
         assert_eq!(new_handle.slot, old_handle.slot);
         assert_ne!(new_handle.generation, old_handle.generation);
         assert_eq!(atlas.residency().resolve_handle(old_handle), None);
+        assert_single_live_page_at_current_revision(&app, &new_key);
+    }
+
+    /// Prime an app with a single streamed page resident at the current output
+    /// revision. Returns the seeded metrics, the resident page's key, and its
+    /// handle so a caller can assert the page is retired after an edit.
+    fn app_with_one_streamed_page(
+        gpu: &terra_test_gpu::TestGpu,
+    ) -> (
+        TerraApp,
+        HeightfieldMetrics,
+        TerrainTileKey,
+        terra_core::TilePageHandle,
+    ) {
+        let context = GpuContext {
+            device: gpu.device.clone(),
+            queue: gpu.queue.clone(),
+            surface_format: wgpu::TextureFormat::Rgba8Unorm,
+        };
+        let mut app = TerraApp::default();
+        app.renderer = Some(TerrainRenderer::new_headless(&context, 64, 64));
+        app.gpu = Some(context);
+        let config = app.terrain_runtime.pyramid.config;
+        app.tile_atlas = Some(
+            GpuTileAtlas::new(&gpu.device, config.tile_size, config.halo, 4).expect("test atlas"),
+        );
+        let metrics = HeightfieldMetrics {
+            width: config.tile_size,
+            height: config.tile_size,
+            world_size_x: 1000.0,
+            world_size_z: 1000.0,
+            tile_size: config.tile_size,
+            halo: config.halo,
+        };
+        app.last_height = Some(Heightfield::filled(metrics, 1.0));
+        app.queue_final_tile_uploads();
+        let pending = app
+            .terrain_tile_scheduler
+            .queued_requests()
+            .next()
+            .expect("page upload queued");
+        let (level, tile) = (pending.key.tile.level, pending.key.tile.tile);
+        assert_eq!(app.upload_pending_terrain_tiles(), 1);
+        let key = TerrainTileKey {
+            layer: None,
+            field: FieldId::Height,
+            level,
+            tile,
+        };
+        let handle = app
+            .tile_atlas
+            .as_mut()
+            .expect("atlas")
+            .lookup(&key)
+            .expect("page resident");
+        let entry = assert_single_live_page_at_current_revision(&app, &key);
+        assert_eq!(
+            entry.generation, handle.generation,
+            "page table records the seeded handle's generation"
+        );
+        (app, metrics, key, handle)
+    }
+
+    /// Assert the revision boundary retired streamed residency: the atlas has no
+    /// resident tiles and cannot resolve the old handle, no uploads remain queued,
+    /// and the renderer has stopped streaming (so the shader falls back to the
+    /// monolithic texture).
+    fn assert_streamed_residency_retired(app: &TerraApp, old_handle: terra_core::TilePageHandle) {
+        let atlas = app.tile_atlas.as_ref().expect("atlas retained");
+        assert_eq!(atlas.residency().stats().resident_tiles, 0);
+        assert_eq!(atlas.residency().resolve_handle(old_handle), None);
+        assert!(app.terrain_tile_scheduler.is_empty());
+        assert!(!app
+            .renderer
+            .as_ref()
+            .expect("renderer")
+            .tile_stream_enabled());
+
+        // The CPU mirrors above can agree while the GPU page table the shader
+        // actually reads still holds the retired revision's pages -- that is the
+        // exact E1-C2 divergence. Read the buffer back and require no row survives.
+        let gpu = app.gpu.as_ref().expect("gpu context");
+        assert!(
+            atlas
+                .read_page_table_blocking(&gpu.device, &gpu.queue)
+                .iter()
+                .all(|entry| entry.valid == 0),
+            "no page-table row may stay valid once residency is retired"
+        );
+    }
+
+    /// Assert the atlas holds exactly one resident page, that it carries `key`'s
+    /// identity stamped with the runtime's *current* output revision, and that the
+    /// renderer streams at that same revision. This is the post-sync invariant the
+    /// shader's stale-page gate relies on (uniform revision == page-stamp revision);
+    /// returns the live entry so callers can assert more (e.g. handle generation).
+    fn assert_single_live_page_at_current_revision(
+        app: &TerraApp,
+        key: &TerrainTileKey,
+    ) -> GpuPageTableEntry {
+        let revision = app.terrain_runtime.output_revision();
+        let renderer = app.renderer.as_ref().expect("renderer");
+        assert!(
+            renderer.tile_stream_enabled(),
+            "streaming stays enabled after a completed sync"
+        );
+        assert_eq!(
+            renderer.tile_stream_revision(),
+            revision,
+            "renderer streams the current output revision"
+        );
+        let gpu = app.gpu.as_ref().expect("gpu context");
+        let atlas = app.tile_atlas.as_ref().expect("atlas");
+        let live: Vec<GpuPageTableEntry> = atlas
+            .read_page_table_blocking(&gpu.device, &gpu.queue)
+            .into_iter()
+            .filter(|entry| entry.valid != 0)
+            .collect();
+        assert_eq!(live.len(), 1, "exactly one page resident after sync");
+        let entry = live[0];
+        assert_eq!(entry.level as u8, key.level, "page level matches key");
+        assert_eq!(
+            (entry.tile_x, entry.tile_z),
+            (key.tile.tx, key.tile.tz),
+            "page tile coords match key"
+        );
+        assert_eq!(
+            (entry.output_revision_hi, entry.output_revision_lo),
+            ((revision >> 32) as u32, revision as u32),
+            "page stamped with the current output revision"
+        );
+        entry
+    }
+
+    /// Ratchet 3 (count honesty): every residency source must agree, so the HUD
+    /// can never report "no residency" while stale pages still render (the E1-C2
+    /// symptom).
+    ///
+    /// The sources cross-checked are the GPU page table (what the shader actually
+    /// samples, authoritative), `atlas.residency().stats()` (the CPU mirror the HUD
+    /// is fed from), and `profile.tile_cache_resident` (the count the artist reads).
+    /// It also forbids stale rows and pins stream-enable honesty (streaming on only
+    /// with live pages at the current revision). With the write-only CPU pyramid
+    /// plan retired (#91) and its name blacklist replaced by behavioral authority
+    /// guards (#171), residency has one shader-visible source (the GPU page table)
+    /// and one CPU policy mirror (`TileResidencyCache`).
+    fn assert_residency_sources_agree(app: &TerraApp) {
+        let revision = app.terrain_runtime.output_revision();
+        let rev_lo = revision as u32;
+        let rev_hi = (revision >> 32) as u32;
+
+        let entries = {
+            let gpu = app.gpu.as_ref().expect("gpu context");
+            app.tile_atlas
+                .as_ref()
+                .expect("atlas")
+                .read_page_table_blocking(&gpu.device, &gpu.queue)
+        };
+        let live = entries.iter().filter(|e| e.valid != 0).count();
+        let stale = entries
+            .iter()
+            .filter(|e| {
+                e.valid != 0 && (e.output_revision_lo, e.output_revision_hi) != (rev_lo, rev_hi)
+            })
+            .count();
+        assert_eq!(
+            stale, 0,
+            "no page-table row may carry a prior output revision"
+        );
+
+        // GPU truth vs the CPU mirror that feeds the HUD, and the HUD field itself.
+        let resident = app
+            .tile_atlas
+            .as_ref()
+            .expect("atlas")
+            .residency()
+            .stats()
+            .resident_tiles;
+        assert_eq!(
+            resident, live,
+            "atlas residency stats must match the page-table valid count"
+        );
+        assert_eq!(
+            app.ui_state.profile.tile_cache_resident, live,
+            "HUD tile_cache_resident must match the page-table valid count"
+        );
+
+        // Stream-enable honesty: streaming is on only with live pages at this revision.
+        let (enabled, stream_rev) = {
+            let renderer = app.renderer.as_ref().expect("renderer");
+            (
+                renderer.tile_stream_enabled(),
+                renderer.tile_stream_revision(),
+            )
+        };
+        if enabled {
+            assert!(live >= 1, "streaming enabled while the page table is empty");
+            assert_eq!(
+                stream_rev, revision,
+                "streaming enabled at a revision the pages are not stamped with"
+            );
+        }
+    }
+
+    /// Revert check for #86: advancing the output revision via `mark_dirty_from`
+    /// must retire the prior revision's streamed pages, and the #34 upload/sync
+    /// lifecycle must then re-populate the atlas and re-enable streaming.
+    #[test]
+    fn edit_via_mark_dirty_from_retires_streamed_pages_until_resync() {
+        let Some(gpu) = terra_test_gpu::headless() else {
+            return;
+        };
+        let (mut app, metrics, _old_key, old_handle) = app_with_one_streamed_page(gpu);
+        let revision_before = app.terrain_runtime.output_revision();
+
+        // An unknown layer id dirties the whole stack — the strongest edit shape.
+        app.mark_dirty_from(terra_core::LayerId::new());
+
+        assert_ne!(app.terrain_runtime.output_revision(), revision_before);
+        assert_streamed_residency_retired(&app, old_handle);
+
+        // #34 lifecycle: worker completion re-queues tiles and re-enables streaming.
+        app.last_height = Some(Heightfield::filled(metrics, 2.0));
+        app.queue_final_tile_uploads();
+        let new_pending = app
+            .terrain_tile_scheduler
+            .queued_requests()
+            .next()
+            .expect("resync upload queued");
+        let (new_level, new_tile) = (new_pending.key.tile.level, new_pending.key.tile.tile);
+        assert_eq!(app.upload_pending_terrain_tiles(), 1);
+        let new_key = TerrainTileKey {
+            layer: None,
+            field: FieldId::Height,
+            level: new_level,
+            tile: new_tile,
+        };
+        // Re-enable ratchet: the page repopulates and the renderer streams again,
+        // now stamped with the post-edit revision (not the retired one).
+        assert_ne!(app.terrain_runtime.output_revision(), revision_before);
+        assert_single_live_page_at_current_revision(&app, &new_key);
+    }
+
+    /// The stage-aware edit path advances the revision too, so it must retire
+    /// streamed pages identically.
+    #[test]
+    fn edit_via_mark_dirty_from_stage_retires_streamed_pages() {
+        let Some(gpu) = terra_test_gpu::headless() else {
+            return;
+        };
+        let (mut app, _metrics, _old_key, old_handle) = app_with_one_streamed_page(gpu);
+        let revision_before = app.terrain_runtime.output_revision();
+
+        app.mark_dirty_from_stage(terra_core::LayerId::new());
+
+        assert_ne!(app.terrain_runtime.output_revision(), revision_before);
+        assert_streamed_residency_retired(&app, old_handle);
+    }
+
+    /// Whole-stack edits advance the revision via `reconfigure`; that boundary
+    /// must retire streamed pages as well.
+    #[test]
+    fn mark_all_layers_dirty_retires_streamed_pages() {
+        let Some(gpu) = terra_test_gpu::headless() else {
+            return;
+        };
+        let (mut app, _metrics, _old_key, old_handle) = app_with_one_streamed_page(gpu);
+
+        app.mark_all_layers_dirty();
+
+        assert_streamed_residency_retired(&app, old_handle);
+    }
+
+    /// Consistency ratchet (#87): the residency counts the HUD reads and the page
+    /// table the shader samples must agree at every point in the edit lifecycle,
+    /// so the E1-C2 divergence -- HUD reporting no residency while stale pages
+    /// still render -- cannot silently reappear.
+    #[test]
+    fn residency_counts_agree_across_hud_sources_and_page_table() {
+        let Some(gpu) = terra_test_gpu::headless() else {
+            return;
+        };
+        let (mut app, metrics, _old_key, _old_handle) = app_with_one_streamed_page(gpu);
+
+        // Stage 1: freshly streamed -- every source reports the one resident page.
+        assert_residency_sources_agree(&app);
+
+        // Stage 2: the E1-C2 moment. The edit retires residency; no source may
+        // still count (or let the shader sample) the prior revision's page.
+        app.mark_dirty_from(terra_core::LayerId::new());
+        assert_residency_sources_agree(&app);
+
+        // Stage 3: worker completion re-streams; every source agrees once more,
+        // now at the post-edit revision.
+        app.last_height = Some(Heightfield::filled(metrics, 2.0));
+        app.queue_final_tile_uploads();
+        assert_eq!(app.upload_pending_terrain_tiles(), 1);
+        assert_residency_sources_agree(&app);
+    }
+
+    /// Revert check for the streamed-tile corner artifact: the streamed resolution
+    /// the renderer hands the shader must track the resident pages (`last_height`),
+    /// independent of the monolithic height-texture size. If the shader
+    /// denormalized streamed UVs by `tex_size` again, a coarse result would render
+    /// into a `page_res / tex_size` corner at the origin.
+    #[test]
+    fn streamed_resolution_tracks_pages_not_monolithic_tex_size() {
+        let Some(gpu) = terra_test_gpu::headless() else {
+            return;
+        };
+        let (mut app, metrics, _key, _handle) = app_with_one_streamed_page(gpu);
+        let page_res = metrics.width;
+
+        {
+            let renderer = app.renderer.as_ref().expect("renderer");
+            assert!(renderer.tile_stream_enabled());
+            assert_eq!(renderer.tile_stream_res(), (page_res, page_res));
+        }
+
+        // Drive the monolithic texture to a larger, different resolution, then
+        // re-sync. The streamed resolution must still equal the resident pages'
+        // resolution, not the monolithic tex_size.
+        let big = HeightfieldMetrics {
+            width: page_res * 2,
+            height: page_res * 2,
+            world_size_x: metrics.world_size_x,
+            world_size_z: metrics.world_size_z,
+            tile_size: metrics.tile_size,
+            halo: metrics.halo,
+        };
+        app.renderer
+            .as_mut()
+            .expect("renderer")
+            .upload_heightfield(&Heightfield::filled(big, 3.0));
+        app.sync_tile_stream_to_renderer();
+
+        let renderer = app.renderer.as_ref().expect("renderer");
+        assert!(renderer.tile_stream_enabled());
+        assert_eq!(
+            renderer.tile_stream_res(),
+            (page_res, page_res),
+            "streamed resolution must track resident pages, not the monolithic tex_size"
+        );
+    }
+
+    /// A result whose resolution is not a pyramid level (e.g. an interactive
+    /// Export-quality field larger than every level) must not stream: the upload
+    /// queue stays empty and the renderer falls back to the monolithic texture,
+    /// instead of stamping pages at a fabricated level the shader samples at a
+    /// different one (the divergent `max_level()` vs `0` fallback this replaces).
+    #[test]
+    fn non_pyramid_resolution_disables_streaming() {
+        let Some(gpu) = terra_test_gpu::headless() else {
+            return;
+        };
+        let (mut app, metrics, _key, _handle) = app_with_one_streamed_page(gpu);
         assert!(app
             .renderer
             .as_ref()
             .expect("renderer")
             .tile_stream_enabled());
+
+        // An odd resolution cannot be a power-of-two pyramid level.
+        let odd = metrics.width * 2 + 1;
+        let non_level = HeightfieldMetrics {
+            width: odd,
+            height: odd,
+            world_size_x: metrics.world_size_x,
+            world_size_z: metrics.world_size_z,
+            tile_size: metrics.tile_size,
+            halo: metrics.halo,
+        };
+        app.last_height = Some(Heightfield::filled(non_level, 1.0));
+        assert_eq!(
+            app.streamed_level_for_last_height(),
+            None,
+            "an odd resolution must not resolve to a pyramid level"
+        );
+
+        app.queue_final_tile_uploads();
+        assert!(
+            app.terrain_tile_scheduler.is_empty(),
+            "a non-pyramid resolution must not queue tile uploads"
+        );
+
+        app.sync_tile_stream_to_renderer();
+        assert!(
+            !app.renderer
+                .as_ref()
+                .expect("renderer")
+                .tile_stream_enabled(),
+            "a non-pyramid resolution must fall back to the monolithic path"
+        );
     }
 }

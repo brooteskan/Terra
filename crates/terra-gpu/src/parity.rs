@@ -44,13 +44,106 @@ pub const THERMAL_PREVIEW: ParityTolerance = ParityTolerance::new(3.2, 5.0e-2);
 /// Hydraulic preview omits the CPU particle/detail pass. The fixture disables
 /// those extensions and bounds the remaining shallow-water approximation.
 pub const HYDRAULIC_PREVIEW: ParityTolerance = ParityTolerance::new(3.0, 3.0e-2);
+/// RiverCarve D8 preview uses bounded iterative accumulation and an additive
+/// gather carve. On the monotone drainage fixture it is exact-height class.
+pub const RIVER_CARVE_D8_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-3, 1.0e-5);
+/// The preview intentionally approximates D-infinity routing with D8. The CPU's
+/// priority-flood/D-infinity solver remains the export oracle.
+pub const RIVER_CARVE_DINFINITY_PREVIEW: ParityTolerance = ParityTolerance::new(6.0, 2.0e-2);
+/// Stream-power D8 preview uses the CPU incision law over bounded iterative D8
+/// accumulation. The open-basin fixture is bit-exact; exact-height headroom catches
+/// slope-unit, area, hardness, iteration, or ping-pong regressions.
+pub const STREAM_POWER_D8_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-3, 1.0e-5);
+/// Authored D-infinity routing is deliberately approximated with the same D8
+/// accumulation preview; the CPU D-infinity/Priority-Flood path remains authoritative.
+/// Measured max abs / normalized RMSE are 0.0576 m / 0.000170 on the open basin.
+pub const STREAM_POWER_DINFINITY_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-1, 5.0e-4);
+/// MultiScaleAmplify runs the CPU coarse-to-fine schedule with the existing
+/// bounded thermal, D8 stream-power, and hydraulic preview solvers. The CPU
+/// export path remains authoritative for Priority-Flood routing and aux fields.
+/// Measured max abs / normalized RMSE are 0.564 m / 0.000261 on the two-level
+/// open-basin fixture; the contract retains portable headroom around both axes.
+pub const MULTI_SCALE_AMPLIFY_PREVIEW: ParityTolerance = ParityTolerance::new(8.0e-1, 4.0e-4);
 /// Volcanic-island preview is intentionally a reduced massif/shelf model.
 pub const VOLCANIC_ISLAND_PREVIEW: ParityTolerance = ParityTolerance::new(220.0, 1.0e-1);
+/// GPU shape-family contracts (#126). These are separate named budgets because
+/// the preview kernels range from an exact pointwise remap (Plateau) to bounded
+/// procedural approximations (notably Dunes and the legacy volcanic island).
+pub const MOUNTAINS_PREVIEW: ParityTolerance = ParityTolerance::new(10.0, 5.0e-3);
+pub const DUNES_PREVIEW: ParityTolerance = ParityTolerance::new(36.0, 7.8e-1);
+pub const CANYONS_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-3, 1.0e-5);
+pub const MESA_PREVIEW: ParityTolerance = ParityTolerance::new(3.0e-3, 1.0e-5);
+pub const VOLCANO_PREVIEW: ParityTolerance = ParityTolerance::new(4.0e-3, 1.0e-5);
+/// #148 cumulative Base/SculptStrokes + isolated-biome Volcano interaction.
+/// This covers the sum of the individual exact-height-class contracts through
+/// two additional group composites.
+pub const UNTITLED6_INTERACTION: ParityTolerance = ParityTolerance::new(2.0e-2, 1.0e-5);
+pub const UPLIFT_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-1, 2.0e-5);
+pub const PLATEAU_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-3, 1.0e-5);
+pub const ARCHIPELAGO_PREVIEW: ParityTolerance = ParityTolerance::new(3.0e-2, 5.0e-6);
+pub const ATOLL_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-3, 1.0e-5);
 /// Portable value-noise preview; CPU and GPU use different hash arithmetic.
 pub const VALUE_NOISE_PREVIEW: ParityTolerance = ParityTolerance::new(17.0, 2.3e-1);
+/// CPU-aligned noise-family previews (#125). The WGSL ports the CPU integer hash,
+/// four-way Perlin gradient, octave seed streams, remap, ridged feedback, and domain
+/// displacement directly. Residuals are f32 expression-order differences: measured
+/// max abs / normalized RMSE were 2.6e-5 / 1.3e-7 (Perlin), 4.5e-5 / 1.7e-7
+/// (fBm), 4.1e-5 / 3.7e-7 (ridged), and 7.5e-5 / 3.0e-7 (domain warp) on the
+/// non-square parameter fixture. These exact-height-class bounds retain portable
+/// headroom without hiding a hash, gradient, octave, or warp wiring regression.
+pub const PERLIN_NOISE_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-3, 1.0e-5);
+pub const FBM_VALUE_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-3, 1.0e-5);
+pub const FBM_PERLIN_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-3, 1.0e-5);
+pub const RIDGED_VALUE_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-3, 1.0e-5);
+pub const RIDGED_PERLIN_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-3, 1.0e-5);
+pub const DOMAIN_WARP_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-3, 1.0e-5);
+/// VoronoiRegions ports the CPU 3x3 Worley F1 search, value-noise cell term,
+/// remap, and low-32-bit seed contract directly into the noise shader.
+pub const VORONOI_REGIONS_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-3, 1.0e-5);
 /// Effect-filter modes retained on GPU after the support audit.
 pub const SMOOTH_FILTER_PREVIEW: ParityTolerance = ParityTolerance::new(1.8, 3.0e-2);
 pub const INFLATE_FILTER_PREVIEW: ParityTolerance = ParityTolerance::new(2.7, 2.8e-2);
+/// Denoise (bilateral) preview (#119). The GPU kernel mirrors the CPU
+/// `filter_kernels::bilateral` term-for-term, so the residual is the same class
+/// as Smooth: the exp() range/spatial weights diverge only at transcendental
+/// edges, and at Draft quality the shared effect-filter dispatch mixes `strength`
+/// and floors the pass count per pass while the CPU mixes once at the end (so an
+/// authored `iterations: 1` runs two GPU passes against one CPU pass). Across the
+/// depth discontinuity the range weight underflows to 0 on both backends, so the
+/// deep basin is preserved bit-for-bit; the budget is set by the small-fixture
+/// worst texel where the Draft 2-vs-1-pass fold difference lives. Measured worst
+/// case is ~1.5 m / 0.030 on the patterned fixture (the shelf/basin fixture, whose
+/// passes align at 2, stays well under); this holds portable headroom.
+pub const DENOISE_FILTER_PREVIEW: ParityTolerance = ParityTolerance::new(2.2, 3.8e-2);
+/// Pointwise Add/Set and bounded greyscale erosion mirror the CPU formulas.
+pub const ADD_SET_FILTER_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-3, 1.0e-5);
+pub const DEFLATE_FILTER_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-3, 1.0e-5);
+/// Field-range remaps use an exact GPU reduction; residuals are f32 pow ordering.
+pub const CURVE_FILTER_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-3, 1.0e-5);
+pub const CUTOFF_FILTER_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-3, 1.0e-5);
+/// Newly ratcheted pointwise, range-remap, neighbourhood, and procedural filters.
+pub const EFFECT_FILTER_EXACT_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-3, 1.0e-5);
+pub const EFFECT_FILTER_SPATIAL_PREVIEW: ParityTolerance = ParityTolerance::new(2.0e-2, 2.0e-4);
+pub const EFFECT_FILTER_WARP_PREVIEW: ParityTolerance = ParityTolerance::new(5.0e-2, 1.0e-3);
+/// SculptStrokes preview: untouched texels are bit-exact copies; stamped texels
+/// diverge only by transcendental edges (`sqrt` vs `hypot`, `pow` vs `powf`). The
+/// bit-exact `hash_noise` port keeps Noise strokes in the same budget; the base-3x3
+/// pull of Smooth (#114), Pinch (#115), and Coastline (#116) is transcendental-free
+/// (nine same-order adds and a divide, plus Pinch's bounded strength/gain blend
+/// and Coastline's lower-and-blend), so none widens the worst case. Flatten (#117)
+/// settles toward a footprint mean the reduce/resolve passes sum in an f32 tree
+/// rather than the CPU's f64 sequential order; because the out-of-footprint texels
+/// contribute exact zeros, that error normalises against the mean and stays below the
+/// distance-stamp edge that still dominates. Measured worst case is ~6.5e-5 m over the
+/// 16-kind stroke set (unchanged, and located on a distance stamp, not a Flatten);
+/// this holds portable headroom.
+pub const SCULPT_STROKES_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-3, 1.0e-5);
+/// CPU-tessellated path and direct polygon raster contracts. Both kernels share
+/// the CPU's world-space sampling and differ only by portable f32 expression order.
+pub const PATH_HEIGHT_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-3, 1.0e-5);
+pub const POLYGON_HEIGHT_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-3, 1.0e-5);
+/// Nearest-neighbour R16 source sampling and Stamp2d placement/feathering.
+pub const HEIGHTMAP_SAMPLE_PREVIEW: ParityTolerance = ParityTolerance::new(1.0e-3, 1.0e-5);
 
 /// Canonical documentation table. A unit test keeps the checked-in fidelity
 /// document synchronized with these executable contracts.
@@ -58,14 +151,48 @@ pub const FIDELITY_MATRIX_MARKDOWN: &str = "\
 | Contract | Supported configuration | Max abs (m) | Normalized RMSE |\n\
 | --- | --- | ---: | ---: |\n\
 | `exact-height` | Flat, Ramp, SculptBase, exact blends, hybrid checkpoint | 0.001 | 0.00001 |\n\
-| `mask.simple` | One Constant, Height, or Slope Multiply entry without asset operations | 0.001 | 0.0001 |\n\
+| `authoring.sculpt-strokes` | Per-sample stroke kinds, Smooth/Pinch/Coastline, Flatten, and distance stamps, supported blend/mask | 0.001 | 0.00001 |\n\
+| `authoring.path-height` | CPU-tessellated spline, raise/carve height preview; carved wetness falls back when consumed | 0.001 | 0.00001 |\n\
+| `authoring.polygon-height` | RaiseBy/SetElevation, raise/carve, world-space feather | 0.001 | 0.00001 |\n\
+| `asset.heightmap-sample` | ImportHeightmap and transformed Stamp2d, normalized R16 nearest/clamp sampling | 0.001 | 0.00001 |\n\
+| `mask.simple` | Ordered Constant, Height, or Slope entries; all combines and operations, blur radius up to 16 | 0.001 | 0.0001 |\n\
 | `noise.value` | Value noise with a 32-bit seed | 17.0 | 0.23 |\n\
-| `filter.blur` | Default outer composite; radius/iteration fixture | 2.1 | 0.0055 |\n\
-| `effect.smooth` | Smooth, default outer composite | 1.8 | 0.03 |\n\
-| `effect.inflate` | Inflate, default outer composite | 2.7 | 0.028 |\n\
-| `filter.terrace` | Default outer composite | 8.5 | 0.10 |\n\
+| `noise.perlin` | Perlin, 1-12 octaves, reproducible 32-bit seed stream | 0.001 | 0.00001 |\n\
+| `noise.fbm.value` | Value fBm, 1-12 octaves, reproducible 32-bit seed stream | 0.001 | 0.00001 |\n\
+| `noise.fbm.perlin` | Perlin fBm, 1-12 octaves, reproducible 32-bit seed stream | 0.001 | 0.00001 |\n\
+| `noise.ridged.value` | Value ridged MF, 1-12 octaves, reproducible 32-bit seed stream | 0.001 | 0.00001 |\n\
+| `noise.ridged.perlin` | Perlin ridged MF, 1-12 octaves, reproducible 32-bit seed stream | 0.001 | 0.00001 |\n\
+| `noise.domain-warp` | Perlin domain warp, 1-12 octaves, reproducible 32-bit seed stream | 0.001 | 0.00001 |\n\
+| `noise.voronoi-regions` | Euclidean Worley F1 plus value-noise cell heights, reproducible 32-bit seed | 0.001 | 0.00001 |\n\
+| `filter.blur` | Authored outer composite; radius/iteration fixture | 2.1 | 0.0055 |\n\
+| `effect.smooth` | Smooth, authored outer composite | 1.8 | 0.03 |\n\
+| `effect.inflate` | Inflate, authored outer composite | 2.7 | 0.028 |\n\
+| `effect.denoise` | Denoise (bilateral), authored outer composite | 2.2 | 0.038 |\n\
+| `effect.add-set` | Add and Set pointwise remaps, authored outer composite | 0.001 | 0.00001 |\n\
+| `effect.deflate` | Amount-limited greyscale erosion, authored outer composite | 0.001 | 0.00001 |\n\
+| `effect.curve` | Exact entering-field range reduction, authored outer composite | 0.001 | 0.00001 |\n\
+| `effect.cutoff` | Exact entering-field range reduction, authored outer composite | 0.001 | 0.00001 |\n\
+| `effect.pointwise-procedural` | TerraceSimple, Shore, Blocks, ZeroEdge, Squeeze, Perlin-family noise, scatter, Hexagons, and authored absolute border/flatten targets | 0.001 | 0.00001 |\n\
+| `effect.spatial` | DirectionalBlur, AngleBlur, Balloon, Crater, TerraceSteep, and radius-one SpikeRemoval | 0.02 | 0.0002 |\n\
+| `effect.warp` | Swirl and Distortion with a reproducible 32-bit seed | 0.05 | 0.001 |\n\
+| `filter.terrace` | Authored outer composite | 8.5 | 0.10 |\n\
 | `simulation.thermal` | Non-layered, constant hardness, no weathering extension | 3.2 | 0.05 |\n\
 | `simulation.hydraulic` | Base transport, no sources, particles, layers, or post-effects | 3.0 | 0.03 |\n\
+| `simulation.river-carve.d8` | D8 routing, no guide mask, bounded bank radius | 0.001 | 0.00001 |\n\
+| `simulation.river-carve.d-infinity` | D-infinity authored mode approximated by D8 preview, no guide mask, bounded bank radius | 6.0 | 0.02 |\n\
+| `simulation.stream-power.d8` | Constant hardness, iterative D8 accumulation, no Priority-Flood or dendritic seed | 0.001 | 0.00001 |\n\
+| `simulation.stream-power.d-infinity` | D-infinity authored mode approximated by D8 preview, constant hardness | 0.1 | 0.0005 |\n\
+| `simulation.multi-scale-amplify` | Uniform hardness/lock, coarse-to-fine thermal + D8 stream-power + hydraulic preview | 0.8 | 0.0004 |\n\
+| `shape.mountains` | Mountains with reproducible 32-bit seed streams | 10.0 | 0.005 |\n\
+| `shape.dunes` | Default transport controls, 2-4 octaves, reproducible 32-bit seed stream | 36.0 | 0.78 |\n\
+| `shape.canyons` | Canyons with a 32-bit seed | 0.001 | 0.00001 |\n\
+| `shape.mesa` | Mesa with a 32-bit seed | 0.003 | 0.00001 |\n\
+| `shape.volcano` | Volcano with a 32-bit seed | 0.004 | 0.00001 |\n\
+| `shape.uplift` | Uplift with reproducible 32-bit seed streams | 0.1 | 0.00002 |\n\
+| `shape.plateau` | Pointwise input remap | 0.001 | 0.00001 |\n\
+| `shape.procedural` | Mountain, Hills, Plateau, Mesa, Volcano, Canyon, Crater, or Noise picker; delegates to the named shape/noise/effect contract | per delegated contract | per delegated contract |\n\
+| `island.archipelago` | Archipelago with reproducible 32-bit seed streams | 0.03 | 0.000005 |\n\
+| `island.atoll` | Atoll with reproducible 32-bit seed streams | 0.001 | 0.00001 |\n\
 | `island.volcanic-high` | VolcanicHighIsland with a 32-bit seed | 220.0 | 0.10 |";
 
 /// Largest element-wise absolute difference between equally sized slices.

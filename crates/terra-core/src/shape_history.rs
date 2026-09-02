@@ -4,8 +4,8 @@
 //! on the terrain stack. Brush coverage lives on the stroke IR — artists never
 //! manually add a Shape Layer, add a Mask, or paint a Mask separately.
 
-use crate::authoring::{SculptStroke, SculptStrokeKind, SculptStrokeParams};
-use crate::layer::{Layer, LayerId, LayerKind, LayerStack};
+use crate::authoring::{SculptStrokeKind, SculptStrokeParams};
+use crate::layer::{BrushEditable, EditSupport, Layer, LayerId, LayerKind, LayerStack};
 use serde::{Deserialize, Serialize};
 
 /// Whether the next stroke session creates a new Shape Layer or appends to the selection.
@@ -189,25 +189,30 @@ pub fn resolve_shape_target(
     session_layer: Option<LayerId>,
     tool: ShapeTool,
 ) -> ShapeTargetDecision {
-    // Explicit selection always wins — artists expect the selected Shape Layer to receive strokes.
+    let brush = tool.stroke_kind();
+
+    // Explicit Semantic Sculpt selection wins so artists can deliberately
+    // continue an existing non-destructive stroke layer. Foundation is the one
+    // other explicit edit target; an unsupported brush stays unavailable rather
+    // than silently redirecting away from the artist's selection.
     if let Some(id) = selected {
-        if stack
-            .find(id)
-            .is_some_and(|l| matches!(l.kind, LayerKind::SculptStrokes(_)))
-        {
-            return ShapeTargetDecision::UseExisting(id);
-        }
-        if stack
-            .find(id)
-            .is_some_and(|l| matches!(l.kind, LayerKind::SculptBase(_)))
-        {
-            return ShapeTargetDecision::UseExisting(id);
+        if let Some(layer) = stack.find(id) {
+            if matches!(layer.kind, LayerKind::SculptStrokes(_)) {
+                return ShapeTargetDecision::UseExisting(id);
+            }
+            if layer.kind.is_sculpt_base() {
+                return if layer.brush_support(brush) == EditSupport::Unsupported {
+                    ShapeTargetDecision::UnavailableOnFoundation { layer: id, tool }
+                } else {
+                    ShapeTargetDecision::UseExisting(id)
+                };
+            }
         }
     }
     if let Some(id) = session_layer {
         if stack
             .find(id)
-            .is_some_and(|l| matches!(l.kind, LayerKind::SculptStrokes(_)))
+            .is_some_and(|layer| matches!(layer.kind, LayerKind::SculptStrokes(_)))
         {
             return ShapeTargetDecision::UseExisting(id);
         }
@@ -216,7 +221,7 @@ pub fn resolve_shape_target(
         if let Some(id) = selected {
             if stack
                 .find(id)
-                .is_some_and(|l| matches!(l.kind, LayerKind::SculptStrokes(_)))
+                .is_some_and(|layer| matches!(layer.kind, LayerKind::SculptStrokes(_)))
             {
                 return ShapeTargetDecision::UseExisting(id);
             }
@@ -231,7 +236,15 @@ pub fn resolve_shape_target(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShapeTargetDecision {
     UseExisting(LayerId),
-    CreateNew { name: String, tool: ShapeTool },
+    CreateNew {
+        name: String,
+        tool: ShapeTool,
+    },
+    /// Foundation was explicitly selected but cannot represent this brush.
+    UnavailableOnFoundation {
+        layer: LayerId,
+        tool: ShapeTool,
+    },
 }
 
 fn unique_shape_name(stack: &LayerStack, base: &str) -> String {
@@ -283,6 +296,9 @@ pub fn is_shape_history_layer(kind: &LayerKind) -> bool {
 }
 
 /// Append or extend a stroke on params (coverage stored on the layer).
+// Sculpt-stroke stamp: the stroke params plus the brush kind, uv position,
+// radius/strength/target and a continuing flag, each used once. Kept flat.
+#[allow(clippy::too_many_arguments)]
 pub fn stamp_stroke(
     params: &mut SculptStrokeParams,
     kind: SculptStrokeKind,
@@ -293,34 +309,13 @@ pub fn stamp_stroke(
     target_height: f32,
     continuing: bool,
 ) {
-    use crate::authoring::SculptPoint;
-    let point = SculptPoint {
-        u,
-        v,
-        pressure: 1.0,
-    };
-    let append = continuing
-        && params.strokes.last().is_some_and(|last| {
-            last.kind == kind && (last.radius_m - radius_m).abs() <= radius_m.max(1.0) * 0.05
-        });
-    if append {
-        params.strokes.last_mut().unwrap().points.push(point);
-    } else {
-        params.strokes.push(SculptStroke {
-            kind,
-            points: vec![point],
-            radius_m: radius_m.max(1.0),
-            strength,
-            target_height,
-            falloff: 1.5,
-        });
-    }
+    params.stamp_stroke(kind, u, v, radius_m, strength, target_height, continuing);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::authoring::SculptPoint;
+    use crate::authoring::{SculptPoint, SculptStroke};
 
     #[test]
     fn new_session_creates_named_layer_decision() {
@@ -374,6 +369,127 @@ mod tests {
             d,
             ShapeTargetDecision::UseExisting(id),
             "selecting a Shape Layer must keep strokes on that layer"
+        );
+    }
+
+    fn base_stack() -> (LayerStack, LayerId) {
+        let mut stack = LayerStack::new();
+        let layer = Layer::new(
+            "Base",
+            LayerKind::SculptBase(crate::layer::SculptParams::filled(8, 0.0)),
+        );
+        let id = layer.id();
+        stack.push(layer);
+        (stack, id)
+    }
+
+    fn constraints_stack() -> (LayerStack, LayerId) {
+        let mut stack = LayerStack::new();
+        let layer = Layer::new(
+            "Constraints",
+            LayerKind::TerrainConstraints(Default::default()),
+        );
+        let id = layer.id();
+        stack.push(layer);
+        (stack, id)
+    }
+
+    #[test]
+    fn foundation_keeps_supported_brush() {
+        // A brush the legacy foundation raster implements stays on the Base layer.
+        let (stack, id) = base_stack();
+        let d = resolve_shape_target(
+            &stack,
+            Some(id),
+            ShapeEditMode::NewLayerPerSession,
+            None,
+            ShapeTool::Lower,
+        );
+        assert_eq!(d, ShapeTargetDecision::UseExisting(id));
+    }
+
+    #[test]
+    fn foundation_keeps_approximate_brush() {
+        let (stack, id) = base_stack();
+        let d = resolve_shape_target(
+            &stack,
+            Some(id),
+            ShapeEditMode::NewLayerPerSession,
+            None,
+            ShapeTool::Pinch,
+        );
+        assert_eq!(d, ShapeTargetDecision::UseExisting(id));
+    }
+
+    #[test]
+    fn constraints_selection_creates_semantic_sculpt_layer() {
+        let (stack, id) = constraints_stack();
+        let d = resolve_shape_target(
+            &stack,
+            Some(id),
+            ShapeEditMode::NewLayerPerSession,
+            None,
+            ShapeTool::MountainStamp,
+        );
+        assert!(matches!(d, ShapeTargetDecision::CreateNew { .. }));
+    }
+
+    #[test]
+    fn constraints_redirect_unsupported_brush() {
+        let (stack, id) = constraints_stack();
+        let d = resolve_shape_target(
+            &stack,
+            Some(id),
+            ShapeEditMode::NewLayerPerSession,
+            None,
+            ShapeTool::Raise,
+        );
+        assert!(matches!(d, ShapeTargetDecision::CreateNew { .. }));
+    }
+
+    #[test]
+    fn foundation_makes_unsupported_brushes_unavailable() {
+        // Foundation is an explicit edit request. Brushes its raster cannot
+        // represent must stay unavailable instead of redirecting elsewhere.
+        let (stack, base) = base_stack();
+        for tool in [
+            ShapeTool::Terrace,
+            ShapeTool::Inflate,
+            ShapeTool::MountainStamp,
+        ] {
+            let d = resolve_shape_target(
+                &stack,
+                Some(base),
+                ShapeEditMode::NewLayerPerSession,
+                None,
+                tool,
+            );
+            assert_eq!(
+                d,
+                ShapeTargetDecision::UnavailableOnFoundation { layer: base, tool }
+            );
+        }
+    }
+
+    #[test]
+    fn foundation_restriction_wins_over_live_session_shape_layer() {
+        let (mut stack, base) = base_stack();
+        let shape = create_shape_layer("Terraces");
+        let shape_id = shape.id();
+        stack.push(shape);
+        let d = resolve_shape_target(
+            &stack,
+            Some(base),
+            ShapeEditMode::NewLayerPerSession,
+            Some(shape_id),
+            ShapeTool::Terrace,
+        );
+        assert_eq!(
+            d,
+            ShapeTargetDecision::UnavailableOnFoundation {
+                layer: base,
+                tool: ShapeTool::Terrace,
+            }
         );
     }
 

@@ -28,6 +28,8 @@ const H: u32 = 128;
 const RES: u32 = 256;
 
 /// Count differing pixels and report the first mismatch for a legible failure.
+// The (count, first-mismatch) report tuple is local to this test helper.
+#[allow(clippy::type_complexity)]
 fn diff_pixels(
     a: &terra_test_gpu::Pixels,
     b: &terra_test_gpu::Pixels,

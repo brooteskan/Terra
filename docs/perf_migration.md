@@ -9,7 +9,7 @@
 ## Interactive path at the time of migration
 
 ```
-UI edit → mark_dirty_from → debounce → GpuTerrainEngine (WGSL)
+UI edit → mark_dirty_from → debounce → terra-gpu-eval::GpuTerrainEngine (WGSL)
   → layer cache textures → ping-pong thermal/hydraulic
   → dirty tile bounds → region copy + region normals → swap
   → clipmap nested grids sample height (camera-centered LOD)
@@ -51,7 +51,7 @@ CPU fallback when stack has unsupported layers / masks
 
 ## Wave C/D GPU-supported layers
 
-`Flat`, `Ramp`, `NoiseValue`, `NoisePerlin`, `Fbm` (Value/Perlin), `Ridged`, `ThermalErosion`, `HydraulicErosion`, `Blur`, `Terrace`
+`Flat`, `Ramp`, `NoiseValue`, `NoisePerlin`, `Fbm` (Value/Perlin), `Ridged` (Value/Perlin), `DomainWarp`, `ThermalErosion`, `HydraulicErosion`, `Blur`, `Terrace`
 
 ## Verification
 

@@ -1,5 +1,7 @@
 //! Panel and mask-edit actions emitted by the editor UI.
 
+use terra_core::command::OwnedRasterTarget;
+use terra_core::layer::GridDimensions;
 use terra_core::layer::{Layer, LayerId, LayerKind};
 use terra_core::mask::{MaskAsset, MaskId, MaskPaintTool};
 
@@ -38,6 +40,10 @@ pub enum MaskEditAction {
 
 #[derive(Debug)]
 pub enum PanelAction {
+    ResizeRasterSource {
+        target: OwnedRasterTarget,
+        dimensions: GridDimensions,
+    },
     UpdateTerrainSettings(TerrainSettingsUpdate),
     AddLayer(Layer),
     /// Add a layer into a specific World Creator—style category folder.
@@ -55,6 +61,19 @@ pub enum PanelAction {
     SetEnabled {
         id: LayerId,
         enabled: bool,
+    },
+    SelectStroke {
+        layer: LayerId,
+        index: usize,
+    },
+    SetStrokeEnabled {
+        layer: LayerId,
+        index: usize,
+        enabled: bool,
+    },
+    DeleteStroke {
+        layer: LayerId,
+        index: usize,
     },
     SetOpacity {
         id: LayerId,
@@ -107,7 +126,7 @@ pub enum PanelAction {
         mask_id: MaskId,
         action: MaskEditAction,
     },
-    /// Stamp onto the sculptable Base height buffer.
+    /// Stamp onto a brush-editable layer.
     PaintSculptStamp {
         layer: LayerId,
         u: f32,

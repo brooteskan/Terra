@@ -1,23 +1,8 @@
-use std::time::Instant;
-
 use crate::ui::PanelAction;
 use terra_core::layer::LayerKind;
 
-use super::{LayerPointDrag, LayerPointKind, TerraApp, PAINT_DEBOUNCE_MS};
+use super::{LayerPointDrag, LayerPointKind, TerraApp};
 impl TerraApp {
-    pub(crate) fn flush_live_paint_preview(&mut self) {
-        if !self.pending_eval {
-            return;
-        }
-        if self.last_refine.elapsed().as_millis() < PAINT_DEBOUNCE_MS {
-            return;
-        }
-        self.pending_eval = false;
-        self.force_draft = true;
-        self.run_eval_step();
-        self.last_refine = Instant::now();
-    }
-
     /// Click-select a nearby landform shape, or start dragging a control point.
     pub(crate) fn try_pick_shape_at_cursor(&mut self) -> bool {
         if self.ui_state.app_workspace != crate::ui::AppWorkspace::Landforms {
@@ -115,7 +100,7 @@ impl TerraApp {
             self.placement_tint_dirty = false;
             return;
         }
-        let res = doc.preview_resolution.min(512).max(64);
+        let res = doc.preview_resolution.clamp(64, 512);
         let isolate = if layer.isolate_active {
             doc.active_biome
         } else {

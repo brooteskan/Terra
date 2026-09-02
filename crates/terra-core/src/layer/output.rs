@@ -1,6 +1,6 @@
 //! Named published outputs from layers and groups.
 
-use crate::fields::FieldId;
+use crate::field_data::FieldId;
 use crate::ids::{LayerId, OutputId};
 use serde::{Deserialize, Serialize};
 

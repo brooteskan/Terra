@@ -3,22 +3,27 @@
 mod binding;
 mod blend;
 mod cache_policy;
+mod edit_support;
 mod group_mode;
 mod kinds;
 mod metadata;
 mod operation;
+mod operation_placement_model;
 mod output;
 mod registry;
+mod resolution;
 mod scale;
 mod stack;
 mod workflow;
 
 pub use crate::ids::{LayerId, OutputId};
+pub use crate::raster::GridDimensions;
 pub use binding::{
     BindingCombine, BindingCurve, BindingSource, ParamBinding, ParamPath, RemapRange,
 };
 pub use blend::{blend_heights, blend_pair, blend_weights, BlendMode};
 pub use cache_policy::{CachePolicy, CacheState};
+pub use edit_support::{BrushDab, BrushEditable, EditSupport};
 pub use group_mode::{
     default_preview_color, is_default_preview_color, palette_preview_color, BiomeSection,
     FalloffCurve, GroupEvalMode, GroupInputMode, GroupKind, SelectedGroupInput, StackCategory,
@@ -30,14 +35,18 @@ pub use metadata::{
     LayerTypeMeta, MaskCompatibility,
 };
 pub use operation::{FieldContract, OperationCategory};
+pub use operation_placement_model::{ApplyWhere, DevelopCategory, OperationPlacement};
 pub use output::{NamedOutputDecl, OutputRef, PublishedOutput};
 pub use registry::LayerTypeRegistry;
+pub use resolution::{
+    effective_detail, EffectiveDetail, EffectiveDetailLimit, EvaluationResolutionBehavior,
+    LayerResolutionSemantics, LayerResolutionSource,
+};
 pub use scale::ScaleBand;
 pub use stack::{biome_destination_section, is_shape_kind, LayerGroup, LayerStack, StackNode};
 pub use workflow::WorkflowStage;
 
 use crate::mask::Distribution;
-use crate::operation_placement::OperationPlacement;
 use serde::{Deserialize, Serialize};
 
 /// Parameters shared by every layer.
@@ -80,7 +89,7 @@ pub struct LayerCommon {
     pub operation_placement: OperationPlacement,
     /// Artist Develop category when under a Biome (Vegetation vs Objects, etc.).
     #[serde(default)]
-    pub develop_category: Option<crate::operation_placement::DevelopCategory>,
+    pub develop_category: Option<DevelopCategory>,
 }
 
 impl LayerCommon {
@@ -130,7 +139,7 @@ impl Layer {
         common.blend = blend;
         // Default published outputs from the operation contract.
         for field in kind.produced_fields() {
-            if field != crate::fields::FieldId::Height {
+            if field != crate::field_data::FieldId::Height {
                 common
                     .outputs
                     .push(NamedOutputDecl::new(field.display_name(), field));

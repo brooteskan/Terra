@@ -2,18 +2,23 @@
 
 mod actions;
 mod eval;
+pub mod export;
+mod frame_trace;
 mod helpers;
+mod input;
 mod lifecycle;
+mod logical_frame;
 mod paint;
 pub mod prefs;
 mod project;
 mod redraw;
+mod refinement_job;
 mod shapes;
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::ui::{
     layers_from_project_template, ChromeGuiState, DockGuiState, InspectorGuiState, LayersGuiState,
@@ -21,20 +26,66 @@ use crate::ui::{
     WindowsGuiState,
 };
 use terra_core::document::EditorSession;
-use terra_core::eval::{EvalScheduler, EvalWorker, PreviewQuality};
-use terra_core::heightfield::{Heightfield, TileId};
+use terra_core::heightfield::Heightfield;
 use terra_core::layer::LayerId;
-use terra_gpu::{GpuTerrainEngine, GpuTileAtlas};
+use terra_core::quality::PreviewQuality;
+use terra_core::tiling::UvRect;
+use terra_cpu_eval::{EvalScheduler, EvalWorker};
+use terra_gpu::{
+    GpuHeightPyramid, GpuHeightPyramidMaterializer, GpuPyramidErrorReadback,
+    GpuPyramidPlanningMetadata, GpuTileAtlas,
+};
+use terra_gpu_eval::{GpuCompiledTileProducer, GpuTerrainEngine, GpuTileEvaluationJob};
 use terra_gui::{GuiRenderer, GuiState, Rect, WidgetLabState};
-use terra_io::{BackgroundExporter, BackgroundProjectIo};
+use terra_io::{BackgroundFieldExporter, BackgroundProjectIo};
 use terra_render::TerrainRenderer;
 use winit::event::MouseButton;
+use winit::event_loop::EventLoopProxy;
 use winit::window::Window;
 
-pub(crate) const EDIT_DEBOUNCE_MS: u128 = 40;
-/// While sculpting/painting, rebuild Draft as soon as the previous preview finishes.
-pub(crate) const PAINT_DEBOUNCE_MS: u128 = 0;
 pub(crate) const REFINE_INTERVAL_MS: u128 = 80;
+/// Required quiet time after input before optional Medium/Full work may start.
+pub(crate) const POST_INPUT_REFINE_GRACE_MS: u64 = 80;
+/// Host-side logical-frame budget. This is a start/defer gate, never a promise
+/// that an already-started GPU submission can be preempted.
+pub(crate) const LOGICAL_FRAME_HOST_BUDGET_MS: u64 = 8;
+pub(crate) const FULL_FIELD_SETTLE_MS: u64 = 75;
+pub(crate) const FULL_FIELD_REFINE_MS: u64 = 225;
+
+struct CompiledTileWorkJob {
+    lease: terra_core::TerrainTileWorkLease,
+    engine: GpuTileEvaluationJob,
+}
+
+#[derive(Debug, Clone)]
+pub enum RuntimeEvent {
+    DeviceLost {
+        reason: wgpu::DeviceLostReason,
+        message: String,
+    },
+}
+
+/// GPU objects built off the main thread during startup, handed back through
+/// [`BootState::job`]. All three are `wgpu`-backed and therefore `Send`.
+pub(crate) struct BootResult {
+    renderer: TerrainRenderer,
+    tile_atlas: Option<GpuTileAtlas>,
+    gpu_engine: GpuTerrainEngine,
+    gpu_pyramid_materializer: GpuHeightPyramidMaterializer,
+}
+
+/// Startup state held while the renderer's pipelines/shaders compile on a worker
+/// thread. The main thread keeps the surface (in `pending`) so it can animate the
+/// splash every frame; when the worker sends its [`BootResult`], the surface is
+/// attached and the objects installed into the app.
+pub(crate) struct BootState {
+    pub(crate) gpu: terra_render::GpuContext,
+    pub(crate) pending: terra_render::PendingSurface,
+    pub(crate) job: terra_jobs::JobHandle<BootResult>,
+    pub(crate) started: Instant,
+    /// Boot worker failure, parked here while the failure splash is shown.
+    pub(crate) failure: Option<crate::startup::StartupError>,
+}
 
 /// Continuous fly keys for the game-engine-style viewport camera.
 #[derive(Debug, Clone, Copy, Default)]
@@ -121,8 +172,42 @@ pub(crate) struct LayerPointDrag {
     start_height: f32,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct DeferredFullField {
+    pub generation: u64,
+    pub layer_name: String,
+    pub deferred_layers: usize,
+    /// `None` while the bounded terrain gesture remains active.
+    pub settle_at: Option<Instant>,
+}
+
+impl DeferredFullField {
+    fn hold_during_gesture(&mut self) {
+        self.settle_at = None;
+    }
+
+    /// Arm exactly once after the gesture ends. Further idle ticks do not debounce
+    /// the deadline, so the suffix starts 75 ms after mouse-up rather than 75 ms
+    /// after whichever event loop tick happened most recently.
+    fn arm_after_gesture(&mut self, now: Instant) -> bool {
+        if self.settle_at.is_some() {
+            return false;
+        }
+        self.settle_at = Some(now + Duration::from_millis(FULL_FIELD_SETTLE_MS));
+        true
+    }
+
+    fn ready(&self, generation: u64, now: Instant) -> bool {
+        self.generation == generation && self.settle_at.is_some_and(|deadline| now >= deadline)
+    }
+}
+
 pub struct TerraApp {
+    runtime_event_proxy: Option<EventLoopProxy<RuntimeEvent>>,
     window: Option<Arc<Window>>,
+    /// Set only during startup while GPU pipelines compile on a worker thread;
+    /// `None` once the renderer is installed. Drives the animated splash.
+    boot: Option<BootState>,
     renderer: Option<TerrainRenderer>,
     /// App-owned GPU handles. Every GPU consumer (renderer, tile atlas, terrain
     /// engine, GUI) shares clones of this instead of sourcing device/queue
@@ -138,17 +223,58 @@ pub struct TerraApp {
     /// Dedicated CPU evaluator for Medium/Full progressive refinement.
     eval_worker: EvalWorker,
     eval_token: u64,
+    /// OS events accumulated until the next event-loop scheduling boundary.
+    input: input::InputAccumulator,
+    /// Owned effects emitted by immediate-mode UI presentation. They are applied
+    /// during the next logical frame's application-update phase, never from the
+    /// `RedrawRequested` callback that produced them.
+    pending_ui_effects: VecDeque<redraw::PendingUiEffects>,
+    /// Latest OS surface size captured by `window_event`; repeated resize events
+    /// coalesce here until the next logical frame applies the final size.
+    pending_surface_resize: Option<winit::dpi::PhysicalSize<u32>>,
+    pending_surface_reconfigure: bool,
+    /// Logical scheduling/diagnostic lifecycle; deliberately app-owned and non-global.
+    logical_frames: logical_frame::LogicalFrameCoordinator,
+    /// Bounded, frame/generation-correlated observability for the Base brush path.
+    frame_trace: frame_trace::FrameTraceRecorder,
+    /// Optional Medium/Full GPU work, resumable only at safe allocation and
+    /// compiled-operation submission boundaries.
+    refinement_job: Option<refinement_job::RefinementJob>,
+    next_refinement_job_id: u64,
+    /// Most recent complete terrain generation made available for presentation.
+    last_complete_generation: logical_frame::EditGeneration,
+    last_accepted_evaluation_id: u64,
+    last_reported_presentation_timing_frame: u64,
     /// A matching Medium/Full job is queued or executing on the worker.
     worker_refine_pending: bool,
     /// Earliest edited layer not yet communicated to the persistent worker cache.
     worker_dirty_from: Option<LayerId>,
+    /// Spatial scope (normalized UV) of the pending bounded suffix dirty, carried
+    /// to the worker beside `worker_dirty_from`. `Some` only while a bounded suffix
+    /// is pending; any footprint-less trigger escalates it to `None` (a whole-field
+    /// suffix, today's behavior). Cleared with the other accumulators when a fresh
+    /// result is consumed.
+    worker_dirty_region: Option<UvRect>,
+    /// Resolution the worker's persistent layer cache currently holds (the last
+    /// fresh result's width), or `None` when unknown/invalidated. Gates the
+    /// straight-to-Full sculpt policy: a bounded scope may skip the Draft/Medium
+    /// CPU rungs only when the Full-res checkpoints it would reuse already exist.
+    worker_cache_res: Option<u32>,
     /// Project/stack changes require the worker to discard every cached suffix.
     worker_mark_all_dirty: bool,
 
     last_height: Option<Heightfield>,
     project_path: Option<PathBuf>,
-    exporter: BackgroundExporter,
+    exporter: BackgroundFieldExporter,
+    height_pyramid_export: export::HeightPyramidExportController,
     project_io: BackgroundProjectIo,
+    /// Zero-sized registry adapter for the tool-thumbnail decode pool.
+    tool_thumbs: crate::ui::ToolThumbPump,
+    /// Per-frame poll registry: one `about_to_wait` tick pumps the background
+    /// subsystems above (exporter, project IO, thumbnails) and aggregates their
+    /// pending/wake facts. Behind an `Arc` so the tick can take `&mut self` while
+    /// the entry list — fixed at construction — is read through the shared handle.
+    jobs: Arc<terra_jobs::JobRegistry<TerraApp>>,
     /// After async save of a newly created project, enter the editor with this doc.
     pending_enter_after_save: Option<(terra_core::document::TerrainDocument, PathBuf)>,
     mouse_pressed: Option<MouseButton>,
@@ -169,16 +295,43 @@ pub struct TerraApp {
     last_refine: Instant,
     last_edit: Instant,
     pending_eval: bool,
+    /// Required evaluation requested with no edit debounce. This is an explicit
+    /// work intent consumed only by the coordinator's interactive-work phase.
+    pending_eval_immediate: bool,
     /// When true, next eval starts from Draft even if already refining.
     force_draft: bool,
+    /// Bounded edit scope waiting for the next GPU evaluation. UV is retained
+    /// until quality/metrics are known, then converted to texels.
+    pending_gpu_dirty_region: Option<UvRect>,
+    /// Missing globally coupled suffix for the latest local edit generation.
+    deferred_full_field: Option<DeferredFullField>,
     /// Wave C GPU layer preview engine (shares renderer device).
     gpu_engine: Option<GpuTerrainEngine>,
-    /// Last interactive GPU eval covered the full height stack (no CPU resume).
-    last_eval_fully_gpu: bool,
+    /// Backend-neutral structural plan and pending semantic edit batch.
+    terrain_plan_cache: terra_core::terrain_plan::TerrainPlanCache,
+    pending_plan_edits: Vec<terra_core::terrain_plan::TerrainEditClass>,
+    pending_plan_invalidation: Option<terra_core::terrain_plan::PlanInvalidation>,
+    /// The last interactive path can complete entirely on the GPU. A locally
+    /// truthful result may still have a deferred full-field GPU suffix; that is
+    /// distinct from requiring CPU fallback and must not demote the next dab.
+    last_eval_gpu_supported: bool,
     /// Progressive final-output tile atlas used by the LOD renderer migration.
     tile_atlas: Option<GpuTileAtlas>,
-    /// (output revision, pyramid level, tile) awaiting a frame-budgeted GPU upload.
-    pending_tile_uploads: VecDeque<(u64, u8, TileId)>,
+    /// Immutable GPU content pyramid for the latest accepted complete output.
+    gpu_height_pyramid: Option<GpuHeightPyramid>,
+    gpu_pyramid_materializer: Option<GpuHeightPyramidMaterializer>,
+    /// Compact measured-error transfer and immutable CPU planning snapshot. These
+    /// describe pyramid content and demand only; neither mirrors atlas residency.
+    gpu_pyramid_error_readback: Option<GpuPyramidErrorReadback>,
+    gpu_pyramid_planning_metadata: Option<GpuPyramidPlanningMetadata>,
+    terrain_demand_planner: terra_core::TerrainDemandPlanner,
+    latest_terrain_demand: Option<terra_core::TerrainDemandPlan>,
+    /// Bounded, revision-aware demand awaiting concrete CPU/GPU atlas publication.
+    terrain_tile_scheduler: terra_core::TerrainTileWorkScheduler,
+    compiled_tile_producer: GpuCompiledTileProducer,
+    compiled_tile_jobs: Vec<CompiledTileWorkJob>,
+    /// Monotonic identity for accepted CPU heightfields within an output revision.
+    next_cpu_tile_content_revision: u64,
     gui_renderer: Option<GuiRenderer>,
     gui_state: GuiState,
     widget_lab: WidgetLabState,
@@ -195,10 +348,19 @@ pub struct TerraApp {
     gui_backspace: bool,
     gui_escape: bool,
     gui_enter: bool,
+    /// Pointer edges accumulated from sealed input snapshots until GUI presentation.
+    gui_primary_pressed: bool,
+    gui_primary_released: bool,
+    gui_secondary_pressed: bool,
+    gui_secondary_released: bool,
     /// Last frame: custom UI captured the pointer (blocks camera/paint).
     gui_wants_pointer: bool,
     /// Quit requested from the custom caption close button.
     pending_exit: bool,
+    /// Startup failure stored for reporting after the event loop exits.
+    startup_failure: Option<crate::startup::StartupError>,
+    /// The failure was already shown on the boot-failure splash (skip dialog).
+    failure_presented: bool,
     /// True while GUI has active pointer capture (drag/scroll/text) â€” not hover.
     gui_interacting: bool,
     /// A sculpt gesture changed the base buffer; represented in History as an annotation.
@@ -276,8 +438,17 @@ impl Default for TerraApp {
             metrics.world_size_x,
             metrics.world_size_z,
         ));
+        // Register the background subsystems that `about_to_wait` pumps each
+        // frame, in the order it used to poll them by hand: export, project IO,
+        // then the tool-thumbnail pool.
+        let mut jobs = terra_jobs::JobRegistry::<TerraApp>::new();
+        jobs.register(|app| &mut app.exporter);
+        jobs.register(|app| &mut app.project_io);
+        jobs.register(|app| &mut app.tool_thumbs);
         Self {
+            runtime_event_proxy: None,
             window: None,
+            boot: None,
             renderer: None,
             gpu: None,
             session,
@@ -287,13 +458,29 @@ impl Default for TerraApp {
             runtime_started: now,
             eval_worker: EvalWorker::spawn(),
             eval_token: 0,
+            input: input::InputAccumulator::default(),
+            pending_ui_effects: VecDeque::new(),
+            pending_surface_resize: None,
+            pending_surface_reconfigure: false,
+            logical_frames: logical_frame::LogicalFrameCoordinator::default(),
+            frame_trace: frame_trace::FrameTraceRecorder::default(),
+            refinement_job: None,
+            next_refinement_job_id: 0,
+            last_complete_generation: logical_frame::EditGeneration::default(),
+            last_accepted_evaluation_id: 0,
+            last_reported_presentation_timing_frame: 0,
             worker_refine_pending: false,
             worker_dirty_from: None,
+            worker_dirty_region: None,
+            worker_cache_res: None,
             worker_mark_all_dirty: true,
             last_height: None,
             project_path: None,
-            exporter: BackgroundExporter::new(),
+            exporter: BackgroundFieldExporter::new(),
+            height_pyramid_export: export::HeightPyramidExportController::default(),
             project_io: BackgroundProjectIo::new(),
+            tool_thumbs: crate::ui::ToolThumbPump,
+            jobs: Arc::new(jobs),
             pending_enter_after_save: None,
             mouse_pressed: None,
             last_cursor: None,
@@ -309,11 +496,26 @@ impl Default for TerraApp {
             last_refine: now,
             last_edit: now,
             pending_eval: false,
+            pending_eval_immediate: false,
             force_draft: false,
+            pending_gpu_dirty_region: None,
+            deferred_full_field: None,
             gpu_engine: None,
-            last_eval_fully_gpu: false,
+            terrain_plan_cache: terra_core::terrain_plan::TerrainPlanCache::new(),
+            pending_plan_edits: vec![terra_core::terrain_plan::TerrainEditClass::Structure],
+            pending_plan_invalidation: None,
+            last_eval_gpu_supported: false,
             tile_atlas: None,
-            pending_tile_uploads: VecDeque::new(),
+            gpu_height_pyramid: None,
+            gpu_pyramid_materializer: None,
+            gpu_pyramid_error_readback: None,
+            gpu_pyramid_planning_metadata: None,
+            terrain_demand_planner: terra_core::TerrainDemandPlanner::default(),
+            latest_terrain_demand: None,
+            terrain_tile_scheduler: terra_core::TerrainTileWorkScheduler::default(),
+            compiled_tile_producer: GpuCompiledTileProducer::new(),
+            compiled_tile_jobs: Vec::new(),
+            next_cpu_tile_content_revision: 0,
             gui_renderer: None,
             gui_state,
             widget_lab: WidgetLabState::default(),
@@ -322,14 +524,20 @@ impl Default for TerraApp {
             inspector_gui: InspectorGuiState::default(),
             layers_gui: LayersGuiState::default(),
             windows_gui: WindowsGuiState::default(),
-            dock_gui: DockGuiState::default(),
+            dock_gui: DockGuiState,
             gui_scroll_delta: 0.0,
             gui_text: String::new(),
             gui_backspace: false,
             gui_escape: false,
             gui_enter: false,
+            gui_primary_pressed: false,
+            gui_primary_released: false,
+            gui_secondary_pressed: false,
+            gui_secondary_released: false,
             gui_wants_pointer: false,
             pending_exit: false,
+            startup_failure: None,
+            failure_presented: false,
             gui_interacting: false,
             sculpt_stroke_active: false,
             last_paint_uv: None,
@@ -361,6 +569,20 @@ impl Default for TerraApp {
             last_mask_overlay_id: None,
             mask_paint_stroke_before: None,
         }
+    }
+}
+
+impl TerraApp {
+    pub fn set_runtime_event_proxy(&mut self, proxy: EventLoopProxy<RuntimeEvent>) {
+        self.runtime_event_proxy = Some(proxy);
+    }
+}
+
+impl TerraApp {
+    pub fn take_startup_failure(&mut self) -> Option<(crate::startup::StartupError, bool)> {
+        self.startup_failure
+            .take()
+            .map(|e| (e, self.failure_presented))
     }
 }
 
@@ -495,7 +717,9 @@ pub(crate) fn apply_blueprint_to_stack(doc: &mut terra_core::document::TerrainDo
             shape.width_m = ridge_w;
         }
     }
-    doc.compile_shapes_into_stack();
+    if !doc.shapes.shapes.is_empty() || doc.shapes.managed_constraints_layer.is_some() {
+        doc.compile_shapes_into_stack();
+    }
     for layer in doc.stack.flatten_layers_mut() {
         match &mut layer.kind {
             terra_core::LayerKind::LandscapeEvolution(p) => {

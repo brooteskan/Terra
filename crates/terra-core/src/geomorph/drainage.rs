@@ -1,8 +1,8 @@
 //! Drainage-aware ridge / valley analysis.
 
-use crate::analyze::jump_flood_distance;
 use crate::heightfield::Heightfield;
 use crate::mask::MaskField;
+use crate::spatial_kernels::jump_flood_distance;
 
 use super::derivatives::ridge_valley_likelihood;
 use super::routing::{FlowGraph, D8_OFFSETS};
@@ -106,9 +106,7 @@ pub fn valley_mask(streams: &StreamNetwork, valley_likelihood: &MaskField) -> Ma
     let mut out = MaskField::zeros(m);
     for j in 0..m.height {
         for i in 0..m.width {
-            let v = if streams.channel_mask.get(i, j) > 0.5 {
-                1.0
-            } else if valley_likelihood.get(i, j) > 0.65 {
+            let v = if streams.channel_mask.get(i, j) > 0.5 || valley_likelihood.get(i, j) > 0.65 {
                 1.0
             } else {
                 0.0

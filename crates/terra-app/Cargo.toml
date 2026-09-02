@@ -11,7 +11,10 @@ path = "src/main.rs"
 
 [dependencies]
 terra-core = { workspace = true }
+terra-cpu-eval = { workspace = true }
+terra-jobs = { workspace = true }
 terra-gpu = { workspace = true }
+terra-gpu-eval = { workspace = true }
 terra-render = { workspace = true }
 terra-gui = { workspace = true }
 terra-io = { workspace = true }
@@ -19,14 +22,18 @@ wgpu = { workspace = true }
 winit = { workspace = true }
 glam = { workspace = true }
 pollster = { workspace = true }
-env_logger = { workspace = true }
+flexi_logger = { workspace = true }
 log = { workspace = true }
 profiling = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
 rfd = { workspace = true }
 directories = { workspace = true }
 image = { workspace = true }
 
 [dev-dependencies]
 terra-test-gpu = { workspace = true }
+
+[lints]
+workspace = true

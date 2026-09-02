@@ -3,12 +3,15 @@ use crate::ui::{MaskEditAction, PanelAction};
 use super::super::TerraApp;
 use super::ApplyCtx;
 
+// Returns the unhandled action on `Err` so the next handler in the chain can try it
+// (see actions/mod.rs); that payload is the intrinsic-size `PanelAction` (`LayerKind`).
+#[allow(clippy::result_large_err)]
 pub(crate) fn try_apply(
     app: &mut TerraApp,
     action: PanelAction,
     ctx: &mut ApplyCtx,
 ) -> Result<(), PanelAction> {
-    let result = match action {
+    match action {
         PanelAction::AddMask(mut asset) => {
             asset.prepare_for_document();
             let id = asset.id;
@@ -260,125 +263,66 @@ pub(crate) fn try_apply(
             stroke_kind,
             target_height,
         } => {
+            use terra_core::layer::{BrushDab, BrushEditable, EditSupport};
+
+            let falloff = app.ui_state.sculpt_falloff_exponent();
+            let continuing = app.last_paint_uv.is_some();
+            let world_radius = radius
+                * 0.5
+                * (app.session.document.metrics.world_size_x
+                    + app.session.document.metrics.world_size_z);
             if let Some(target) = app.session.document.stack.find_mut(layer) {
-                let continuing = app.last_paint_uv.is_some();
-                let world_radius = radius
-                    * 0.5
-                    * (app.session.document.metrics.world_size_x
-                        + app.session.document.metrics.world_size_z);
-                if let terra_core::layer::LayerKind::SculptStrokes(params) = &mut target.kind {
-                    terra_core::shape_history::stamp_stroke(
-                        params,
+                let support = target.brush_support(stroke_kind);
+                if support == EditSupport::Unsupported {
+                    app.ui_state.status = if target.kind.is_sculpt_base() {
+                        format!(
+                            "{} isn't supported on the Foundation layer — use a Shape Layer",
+                            stroke_kind.label()
+                        )
+                    } else {
+                        format!(
+                            "{} isn't supported on layer \"{}\"",
+                            stroke_kind.label(),
+                            target.common.name
+                        )
+                    };
+                } else {
+                    let is_shape_history =
+                        terra_core::shape_history::is_shape_history_layer(&target.kind);
+                    target.apply_brush(
                         stroke_kind,
-                        u,
-                        v,
-                        world_radius.max(1.0),
-                        strength,
-                        target_height,
-                        continuing,
+                        BrushDab {
+                            u,
+                            v,
+                            radius_uv: radius,
+                            radius_m: world_radius,
+                            strength,
+                            target_height,
+                            falloff,
+                            continuing,
+                        },
                     );
                     ctx.dirty_from = Some(layer);
                     app.session.document.selected = Some(layer);
-                    app.ui_state.shape_session_layer = Some(layer);
-                } else if let terra_core::layer::LayerKind::TerrainConstraints(params) =
-                    &mut target.kind
-                {
-                    use terra_core::layer::{
-                        SculptPoint, TerrainConstraint, TerrainConstraintKind,
-                    };
-                    let constraint_kind = match stroke_kind {
-                        terra_core::authoring::SculptStrokeKind::Ridge
-                        | terra_core::authoring::SculptStrokeKind::MountainStamp => {
-                            TerrainConstraintKind::Ridge
-                        }
-                        terra_core::authoring::SculptStrokeKind::Valley
-                        | terra_core::authoring::SculptStrokeKind::ValleyStamp => {
-                            TerrainConstraintKind::Valley
-                        }
-                        terra_core::authoring::SculptStrokeKind::RiverPath => {
-                            TerrainConstraintKind::River
-                        }
-                        terra_core::authoring::SculptStrokeKind::Coastline => {
-                            TerrainConstraintKind::Coastline
-                        }
-                        terra_core::authoring::SculptStrokeKind::Protect => {
-                            TerrainConstraintKind::Protect
-                        }
-                        terra_core::authoring::SculptStrokeKind::PlateauStamp => {
-                            TerrainConstraintKind::Plateau
-                        }
-                        _ => TerrainConstraintKind::Roughness,
-                    };
-                    let point = SculptPoint {
-                        u,
-                        v,
-                        pressure: 1.0,
-                    };
-                    let append = continuing
-                        && params.constraints.last().is_some_and(|last| {
-                            last.kind == constraint_kind
-                                && (last.width_m - world_radius).abs()
-                                    <= world_radius.max(1.0) * 0.05
-                        });
-                    if append {
-                        params.constraints.last_mut().unwrap().points.push(point);
-                    } else {
-                        params.constraints.push(TerrainConstraint {
-                            kind: constraint_kind,
-                            points: vec![point],
-                            width_m: world_radius.max(1.0),
-                            value: strength,
-                            strength: if matches!(constraint_kind, TerrainConstraintKind::Protect) {
-                                strength.clamp(0.0, 1.0)
-                            } else {
-                                1.0
-                            },
-                        });
+                    if is_shape_history {
+                        app.ui_state.shape_session_layer = Some(layer);
                     }
-                    ctx.dirty_from = Some(layer);
-                    app.session.document.selected = Some(layer);
-                } else if let terra_core::layer::LayerKind::SculptBase(params) = &mut target.kind {
-                    // Legacy foundation path â€” prefer Shape history for new strokes.
-                    let mode = match stroke_kind {
-                        terra_core::authoring::SculptStrokeKind::Lower
-                        | terra_core::authoring::SculptStrokeKind::Erode => 1u8,
-                        terra_core::authoring::SculptStrokeKind::Smooth
-                        | terra_core::authoring::SculptStrokeKind::Pinch => 2u8,
-                        _ => 0u8,
-                    };
-                    params.stamp_circle(u, v, radius, strength, mode);
-                    ctx.dirty_from = Some(layer);
-                    app.session.document.selected = Some(layer);
                 }
             }
             if ctx.dirty_from == Some(layer) {
-                let resolution = app
-                    .scheduler
-                    .quality
-                    .resolution(
-                        app.session.document.preview_resolution.min(8192),
-                        app.session.document.export_resolution,
-                    )
-                    .max(1);
-                let x0 = ((u - radius).clamp(0.0, 1.0) * resolution as f32).floor() as u32;
-                let y0 = ((v - radius).clamp(0.0, 1.0) * resolution as f32).floor() as u32;
-                let x1 = ((u + radius).clamp(0.0, 1.0) * resolution as f32).ceil() as u32;
-                let y1 = ((v + radius).clamp(0.0, 1.0) * resolution as f32).ceil() as u32;
-                let next = (
-                    x0,
-                    y0,
-                    x1.saturating_sub(x0).max(1),
-                    y1.saturating_sub(y0).max(1),
-                );
-                ctx.sculpt_dirty_rect = Some(match ctx.sculpt_dirty_rect {
-                    Some((ox, oy, ow, oh)) => {
-                        let ex = (ox + ow).max(next.0 + next.2);
-                        let ey = (oy + oh).max(next.1 + next.3);
-                        let nx = ox.min(next.0);
-                        let ny = oy.min(next.1);
-                        (nx, ny, ex - nx, ey - ny)
-                    }
-                    None => next,
+                // Retain the same footprint in resolution-free UV for the CPU
+                // worker. A continuing stroke's appended segment sweeps from the
+                // previous point, so cover both endpoints ± radius; `last_paint_uv`
+                // still holds the prior point (it is advanced only after apply).
+                let mut stamp_uv = terra_core::tiling::UvRect::from_center_radius(u, v, radius);
+                if let Some((pu, pv)) = app.last_paint_uv {
+                    stamp_uv = stamp_uv.union(terra_core::tiling::UvRect::from_center_radius(
+                        pu, pv, radius,
+                    ));
+                }
+                ctx.sculpt_dirty_region_uv = Some(match ctx.sculpt_dirty_region_uv {
+                    Some(existing) => existing.union(stamp_uv),
+                    None => stamp_uv,
                 });
             }
         }
@@ -425,6 +369,270 @@ pub(crate) fn try_apply(
         }
         other => return Err(other),
     };
-    let _ = result;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::super::TerraApp;
+    use crate::ui::PanelAction;
+    use terra_core::authoring::SculptStrokeKind;
+    use terra_core::layer::LayerStack;
+    use terra_core::shape_history::create_shape_layer;
+
+    /// A sculpt stamp retains its UV footprint through the full apply path
+    /// (`masks::try_apply` → `actions::mod` dispatch → `track_worker_dirty_from`),
+    /// so the CPU worker receives a bounded `worker_dirty_region` covering the stamp
+    /// rather than a whole-field escalation.
+    #[test]
+    fn sculpt_stamp_populates_worker_dirty_region() {
+        let mut app = TerraApp::default();
+        let layer = create_shape_layer("Shape");
+        let id = layer.id();
+        app.session.document.stack = LayerStack::new();
+        app.session.document.stack.push(layer);
+        app.session.document.selected = Some(id);
+
+        // Steady state right after a completed job: nothing pending.
+        app.worker_mark_all_dirty = false;
+        app.worker_dirty_from = None;
+        app.worker_dirty_region = None;
+        app.last_paint_uv = None; // fresh stroke, no previous point
+
+        let (u, v, radius) = (0.5f32, 0.5f32, 0.05f32);
+        app.apply_actions(vec![PanelAction::PaintSculptStamp {
+            layer: id,
+            u,
+            v,
+            radius,
+            strength: 1.0,
+            stroke_kind: SculptStrokeKind::Raise,
+            target_height: 0.0,
+        }]);
+
+        let region = app
+            .worker_dirty_region
+            .expect("a sculpt stamp seeds a bounded worker scope");
+        // A fresh single stamp's footprint is exactly the stamp's clamped UV box.
+        let expected = terra_core::tiling::UvRect::from_center_radius(u, v, radius);
+        assert_eq!(region, expected);
+        assert_eq!(app.worker_dirty_from, Some(id));
+        assert!(
+            !app.worker_mark_all_dirty,
+            "a bounded sculpt edit must not escalate to whole-field"
+        );
+    }
+
+    /// The brush strength and edge-falloff must land on the painted stroke: falloff
+    /// has no other UI path onto the stroke IR, and strength must stay live across a
+    /// continuing drag (not freeze at the first dab). Regression for the "falloff /
+    /// strength don't affect raise strokes" report.
+    #[test]
+    fn brush_strength_and_falloff_reach_the_painted_stroke() {
+        use terra_core::layer::LayerKind;
+
+        let mut app = TerraApp::default();
+        let layer = create_shape_layer("Shape");
+        let id = layer.id();
+        app.session.document.stack = LayerStack::new();
+        app.session.document.stack.push(layer);
+        app.session.document.selected = Some(id);
+        app.last_paint_uv = None;
+
+        // Soft brush, first dab: creates the stroke.
+        app.ui_state.brush_falloff = 0.2;
+        let soft_falloff = app.ui_state.sculpt_falloff_exponent();
+        app.apply_actions(vec![PanelAction::PaintSculptStamp {
+            layer: id,
+            u: 0.5,
+            v: 0.5,
+            radius: 0.05,
+            strength: 7.0,
+            stroke_kind: SculptStrokeKind::Raise,
+            target_height: 0.0,
+        }]);
+        let stroke = |app: &TerraApp| match &app.session.document.stack.find(id).unwrap().kind {
+            LayerKind::SculptStrokes(p) => p.strokes.last().unwrap().clone(),
+            other => panic!("expected SculptStrokes, got {other:?}"),
+        };
+        let first = stroke(&app);
+        assert_eq!(first.strength, 7.0);
+        assert!((first.falloff - soft_falloff).abs() < 1e-6);
+
+        // Continue the same drag with a harder brush and higher strength: the active
+        // stroke must pick up both, not stay frozen at the first dab's values.
+        app.last_paint_uv = Some((0.5, 0.5));
+        app.ui_state.brush_falloff = 0.9;
+        let hard_falloff = app.ui_state.sculpt_falloff_exponent();
+        assert!(
+            hard_falloff > soft_falloff,
+            "harder brush => larger exponent"
+        );
+        app.apply_actions(vec![PanelAction::PaintSculptStamp {
+            layer: id,
+            u: 0.52,
+            v: 0.5,
+            radius: 0.05,
+            strength: 30.0,
+            stroke_kind: SculptStrokeKind::Raise,
+            target_height: 0.0,
+        }]);
+        let updated = stroke(&app);
+        assert_eq!(updated.points.len(), 2, "same stroke, appended point");
+        assert_eq!(updated.strength, 30.0, "strength stays live mid-drag");
+        assert!(
+            (updated.falloff - hard_falloff).abs() < 1e-6,
+            "falloff stays live"
+        );
+    }
+
+    /// #97 regression: a brush the legacy foundation raster can't represent
+    /// (Terrace here) must never silently raise the terrain. Before the fix it
+    /// fell through the mode `match` to `_ => 0` (Raise) and edited the heights.
+    #[test]
+    fn unsupported_foundation_brush_does_not_silently_raise() {
+        use terra_core::layer::{Layer, LayerKind, SculptParams};
+
+        let mut app = TerraApp::default();
+        let base = Layer::new(
+            "Base",
+            LayerKind::SculptBase(SculptParams::filled(64, 20.0)),
+        );
+        let id = base.id();
+        app.session.document.stack = LayerStack::new();
+        app.session.document.stack.push(base);
+        app.session.document.selected = Some(id);
+
+        let samples = |app: &TerraApp| match &app.session.document.stack.find(id).unwrap().kind {
+            LayerKind::SculptBase(p) => p.samples.clone(),
+            other => panic!("expected SculptBase, got {other:?}"),
+        };
+        let before = samples(&app);
+
+        // Reset dirty tracking so the refusal can be shown to invalidate nothing.
+        app.worker_mark_all_dirty = false;
+        app.worker_dirty_from = None;
+        app.worker_dirty_region = None;
+        app.last_paint_uv = None;
+
+        // Terrace has no foundation mode — it must be refused, not raised.
+        app.apply_actions(vec![PanelAction::PaintSculptStamp {
+            layer: id,
+            u: 0.5,
+            v: 0.5,
+            radius: 0.2,
+            strength: 30.0,
+            stroke_kind: SculptStrokeKind::Terrace,
+            target_height: 0.0,
+        }]);
+
+        assert_eq!(
+            samples(&app),
+            before,
+            "an unsupported foundation brush must not modify heights"
+        );
+        assert!(
+            app.worker_dirty_region.is_none() && app.worker_dirty_from.is_none(),
+            "a refused stroke invalidates nothing"
+        );
+        assert!(!app.worker_mark_all_dirty);
+        assert!(
+            app.ui_state.status.contains("Terrace") && app.ui_state.status.contains("Foundation"),
+            "the artist must be told why the brush did nothing: {:?}",
+            app.ui_state.status
+        );
+
+        // Positive control: a supported brush (Lower) still edits the foundation.
+        app.apply_actions(vec![PanelAction::PaintSculptStamp {
+            layer: id,
+            u: 0.5,
+            v: 0.5,
+            radius: 0.2,
+            strength: 30.0,
+            stroke_kind: SculptStrokeKind::Lower,
+            target_height: 0.0,
+        }]);
+        assert!(
+            samples(&app).iter().any(|&s| s < 20.0),
+            "Lower is supported on the foundation and must lower heights"
+        );
+        assert_eq!(app.session.document.selected, Some(id));
+    }
+
+    #[test]
+    fn approximate_constraint_brush_uses_explicit_roughness_mapping() {
+        use terra_core::layer::{Layer, LayerKind, TerrainConstraintKind, TerrainConstraintParams};
+
+        let mut app = TerraApp::default();
+        let constraints = Layer::new(
+            "Constraints",
+            LayerKind::TerrainConstraints(TerrainConstraintParams::default()),
+        );
+        let id = constraints.id();
+        app.session.document.stack = LayerStack::new();
+        app.session.document.stack.push(constraints);
+        app.session.document.selected = Some(id);
+        app.worker_mark_all_dirty = false;
+        app.worker_dirty_from = None;
+        app.worker_dirty_region = None;
+
+        app.apply_actions(vec![PanelAction::PaintSculptStamp {
+            layer: id,
+            u: 0.5,
+            v: 0.5,
+            radius: 0.05,
+            strength: 0.7,
+            stroke_kind: SculptStrokeKind::Hardness,
+            target_height: 0.0,
+        }]);
+
+        let params = match &app.session.document.stack.find(id).unwrap().kind {
+            LayerKind::TerrainConstraints(params) => params,
+            other => panic!("expected TerrainConstraints, got {other:?}"),
+        };
+        assert_eq!(params.constraints.len(), 1);
+        assert_eq!(params.constraints[0].kind, TerrainConstraintKind::Roughness);
+        assert_eq!(app.worker_dirty_from, Some(id));
+    }
+
+    #[test]
+    fn unsupported_constraint_brush_creates_nothing() {
+        use terra_core::layer::{Layer, LayerKind, TerrainConstraintParams};
+
+        let mut app = TerraApp::default();
+        let constraints = Layer::new(
+            "Constraints",
+            LayerKind::TerrainConstraints(TerrainConstraintParams::default()),
+        );
+        let id = constraints.id();
+        app.session.document.stack = LayerStack::new();
+        app.session.document.stack.push(constraints);
+        app.session.document.selected = Some(id);
+        app.worker_mark_all_dirty = false;
+        app.worker_dirty_from = None;
+        app.worker_dirty_region = None;
+
+        app.apply_actions(vec![PanelAction::PaintSculptStamp {
+            layer: id,
+            u: 0.5,
+            v: 0.5,
+            radius: 0.05,
+            strength: 1.0,
+            stroke_kind: SculptStrokeKind::Raise,
+            target_height: 0.0,
+        }]);
+
+        let params = match &app.session.document.stack.find(id).unwrap().kind {
+            LayerKind::TerrainConstraints(params) => params,
+            other => panic!("expected TerrainConstraints, got {other:?}"),
+        };
+        assert!(params.constraints.is_empty());
+        assert!(app.worker_dirty_region.is_none() && app.worker_dirty_from.is_none());
+        assert!(!app.worker_mark_all_dirty);
+        assert!(
+            app.ui_state.status.contains("Raise") && app.ui_state.status.contains("Constraints"),
+            "unsupported constraint brush should explain its refusal: {:?}",
+            app.ui_state.status
+        );
+    }
 }

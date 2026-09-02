@@ -2,9 +2,8 @@
 //!
 //! `PreviewQuality` is a plain four-variant enum (Draft/Medium/Full/Export)
 //! whose resolution and refine helpers are pure arithmetic, so it lives in its
-//! own leaf module rather than in `eval`. `eval` re-exports it, keeping
-//! `terra_core::eval::PreviewQuality` and every serialized document valid, while
-//! `analyze` names it directly from here instead of importing `eval` from below.
+//! own leaf module so CPU and GPU evaluators can share the policy without either
+//! backend owning it.
 
 use serde::{Deserialize, Serialize};
 

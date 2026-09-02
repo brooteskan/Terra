@@ -4,9 +4,12 @@
 //! **dual-height** representation: a carved floor DEM plus a ceiling aux map, limited to a
 //! UV region / falloff. A lightweight triangle proxy visualizes the overhang / cave roof.
 
+mod params;
+
+pub use params::{LocalSdfParams, OverhangStampParams};
+
 use crate::heightfield::Heightfield;
-use crate::layer::{LocalSdfParams, OverhangStampParams};
-use crate::mask::MaskField;
+use crate::mask_field::MaskField;
 use crate::noise::{canonical_seed32, value_noise2};
 
 /// Result of an opt-in volumetric stamp: carved floor + ceiling dual-height + region mask.
@@ -167,7 +170,7 @@ pub fn apply_local_sdf(hf: &Heightfield, p: &LocalSdfParams) -> DualHeightResult
     let j0 = (v0 * m.height as f32).floor() as u32;
     let j1 = ((v1 * m.height as f32).ceil() as u32).min(m.height);
 
-    let y_samples = p.vertical_samples.max(4).min(64);
+    let y_samples = p.vertical_samples.clamp(4, 64);
     let noise_amp = p.noise_amplitude.clamp(0.0, 1.0);
 
     for j in j0..j1 {
@@ -214,6 +217,9 @@ pub fn apply_local_sdf(hf: &Heightfield, p: &LocalSdfParams) -> DualHeightResult
 /// Analytic cave SDF: ellipsoid chamber union soft entrance tunnel toward `ent_dir`.
 ///
 /// Negative = void. Noise warps the shell slightly for organic walls (deterministic seed).
+// Signed-distance kernel: sample point + cave centre/radii + entrance/depth/
+// surface + noise, each an independent scalar of the field. Kept flat.
+#[allow(clippy::too_many_arguments)]
 fn cave_sdf(
     x: f32,
     y: f32,
@@ -257,6 +263,9 @@ fn cave_sdf(
     d
 }
 
+// Capsule SDF: sample point (x,y,z), the two segment endpoints (a,b) and the
+// radius — the canonical flat form for this primitive. Kept flat.
+#[allow(clippy::too_many_arguments)]
 fn capsule_xz(
     x: f32,
     y: f32,
@@ -274,6 +283,9 @@ fn capsule_xz(
     let paz = z - az;
     let bax = bx - ax;
     let bay = by - ay;
+    // `baz` is the z-component of the (b − a) segment vector (the `pa`/`ba` capsule-SDF
+    // convention), not the placeholder clippy::disallowed_names guards against.
+    #[allow(clippy::disallowed_names)]
     let baz = bz - az;
     let baba = bax * bax + bay * bay + baz * baz;
     let paba = pax * bax + pay * bay + paz * baz;
@@ -406,8 +418,8 @@ fn push_quad(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::{LocalSdfParams, OverhangStampParams};
     use crate::heightfield::HeightfieldMetrics;
-    use crate::layer::{LocalSdfParams, OverhangStampParams};
 
     fn cliff_plateau(res: u32) -> Heightfield {
         let m = HeightfieldMetrics::new(res, res, res as f32 * 2.0, res as f32 * 2.0);

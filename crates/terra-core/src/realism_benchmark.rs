@@ -3,10 +3,7 @@
 //! Benchmarks assemble editable documents from real algorithms (not black-box
 //! generators) and expose expected morphometric ranges for clay-render review.
 
-use crate::analyze::TerrainStatistics;
 use crate::document::TerrainDocument;
-use crate::eval::{EvalContext, PreviewQuality, StackEvaluator};
-use crate::heightfield::Heightfield;
 use crate::landscape_style::LandscapeStyle;
 use crate::world_archetype::{
     alpine_world, badlands_world, coastal_world, desert_world, dune_field_world,
@@ -142,18 +139,6 @@ pub struct BenchmarkExpectations {
     pub max_mean_slope_deg: f32,
     pub min_drainage_density: f32,
     pub notes: &'static str,
-}
-
-/// Evaluate a document to a heightfield and collect morphometrics.
-pub fn measure_document(doc: &TerrainDocument) -> Result<(Heightfield, TerrainStatistics), String> {
-    let mut ctx = EvalContext::new(doc.metrics);
-    ctx.quality = PreviewQuality::Draft;
-    let mut eval = StackEvaluator::new();
-    let hf = eval
-        .rebuild_all(&doc.stack, &mut ctx)
-        .map_err(|e| format!("benchmark eval failed: {e}"))?;
-    let stats = TerrainStatistics::compute(&hf);
-    Ok((hf, stats))
 }
 
 /// Soft structural checks for a benchmark (CI-friendly, low resolution).

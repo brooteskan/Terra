@@ -4,6 +4,7 @@ use terra_core::generators::{fbm_field, uplift};
 use terra_core::heightfield::HeightfieldMetrics;
 use terra_core::hydro::fill_depressions;
 use terra_core::layer::{FbmParams, FractalNoiseType, NoiseParams, UpliftParams};
+use terra_core::CancelToken;
 
 fn depression_fill_volume(hf: &terra_core::heightfield::Heightfield) -> f32 {
     let filled = fill_depressions(hf);
@@ -19,8 +20,8 @@ fn uplift_is_deterministic() {
         seed: 12345,
         ..UpliftParams::default()
     };
-    let a = uplift(m, &p);
-    let b = uplift(m, &p);
+    let a = uplift(m, &CancelToken::never(), &p).unwrap();
+    let b = uplift(m, &CancelToken::never(), &p).unwrap();
     assert_eq!(a.to_dense(), b.to_dense());
 }
 
@@ -29,18 +30,22 @@ fn uplift_seed_changes_output() {
     let m = HeightfieldMetrics::new(48, 48, 1500.0, 1500.0);
     let a = uplift(
         m,
+        &CancelToken::never(),
         &UpliftParams {
             seed: 1,
             ..UpliftParams::default()
         },
-    );
+    )
+    .unwrap();
     let b = uplift(
         m,
+        &CancelToken::never(),
         &UpliftParams {
             seed: 2,
             ..UpliftParams::default()
         },
-    );
+    )
+    .unwrap();
     assert_ne!(a.to_dense(), b.to_dense());
 }
 
@@ -56,7 +61,7 @@ fn uplift_peak_near_corridor_center() {
         altitude_fade: 1.0,
         ..UpliftParams::default()
     };
-    let hf = uplift(m, &p);
+    let hf = uplift(m, &CancelToken::never(), &p).unwrap();
     let mut peak_j = 0u32;
     let mut peak = f32::NEG_INFINITY;
     let i = 32;
@@ -84,6 +89,7 @@ fn uplift_fills_fewer_sinks_than_fbm() {
     let amp = 300.0;
     let up = uplift(
         m,
+        &CancelToken::never(),
         &UpliftParams {
             seed: 42,
             amplitude: amp,
@@ -92,9 +98,11 @@ fn uplift_fills_fewer_sinks_than_fbm() {
             warp_strength: 0.25,
             ..UpliftParams::default()
         },
-    );
+    )
+    .unwrap();
     let noise = fbm_field(
         m,
+        &CancelToken::never(),
         &FbmParams {
             base: NoiseParams {
                 seed: 42,
@@ -105,7 +113,8 @@ fn uplift_fills_fewer_sinks_than_fbm() {
             },
             noise: FractalNoiseType::Perlin,
         },
-    );
+    )
+    .unwrap();
     // Shift fBm to be non-negative like uplift (fBm is signed).
     let mut noise_pos = noise;
     let min_h = noise_pos

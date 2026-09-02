@@ -1,8 +1,13 @@
 //! Inspector panel drawn with `terra-gui` (replaces egui right panel content).
 
 mod edit_kind;
+mod resolution;
 
 use self::edit_kind::{edit_kind, kind_display_name, KindEditPane};
+pub(super) use self::resolution::draw_resize_confirmation_modal;
+use self::resolution::{
+    draw_layer_resolution, draw_painted_mask_resolution, ImportedSourceCache, PendingRasterResize,
+};
 use crate::ui::actions::PanelAction;
 use crate::ui::dist_kinds::{dist_base_kinds, dist_effect_kinds};
 use crate::ui::presets::contextual_presets;
@@ -170,7 +175,7 @@ fn draw_layer_masks_chrome(
 }
 
 /// Expand/collapse flags for Unreal Details–style inspector sections.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct DetailsExpandState {
     pub layer_apply_where: bool,
     pub layer_masks: bool,
@@ -178,19 +183,6 @@ pub struct DetailsExpandState {
     pub layer_advanced: bool,
     /// Noise nested under the Shape tab.
     pub layer_noise: bool,
-}
-
-impl Default for DetailsExpandState {
-    fn default() -> Self {
-        // Start collapsed so inspector chrome is minimized on project entry.
-        Self {
-            layer_apply_where: false,
-            layer_masks: false,
-            layer_parameters: false,
-            layer_advanced: false,
-            layer_noise: false,
-        }
-    }
 }
 
 /// Persistent scroll for the inspector panel.
@@ -207,6 +199,9 @@ pub struct InspectorGuiState {
     pub rename_buffer: Option<String>,
     /// Collapsible Details sections.
     pub details: DetailsExpandState,
+    /// Header-only metadata for the currently inspected imported raster.
+    source_metadata: ImportedSourceCache,
+    pending_source_downsize: Option<PendingRasterResize>,
 }
 
 impl Default for InspectorGuiState {
@@ -218,14 +213,22 @@ impl Default for InspectorGuiState {
             more_menu_open: false,
             rename_buffer: None,
             details: DetailsExpandState::default(),
+            source_metadata: ImportedSourceCache::default(),
+            pending_source_downsize: None,
         }
     }
 }
 
 impl InspectorGuiState {
+    pub(crate) fn has_resize_confirmation(&self) -> bool {
+        self.pending_source_downsize.is_some()
+    }
+
     /// Reset Details sections to the project-entry default (all collapsed).
     pub fn reset_expand_for_project(&mut self) {
         self.details = DetailsExpandState::default();
+        self.source_metadata = ImportedSourceCache::default();
+        self.pending_source_downsize = None;
     }
 }
 
@@ -347,12 +350,15 @@ pub fn draw_inspector_gui(
         .and_then(|id| doc.stack.find(id))
         .is_some_and(|l| l.kind.is_sculpt_base());
     if ui_state.editor_tool == EditorTool::PaintMask {
-        draw_mask_tool_inspector(ui, doc, ui_state, &mut actions);
+        draw_mask_tool_inspector(ui, doc, ui_state, state, &mut actions);
         ui.end_panel_scrolled(&mut state.scroll_y);
         return actions;
     }
     if ui_state.editor_tool.is_sculpt() && (selected_is_base || doc.selected.is_none()) {
         draw_tool_inspector(ui, doc, ui_state);
+        if let Some(layer) = doc.selected.and_then(|id| doc.stack.find(id)) {
+            draw_layer_resolution(ui, doc, ui_state, state, layer, &mut actions);
+        }
         ui.end_panel_scrolled(&mut state.scroll_y);
         return actions;
     }
@@ -753,8 +759,9 @@ pub fn draw_inspector_gui(
         }
     }
 
-    // Clear split between identity chip and top section tabs.
+    // Resolution is selection context, so keep it visible regardless of the active tab.
     ui.gap(4.0);
+    draw_layer_resolution(ui, doc, ui_state, state, &layer, &mut actions);
     ui.separator();
 
     let tab_icons: Vec<Icon> = tabs.iter().map(|t| t.icon()).collect();
@@ -887,15 +894,43 @@ pub fn draw_inspector_gui(
             ) {
                 changed = true;
             }
-            if has_separate_noise_tab(&layer.kind) {
-                if collapsible_section(
+            if has_separate_noise_tab(&layer.kind)
+                && collapsible_section(
                     ui,
                     Id::new("insp_sec_noise"),
                     "NOISE",
                     &mut state.details.layer_noise,
-                ) {
-                    if edit_kind(ui, &mut kind, KindEditPane::Noise, id, &mut actions) {
-                        changed = true;
+                )
+                && edit_kind(ui, &mut kind, KindEditPane::Noise, id, &mut actions)
+            {
+                changed = true;
+            }
+            if let Some((sel_layer, sel_idx)) = ui_state.selected_stroke {
+                if sel_layer == id {
+                    if let LayerKind::SculptStrokes(p) = &mut kind {
+                        if let Some(stroke) = p.strokes.get_mut(sel_idx) {
+                            section_header(ui, "SELECTED STROKE");
+                            label_dim(
+                                ui,
+                                &format!(
+                                    "{} \u{00b7} {} point{}",
+                                    stroke.kind.label(),
+                                    stroke.points.len(),
+                                    if stroke.points.len() == 1 { "" } else { "s" },
+                                ),
+                            );
+                            changed |= slider_f32(ui, "Strength", &mut stroke.strength, 0.0, 100.0);
+                            changed |= slider_f32(ui, "Radius", &mut stroke.radius_m, 1.0, 500.0);
+                            changed |= slider_f32(ui, "Falloff", &mut stroke.falloff, 0.1, 5.0);
+                            changed |= slider_f32(
+                                ui,
+                                "Target Height",
+                                &mut stroke.target_height,
+                                -500.0,
+                                2000.0,
+                            );
+                            changed |= checkbox(ui, "Enabled", &mut stroke.enabled);
+                        }
                     }
                 }
             }
@@ -1052,11 +1087,9 @@ fn draw_inspector_more_menu_inner(
                 "del" if !is_base => actions.push(PanelAction::RemoveSelected),
                 _ => {}
             }
-            if *key != "rename" {
-                state.more_menu_open = false;
-            } else {
-                state.more_menu_open = false;
-            }
+            // Every action dismisses the menu; "rename" then shows the inline rename
+            // field (rendered independently on `rename_buffer`), so it closes too.
+            state.more_menu_open = false;
         }
         iy += 26.0;
     }
@@ -1122,12 +1155,12 @@ fn default_kind_like(kind: &LayerKind) -> LayerKind {
     }
 }
 
-fn quality_label(quality: terra_core::eval::PreviewQuality) -> &'static str {
+fn quality_label(quality: terra_core::quality::PreviewQuality) -> &'static str {
     match quality {
-        terra_core::eval::PreviewQuality::Draft => "Draft",
-        terra_core::eval::PreviewQuality::Medium => "Medium",
-        terra_core::eval::PreviewQuality::Full => "Full",
-        terra_core::eval::PreviewQuality::Export => "Export",
+        terra_core::quality::PreviewQuality::Draft => "Draft",
+        terra_core::quality::PreviewQuality::Medium => "Medium",
+        terra_core::quality::PreviewQuality::Full => "Full",
+        terra_core::quality::PreviewQuality::Export => "Export",
     }
 }
 
@@ -1230,7 +1263,7 @@ fn draw_tool_inspector(ui: &mut GuiContext<'_>, doc: &TerrainDocument, ui_state:
         "Drag to author Base heights or semantic world-space strokes.",
     );
     slider_f32(ui, "Radius", &mut ui_state.sculpt_radius, 0.01, 0.2);
-    if ui_state.editor_tool == EditorTool::Smooth {
+    if matches!(ui_state.editor_tool, EditorTool::Smooth | EditorTool::Pinch) {
         let mut s = (ui_state.sculpt_strength / 10.0).clamp(0.05, 1.0);
         if slider_f32(ui, "Strength", &mut s, 0.05, 1.0) {
             ui_state.sculpt_strength = s * 10.0;
@@ -1238,6 +1271,8 @@ fn draw_tool_inspector(ui: &mut GuiContext<'_>, doc: &TerrainDocument, ui_state:
     } else {
         slider_f32(ui, "Strength (m)", &mut ui_state.sculpt_strength, 0.5, 40.0);
     }
+    // Brush edge hardness → stroke falloff (0 soft/broad … 1 hard/pointed).
+    slider_f32(ui, "Falloff", &mut ui_state.brush_falloff, 0.0, 1.0);
     if let Some(base) = doc
         .stack
         .flatten_layers()
@@ -1253,6 +1288,7 @@ fn draw_mask_tool_inspector(
     ui: &mut GuiContext<'_>,
     doc: &TerrainDocument,
     ui_state: &mut UiState,
+    state: &mut InspectorGuiState,
     actions: &mut Vec<PanelAction>,
 ) {
     use terra_core::mask::MaskPaintTool;
@@ -1309,6 +1345,8 @@ fn draw_mask_tool_inspector(
             }
         }
     }
+
+    draw_painted_mask_resolution(ui, doc, ui_state, state, actions);
 
     let mut overlay = ui_state.viewport_overlays.mask_overlay;
     if checkbox(ui, "Show mask overlay", &mut overlay) {

@@ -1,10 +1,10 @@
 use crate::IoError;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
-use terra_core::eval::EvalContext;
 use terra_core::fields::keys;
 use terra_core::heightfield::Heightfield;
 use terra_core::mask::MaskField;
+use terra_cpu_eval::EvalContext;
 
 pub struct ExportRequest {
     pub out_dir: PathBuf,
@@ -44,6 +44,7 @@ impl Default for ExportRequest {
     }
 }
 
+#[derive(Debug)]
 pub struct ExportResult {
     pub height_path: PathBuf,
     pub height_metadata_path: PathBuf,
@@ -215,8 +216,8 @@ pub struct TileManifest {
 /// Build a deterministic tile manifest for incremental export / change detection.
 pub fn build_tile_manifest(hf: &Heightfield, tile_size: u32, height_hash: u64) -> TileManifest {
     let tw = tile_size.max(1);
-    let tiles_x = (hf.metrics.width + tw - 1) / tw;
-    let tiles_z = (hf.metrics.height + tw - 1) / tw;
+    let tiles_x = hf.metrics.width.div_ceil(tw);
+    let tiles_z = hf.metrics.height.div_ceil(tw);
     let dx = hf.metrics.dx();
     let dz = hf.metrics.dz();
     let mut tiles = Vec::new();
@@ -511,8 +512,8 @@ pub fn write_collision_obj(
     let dz = hf.metrics.dz();
     let mut verts = String::new();
     let mut faces = String::new();
-    let cols = (w + stride - 1) / stride;
-    let rows = (h + stride - 1) / stride;
+    let cols = w.div_ceil(stride);
+    let rows = h.div_ceil(stride);
     for jj in 0..rows {
         for ii in 0..cols {
             let i = (ii * stride).min(w - 1);
@@ -733,8 +734,10 @@ mod tests {
         write_height_raw_streamed(&hf, &path).unwrap();
         let bytes = std::fs::read(path).unwrap();
         let values: Vec<f32> = bytes
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
             .collect();
         assert_eq!(values, vec![0.25, 1.25, 2.25, 3.25, 4.25, 5.25]);
         let _ = std::fs::remove_dir_all(&dir);

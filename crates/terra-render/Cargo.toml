@@ -7,6 +7,7 @@ description = "wgpu terrain viewport rendering"
 
 [dependencies]
 terra-core = { workspace = true }
+terra-gpu = { workspace = true }
 wgpu = { workspace = true }
 winit = { workspace = true }
 glam = { workspace = true }
@@ -20,3 +21,6 @@ profiling = { workspace = true }
 naga = { version = "24.0.0", features = ["wgsl-in"] }
 pollster = { workspace = true }
 terra-test-gpu = { workspace = true }
+
+[lints]
+workspace = true

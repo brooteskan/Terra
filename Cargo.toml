@@ -2,7 +2,10 @@
 resolver = "2"
 members = [
     "crates/terra-core",
+    "crates/terra-cpu-eval",
+    "crates/terra-jobs",
     "crates/terra-gpu",
+    "crates/terra-gpu-eval",
     "crates/terra-render",
     "crates/terra-gui",
     "crates/terra-io",
@@ -12,7 +15,7 @@ members = [
 default-members = ["crates/terra-app"]
 
 [workspace.package]
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 edition = "2021"
 license = "MIT"
 authors = ["Terra Contributors"]
@@ -20,7 +23,10 @@ repository = "https://github.com/brooteskan/Terra"
 
 [workspace.dependencies]
 terra-core = { path = "crates/terra-core" }
+terra-cpu-eval = { path = "crates/terra-cpu-eval" }
+terra-jobs = { path = "crates/terra-jobs" }
 terra-gpu = { path = "crates/terra-gpu" }
+terra-gpu-eval = { path = "crates/terra-gpu-eval" }
 terra-render = { path = "crates/terra-render" }
 terra-gui = { path = "crates/terra-gui" }
 terra-io = { path = "crates/terra-io" }
@@ -34,9 +40,10 @@ image = { version = "0.25", default-features = false, features = ["png", "tiff"]
 thiserror = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 bytemuck = { version = "1", features = ["derive"] }
+blake3 = "1"
 pollster = "0.4"
 log = "0.4"
-env_logger = "0.11"
+flexi_logger = { version = "0.31", default-features = false }
 profiling = { version = "1", default-features = false }
 rfd = "0.15"
 directories = "6"
@@ -47,3 +54,32 @@ winit = "0.30"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# Clippy lint policy (see issue #74). Crates opt in via `[lints] workspace = true`.
+#
+# The CI Clippy step runs `-D warnings`, so every warn-by-default lint is enforced
+# across the workspace. The entries below are the deliberate exceptions. Five tranches
+# have been enabled (absent here on purpose); intentional occurrences carry narrowly
+# scoped `#[allow(...)]` with a rationale at the site:
+#   Tranche 1: large_enum_variant, len_without_is_empty, unnecessary_unwrap,
+#              iter_overeager_cloned, manual_contains, result_large_err.
+#   Tranche 2: derivable_impls, unnecessary_cast, needless_borrow, approx_constant,
+#              len_zero, needless_return, redundant_closure, useless_conversion,
+#              question_mark, unnecessary_lazy_evaluations, single_match, needless_update.
+#   Tranche 3: collapsible_if, collapsible_match, empty_line_after_doc_comments,
+#              items_after_test_module, vec_init_then_push, unusual_byte_groupings,
+#              excessive_precision, ptr_arg, needless_lifetimes,
+#              default_constructed_unit_structs, cloned_ref_to_slice_refs,
+#              disallowed_names, assertions_on_constants, if_same_then_else, identity_op.
+#   Tranche 4: needless_bool_assign (no occurrences), absurd_extreme_comparisons
+#              (the paint-debounce scaffolding was removed), let_unit_value,
+#              type_complexity, manual_div_ceil.
+#   Tranche 5: manual_clamp. 44 integer/finite-float sites became `.clamp(lo, hi)`;
+#              the one document-sourced float chain (analyze::apply_transport_model)
+#              keeps an explicit min/max as NaN repair under a scoped allow.
+#
+# Everything below is deferred for a stated reason (not merely "not done yet"):
+#   field_reassign_with_default — pure style, no rustfix suggestion, large hand churn.
+# (too_many_arguments and needless_range_loop were resolved in #96 and removed from the allowlist.)
+[workspace.lints.clippy]
+field_reassign_with_default = "allow"

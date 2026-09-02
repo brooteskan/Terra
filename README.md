@@ -46,7 +46,7 @@ See the disclaimer above before relying on any of this.
 - Layer stack with blend modes, groups, biome containers, masks, and distribution / placement rules
 - Shape layers and brushes (procedural landforms, stamps, paths, polygons, sculpt base/strokes, heightmap import) plus shape objects
 - Biome paint & placement, Apply Where, and world rules
-- Progressive Draft→Full evaluation with hybrid GPU+CPU preview (`terra-gpu` / `terra-render`)
+- Progressive Draft→Full evaluation with hybrid GPU+CPU preview (`terra-gpu-eval` / `terra-render`)
 - Geomorph, erosion, hydrology, and landscape-evolution operators (CPU foundations; GPU subset for common generators/filters and thermal/hydraulic)
 - New World templates (`WorldTemplate`: Blank, Tropical Island, Alpine Range, Desert Mesa, River Valley, Badlands, Young/Old Mountains, Dune Field, Coastal)
 - Project JSON save/load; heightmap-oriented export package via `terra-io` (not production-ready)
@@ -57,8 +57,10 @@ See the disclaimer above before relying on any of this.
 
 | Crate | Role |
 |-------|------|
-| `terra-core` | Heightfields, layers, masks, biomes, CPU evaluation, commands |
-| `terra-gpu` | WGSL compute for supported generators, filters, and erosion |
+| `terra-core` | Backend-neutral heightfields, layers, masks, biomes, and commands |
+| `terra-cpu-eval` | Stateful CPU terrain evaluation, caches, scheduling, and worker runtime |
+| `terra-gpu` | Reusable WGSL kernels, compiled-plan resources, derivatives, and tile caching |
+| `terra-gpu-eval` | Stateful GPU terrain evaluation, refinement, timing, and output lifecycle |
 | `terra-render` | wgpu 3D viewport / clipmaps / progressive presentation |
 | `terra-gui` | Custom immediate-mode wgpu UI toolkit (not egui) |
 | `terra-app` | Editor chrome, panels, tools; application binary (winit event loop + wiring) |

@@ -4,16 +4,14 @@
 //! and Hydraulic Sediment. Presets bias transport / erodibility / particle kernels —
 //! they do not fork independent erosion implementations or post-apply ridge noise.
 
+use crate::filter_params::{EffectFilterKind, EffectFilterParams};
 use crate::geomorph::ridge_valley_likelihood;
 use crate::heightfield::{Heightfield, HeightfieldMetrics};
-use crate::layer::{
-    EffectFilterKind, EffectFilterParams, FractalNoiseType, HydraulicErosionParams, NoiseParams,
-    TransportModel,
-};
 use crate::mask::{MaskField, MaskSource};
-use crate::noise::fbm;
+use crate::noise::{fbm, FractalNoiseType, NoiseParams};
 
 use super::erosion::{apply_particle_erosion, hydraulic_erode_with_fields, HydraulicResult};
+use super::{HydraulicErosionParams, TransportModel};
 
 /// How rainfall is authored for every hydraulic-family operator.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -156,9 +154,9 @@ impl TerrainHydroState {
         let height = input.to_dense();
         let (bedrock, loose_sediment, resistance) = if let Some(m) = materials {
             let mut res = vec![m.bedrock_hardness; n];
-            for i in 0..n {
-                if m.loose_sediment[i] > 1e-5 {
-                    res[i] = m.sediment_hardness;
+            for (r, &loose) in res.iter_mut().zip(&m.loose_sediment) {
+                if loose > 1e-5 {
+                    *r = m.sediment_hardness;
                 }
             }
             (m.bedrock.clone(), m.loose_sediment.clone(), res)
@@ -313,10 +311,7 @@ pub fn clamp_timestep_cfl(timestep: f32, dx: f32, max_speed: f32) -> f32 {
 pub fn sanitize_field(data: &mut [f32]) -> u32 {
     let mut hits = 0u32;
     for v in data.iter_mut() {
-        if !v.is_finite() {
-            *v = 0.0;
-            hits += 1;
-        } else if *v < 0.0 {
+        if !v.is_finite() || *v < 0.0 {
             *v = 0.0;
             hits += 1;
         }
@@ -392,6 +387,10 @@ pub fn generate_rainfall_field(
 }
 
 /// Apply transport-model biases onto a base parameter set.
+// `bank_slip`'s `.max(0.2).min(0.35)` chain doubles as NaN repair: these params come
+// from the saved document, and `max(NaN, 0.2)` pins a NaN to the low bound, whereas
+// `.clamp()` would propagate NaN straight into the erosion sim. Kept as an explicit pair.
+#[allow(clippy::manual_clamp)]
 pub fn apply_transport_model(
     base: &HydraulicErosionParams,
     model: TransportModel,
@@ -666,6 +665,11 @@ impl HydraulicErosionCore {
         );
         // Flux / velocity proxies from wetness + water depth.
         let wet = result.wetness.data();
+        // Shared `i` fans out across many parallel result/state fields
+        // (water_raw/wet/sediment_raw + water_flux/velocity/suspended/
+        // concentration/loose/bedrock/resistance), several mutated in place —
+        // no clean single-iterator rewrite. Left indexed pending profiling (#96).
+        #[allow(clippy::needless_range_loop)]
         for i in 0..state.water_flux.len() {
             let w = result.water_raw.data()[i].max(0.0);
             let flux = wet[i].max(0.0);

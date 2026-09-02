@@ -1,4 +1,4 @@
-//! Terra core: heightfields, layer stack, masks, and CPU evaluation.
+//! Terra core: backend-neutral heightfields, layer stacks, masks, and terrain algorithms.
 //!
 //! This crate must remain free of `wgpu` and UI crates.
 //!
@@ -16,33 +16,49 @@ pub mod contextual_create;
 pub mod deps;
 pub mod document;
 pub mod domain;
-pub mod eval;
+pub mod field_data;
 pub mod fields;
+pub mod filter_params;
 pub mod generators;
+pub mod geology;
 pub mod geomorph;
 pub mod heightfield;
 pub mod hydro;
 pub mod ids;
+pub mod invalidation;
 pub mod landscape_blueprint;
 pub mod landscape_evolution;
 pub mod landscape_style;
 pub mod layer;
+pub mod layer_reach;
 pub mod mask;
+pub mod mask_execution;
+pub mod mask_field;
+pub mod mask_ir;
+pub mod mask_types;
+pub mod material_schema;
 pub mod matter_sim;
 pub mod noise;
 pub mod operation_placement;
 pub mod quality;
+pub mod raster;
 pub mod realism_benchmark;
 pub mod rebuild_feedback;
+pub mod rebuild_state;
 pub mod scatter;
+pub mod shader_progress;
 pub mod shape_history;
 pub mod shape_object;
 pub mod simd_ops;
 pub mod simulation_scenario;
 pub mod sparse_paint;
+pub mod spatial_kernels;
 pub mod surface;
 pub mod terrain;
+pub mod terrain_plan;
 pub mod terrain_recipe;
+#[doc(hidden)]
+pub mod test_fixtures;
 pub mod tiling;
 pub mod volumetric;
 pub mod world_archetype;
@@ -55,6 +71,10 @@ pub use fields::{
 pub use geomorph::{
     analyze_terrain, bake_debug_field, GeomorphAnalysis, GeomorphDebugField, GeomorphOptions,
 };
+/// The cancellation primitive backing eval cancellation. Re-exported so callers
+/// and fixtures have one canonical path and sibling crates need no direct
+/// `terra-jobs` dependency.
+pub use terra_jobs::CancelToken;
 pub use terrain_recipe::{
     build_terrain_recipe_from_stack, recipe_matches_stack, RecipeItem, RecipeItemKind,
     RecipeRebuildStatus,
@@ -74,7 +94,7 @@ pub use domain::{
     workflow_stage_metadata_order, world_eval_outline, DomainBiomeRef, DomainLayerRef,
     DomainParent, DomainRole, DomainView, SoftDiagnostic,
 };
-pub use heightfield::{HeightTile, Heightfield, HeightfieldMetrics, TileId};
+pub use heightfield::{HeightTile, Heightfield, HeightfieldMetrics, MetricsError, TileId};
 pub use landscape_blueprint::{
     preview_resolution_for_world_size, ArchetypeId, EvalStage, LandscapeBlueprint,
 };
@@ -96,7 +116,7 @@ pub use matter_sim::{
     MatterSimConfig, MatterType,
 };
 pub use realism_benchmark::{
-    measure_document, validate_benchmark_structure, BenchmarkExpectations, RealismBenchmark,
+    validate_benchmark_structure, BenchmarkExpectations, RealismBenchmark,
 };
 pub use shape_object::{ShapeKind, ShapeObject, ShapeObjectId, ShapeObjectStore, WorldBounds};
 pub use simulation_scenario::{
@@ -109,10 +129,15 @@ pub use sparse_paint::{
     PaintPage, PaintPageCoord, PaintStrokeId, SparsePaintChannelKey, SparsePaintStore,
 };
 pub use terrain::{
-    EditorRefinementState, NormalizedRect, PyramidConfig, RefinementController, RefinementTimings,
-    RegionSet, ResidentTile, TerrainCacheKey, TerrainLevel, TerrainPyramid, TerrainRuntime,
-    TerrainTileKey, TileCacheError, TileCacheInsert, TileCacheStats, TilePageHandle, TileRecord,
-    TileResidencyCache,
+    conservative_geometric_errors, measure_tile_geometric_error, EditorRefinementState,
+    PyramidConfig, RefinementController, RefinementTimings, ResidentTile, TerrainCacheKey,
+    TerrainContentStamp, TerrainDemandClass, TerrainDemandConfig, TerrainDemandError,
+    TerrainDemandPlan, TerrainDemandPlanner, TerrainDemandView, TerrainDomainError,
+    TerrainEvaluationDomain, TerrainLevel, TerrainPyramid, TerrainRuntime, TerrainSampleExtent,
+    TerrainTileDemand, TerrainTileExtent, TerrainTileKey, TerrainTileRange, TerrainTileWorkBudget,
+    TerrainTileWorkKey, TerrainTileWorkLease, TerrainTileWorkRequest, TerrainTileWorkScheduler,
+    TerrainTileWorkSource, TerrainTileWorkStats, TerrainWorldTransform, TileCacheError,
+    TileCacheEviction, TileCacheInsert, TileCacheStats, TilePageHandle, TileResidencyCache,
 };
 pub use world_archetype::{
     alpine_world, badlands_world, blank_world_design, build_world, coastal_world, desert_world,

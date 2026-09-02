@@ -6,32 +6,11 @@
 //! Default Apply Where = Entire Biome (identity local placement). Artists never
 //! manually assign a Biome Mask — inheritance is automatic from the enclosing biome.
 
+pub use crate::layer::{ApplyWhere, DevelopCategory, OperationPlacement};
 use crate::mask::{
     CompareOp, Condition, ConditionChannel, Distribution, PlacementDefinition, PlacementSource,
     RuleGroup, RuleGroupMode, RuleNode,
 };
-use serde::{Deserialize, Serialize};
-
-/// Simple Apply Where control (artist-facing). Compiles into [`PlacementDefinition`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum ApplyWhere {
-    /// Full Biome Effective Placement — no extra local restriction.
-    #[default]
-    EntireBiome,
-    /// Local painted restriction (world/surface paint) × biome.
-    PaintedRestriction,
-    HeightRange,
-    SlopeRange,
-    NearWater,
-    NearRivers,
-    FlowRange,
-    Curvature,
-    /// Free-form rule group (multiple conditions).
-    CustomConditions,
-    /// Hand-edited Mask Stack (Custom PlacementSource). Advanced access preserved.
-    AdvancedMask,
-}
 
 impl ApplyWhere {
     pub fn all() -> &'static [ApplyWhere] {
@@ -61,62 +40,6 @@ impl ApplyWhere {
             Self::Curvature => "Curvature",
             Self::CustomConditions => "Custom Conditions",
             Self::AdvancedMask => "Advanced Mask",
-        }
-    }
-}
-
-/// Operation placement authored in Develop. Serializes with the layer.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OperationPlacement {
-    #[serde(default)]
-    pub apply_where: ApplyWhere,
-    /// Local placement IR. Empty / identity when Entire Biome.
-    #[serde(default)]
-    pub definition: PlacementDefinition,
-    /// Height range (metres) when ApplyWhere::HeightRange.
-    #[serde(default = "default_height_min")]
-    pub height_min: f32,
-    #[serde(default = "default_height_max")]
-    pub height_max: f32,
-    /// Slope range (degrees) when ApplyWhere::SlopeRange.
-    #[serde(default)]
-    pub slope_min: f32,
-    #[serde(default = "default_slope_max")]
-    pub slope_max: f32,
-    /// Flow / near-river threshold.
-    #[serde(default = "default_flow_min")]
-    pub flow_min: f32,
-    #[serde(default = "default_near_m")]
-    pub near_distance_m: f32,
-}
-
-fn default_height_min() -> f32 {
-    0.0
-}
-fn default_height_max() -> f32 {
-    2000.0
-}
-fn default_slope_max() -> f32 {
-    50.0
-}
-fn default_flow_min() -> f32 {
-    0.15
-}
-fn default_near_m() -> f32 {
-    80.0
-}
-
-impl Default for OperationPlacement {
-    fn default() -> Self {
-        Self {
-            apply_where: ApplyWhere::EntireBiome,
-            definition: PlacementDefinition::default(),
-            height_min: default_height_min(),
-            height_max: default_height_max(),
-            slope_min: 0.0,
-            slope_max: default_slope_max(),
-            flow_min: default_flow_min(),
-            near_distance_m: default_near_m(),
         }
     }
 }
@@ -345,18 +268,6 @@ fn condition_phrase(c: &Condition) -> String {
         (ConditionChannel::Curvature, _) => "curvature matches".into(),
         _ => format!("{:?} {:?}", c.channel, c.op),
     }
-}
-
-/// Develop category for contextual creation under a biome.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DevelopCategory {
-    Terrain,
-    Materials,
-    Simulation,
-    Vegetation,
-    Objects,
-    Placement,
 }
 
 impl DevelopCategory {

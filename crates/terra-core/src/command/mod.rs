@@ -1,7 +1,45 @@
-//! Command-based undo/redo (params & stack ops, not texture snapshots).
+//! Command-based undo/redo, including bounded snapshots for explicitly resized owned rasters.
 
-use crate::layer::{BlendMode, Layer, LayerGroup, LayerId, LayerKind, LayerStack, StackNode};
+use crate::authoring::SculptStroke;
+use crate::layer::{
+    BlendMode, GridDimensions, Layer, LayerGroup, LayerId, LayerKind, LayerStack, SculptParams,
+    StackNode,
+};
+use crate::mask::{MaskAsset, MaskId, PaintBuffer};
+use crate::raster::{RasterResizeError, RasterResizeLimits};
 use serde::{Deserialize, Serialize};
+use std::mem;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OwnedRasterTarget {
+    SculptBase(LayerId),
+    PaintedMask(MaskId),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum StoredRaster {
+    Sculpt(SculptParams),
+    Mask(PaintBuffer),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandImpact {
+    None,
+    Layer(LayerId),
+    Masks,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ResizeRasterSourceError {
+    #[error("the selected source no longer exists")]
+    MissingTarget,
+    #[error("the selected source is not an editable stored raster")]
+    NotEditable,
+    #[error("source already has the requested dimensions")]
+    Unchanged,
+    #[error(transparent)]
+    Resize(#[from] RasterResizeError),
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum EditorCommand {
@@ -87,6 +125,22 @@ pub enum EditorCommand {
         previous: crate::operation_placement::OperationPlacement,
         previous_masks: crate::mask::Distribution,
     },
+    /// Swap-based snapshot for an explicitly resized owned raster source.
+    ResizeRasterSource {
+        target: OwnedRasterTarget,
+        stored: StoredRaster,
+    },
+    SetStrokeEnabled {
+        id: LayerId,
+        index: usize,
+        enabled: bool,
+        previous: bool,
+    },
+    RemoveStroke {
+        id: LayerId,
+        index: usize,
+        stroke: SculptStroke,
+    },
 }
 
 pub struct CommandHistory {
@@ -95,6 +149,8 @@ pub struct CommandHistory {
     snapshots: Vec<(String, usize)>,
     last_coalesce_key: Option<(u64, &'static str)>,
     pub limit: usize,
+    /// Maximum retained raster snapshot payload across the undo stack.
+    pub raster_byte_limit: usize,
 }
 
 impl Default for CommandHistory {
@@ -111,15 +167,14 @@ impl CommandHistory {
             snapshots: Vec::new(),
             last_coalesce_key: None,
             limit,
+            raster_byte_limit: 512 * crate::raster::MIB,
         }
     }
 
     pub fn push_executed(&mut self, cmd: EditorCommand) {
         self.last_coalesce_key = None;
         self.undo_stack.push(cmd);
-        if self.undo_stack.len() > self.limit {
-            self.undo_stack.remove(0);
-        }
+        self.trim_undo();
         self.redo_stack.clear();
     }
 
@@ -150,9 +205,7 @@ impl CommandHistory {
             }
         }
         self.undo_stack.push(cmd);
-        if self.undo_stack.len() > self.limit {
-            self.undo_stack.remove(0);
-        }
+        self.trim_undo();
         self.redo_stack.clear();
         self.last_coalesce_key = coalesce_key;
     }
@@ -199,11 +252,224 @@ impl CommandHistory {
         let cmd = self.redo_stack.pop()?;
         let dirty = apply(&cmd, stack);
         self.undo_stack.push(cmd);
+        self.trim_undo();
         dirty
+    }
+
+    pub fn undo_document(
+        &mut self,
+        stack: &mut LayerStack,
+        masks: &mut [MaskAsset],
+    ) -> Option<CommandImpact> {
+        self.last_coalesce_key = None;
+        let mut cmd = self.undo_stack.pop()?;
+        let impact = match &mut cmd {
+            EditorCommand::ResizeRasterSource { target, stored } => {
+                swap_raster_source(stack, masks, *target, stored)
+            }
+            _ => invert(&cmd, stack)
+                .map(CommandImpact::Layer)
+                .unwrap_or(CommandImpact::None),
+        };
+        self.redo_stack.push(cmd);
+        Some(impact)
+    }
+
+    pub fn redo_document(
+        &mut self,
+        stack: &mut LayerStack,
+        masks: &mut [MaskAsset],
+    ) -> Option<CommandImpact> {
+        self.last_coalesce_key = None;
+        let mut cmd = self.redo_stack.pop()?;
+        let impact = match &mut cmd {
+            EditorCommand::ResizeRasterSource { target, stored } => {
+                swap_raster_source(stack, masks, *target, stored)
+            }
+            _ => apply(&cmd, stack)
+                .map(CommandImpact::Layer)
+                .unwrap_or(CommandImpact::None),
+        };
+        self.undo_stack.push(cmd);
+        self.trim_undo();
+        Some(impact)
+    }
+
+    fn trim_undo(&mut self) {
+        while self.undo_stack.len() > self.limit
+            || (self.undo_stack.len() > 1
+                && self
+                    .undo_stack
+                    .iter()
+                    .map(EditorCommand::raster_payload_bytes)
+                    .sum::<usize>()
+                    > self.raster_byte_limit)
+        {
+            if self.undo_stack.is_empty() {
+                break;
+            }
+            self.undo_stack.remove(0);
+        }
+    }
+}
+
+pub fn resize_raster_source(
+    stack: &mut LayerStack,
+    masks: &mut [MaskAsset],
+    target: OwnedRasterTarget,
+    dimensions: GridDimensions,
+    limits: RasterResizeLimits,
+) -> Result<EditorCommand, ResizeRasterSourceError> {
+    let stored = match target {
+        OwnedRasterTarget::SculptBase(id) => {
+            let layer = stack
+                .find_mut(id)
+                .ok_or(ResizeRasterSourceError::MissingTarget)?;
+            let LayerKind::SculptBase(params) = &mut layer.kind else {
+                return Err(ResizeRasterSourceError::NotEditable);
+            };
+            if params.dimensions() == dimensions {
+                return Err(ResizeRasterSourceError::Unchanged);
+            }
+            let replacement = params.resized(dimensions, limits)?;
+            StoredRaster::Sculpt(mem::replace(params, replacement))
+        }
+        OwnedRasterTarget::PaintedMask(id) => {
+            let asset = masks
+                .iter_mut()
+                .find(|asset| asset.id == id)
+                .ok_or(ResizeRasterSourceError::MissingTarget)?;
+            if !asset.is_painted() {
+                return Err(ResizeRasterSourceError::NotEditable);
+            }
+            let paint = asset
+                .paint
+                .as_mut()
+                .ok_or(ResizeRasterSourceError::NotEditable)?;
+            if paint.dimensions() == dimensions {
+                return Err(ResizeRasterSourceError::Unchanged);
+            }
+            let replacement = paint.resized(dimensions, limits)?;
+            StoredRaster::Mask(mem::replace(paint, replacement))
+        }
+    };
+    Ok(EditorCommand::ResizeRasterSource { target, stored })
+}
+
+fn swap_raster_source(
+    stack: &mut LayerStack,
+    masks: &mut [MaskAsset],
+    target: OwnedRasterTarget,
+    stored: &mut StoredRaster,
+) -> CommandImpact {
+    match (target, stored) {
+        (OwnedRasterTarget::SculptBase(id), StoredRaster::Sculpt(snapshot)) => {
+            let Some(layer) = stack.find_mut(id) else {
+                return CommandImpact::None;
+            };
+            let LayerKind::SculptBase(current) = &mut layer.kind else {
+                return CommandImpact::None;
+            };
+            mem::swap(current, snapshot);
+            CommandImpact::Layer(id)
+        }
+        (OwnedRasterTarget::PaintedMask(id), StoredRaster::Mask(snapshot)) => {
+            let Some(asset) = masks.iter_mut().find(|asset| asset.id == id) else {
+                return CommandImpact::None;
+            };
+            let Some(current) = asset.paint.as_mut() else {
+                return CommandImpact::None;
+            };
+            mem::swap(current, snapshot);
+            CommandImpact::Masks
+        }
+        _ => CommandImpact::None,
     }
 }
 
 impl EditorCommand {
+    /// Classify this undoable edit at the authored-tree/compiled-plan boundary.
+    /// Numeric changes inside the same layer operation shape remain patchable;
+    /// topology, dependency, and operation-I/O changes advance plan structure.
+    pub fn terrain_edit_class(&self, stack: &LayerStack) -> crate::terrain_plan::TerrainEditClass {
+        use crate::deps::NodeRef;
+        use crate::field_data::FieldId;
+        use crate::terrain_plan::{PlanDirtyScope, TerrainEditClass};
+
+        match self {
+            Self::AddLayer { .. }
+            | Self::RemoveLayer { .. }
+            | Self::Reorder { .. }
+            | Self::Duplicate { .. }
+            | Self::AddGroup { .. }
+            | Self::SetEnabled { .. }
+            | Self::SetSolo { .. }
+            | Self::SetOperationPlacement { .. } => TerrainEditClass::Structure,
+            Self::SetKind { id, kind, previous } => {
+                if layer_kind_plan_shape(kind) == layer_kind_plan_shape(previous) {
+                    TerrainEditClass::Parameters {
+                        owner: NodeRef::Layer(*id),
+                    }
+                } else {
+                    TerrainEditClass::Structure
+                }
+            }
+            Self::SetOpacity { id, .. } | Self::SetBlend { id, .. } => {
+                let owner = if stack.find_group(*id).is_some() {
+                    NodeRef::Group(*id)
+                } else {
+                    NodeRef::Layer(*id)
+                };
+                TerrainEditClass::Parameters { owner }
+            }
+            Self::ResizeRasterSource { target, .. } => {
+                let (owner, fields) = match target {
+                    OwnedRasterTarget::SculptBase(id) => {
+                        (NodeRef::Layer(*id), vec![FieldId::Height])
+                    }
+                    OwnedRasterTarget::PaintedMask(id) => (NodeRef::Mask(*id), Vec::new()),
+                };
+                TerrainEditClass::Content {
+                    owner,
+                    fields,
+                    scope: PlanDirtyScope::FullField,
+                }
+            }
+            Self::SetStrokeEnabled { id, .. } | Self::RemoveStroke { id, .. } => {
+                TerrainEditClass::Content {
+                    owner: NodeRef::Layer(*id),
+                    fields: vec![FieldId::Height],
+                    scope: PlanDirtyScope::FullField,
+                }
+            }
+            Self::SetCached { .. } => TerrainEditClass::Resources,
+            Self::Rename { .. }
+            | Self::SetLocked { .. }
+            | Self::SetColorTag { .. }
+            | Self::Annotate { .. } => TerrainEditClass::ViewOnly,
+        }
+    }
+
+    fn raster_payload_bytes(&self) -> usize {
+        match self {
+            Self::ResizeRasterSource {
+                stored: StoredRaster::Sculpt(params),
+                ..
+            } => params
+                .samples
+                .len()
+                .saturating_mul(std::mem::size_of::<f32>()),
+            Self::ResizeRasterSource {
+                stored: StoredRaster::Mask(paint),
+                ..
+            } => paint
+                .samples
+                .len()
+                .saturating_mul(std::mem::size_of::<f32>()),
+            _ => 0,
+        }
+    }
+
     /// Concise, artist-facing description suitable for the History panel.
     pub fn describe(&self) -> String {
         match self {
@@ -243,8 +509,34 @@ impl EditorCommand {
             Self::AddGroup { name, .. } => format!("Added Group {}", name),
             Self::Annotate { label } => label.clone(),
             Self::SetOperationPlacement { .. } => "Changed Apply Where".into(),
+            Self::ResizeRasterSource { .. } => "Resized Source Resolution".into(),
+            Self::SetStrokeEnabled { enabled, .. } => if *enabled {
+                "Enabled Stroke"
+            } else {
+                "Disabled Stroke"
+            }
+            .into(),
+            Self::RemoveStroke { stroke, .. } => {
+                format!("Deleted {} Stroke", stroke.kind.label())
+            }
         }
     }
+}
+
+fn layer_kind_plan_shape(
+    kind: &LayerKind,
+) -> (
+    String,
+    Vec<crate::field_data::FieldId>,
+    Vec<crate::field_data::FieldId>,
+    Vec<crate::field_data::FieldId>,
+) {
+    (
+        kind.type_id().into(),
+        kind.required_fields(),
+        kind.optional_fields(),
+        kind.produced_fields(),
+    )
 }
 
 pub fn apply(cmd: &EditorCommand, stack: &mut LayerStack) -> Option<LayerId> {
@@ -345,6 +637,30 @@ pub fn apply(cmd: &EditorCommand, stack: &mut LayerStack) -> Option<LayerId> {
             if let Some(l) = stack.find_mut(*id) {
                 l.common.operation_placement = placement.clone();
                 l.sync_operation_placement_masks();
+            }
+            Some(*id)
+        }
+        EditorCommand::ResizeRasterSource { .. } => None,
+        EditorCommand::SetStrokeEnabled {
+            id, index, enabled, ..
+        } => {
+            if let Some(l) = stack.find_mut(*id) {
+                if let LayerKind::SculptStrokes(p) = &mut l.kind {
+                    if let Some(s) = p.strokes.get_mut(*index) {
+                        s.enabled = *enabled;
+                    }
+                }
+            }
+            Some(*id)
+        }
+        EditorCommand::RemoveStroke { id, index, .. } => {
+            if let Some(l) = stack.find_mut(*id) {
+                if let LayerKind::SculptStrokes(p) = &mut l.kind {
+                    let i = (*index).min(p.strokes.len().saturating_sub(1));
+                    if i < p.strokes.len() {
+                        p.strokes.remove(i);
+                    }
+                }
             }
             Some(*id)
         }
@@ -475,13 +791,42 @@ fn invert(cmd: &EditorCommand, stack: &mut LayerStack) -> Option<LayerId> {
             }
             Some(*id)
         }
+        EditorCommand::ResizeRasterSource { .. } => None,
+        EditorCommand::SetStrokeEnabled {
+            id,
+            index,
+            previous,
+            ..
+        } => {
+            if let Some(l) = stack.find_mut(*id) {
+                if let LayerKind::SculptStrokes(p) = &mut l.kind {
+                    if let Some(s) = p.strokes.get_mut(*index) {
+                        s.enabled = *previous;
+                    }
+                }
+            }
+            Some(*id)
+        }
+        EditorCommand::RemoveStroke {
+            id, index, stroke, ..
+        } => {
+            if let Some(l) = stack.find_mut(*id) {
+                if let LayerKind::SculptStrokes(p) = &mut l.kind {
+                    let i = (*index).min(p.strokes.len());
+                    p.strokes.insert(i, stroke.clone());
+                }
+            }
+            Some(*id)
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::document::TerrainDocument;
     use crate::layer::FlatParams;
+    use crate::mask::MaskAsset;
 
     #[test]
     fn undo_redo_opacity() {
@@ -529,5 +874,72 @@ mod tests {
 
         hist.undo(&mut stack);
         assert_eq!(stack.find(id).unwrap().common.opacity, 1.0);
+    }
+
+    #[test]
+    fn sculpt_resize_undo_redo_swaps_complete_rectangular_buffers() {
+        let mut document = TerrainDocument::default();
+        let id = document
+            .stack
+            .flatten_layers()
+            .into_iter()
+            .find(|layer| layer.kind.is_sculpt_base())
+            .unwrap()
+            .id();
+        let mut history = CommandHistory::new(8);
+        let command = resize_raster_source(
+            &mut document.stack,
+            &mut document.masks,
+            OwnedRasterTarget::SculptBase(id),
+            GridDimensions::new(256, 128),
+            RasterResizeLimits::default(),
+        )
+        .unwrap();
+        history.push_executed(command);
+        let dimensions = |doc: &TerrainDocument| match &doc.stack.find(id).unwrap().kind {
+            LayerKind::SculptBase(params) => params.dimensions(),
+            _ => unreachable!(),
+        };
+        assert_eq!(dimensions(&document), GridDimensions::new(256, 128));
+        assert_eq!(
+            history.undo_document(&mut document.stack, &mut document.masks),
+            Some(CommandImpact::Layer(id))
+        );
+        assert_eq!(dimensions(&document), GridDimensions::square(512));
+        assert_eq!(
+            history.redo_document(&mut document.stack, &mut document.masks),
+            Some(CommandImpact::Layer(id))
+        );
+        assert_eq!(dimensions(&document), GridDimensions::new(256, 128));
+    }
+
+    #[test]
+    fn painted_mask_resize_is_undoable_and_reports_mask_impact() {
+        let mut document = TerrainDocument::default();
+        let asset = MaskAsset::new_painted(MaskId::new(), "Paint", 256);
+        let id = asset.id;
+        document.masks.push(asset);
+        let command = resize_raster_source(
+            &mut document.stack,
+            &mut document.masks,
+            OwnedRasterTarget::PaintedMask(id),
+            GridDimensions::new(128, 512),
+            RasterResizeLimits::default(),
+        )
+        .unwrap();
+        let mut history = CommandHistory::new(8);
+        history.push_executed(command);
+        assert_eq!(
+            document.masks[0].paint.as_ref().unwrap().dimensions(),
+            GridDimensions::new(128, 512)
+        );
+        assert_eq!(
+            history.undo_document(&mut document.stack, &mut document.masks),
+            Some(CommandImpact::Masks)
+        );
+        assert_eq!(
+            document.masks[0].paint.as_ref().unwrap().dimensions(),
+            GridDimensions::square(256)
+        );
     }
 }

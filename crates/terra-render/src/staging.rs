@@ -49,6 +49,10 @@ impl StagingRing {
     ///
     /// Tiny payloads stay on `queue.write_texture` (lower overhead). Larger
     /// regions go through a ring slot with padded rows.
+    // Staging upload: device/queue + optional encoder + destination texture and
+    // its region geometry (origin/width/height) + the source slice, each used
+    // once. Kept flat.
+    #[allow(clippy::too_many_arguments)]
     pub fn write_r32_region(
         &mut self,
         device: &wgpu::Device,

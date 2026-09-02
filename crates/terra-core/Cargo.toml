@@ -3,9 +3,10 @@ name = "terra-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Terrain processing domain: heightfields, layers, masks, evaluation"
+description = "Backend-neutral terrain domain: heightfields, layers, masks, and algorithms"
 
 [dependencies]
+terra-jobs = { workspace = true }
 glam = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -18,3 +19,6 @@ profiling = { workspace = true }
 
 [dev-dependencies]
 approx = "0.5"
+
+[lints]
+workspace = true

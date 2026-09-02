@@ -169,6 +169,10 @@ pub fn evolve_analytical(
     (z, cache, incision)
 }
 
+// Analytical stream-power solve: the input fields plus independent physical
+// scalars (t/k/m, area/cell scaling) and the tree stride; heterogeneous, each
+// used once — no coherent sub-struct. Kept flat.
+#[allow(clippy::too_many_arguments)]
 fn analytical_on_tree(
     z: &Heightfield,
     z0: &Heightfield,
@@ -298,6 +302,10 @@ fn analytical_on_tree(
     out
 }
 
+// Per-cell characteristic solve: index + the drainage arrays it walks
+// (receiver/travel/uplift/area) + z0/uplift fields + grid width and cell length,
+// each distinct. Kept flat.
+#[allow(clippy::too_many_arguments)]
 fn characteristic_elevation(
     idx: usize,
     t: f32,

@@ -828,6 +828,10 @@ fn pack_image_atlas(images: &[(u32, u32, Vec<u8>)]) -> (u32, u32, Vec<u8>, Vec<[
     (atlas_w, atlas_h, atlas, uvs)
 }
 
+// Quad vertex emitter: the two corners, UVs, colour, mode, radius and size map
+// directly onto the vertices it pushes; a struct would not group them and this
+// is on the hot per-quad path. Kept flat.
+#[allow(clippy::too_many_arguments)]
 fn push_quad(
     verts: &mut Vec<Vertex>,
     x0: f32,
