@@ -56,6 +56,7 @@ fn small_strokes(count: u32) -> Vec<SculptStroke> {
                 radius_m: radius,
                 strength: 5.0,
                 target_height: 8.0,
+                riser_width_m: 0.0,
                 falloff: 1.5,
                 enabled: true,
             }
@@ -76,6 +77,7 @@ fn field_covering_stroke() -> Vec<SculptStroke> {
         radius_m: WORLD * 1.5,
         strength: 5.0,
         target_height: 0.0,
+        riser_width_m: 0.0,
         falloff: 1.5,
         enabled: true,
     }]

@@ -3020,6 +3020,7 @@ mod tests {
                 strength: 5.0,
                 stroke_kind: SculptStrokeKind::Raise,
                 target_height: 0.0,
+                riser_width_m: 0.0,
             }]);
             app.last_paint_uv = Some((u, 0.5));
             app.run_eval_step_with_intent(GpuEvaluationIntent::InteractiveLocal);
@@ -3152,6 +3153,7 @@ mod tests {
             strength: 1.0,
             stroke_kind: SculptStrokeKind::Raise,
             target_height: 0.0,
+            riser_width_m: 0.0,
         }]);
         assert!(app.force_draft, "the ordinary edit path requests Draft");
         app.run_eval_step_with_intent(GpuEvaluationIntent::InteractiveLocal);
@@ -3234,6 +3236,7 @@ mod tests {
                 strength: 5.0,
                 stroke_kind: SculptStrokeKind::Raise,
                 target_height: 0.0,
+                riser_width_m: 0.0,
             }]);
             app.logical_frames
                 .update_generation(EditGeneration::new(app.eval_token));

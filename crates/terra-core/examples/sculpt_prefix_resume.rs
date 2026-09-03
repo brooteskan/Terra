@@ -61,6 +61,7 @@ fn big_stroke(lcg: &mut Lcg, points: usize, kind: SculptStrokeKind) -> SculptStr
         radius_m: WORLD * 0.04,
         strength: 5.0,
         target_height: 8.0,
+        riser_width_m: 0.0,
         falloff: 1.5,
         enabled: true,
     }

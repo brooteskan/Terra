@@ -1514,6 +1514,18 @@ fn draw_brush_bar(ui: &mut GuiContext<'_>, state: &mut UiState, vp: Rect) {
         );
         state.smooth_spread = state.smooth_spread.round();
     }
+    if matches!(state.editor_tool, EditorTool::Terrace) && x + 100.0 <= stop {
+        x = compact_slider(
+            ui,
+            Id::new("brush_terrace_riser_width"),
+            x,
+            bar,
+            "Riser",
+            &mut state.terrace_riser_width_m,
+            0.0,
+            terra_core::authoring::TERRACE_RISER_WIDTH_MAX_M,
+        );
+    }
     if x + 100.0 <= stop {
         x = compact_slider(
             ui,

@@ -491,18 +491,27 @@ impl LayerKind {
             },
             LayerKind::SculptStrokes(p) => {
                 use crate::authoring::SculptStrokeKind;
-                let smooth_spread = p
-                    .strokes
-                    .iter()
-                    .filter(|s| s.enabled && matches!(s.kind, SculptStrokeKind::Smooth))
-                    .fold(0u32, |reach, stroke| {
+                let filter_spread = p.strokes.iter().fold(0u32, |reach, stroke| {
+                    if !stroke.enabled {
+                        reach
+                    } else if matches!(stroke.kind, SculptStrokeKind::Smooth) {
                         reach.saturating_add(
                             crate::gradient_smoothing::smooth_filter_support_samples(
                                 stroke.smooth_spread_samples(),
                             ),
                         )
-                    });
-                let smooth_reach = smooth_spread.saturating_mul(2);
+                    } else if matches!(stroke.kind, SculptStrokeKind::Terrace)
+                        && stroke.riser_width_m.is_finite()
+                        && stroke.riser_width_m > 0.0
+                    {
+                        reach.saturating_add(
+                            crate::gradient_smoothing::TERRACE_RISER_FILTER_SUPPORT_MAX_SAMPLES,
+                        )
+                    } else {
+                        reach
+                    }
+                });
+                let filter_reach = filter_spread.saturating_mul(2);
                 let base_neighborhood = p.strokes.iter().any(|s| {
                     s.enabled
                         && matches!(
@@ -510,12 +519,18 @@ impl LayerKind {
                             SculptStrokeKind::Pinch | SculptStrokeKind::Coastline
                         )
                 });
-                let legacy_reach =
-                    u32::from(base_neighborhood).saturating_add(u32::from(p.reconcile > 0.0));
+                let uses_reconcile = p.strokes.iter().any(|s| {
+                    s.enabled
+                        && !(matches!(s.kind, SculptStrokeKind::Terrace)
+                            && s.riser_width_m.is_finite()
+                            && s.riser_width_m > 0.0)
+                });
+                let legacy_reach = u32::from(base_neighborhood)
+                    .saturating_add(u32::from(p.reconcile > 0.0 && uses_reconcile));
                 Reach::Localized {
                     // Keep the historical one-sample floor for empty/default
                     // layers; it also covers their optional reconcile pass.
-                    halo_samples: 1.max(smooth_reach).max(legacy_reach),
+                    halo_samples: 1.max(filter_reach).max(legacy_reach),
                 }
             }
             other => match other.spatial_dependency() {
@@ -913,6 +928,41 @@ mod tests {
                 "{kind:?}"
             );
         }
+        let soft_terrace = LayerKind::SculptStrokes(SculptStrokeParams {
+            strokes: vec![SculptStroke {
+                kind: SculptStrokeKind::Terrace,
+                riser_width_m: 12.0,
+                ..SculptStroke::default()
+            }],
+            reconcile: 0.15,
+        });
+        assert_eq!(
+            soft_terrace.intrinsic_reach(),
+            Reach::Localized {
+                halo_samples: 2
+                    * crate::gradient_smoothing::TERRACE_RISER_FILTER_SUPPORT_MAX_SAMPLES
+            },
+            "soft Terrace declares the spatial filter's conservative source/output guard"
+        );
+        let mixed_terrace = LayerKind::SculptStrokes(SculptStrokeParams {
+            strokes: vec![
+                SculptStroke {
+                    kind: SculptStrokeKind::Terrace,
+                    riser_width_m: 12.0,
+                    ..SculptStroke::default()
+                },
+                SculptStroke::default(),
+            ],
+            reconcile: 0.15,
+        });
+        assert_eq!(
+            mixed_terrace.intrinsic_reach(),
+            Reach::Localized {
+                halo_samples: 2
+                    * crate::gradient_smoothing::TERRACE_RISER_FILTER_SUPPORT_MAX_SAMPLES
+            },
+            "the spatial Terrace guard dominates a reconciled per-sample sibling"
+        );
         for reconcile in [0.0, 0.15] {
             assert_eq!(
                 base_neighborhood_strokes(SculptStrokeKind::Smooth, reconcile).intrinsic_reach(),

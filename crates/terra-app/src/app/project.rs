@@ -1024,6 +1024,7 @@ mod tests {
             strength: 8.0,
             stroke_kind: SculptStrokeKind::Raise,
             target_height: 0.0,
+            riser_width_m: 0.0,
         };
         app.apply_actions(vec![dab(0.48)]);
         let edits = std::mem::take(&mut app.pending_plan_edits);
@@ -1098,6 +1099,7 @@ mod tests {
                 strength: 3.0,
                 stroke_kind: SculptStrokeKind::Raise,
                 target_height: 0.0,
+                riser_width_m: 0.0,
             }]);
             let edits = std::mem::take(&mut app.pending_plan_edits);
             assert!(edits.iter().all(|edit| matches!(

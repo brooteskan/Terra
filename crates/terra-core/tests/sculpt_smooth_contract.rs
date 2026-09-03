@@ -14,6 +14,7 @@ fn smooth(strength: f32) -> SculptStroke {
         radius_m: 100.0,
         strength,
         target_height: 0.0,
+        riser_width_m: 0.0,
         falloff: 1.5,
         enabled: true,
     }
@@ -173,6 +174,7 @@ fn smooth_visibly_rounds_terrace_corners_at_normal_brush_strength() {
         radius_m: 120.0,
         strength: 8.0,
         target_height: 0.0,
+        riser_width_m: 0.0,
         falloff: 1.5,
         enabled: true,
     };

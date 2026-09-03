@@ -934,6 +934,14 @@ pub fn draw_inspector_gui(
                                     stroke.target_height = spread.round();
                                     changed = true;
                                 }
+                            } else if matches!(stroke.kind, SculptStrokeKind::Terrace) {
+                                changed |= slider_f32(
+                                    ui,
+                                    "Riser Width (m)",
+                                    &mut stroke.riser_width_m,
+                                    0.0,
+                                    terra_core::authoring::TERRACE_RISER_WIDTH_MAX_M,
+                                );
                             } else {
                                 changed |= slider_f32(
                                     ui,
@@ -1300,6 +1308,16 @@ fn draw_tool_inspector(ui: &mut GuiContext<'_>, doc: &TerrainDocument, ui_state:
         )
     {
         ui_state.smooth_spread = ui_state.smooth_spread.round();
+    }
+    if matches!(ui_state.editor_tool, EditorTool::Terrace) {
+        slider_f32(
+            ui,
+            "Riser Width (m)",
+            &mut ui_state.terrace_riser_width_m,
+            0.0,
+            terra_core::authoring::TERRACE_RISER_WIDTH_MAX_M,
+        );
+        label_dim(ui, "0 m uses hard legacy risers");
     }
     // Brush edge hardness → stroke falloff (0 soft/broad … 1 hard/pointed).
     slider_f32(ui, "Falloff", &mut ui_state.brush_falloff, 0.0, 1.0);

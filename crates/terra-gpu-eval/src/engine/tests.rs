@@ -100,6 +100,7 @@ fn raise_strokes(u: f32, v: f32, strength: f32) -> SculptStrokeParams {
             radius_m: 60.0,
             strength,
             target_height: 0.0,
+            riser_width_m: 0.0,
             falloff: 1.5,
             enabled: true,
         }],
@@ -115,6 +116,8 @@ mod compilation_fallback;
 mod dirty_regions;
 #[path = "tests/dirty_regions_smooth.rs"]
 mod dirty_regions_smooth;
+#[path = "tests/dirty_regions_terrace.rs"]
+mod dirty_regions_terrace;
 #[path = "tests/execution_resources.rs"]
 mod execution_resources;
 #[path = "tests/masks_composition.rs"]

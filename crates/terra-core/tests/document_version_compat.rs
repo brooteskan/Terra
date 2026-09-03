@@ -9,6 +9,8 @@ use terra_core::mask::{MaskCombine, MaskId, MaskSource};
 use terra_core::world_rules::{WorldRuleEffectKind, WorldRulePhase, WorldRuleScope};
 use uuid::Uuid;
 
+use terra_core::authoring::{SculptStroke, SculptStrokeKind};
+
 // Emitted by TerrainDocument::to_json at audited commit 7b336c4.
 const V1_FIXTURE: &str = include_str!("fixtures/document_v1_7b336c4.json");
 // Emitted by TerrainDocument::to_json at the authoring rewrite commit 8587974.
@@ -439,4 +441,27 @@ fn invalid_heightfield_metrics_are_rejected_at_load_without_panicking() {
             "metrics.{field}: expected a metrics validation error, got: {error}"
         );
     }
+}
+
+#[test]
+fn terrace_riser_width_is_additive_and_round_trips() {
+    let legacy = serde_json::json!({
+        "kind": "Terrace",
+        "points": [{ "u": 0.5, "v": 0.5, "pressure": 1.0 }],
+        "radius_m": 80.0,
+        "strength": 8.0,
+        "target_height": 0.0,
+        "falloff": 1.5,
+        "enabled": true
+    });
+    let mut stroke: SculptStroke =
+        serde_json::from_value(legacy).expect("pre-riser-width stroke must load");
+    assert_eq!(stroke.kind, SculptStrokeKind::Terrace);
+    assert_eq!(stroke.riser_width_m, 0.0, "legacy strokes stay hard");
+
+    stroke.riser_width_m = 17.5;
+    let saved = serde_json::to_value(&stroke).expect("stroke saves");
+    assert_eq!(saved["riser_width_m"], 17.5);
+    let loaded: SculptStroke = serde_json::from_value(saved).expect("stroke reloads");
+    assert_eq!(loaded.riser_width_m, 17.5);
 }

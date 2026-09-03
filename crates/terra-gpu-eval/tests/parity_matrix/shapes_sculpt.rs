@@ -94,6 +94,11 @@ fn supported_stroke_set(reconcile: f32) -> SculptStrokeParams {
         radius_m,
         strength,
         target_height,
+        riser_width_m: if matches!(kind, SculptStrokeKind::Terrace) {
+            12.0
+        } else {
+            0.0
+        },
         falloff: 1.5,
         enabled: true,
     };
@@ -296,6 +301,69 @@ fn gpu_required_sculpt_strokes_match_cpu_with_and_without_reconcile() {
 }
 
 #[test]
+fn gpu_required_soft_terrace_matches_cpu_on_negative_radial_terrain() {
+    let width = 65u32;
+    let height = 61u32;
+    let metrics = HeightfieldMetrics::new(width, height, 650.0, 488.0);
+    let samples = (0..height)
+        .flat_map(|z| {
+            (0..width).map(move |x| {
+                let dx = x as f32 - (width - 1) as f32 * 0.5;
+                let dz = z as f32 - (height - 1) as f32 * 0.5;
+                (dx * dx + dz * dz).sqrt() * 0.9 - 24.0
+            })
+        })
+        .collect();
+    let mut stack = LayerStack::new();
+    stack.push(Layer::new(
+        "negative radial base",
+        LayerKind::SculptBase(SculptParams {
+            width,
+            height,
+            samples,
+            fill_height: 0.0,
+        }),
+    ));
+    stack.push(Layer::new(
+        "soft radial terrace",
+        LayerKind::SculptStrokes(SculptStrokeParams {
+            strokes: vec![
+                SculptStroke {
+                    kind: SculptStrokeKind::Terrace,
+                    points: vec![pt(0.5, 0.5, 1.0)],
+                    radius_m: 1_000.0,
+                    strength: 8.0,
+                    target_height: 0.0,
+                    riser_width_m: 0.0,
+                    falloff: 1.5,
+                    enabled: true,
+                },
+                SculptStroke {
+                    kind: SculptStrokeKind::Terrace,
+                    points: vec![pt(0.5, 0.5, 1.0)],
+                    radius_m: 1_000.0,
+                    strength: 8.0,
+                    target_height: 0.0,
+                    riser_width_m: 18.0,
+                    falloff: 1.5,
+                    enabled: true,
+                },
+            ],
+            reconcile: 0.15,
+        }),
+    ));
+
+    let cpu = cpu_oracle(&stack, &[], metrics);
+    let gpu = gpu_eval(&stack, &[], metrics);
+    assert_field_parity(
+        "shape.soft_terrace_negative_radial",
+        &gpu,
+        &cpu,
+        SCULPT_STROKES_PREVIEW,
+    );
+}
+
+#[test]
 fn gpu_required_sculpt_strokes_match_cpu_under_add_blend_and_mask() {
     // The stamped field flows through the standard blend, so a non-default outer
     // composite (Add + opacity + a Constant mask) must still match the CPU.
@@ -348,6 +416,7 @@ fn hundred_sample_smooth_spread_is_continuous_and_matches_cpu() {
                 radius_m: 100.0,
                 strength: 1.0,
                 target_height: 100.0,
+                riser_width_m: 0.0,
                 falloff: 1.5,
                 enabled: true,
             }],
@@ -410,6 +479,7 @@ fn sculpt_strokes_fall_back_when_a_downstream_layer_consumes_aux() {
                 radius_m: 80.0,
                 strength: 4.0,
                 target_height: 0.0,
+                riser_width_m: 0.0,
                 falloff: 1.5,
                 enabled: true,
             }],

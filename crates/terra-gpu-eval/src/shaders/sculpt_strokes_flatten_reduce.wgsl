@@ -25,7 +25,7 @@ struct StrokeHeader {
     kind: u32,
     first_point: u32,
     point_count: u32,
-    pad0: u32,
+    riser_width_m: f32,
     radius_m: f32,
     strength: f32,
     target_height: f32,

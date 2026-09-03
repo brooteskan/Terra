@@ -5,7 +5,9 @@
 //! resolution independent; only evaluation rasterizes it.
 
 use crate::field_data::keys;
-use crate::gradient_smoothing::apply_tapered_smooth;
+use crate::gradient_smoothing::{
+    apply_tapered_smooth, tapered_filtered_target_xy, terrace_riser_spread_samples,
+};
 use crate::heightfield::{Heightfield, HeightfieldMetrics, TileId};
 use crate::hydro::{self, StreamPowerParams};
 use crate::mask::{MaskField, MaskSource};
@@ -147,6 +149,10 @@ pub struct SculptStroke {
     /// zero in older documents resolves to [`SMOOTH_SPREAD_DEFAULT`].
     #[serde(default)]
     pub target_height: f32,
+    /// Full world-space width of a Terrace riser. Zero preserves the legacy
+    /// discontinuous quantizer used by documents saved before this field existed.
+    #[serde(default)]
+    pub riser_width_m: f32,
     #[serde(default = "sculpt_falloff")]
     pub falloff: f32,
     #[serde(default = "enabled_default")]
@@ -156,6 +162,10 @@ pub struct SculptStroke {
 /// Default and maximum half-width of Smooth's gradient stencil, in samples.
 pub const SMOOTH_SPREAD_DEFAULT: u32 = 1;
 pub const SMOOTH_SPREAD_MAX: u32 = 128;
+/// Artist-facing default and UI ceiling for newly authored Terrace risers.
+/// Persisted strokes still default to zero so older documents retain hard edges.
+pub const TERRACE_RISER_WIDTH_DEFAULT_M: f32 = 12.0;
+pub const TERRACE_RISER_WIDTH_MAX_M: f32 = 256.0;
 
 /// Resolve the persisted/editor Smooth spread payload, including old documents
 /// whose formerly ignored `target_height` field was zero.
@@ -197,6 +207,7 @@ impl Default for SculptStroke {
             radius_m: sculpt_radius(),
             strength: sculpt_strength(),
             target_height: 0.0,
+            riser_width_m: 0.0,
             falloff: sculpt_falloff(),
             enabled: true,
         }
@@ -257,6 +268,7 @@ impl SculptStrokeParams {
                 radius_m: radius_m.max(1.0),
                 strength,
                 target_height,
+                riser_width_m: 0.0,
                 falloff: 1.5,
                 enabled: true,
             });
@@ -938,7 +950,8 @@ fn apply_stroke_sample(
         }
         SculptStrokeKind::Terrace => {
             let step = stroke.strength.abs().max(0.1);
-            h + ((h / step).round() * step - h) * w
+            let target = (h / step).round() * step;
+            h + (target - h) * w
         }
         SculptStrokeKind::Roughness | SculptStrokeKind::Noise => {
             h + hash_noise(i as i32, j as i32, 91) * s
@@ -1016,8 +1029,8 @@ struct SculptStampState {
     hardness: Vec<f32>,
     sediment: Vec<f32>,
     edited: Vec<f32>,
-    /// Coverage consumed by the legacy height-reconcile pass. Smooth has its own
-    /// seam-free constrained operator and deliberately does not contribute here.
+    /// Coverage consumed by the legacy height-reconcile pass. Smooth and soft
+    /// Terrace have their own constrained operators and do not contribute here.
     reconcile_weight: Vec<f32>,
 }
 
@@ -1108,6 +1121,77 @@ fn apply_smooth_stroke(
     }
 }
 
+/// Apply one finite-width Terrace stroke to the running field. The current
+/// terrain is first quantized to the same levels as the legacy hard Terrace,
+/// then that target is spatially filtered and blended once through the brush.
+/// Reading the running field (rather than the immutable layer input) preserves
+/// ordered stroke edits and prevents a later Terrace from pulling terrain down
+/// toward an older, lower source.
+fn apply_soft_terrace_stroke(
+    state: &mut SculptStampState,
+    stroke: &SculptStroke,
+    rect: (u32, u32, u32, u32),
+) {
+    if !stroke.riser_width_m.is_finite() || stroke.riser_width_m <= 0.0 {
+        return;
+    }
+    let m = state.out.metrics;
+    let Some((si0, si1, sj0, sj1)) = stroke_footprint_rect(stroke, &m) else {
+        return;
+    };
+    let (r_i0, r_i1, r_j0, r_j1) = rect;
+    let (i0, i1) = (si0.max(r_i0), si1.min(r_i1));
+    let (j0, j1) = (sj0.max(r_j0), sj1.min(r_j1));
+    if i0 > i1 || j0 > j1 {
+        return;
+    }
+
+    let input = state.out.to_dense();
+    let step = stroke.strength.abs().max(0.1);
+    let quantized: Vec<f32> = input
+        .iter()
+        .map(|&height| (height / step).round() * step)
+        .collect();
+    let spread_x = terrace_riser_spread_samples(stroke.riser_width_m, m.dx());
+    let spread_z = terrace_riser_spread_samples(stroke.riser_width_m, m.dz());
+    let Some(filtered) = tapered_filtered_target_xy(
+        &quantized,
+        m.width,
+        m.height,
+        (i0, i1, j0, j1),
+        spread_x,
+        spread_z,
+    ) else {
+        return;
+    };
+    let mut dense = input.clone();
+    let mut changed = false;
+    for j in j0..=j1 {
+        for i in i0..=i1 {
+            let (distance, pressure) = distance_to_polyline(
+                m.world_x(i),
+                m.world_z(j),
+                &stroke.points,
+                m.world_size_x,
+                m.world_size_z,
+            );
+            let weight = (smoothstep_weight(distance, stroke.radius_m, stroke.falloff) * pressure)
+                .clamp(0.0, 1.0);
+            if weight <= 0.0 {
+                continue;
+            }
+            let idx = (j * m.width + i) as usize;
+            state.edited[idx] = state.edited[idx].max(weight);
+            let next = input[idx] + weight * (filtered[idx] - input[idx]);
+            changed |= next.to_bits() != input[idx].to_bits();
+            dense[idx] = next;
+        }
+    }
+    if changed {
+        state.out = Heightfield::from_dense(m, &dense);
+    }
+}
+
 /// Stamp each of `strokes` into `state`, culled to its padded footprint ∩ `rect`.
 /// Shared by the whole-field [`apply_sculpt_strokes`], the region-scoped
 /// [`apply_sculpt_strokes_scoped`], and the prefix-resumed apply (#123), so none
@@ -1121,15 +1205,15 @@ fn apply_smooth_stroke(
 ///
 /// **The per-stroke footprint cull is semantics-preserving.** `smoothstep_weight`
 /// is exactly zero at `distance >= radius`, so every texel outside a stroke's
-/// padded bbox has `w == 0` — no weight or aux merge. Smooth filters source
-/// context outside that bbox, but blends writes only where `w > 0`. The GPU uses
-/// the same bbox.
+/// padded bbox has `w == 0` — no weight or aux merge. Smooth and finite-width
+/// Terrace filter source context outside that bbox, but blend writes only where
+/// `w > 0`. The GPU uses the same bbox.
 ///
-/// **Neighborhood reads are explicitly guarded.** Smooth reads the running field
-/// across its tapered filter support; Pinch/Coastline read one sample
-/// of `base`; Flatten scans the running field over its footprint. Scoped planning
-/// expands those inputs by the layer's declared reach so the cull cannot expose
-/// stale data.
+/// **Neighborhood reads are explicitly guarded.** Smooth and finite-width
+/// Terrace read the running field across their tapered filter support;
+/// Pinch/Coastline read one sample of `base`; Flatten scans the running field over
+/// its footprint. Scoped planning expands those inputs by the layer's declared
+/// reach so the cull cannot expose stale data.
 fn stamp_strokes(
     state: &mut SculptStampState,
     base: &Heightfield,
@@ -1150,6 +1234,13 @@ fn stamp_strokes(
         }
         if matches!(stroke.kind, SculptStrokeKind::Smooth) {
             apply_smooth_stroke(state, stroke, rect);
+            continue;
+        }
+        if matches!(stroke.kind, SculptStrokeKind::Terrace)
+            && stroke.riser_width_m.is_finite()
+            && stroke.riser_width_m > 0.0
+        {
+            apply_soft_terrace_stroke(state, stroke, rect);
             continue;
         }
         // Cull to the stroke's padded footprint ∩ rect. A stroke with no
@@ -1177,7 +1268,12 @@ fn stamp_strokes(
                 }
                 let idx = (j * m.width + i) as usize;
                 state.edited[idx] = state.edited[idx].max(w);
-                state.reconcile_weight[idx] = state.reconcile_weight[idx].max(w);
+                if !matches!(stroke.kind, SculptStrokeKind::Terrace)
+                    || !stroke.riser_width_m.is_finite()
+                    || stroke.riser_width_m <= 0.0
+                {
+                    state.reconcile_weight[idx] = state.reconcile_weight[idx].max(w);
+                }
                 let h = state.out.get(i, j);
                 let next = apply_stroke_sample(
                     stroke,
@@ -2050,6 +2146,7 @@ mod tests {
                 radius_m: 300.0,
                 strength: 4.0,
                 target_height: 1_000_000.0, // absurd — must be ignored by Flatten
+                riser_width_m: 0.0,
                 falloff: 1.5,
                 enabled: true,
             }],
@@ -2078,6 +2175,7 @@ mod tests {
             radius_m: 300.0,
             strength: 4.0,
             target_height: 0.0,
+            riser_width_m: 0.0,
             falloff: 1.5,
             enabled: true,
         };
@@ -2120,6 +2218,7 @@ mod tests {
             radius_m: 50.0,
             strength,
             target_height: 0.0,
+            riser_width_m: 0.0,
             falloff: 1.5,
             enabled: true,
         };
@@ -2221,6 +2320,7 @@ mod tests {
                     radius_m: 120.0,
                     strength: 8.0,
                     target_height: 0.0,
+                    riser_width_m: 0.0,
                     falloff: 1.5,
                     enabled: true,
                 },
@@ -2230,6 +2330,7 @@ mod tests {
                     radius_m: 90.0,
                     strength: 5.0,
                     target_height: 0.0,
+                    riser_width_m: 0.0,
                     falloff: 1.2,
                     enabled: true,
                 },
@@ -2239,6 +2340,7 @@ mod tests {
                     radius_m: 400.0,
                     strength: 4.0,
                     target_height: 0.0,
+                    riser_width_m: 0.0,
                     falloff: 1.5,
                     enabled: true,
                 },
@@ -2248,6 +2350,7 @@ mod tests {
                     radius_m: 100.0,
                     strength: 3.0,
                     target_height: 0.0,
+                    riser_width_m: 0.0,
                     falloff: 1.5,
                     enabled: true,
                 },
@@ -2349,6 +2452,7 @@ mod tests {
             radius_m,
             strength: 8.0,
             target_height: 0.0,
+            riser_width_m: 0.0,
             falloff: 1.5,
             enabled: true,
         }
@@ -2738,6 +2842,13 @@ mod tests {
                 }
                 continue;
             }
+            if matches!(stroke.kind, SculptStrokeKind::Terrace)
+                && stroke.riser_width_m.is_finite()
+                && stroke.riser_width_m > 0.0
+            {
+                apply_soft_terrace_stroke(&mut state, stroke, (0, m.width - 1, 0, m.height - 1));
+                continue;
+            }
             let flatten_target = flatten_target_for(stroke, &state.out, &m);
             for j in 0..m.height {
                 for i in 0..m.width {
@@ -2751,7 +2862,12 @@ mod tests {
                     }
                     let idx = (j * m.width + i) as usize;
                     state.edited[idx] = state.edited[idx].max(w);
-                    state.reconcile_weight[idx] = state.reconcile_weight[idx].max(w);
+                    if !matches!(stroke.kind, SculptStrokeKind::Terrace)
+                        || !stroke.riser_width_m.is_finite()
+                        || stroke.riser_width_m <= 0.0
+                    {
+                        state.reconcile_weight[idx] = state.reconcile_weight[idx].max(w);
+                    }
                     let h = state.out.get(i, j);
                     let next = apply_stroke_sample(
                         stroke,
@@ -2909,6 +3025,7 @@ mod tests {
                     radius_m: radius,
                     strength: 6.0,
                     target_height: 12.0,
+                    riser_width_m: 0.0,
                     falloff: 1.5,
                     enabled: true,
                 });
@@ -2943,6 +3060,7 @@ mod tests {
                     radius_m: 400.0,
                     strength: 4.0,
                     target_height: 0.0,
+                    riser_width_m: 0.0,
                     falloff: 1.5,
                     enabled: true,
                 },
@@ -2962,6 +3080,7 @@ mod tests {
                     radius_m: 0.0,
                     strength: 6.0,
                     target_height: 0.0,
+                    riser_width_m: 0.0,
                     falloff: 1.5,
                     enabled: true,
                 },
@@ -2971,6 +3090,7 @@ mod tests {
                     radius_m: -50.0,
                     strength: 6.0,
                     target_height: 0.0,
+                    riser_width_m: 0.0,
                     falloff: 1.5,
                     enabled: true,
                 },
@@ -2981,6 +3101,7 @@ mod tests {
                     radius_m: 100.0,
                     strength: 5.0,
                     target_height: 0.0,
+                    riser_width_m: 0.0,
                     falloff: 1.5,
                     enabled: true,
                 },
@@ -2991,6 +3112,7 @@ mod tests {
                     radius_m: 150.0,
                     strength: 9.0,
                     target_height: 0.0,
+                    riser_width_m: 0.0,
                     falloff: 1.5,
                     enabled: false,
                 },
@@ -3192,6 +3314,222 @@ mod tests {
             "the NaN stroke at index 0 blocks any resume"
         );
         cached_step(&h, &p, &mut entry, m, "nan-2");
+    }
+
+    #[test]
+    fn terrace_zero_width_is_bit_exact_legacy_quantization() {
+        let values = [
+            -20.0, -12.0, -4.0, -3.999, -0.0, 0.0, 3.999, 4.0, 12.0, 20.0,
+        ];
+        let m = HeightfieldMetrics::new(values.len() as u32, 1, values.len() as f32, 1.0);
+        let mut input = Heightfield::zeros(m);
+        for (i, value) in values.into_iter().enumerate() {
+            input.set(i as u32, 0, value);
+        }
+        let step = 8.0;
+        let output = apply_sculpt_strokes(
+            &input,
+            &SculptStrokeParams {
+                strokes: vec![full_width_terrace(step, 0.0)],
+                reconcile: 0.0,
+            },
+        )
+        .height;
+        for i in 0..m.width {
+            let h = input.get(i, 0);
+            let got = output.get(i, 0);
+            let target = (h / step).round() * step;
+            let legacy = h + (target - h);
+            assert_eq!(got.to_bits(), legacy.to_bits(), "h={h}");
+        }
+    }
+
+    fn full_width_terrace(step: f32, riser_width_m: f32) -> SculptStroke {
+        SculptStroke {
+            kind: SculptStrokeKind::Terrace,
+            points: vec![
+                SculptPoint {
+                    u: 0.0,
+                    v: 0.5,
+                    pressure: 1.0,
+                },
+                SculptPoint {
+                    u: 1.0,
+                    v: 0.5,
+                    pressure: 1.0,
+                },
+            ],
+            radius_m: 10.0,
+            strength: step,
+            target_height: 0.0,
+            riser_width_m,
+            falloff: 1.0,
+            enabled: true,
+        }
+    }
+
+    fn terrace_ramp(width: u32, world_size: f32, riser_width_m: f32) -> Heightfield {
+        let m = HeightfieldMetrics::new(width, 1, world_size, 1.0);
+        let mut input = Heightfield::zeros(m);
+        for i in 0..m.width {
+            input.set(i, 0, m.world_x(i));
+        }
+        apply_sculpt_strokes(
+            &input,
+            &SculptStrokeParams {
+                strokes: vec![full_width_terrace(40.0, riser_width_m)],
+                reconcile: 0.0,
+            },
+        )
+        .height
+    }
+
+    #[test]
+    fn terrace_width_changes_the_spatial_profile_even_after_a_hard_terrace() {
+        fn max_delta(field: &Heightfield) -> f32 {
+            (1..field.metrics.width)
+                .map(|i| (field.get(i, 0) - field.get(i - 1, 0)).abs())
+                .fold(0.0, f32::max)
+        }
+
+        let input = terrace_ramp(257, 257.0, 0.0);
+        let hard_then = |riser_width_m| {
+            apply_sculpt_strokes(
+                &input,
+                &SculptStrokeParams {
+                    strokes: vec![
+                        full_width_terrace(40.0, 0.0),
+                        full_width_terrace(40.0, riser_width_m),
+                    ],
+                    reconcile: 0.0,
+                },
+            )
+            .height
+        };
+        let narrow = hard_then(12.0);
+        let medium = hard_then(40.0);
+        let wide = hard_then(188.8);
+        let narrow_delta = max_delta(&narrow);
+        let medium_delta = max_delta(&medium);
+        let wide_delta = max_delta(&wide);
+        assert!(
+            medium_delta < narrow_delta,
+            "{medium_delta} !< {narrow_delta}"
+        );
+        assert!(wide_delta < medium_delta, "{wide_delta} !< {medium_delta}");
+        assert_ne!(narrow.to_dense(), medium.to_dense());
+        assert_ne!(medium.to_dense(), wide.to_dense());
+    }
+
+    #[test]
+    fn terrace_riser_width_is_world_space_and_has_a_sample_floor() {
+        fn span(width: u32, world_size: f32, requested_width: f32) -> (f32, usize, f32) {
+            let m = HeightfieldMetrics::new(width, 1, world_size, 1.0);
+            let mut input = Heightfield::zeros(m);
+            for i in 0..m.width {
+                input.set(i, 0, m.world_x(i));
+            }
+            // One isolated 0 -> 400 terrace step avoids neighboring risers
+            // overlapping the span measurement.
+            let field = apply_sculpt_strokes(
+                &input,
+                &SculptStrokeParams {
+                    strokes: vec![full_width_terrace(400.0, requested_width)],
+                    reconcile: 0.0,
+                },
+            )
+            .height;
+            let xs: Vec<f32> = (0..m.width)
+                .filter(|&i| {
+                    let x = m.world_x(i);
+                    let value = field.get(i, 0);
+                    (100.0..300.0).contains(&x) && value > 0.0001 && value < 399.9999
+                })
+                .map(|i| m.world_x(i))
+                .collect();
+            let physical = xs.last().unwrap() - xs.first().unwrap() + m.dx();
+            (physical, xs.len(), m.dx())
+        }
+
+        let (coarse, _, coarse_dx) = span(401, 400.0, 40.0);
+        let (dense, _, dense_dx) = span(801, 400.0, 40.0);
+        for (name, measured, dx) in [("coarse", coarse, coarse_dx), ("dense", dense, dense_dx)] {
+            assert!(
+                (measured - 40.0).abs() <= 4.0 * dx,
+                "{name} riser measured {measured} m"
+            );
+        }
+        assert!((coarse - dense).abs() <= 4.0 * coarse_dx);
+
+        let (_, samples, _) = span(401, 400.0, 0.01);
+        assert!(
+            samples >= 2,
+            "sub-pixel request collapsed to {samples} samples"
+        );
+    }
+
+    #[test]
+    fn soft_terrace_filters_the_running_height_without_gouging_to_layer_input() {
+        let m = HeightfieldMetrics::new(257, 1, 257.0, 1.0);
+        let mut input = Heightfield::zeros(m);
+        for i in 0..m.width {
+            input.set(i, 0, 100.0 + m.world_x(i) * 0.25);
+        }
+        let raise = SculptStroke {
+            kind: SculptStrokeKind::Raise,
+            strength: 300.0,
+            ..full_width_terrace(25.0, 0.0)
+        };
+        let hard = full_width_terrace(25.0, 0.0);
+        let hard_result = apply_sculpt_strokes(
+            &input,
+            &SculptStrokeParams {
+                strokes: vec![raise.clone(), hard.clone()],
+                reconcile: 0.0,
+            },
+        )
+        .height;
+        let softened = apply_sculpt_strokes(
+            &input,
+            &SculptStrokeParams {
+                strokes: vec![raise, hard, full_width_terrace(25.0, 188.8)],
+                reconcile: 0.0,
+            },
+        )
+        .height;
+        let (hard_lo, hard_hi) = hard_result.min_max();
+        let (soft_lo, soft_hi) = softened.min_max();
+        assert!(
+            soft_lo >= hard_lo,
+            "soft Terrace gouged {hard_lo} down to {soft_lo}"
+        );
+        assert!(
+            soft_hi <= hard_hi,
+            "soft Terrace overshot {hard_hi} up to {soft_hi}"
+        );
+        assert!(
+            soft_lo > input.min_max().1,
+            "soft Terrace fell back toward immutable layer input"
+        );
+        for i in 1..m.width {
+            assert!(
+                softened.get(i, 0) >= softened.get(i - 1, 0),
+                "soft profile decreased at sample {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn soft_terrace_keeps_flat_treads_between_narrow_risers() {
+        let field = terrace_ramp(401, 400.0, 12.0);
+        let mut exact_treads = 0;
+        for value in field.to_dense() {
+            let phase = (value / 40.0).fract().abs();
+            if phase <= 1.0e-5 || (1.0 - phase) <= 1.0e-5 {
+                exact_treads += 1;
+            }
+        }
+        assert!(exact_treads > 200, "soft risers consumed the flat treads");
     }
 
     /// An empty stroke list keeps no entry and still matches the whole-field apply.

@@ -43,7 +43,9 @@ Select **Base** or a Shape Layer, then a brush. Test brush params (size, strengt
 - [ ] **Lower** (L)
 - [ ] **Smooth** (S)
 - [ ] **Flatten** — flattens toward target height
-- [ ] **Terrace** — quantizes into steps
+- [ ] **Terrace** — quantizes into flat steps; verify **Riser Width** produces smooth,
+      finite-width edges without radial teeth, `0 m` preserves hard legacy edges,
+      and preview/export agree at more than one resolution
 - [ ] **Pinch** — pulls detail toward center
 - [ ] **Inflate** — bulges outward
 - [ ] **Erode Brush** — soft erosion

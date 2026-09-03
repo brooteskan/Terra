@@ -621,9 +621,9 @@ pub(crate) fn gpu_plan_for_layer(
         SculptBase(_) if gpu_blend_mode(layer.common.blend).is_some() => {
             (GpuKernel::Sculpt, GpuDirtyPolicy::Local, 0)
         }
-        // Height preview for the supported stroke kinds. A Smooth, Pinch, or Coastline
-        // stroke reads a 3x3 of the layer input, so an upstream edit reaches one texel
-        // further through the stamp; a non-zero reconcile reads a 3x3 of the stamped
+        // Height preview for the supported stroke kinds. Spatial Smooth/Terrace
+        // filters expand dependencies by their convolution support; Pinch and
+        // Coastline read the layer input one texel farther. Reconcile reads a 3x3 of the stamped
         // result and adds its own texel. The two compose (the base read feeds
         // reconcile's stamped read), so the plan halo is their sum — kept in agreement
         // with the CPU `SculptStrokes` intrinsic reach. Flatten adds no per-texel
@@ -640,16 +640,42 @@ pub(crate) fn gpu_plan_for_layer(
                     .filter(|s| s.enabled)
                     .all(|stroke| stroke_kind_gpu_supported(stroke.kind)) =>
         {
+            let filter_spread = p.strokes.iter().fold(0u32, |reach, stroke| {
+                if !stroke.enabled {
+                    reach
+                } else if matches!(stroke.kind, SculptStrokeKind::Smooth) {
+                    reach.saturating_add(
+                        terra_core::gradient_smoothing::smooth_filter_support_samples(
+                            stroke.smooth_spread_samples(),
+                        ),
+                    )
+                } else if matches!(stroke.kind, SculptStrokeKind::Terrace)
+                    && stroke.riser_width_m.is_finite()
+                    && stroke.riser_width_m > 0.0
+                {
+                    reach.saturating_add(
+                        terra_core::gradient_smoothing::TERRACE_RISER_FILTER_SUPPORT_MAX_SAMPLES,
+                    )
+                } else {
+                    reach
+                }
+            });
             let reads_base_neighborhood = p.strokes.iter().any(|stroke| {
                 stroke.enabled
                     && matches!(
                         stroke.kind,
-                        SculptStrokeKind::Smooth
-                            | SculptStrokeKind::Pinch
-                            | SculptStrokeKind::Coastline
+                        SculptStrokeKind::Pinch | SculptStrokeKind::Coastline
                     )
             });
-            let halo = u32::from(reads_base_neighborhood) + u32::from(p.reconcile > 0.0);
+            let uses_reconcile = p.strokes.iter().any(|stroke| {
+                stroke.enabled
+                    && !(matches!(stroke.kind, SculptStrokeKind::Terrace)
+                        && stroke.riser_width_m.is_finite()
+                        && stroke.riser_width_m > 0.0)
+            });
+            let halo = filter_spread.saturating_mul(2).max(
+                u32::from(reads_base_neighborhood) + u32::from(p.reconcile > 0.0 && uses_reconcile),
+            );
             (GpuKernel::SculptStrokes, GpuDirtyPolicy::Local, halo)
         }
         SculptStrokes(_) => return Err(rejected_layer_reason(layer)),
@@ -1472,11 +1498,10 @@ mod tests {
 
     #[test]
     fn sculpt_strokes_supported_kinds_compile_to_a_local_stamp_plan() {
-        // Supported kinds preview on the GPU. The plan halo is the base-neighborhood
-        // read (Smooth, Pinch, and Coastline read a 3x3 of the layer input: +1) plus the
-        // reconcile 3x3 relax (non-zero reconcile: +1). Per-sample kinds have no base
-        // read, so they carry only the reconcile texel (1) or none (0); Smooth, Pinch,
-        // and Coastline carry both (2) or their lone base read (1).
+        // Supported kinds preview on the GPU. Smooth declares two full tapered
+        // filter-support widths; Pinch/Coastline read a 3x3 of the layer input and
+        // compose with the reconcile 3x3 relax. Per-sample kinds carry only the
+        // reconcile texel (1) or none (0).
         for (kind, reconcile, halo) in [
             (SculptStrokeKind::Raise, 0.15, 1),
             (SculptStrokeKind::Lower, 0.0, 0),
@@ -1490,8 +1515,8 @@ mod tests {
             (SculptStrokeKind::CraterStamp, 0.2, 1),
             (SculptStrokeKind::MountainStamp, 0.2, 1),
             (SculptStrokeKind::Uplift, 0.2, 1),
-            (SculptStrokeKind::Smooth, 0.2, 2),
-            (SculptStrokeKind::Smooth, 0.0, 1),
+            (SculptStrokeKind::Smooth, 0.2, 4),
+            (SculptStrokeKind::Smooth, 0.0, 4),
             (SculptStrokeKind::Pinch, 0.2, 2),
             (SculptStrokeKind::Pinch, 0.0, 1),
             (SculptStrokeKind::Coastline, 0.2, 2),
@@ -1510,6 +1535,17 @@ mod tests {
             assert_eq!(plan.halo_texels, halo, "{kind:?}");
             assert!(layer_gpu_supported(&layer, &[]), "{kind:?}");
         }
+
+        let mut soft_terrace = strokes_layer(SculptStrokeKind::Terrace, 0.2);
+        let LayerKind::SculptStrokes(params) = &mut soft_terrace.kind else {
+            unreachable!()
+        };
+        params.strokes[0].riser_width_m = 12.0;
+        let plan = gpu_plan_for_layer(&soft_terrace, &[]).expect("soft Terrace GPU plan");
+        assert_eq!(
+            plan.halo_texels,
+            2 * terra_core::gradient_smoothing::TERRACE_RISER_FILTER_SUPPORT_MAX_SAMPLES
+        );
     }
 
     #[test]

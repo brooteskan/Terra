@@ -267,7 +267,8 @@ impl GpuTerrainEngine {
         region: (u32, u32, u32, u32),
     ) {
         let strokes: Vec<&SculptStroke> = p.strokes.iter().filter(|s| s.enabled).collect();
-        let (headers, points) = build_stroke_buffers(&strokes, &self.metrics);
+        let (headers, points) =
+            build_stroke_buffers(&strokes, &self.metrics, self.tile_sample_window);
         let (header_buf, point_buf) =
             self.stroke_runtime_buffers(device, queue, layer, headers, points);
 
@@ -342,9 +343,10 @@ impl GpuTerrainEngine {
             Smooth(SmoothOp),
         }
 
-        // Cut the run before each Flatten and Smooth. `cur` is the field entering
+        // Cut the run before each Flatten and spatial filter. `cur` is the field entering
         // the next segment: Flatten measures it before its following stamp segment;
-        // Smooth consumes it immediately through its two-pass separable filter.
+        // Smooth and finite-width Terrace consume it immediately through the
+        // two-pass separable filter.
         let mut ops: Vec<Op> = Vec::new();
         let mut cur = RunSlot::Src;
         let mut prev = 0u32;
@@ -371,7 +373,10 @@ impl GpuTerrainEngine {
                     // The Flatten itself is applied by the next ordinary segment.
                     prev = f;
                 }
-                SculptStrokeKind::Smooth => {
+                SculptStrokeKind::Smooth | SculptStrokeKind::Terrace
+                    if !matches!(stroke.kind, SculptStrokeKind::Terrace)
+                        || (stroke.riser_width_m.is_finite() && stroke.riser_width_m > 0.0) =>
+                {
                     if f > prev {
                         let out = flip(cur);
                         ops.push(Op::Stamp(StampOp {

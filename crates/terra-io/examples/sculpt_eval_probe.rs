@@ -101,6 +101,7 @@ fn main() {
         radius_m: world_radius.max(1.0),
         strength: 0.3,
         target_height: 0.0,
+        riser_width_m: 0.0,
         falloff: 1.5,
         enabled: true,
     };

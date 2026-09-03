@@ -1237,6 +1237,7 @@ mod tests {
             radius_m,
             strength,
             target_height: 0.0,
+            riser_width_m: 0.0,
             falloff: 1.5,
             enabled: true,
         }
@@ -1419,6 +1420,7 @@ mod tests {
             strength: 10.0,
             stroke_kind: SculptStrokeKind::Raise,
             target_height: 0.0,
+            riser_width_m: 0.0,
         }]);
         let dab_fp = UvRect::from_center_radius(u, v, radius);
         assert_eq!(

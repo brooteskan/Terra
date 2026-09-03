@@ -1,4 +1,4 @@
-// Vertical half and masked blend of the tapered separable Sculpt Smooth filter.
+// Vertical half and masked blend of the tapered separable Sculpt Smooth / Terrace filter.
 //
 //     h' = mix(h, vertical(horizontal(h)), strength * brush_weight)
 //
@@ -22,7 +22,7 @@ struct StrokeHeader {
     kind: u32,
     first_point: u32,
     point_count: u32,
-    pad0: u32,
+    riser_width_m: f32,
     radius_m: f32,
     strength: f32,
     target_height: f32,
@@ -40,7 +40,10 @@ struct StrokeHeader {
 
 const SMOOTH_SPREAD_DEFAULT: u32 = 1u;
 const SMOOTH_SPREAD_MAX: u32 = 128u;
+const TERRACE_SPREAD_MAX: u32 = 64u;
 const SMOOTH_FILTER_SUPPORT_SCALE: u32 = 2u;
+const KIND_TERRACE: u32 = 4u;
+const KIND_SMOOTH: u32 = 12u;
 
 fn smooth_spread(header: StrokeHeader) -> u32 {
     let value = header.target_height;
@@ -48,6 +51,17 @@ fn smooth_spread(header: StrokeHeader) -> u32 {
         return SMOOTH_SPREAD_DEFAULT;
     }
     return u32(clamp(floor(value + 0.5), 1.0, f32(SMOOTH_SPREAD_MAX)));
+}
+
+fn is_soft_terrace(header: StrokeHeader) -> bool {
+    return header.kind == KIND_TERRACE
+        && header.riser_width_m > 0.0
+        && header.riser_width_m <= 3.402823e38;
+}
+
+fn terrace_spread(header: StrokeHeader, sample_spacing_m: f32) -> u32 {
+    let spread = ceil(header.riser_width_m / (4.0 * max(sample_spacing_m, 1.1920929e-7)));
+    return u32(clamp(spread, 1.0, f32(TERRACE_SPREAD_MAX)));
 }
 
 fn kernel_weight(offset: u32, support: u32) -> f32 {
@@ -110,12 +124,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p = vec2<i32>(i32(x), i32(y));
     let original = textureLoad(running_in, p, 0).r;
     let header = headers[u.stroke_index];
-    if (!(header.strength > 0.0) || header.strength > 3.402823e38) {
+    if (header.kind == KIND_SMOOTH
+        && (!(header.strength > 0.0) || header.strength > 3.402823e38)) {
         textureStore(smooth_out, p, vec4<f32>(original, 0.0, 0.0, 0.0));
         return;
     }
 
-    let requested = smooth_spread(header) * SMOOTH_FILTER_SUPPORT_SCALE;
+    var spread = smooth_spread(header);
+    if (is_soft_terrace(header)) {
+        spread = terrace_spread(header, u.world_z / f32(u.height));
+    }
+    let requested = spread * SMOOTH_FILTER_SUPPORT_SCALE;
     let support = min(requested, max(u.height - 1u, 1u));
     var weighted_sum = textureLoad(horizontal_blur, p, 0).r;
     var weight_sum = 1.0;
@@ -143,7 +162,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         0.0,
         1.0,
     );
-    let blend = clamp(header.strength, 0.0, 1.0) * brush_weight;
+    var blend = clamp(header.strength, 0.0, 1.0) * brush_weight;
+    if (is_soft_terrace(header)) {
+        blend = brush_weight;
+    }
     let next = original + blend * (blurred - original);
     textureStore(smooth_out, p, vec4<f32>(next, 0.0, 0.0, 0.0));
 }

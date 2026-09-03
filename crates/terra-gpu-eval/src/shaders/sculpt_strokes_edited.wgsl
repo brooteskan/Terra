@@ -1,8 +1,9 @@
 // Interactive SculptStrokes preview — edited-coverage pass (#117).
 //
 // Writes the max brush weight touching each texel across the legacy-reconciled
-// stroke set. Smooth owns a conservative gradient operator and is deliberately
-// excluded so the old mean reconcile cannot reintroduce elevation drift.
+// stroke set. Smooth and finite-width Terrace own conservative spatial filters
+// and are deliberately excluded so the old mean reconcile cannot reintroduce
+// elevation drift or blur an anti-aliased riser.
 // `edited = max(w)` is independent
 // of stroke order and of the Flatten targets, so it is computed once here rather
 // than threaded through the segmented stamp passes. The weight is the exact mirror
@@ -25,7 +26,7 @@ struct StrokeHeader {
     kind: u32,
     first_point: u32,
     point_count: u32,
-    pad0: u32,
+    riser_width_m: f32,
     radius_m: f32,
     strength: f32,
     target_height: f32,
@@ -102,7 +103,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var edited = 0.0;
     for (var si = u.stroke_lo; si < u.stroke_hi; si = si + 1u) {
         let header = headers[si];
-        if (header.kind == 12u) { continue; }
+        if (header.kind == 12u
+            || (header.kind == 4u && header.riser_width_m > 0.0
+                && header.riser_width_m <= 3.402823e38)) { continue; }
         if (wx < header.bbox_min.x || wx > header.bbox_max.x
             || wz < header.bbox_min.y || wz > header.bbox_max.y) {
             continue;

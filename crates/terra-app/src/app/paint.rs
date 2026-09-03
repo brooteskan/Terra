@@ -143,6 +143,14 @@ impl TerraApp {
                 _ => 0.0,
             };
             let stroke_kind = shape_tool.stroke_kind();
+            let riser_width_m = if matches!(
+                stroke_kind,
+                terra_core::authoring::SculptStrokeKind::Terrace
+            ) {
+                self.ui_state.terrace_riser_width_m
+            } else {
+                0.0
+            };
             let mut actions = Vec::new();
             let stamp_once = shape_tool.is_stamp() && self.last_paint_uv.is_some();
             if stamp_once {
@@ -167,6 +175,7 @@ impl TerraApp {
                                 strength,
                                 stroke_kind,
                                 target_height,
+                                riser_width_m,
                             });
                         }
                     }
@@ -180,6 +189,7 @@ impl TerraApp {
                 strength,
                 stroke_kind,
                 target_height,
+                riser_width_m,
             });
             self.apply_actions(actions);
             self.last_paint_uv = Some((u, v));
@@ -216,6 +226,7 @@ impl TerraApp {
                 strength,
                 stroke_kind,
                 target_height: 0.0,
+                riser_width_m: 0.0,
             }];
             self.apply_actions(actions);
             self.last_paint_uv = Some((u, v));
@@ -395,6 +406,7 @@ impl TerraApp {
                                     strength: sculpt_strength,
                                     stroke_kind,
                                     target_height,
+                                    riser_width_m: 0.0,
                                 });
                             }
                         }
@@ -407,6 +419,7 @@ impl TerraApp {
                         strength: sculpt_strength,
                         stroke_kind,
                         target_height,
+                        riser_width_m: 0.0,
                     });
                 }
             }

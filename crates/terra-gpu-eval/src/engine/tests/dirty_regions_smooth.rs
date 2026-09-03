@@ -52,6 +52,7 @@ fn untitled6_wide_smooth_first_publication_matches_cold_evaluation() {
                 radius_m: 0.05 * document.metrics.world_size_x,
                 strength: 1.0,
                 target_height: 8.0,
+                riser_width_m: 0.0,
                 falloff: 0.1,
                 continuing: false,
             },

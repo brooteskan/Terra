@@ -324,6 +324,7 @@ fn flatten_strokes(u: f32, v: f32) -> SculptStrokeParams {
             radius_m: 60.0,
             strength: 1.0,
             target_height: 0.0,
+            riser_width_m: 0.0,
             falloff: 1.5,
             enabled: true,
         }],

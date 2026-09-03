@@ -82,33 +82,57 @@ fn expand_sample_region(
 }
 
 fn sculpt_stamp_guard(p: &SculptStrokeParams) -> u32 {
-    let smooth_spread = p
-        .strokes
-        .iter()
-        .filter(|stroke| stroke.enabled && matches!(stroke.kind, SculptStrokeKind::Smooth))
-        .fold(0u32, |reach, stroke| {
+    let filter_spread = p.strokes.iter().fold(0u32, |reach, stroke| {
+        if !stroke.enabled {
+            reach
+        } else if matches!(stroke.kind, SculptStrokeKind::Smooth) {
             reach.saturating_add(
                 terra_core::gradient_smoothing::smooth_filter_support_samples(
                     stroke.smooth_spread_samples(),
                 ),
             )
-        });
-    smooth_spread.saturating_add(u32::from(p.reconcile > 0.0))
+        } else if matches!(stroke.kind, SculptStrokeKind::Terrace)
+            && stroke.riser_width_m.is_finite()
+            && stroke.riser_width_m > 0.0
+        {
+            reach.saturating_add(
+                terra_core::gradient_smoothing::TERRACE_RISER_FILTER_SUPPORT_MAX_SAMPLES,
+            )
+        } else {
+            reach
+        }
+    });
+    let uses_reconcile = p.strokes.iter().any(|stroke| {
+        stroke.enabled
+            && !(matches!(stroke.kind, SculptStrokeKind::Terrace)
+                && stroke.riser_width_m.is_finite()
+                && stroke.riser_width_m > 0.0)
+    });
+    filter_spread.saturating_add(u32::from(p.reconcile > 0.0 && uses_reconcile))
 }
 
 fn sculpt_source_guard(p: &SculptStrokeParams) -> u32 {
-    let smooth_spread = p
-        .strokes
-        .iter()
-        .filter(|stroke| stroke.enabled && matches!(stroke.kind, SculptStrokeKind::Smooth))
-        .fold(0u32, |reach, stroke| {
+    let filter_spread = p.strokes.iter().fold(0u32, |reach, stroke| {
+        if !stroke.enabled {
+            reach
+        } else if matches!(stroke.kind, SculptStrokeKind::Smooth) {
             reach.saturating_add(
                 terra_core::gradient_smoothing::smooth_filter_support_samples(
                     stroke.smooth_spread_samples(),
                 ),
             )
-        });
-    let smooth_reach = smooth_spread.saturating_mul(2);
+        } else if matches!(stroke.kind, SculptStrokeKind::Terrace)
+            && stroke.riser_width_m.is_finite()
+            && stroke.riser_width_m > 0.0
+        {
+            reach.saturating_add(
+                terra_core::gradient_smoothing::TERRACE_RISER_FILTER_SUPPORT_MAX_SAMPLES,
+            )
+        } else {
+            reach
+        }
+    });
+    let filter_reach = filter_spread.saturating_mul(2);
     let base_neighborhood = p.strokes.iter().any(|stroke| {
         stroke.enabled
             && matches!(
@@ -116,7 +140,15 @@ fn sculpt_source_guard(p: &SculptStrokeParams) -> u32 {
                 SculptStrokeKind::Pinch | SculptStrokeKind::Coastline
             )
     });
-    smooth_reach.max(u32::from(base_neighborhood).saturating_add(u32::from(p.reconcile > 0.0)))
+    let uses_reconcile = p.strokes.iter().any(|stroke| {
+        stroke.enabled
+            && !(matches!(stroke.kind, SculptStrokeKind::Terrace)
+                && stroke.riser_width_m.is_finite()
+                && stroke.riser_width_m > 0.0)
+    });
+    filter_reach.max(
+        u32::from(base_neighborhood).saturating_add(u32::from(p.reconcile > 0.0 && uses_reconcile)),
+    )
 }
 
 #[path = "compiled_plan.rs"]

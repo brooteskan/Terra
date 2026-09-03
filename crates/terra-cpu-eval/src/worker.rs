@@ -926,6 +926,7 @@ mod tests {
             radius_m,
             strength,
             target_height: 0.0,
+            riser_width_m: 0.0,
             falloff: 1.5,
             enabled: true,
         };

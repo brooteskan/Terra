@@ -11,7 +11,7 @@ pub(super) struct StrokeHeaderGpu {
     pub(super) kind: u32,
     pub(super) first_point: u32,
     pub(super) point_count: u32,
-    pub(super) _pad0: u32,
+    pub(super) riser_width_m: f32,
     pub(super) radius_m: f32,
     pub(super) strength: f32,
     pub(super) target_height: f32,
@@ -76,9 +76,21 @@ pub(super) fn stroke_kind_gpu_id(kind: SculptStrokeKind) -> u32 {
 pub(super) fn build_stroke_buffers(
     strokes: &[&SculptStroke],
     m: &HeightfieldMetrics,
+    sample_window: Option<TileSampleWindow>,
 ) -> (Vec<StrokeHeaderGpu>, Vec<[f32; 4]>) {
-    let sx = m.world_size_x;
-    let sz = m.world_size_z;
+    let (authored_sx, authored_sz, origin_x, origin_z) =
+        sample_window.map_or((m.world_size_x, m.world_size_z, 0.0, 0.0), |window| {
+            let dx = m.dx();
+            let dz = m.dz();
+            (
+                dx * window.level_width as f32,
+                dz * window.level_height as f32,
+                dx * window.origin_x as f32,
+                dz * window.origin_z as f32,
+            )
+        });
+    let local_sx = m.world_size_x.max(f32::EPSILON);
+    let local_sz = m.world_size_z.max(f32::EPSILON);
     let mut headers = Vec::with_capacity(strokes.len());
     let mut points: Vec<[f32; 4]> = Vec::new();
     for stroke in strokes {
@@ -86,13 +98,22 @@ pub(super) fn build_stroke_buffers(
         let (mut min_x, mut min_z) = (f32::INFINITY, f32::INFINITY);
         let (mut max_x, mut max_z) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
         for pt in &stroke.points {
-            let wx = pt.u * sx;
-            let wz = pt.v * sz;
+            let wx = pt.u * authored_sx - origin_x;
+            let wz = pt.v * authored_sz - origin_z;
             min_x = min_x.min(wx);
             max_x = max_x.max(wx);
             min_z = min_z.min(wz);
             max_z = max_z.max(wz);
-            points.push([pt.u, pt.v, pt.pressure, 0.0]);
+            // Shaders reconstruct point positions by multiplying these normalized
+            // coordinates by the local domain span. Full-field evaluation is the
+            // identity transform; tiled evaluation shifts global authored UVs into
+            // the tile's evaluation window (coordinates may lie outside 0..1).
+            let (local_u, local_v) = if sample_window.is_some() {
+                (wx / local_sx, wz / local_sz)
+            } else {
+                (pt.u, pt.v)
+            };
+            points.push([local_u, local_v, pt.pressure, 0.0]);
         }
         let r = stroke.radius_m;
         // A stroke with no points has no footprint: an inverted bbox (min > max)
@@ -106,7 +127,7 @@ pub(super) fn build_stroke_buffers(
             kind: stroke_kind_gpu_id(stroke.kind),
             first_point,
             point_count: stroke.points.len() as u32,
-            _pad0: 0,
+            riser_width_m: stroke.riser_width_m,
             radius_m: stroke.radius_m,
             strength: stroke.strength,
             target_height: stroke.target_height,
@@ -121,7 +142,7 @@ pub(super) fn build_stroke_buffers(
             kind: 11,
             first_point: 0,
             point_count: 0,
-            _pad0: 0,
+            riser_width_m: 0.0,
             radius_m: 0.0,
             strength: 0.0,
             target_height: 0.0,

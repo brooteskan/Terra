@@ -717,14 +717,25 @@ fn preflight_tile_operations(
                     owner: plan.provenance().owner_of(id),
                     detail: "authored layer is missing".into(),
                 })?;
-        if !matches!(
-            authored.kind,
+        let domain_coordinate_safe = match &authored.kind {
             LayerKind::Flat(_)
-                | LayerKind::Blur(_)
-                | LayerKind::SculptBase(_)
-                | LayerKind::NoiseValue(_)
-                | LayerKind::NoisePerlin(_)
-        ) {
+            | LayerKind::Blur(_)
+            | LayerKind::SculptBase(_)
+            | LayerKind::NoiseValue(_)
+            | LayerKind::NoisePerlin(_) => true,
+            // Terrace has a bounded spatial filter and its conservative reach is
+            // included in the compiled domain halo. Stroke points are translated
+            // into the local evaluation window during upload. Other stroke kinds
+            // retain the existing restriction: Flatten is footprint-global and
+            // Noise hashes local indices, for example.
+            LayerKind::SculptStrokes(params) => params
+                .strokes
+                .iter()
+                .filter(|stroke| stroke.enabled)
+                .all(|stroke| matches!(stroke.kind, SculptStrokeKind::Terrace)),
+            _ => false,
+        };
+        if !domain_coordinate_safe {
             return Err(GpuTileEvaluationError::UnsupportedOperation {
                 operation: id,
                 owner: plan.provenance().owner_of(id),

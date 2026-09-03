@@ -262,6 +262,7 @@ pub(crate) fn try_apply(
             strength,
             stroke_kind,
             target_height,
+            riser_width_m,
         } => {
             use terra_core::layer::{BrushDab, BrushEditable, EditSupport};
 
@@ -298,6 +299,7 @@ pub(crate) fn try_apply(
                             radius_m: world_radius,
                             strength,
                             target_height,
+                            riser_width_m,
                             falloff,
                             continuing,
                         },
@@ -410,6 +412,7 @@ mod tests {
             strength: 1.0,
             stroke_kind: SculptStrokeKind::Raise,
             target_height: 0.0,
+            riser_width_m: 0.0,
         }]);
 
         let region = app
@@ -430,7 +433,7 @@ mod tests {
     /// continuing drag (not freeze at the first dab). Regression for the "falloff /
     /// strength don't affect raise strokes" report.
     #[test]
-    fn brush_strength_and_falloff_reach_the_painted_stroke() {
+    fn brush_parameters_reach_the_painted_stroke() {
         use terra_core::layer::LayerKind;
 
         let mut app = TerraApp::default();
@@ -452,6 +455,7 @@ mod tests {
             strength: 7.0,
             stroke_kind: SculptStrokeKind::Raise,
             target_height: 0.0,
+            riser_width_m: 0.0,
         }]);
         let stroke = |app: &TerraApp| match &app.session.document.stack.find(id).unwrap().kind {
             LayerKind::SculptStrokes(p) => p.strokes.last().unwrap().clone(),
@@ -478,6 +482,7 @@ mod tests {
             strength: 30.0,
             stroke_kind: SculptStrokeKind::Raise,
             target_height: 0.0,
+            riser_width_m: 0.0,
         }]);
         let updated = stroke(&app);
         assert_eq!(updated.points.len(), 2, "same stroke, appended point");
@@ -498,10 +503,28 @@ mod tests {
             strength: 0.4,
             stroke_kind: SculptStrokeKind::Smooth,
             target_height: 8.0,
+            riser_width_m: 0.0,
         }]);
         let smoothed = stroke(&app);
         assert_eq!(smoothed.kind, SculptStrokeKind::Smooth);
         assert_eq!(smoothed.smooth_spread_samples(), 8);
+
+        // Terrace carries its world-space riser width through the same action and
+        // BrushDab path; zero remains available for explicit legacy hard edges.
+        app.last_paint_uv = None;
+        app.apply_actions(vec![PanelAction::PaintSculptStamp {
+            layer: id,
+            u: 0.5,
+            v: 0.5,
+            radius: 0.05,
+            strength: 8.0,
+            stroke_kind: SculptStrokeKind::Terrace,
+            target_height: 0.0,
+            riser_width_m: 23.0,
+        }]);
+        let terraced = stroke(&app);
+        assert_eq!(terraced.kind, SculptStrokeKind::Terrace);
+        assert_eq!(terraced.riser_width_m, 23.0);
     }
 
     /// #97 regression: a brush the legacy foundation raster can't represent
@@ -542,6 +565,7 @@ mod tests {
             strength: 30.0,
             stroke_kind: SculptStrokeKind::Terrace,
             target_height: 0.0,
+            riser_width_m: 12.0,
         }]);
 
         assert_eq!(
@@ -569,6 +593,7 @@ mod tests {
             strength: 30.0,
             stroke_kind: SculptStrokeKind::Lower,
             target_height: 0.0,
+            riser_width_m: 0.0,
         }]);
         assert!(
             samples(&app).iter().any(|&s| s < 20.0),
@@ -610,6 +635,7 @@ mod tests {
             strength: 0.0,
             stroke_kind: SculptStrokeKind::Smooth,
             target_height: 0.0,
+            riser_width_m: 0.0,
         }]);
         let LayerKind::SculptStrokes(params) = &app
             .session
@@ -635,6 +661,7 @@ mod tests {
             strength: 1.0,
             stroke_kind: SculptStrokeKind::Smooth,
             target_height: 0.0,
+            riser_width_m: 0.0,
         }]);
         assert!(app.worker_dirty_from.is_none() && app.worker_dirty_region.is_none());
         assert!(!app.worker_mark_all_dirty);
@@ -665,6 +692,7 @@ mod tests {
             strength: 0.7,
             stroke_kind: SculptStrokeKind::Hardness,
             target_height: 0.0,
+            riser_width_m: 0.0,
         }]);
 
         let params = match &app.session.document.stack.find(id).unwrap().kind {
@@ -701,6 +729,7 @@ mod tests {
             strength: 1.0,
             stroke_kind: SculptStrokeKind::Raise,
             target_height: 0.0,
+            riser_width_m: 0.0,
         }]);
 
         let params = match &app.session.document.stack.find(id).unwrap().kind {

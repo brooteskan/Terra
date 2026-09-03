@@ -153,6 +153,8 @@ pub struct UiState {
     pub sculpt_strength: f32,
     /// Smooth stencil half-width in terrain samples, independent of brush radius.
     pub smooth_spread: f32,
+    /// Full world-space width of newly authored Terrace risers, in metres.
+    pub terrace_riser_width_m: f32,
     /// Distinguishes the derived all-zero struct state from an intentional
     /// zero-strength Smooth setting after the editor initializes the brush.
     brush_defaults_initialized: bool,
@@ -708,6 +710,9 @@ impl UiState {
             if self.sculpt_strength == 0.0 {
                 self.sculpt_strength = BrushWorkspaceState::default().strength;
             }
+            if self.terrace_riser_width_m == 0.0 {
+                self.terrace_riser_width_m = BrushWorkspaceState::default().terrace_riser_width_m;
+            }
             self.brush_defaults_initialized = true;
         }
         if self.sculpt_radius <= 0.0 {
@@ -718,6 +723,9 @@ impl UiState {
         }
         if !self.smooth_spread.is_finite() || self.smooth_spread <= 0.0 {
             self.smooth_spread = terra_core::authoring::SMOOTH_SPREAD_DEFAULT as f32;
+        }
+        if !self.terrace_riser_width_m.is_finite() || self.terrace_riser_width_m < 0.0 {
+            self.terrace_riser_width_m = terra_core::authoring::TERRACE_RISER_WIDTH_DEFAULT_M;
         }
         if self.brush_falloff <= 0.0 {
             self.brush_falloff = 0.5;
@@ -773,6 +781,7 @@ impl UiState {
                 radius: self.sculpt_radius,
                 strength: self.sculpt_strength,
                 smooth_spread: self.smooth_spread,
+                terrace_riser_width_m: self.terrace_riser_width_m,
                 falloff: self.brush_falloff,
                 spacing: self.brush_spacing,
                 flow: self.brush_flow,
@@ -816,6 +825,7 @@ impl UiState {
         self.sculpt_radius = ws.brush.radius;
         self.sculpt_strength = ws.brush.strength;
         self.smooth_spread = ws.brush.smooth_spread;
+        self.terrace_riser_width_m = ws.brush.terrace_riser_width_m;
         self.brush_falloff = ws.brush.falloff;
         self.brush_spacing = ws.brush.spacing;
         self.brush_flow = ws.brush.flow;
@@ -1048,10 +1058,16 @@ mod brush_default_tests {
             state.smooth_spread,
             terra_core::authoring::SMOOTH_SPREAD_DEFAULT as f32
         );
+        assert_eq!(
+            state.terrace_riser_width_m,
+            terra_core::authoring::TERRACE_RISER_WIDTH_DEFAULT_M
+        );
 
         state.sculpt_strength = 0.0;
+        state.terrace_riser_width_m = 0.0;
         state.ensure_sculpt_defaults();
         assert_eq!(state.sculpt_strength, 0.0);
+        assert_eq!(state.terrace_riser_width_m, 0.0);
         assert_eq!(
             state.smooth_spread,
             terra_core::authoring::SMOOTH_SPREAD_DEFAULT as f32

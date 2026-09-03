@@ -679,6 +679,7 @@ fn warm_terrace_then_smooth_publishes_a_visible_change() {
                 radius_m: 41.0,
                 strength: 8.0,
                 target_height: 0.0,
+                riser_width_m: 0.0,
                 falloff: 1.5,
                 enabled: true,
             }],
@@ -718,6 +719,7 @@ fn warm_terrace_then_smooth_publishes_a_visible_change() {
                 radius_m: 41.0,
                 strength: 0.4,
                 target_height: 8.0,
+                riser_width_m: 0.0,
                 falloff: 1.5,
                 continuing: false,
             },
@@ -779,6 +781,7 @@ fn warm_overlapping_smooth_strokes_match_a_cold_full_evaluation() {
         radius_m,
         strength: 1.0,
         target_height: 8.0,
+        riser_width_m: 0.0,
         falloff: 0.1,
         enabled: true,
     };
@@ -898,6 +901,7 @@ fn warm_pinch_drag_matches_full_field_before_refinement() {
                 radius_m: 55.0,
                 strength: 0.85,
                 target_height: 0.0,
+                riser_width_m: 0.0,
                 falloff: 0.7,
                 enabled: true,
             }],
@@ -1367,6 +1371,7 @@ fn untitled6_tree_warm_brushes_stay_bounded() {
                     } else {
                         24.0
                     },
+                    riser_width_m: 0.0,
                     falloff: 0.55,
                     continuing: index != 0,
                 },

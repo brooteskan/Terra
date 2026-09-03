@@ -137,6 +137,8 @@ pub enum PanelAction {
         stroke_kind: terra_core::authoring::SculptStrokeKind,
         /// Absolute height for Flatten / HeightStamp (metres).
         target_height: f32,
+        /// Full world-space Terrace riser width (metres); zero selects hard legacy edges.
+        riser_width_m: f32,
     },
     /// Merge selected Shape history layers (SculptStrokes) into the first.
     MergeShapeLayers {

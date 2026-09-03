@@ -32,6 +32,7 @@ pub struct BrushDab {
     pub radius_m: f32,
     pub strength: f32,
     pub target_height: f32,
+    pub riser_width_m: f32,
     pub falloff: f32,
     pub continuing: bool,
 }
@@ -71,6 +72,7 @@ impl BrushEditable for SculptStrokeParams {
             last.strength = dab.strength;
             last.falloff = dab.falloff;
             last.target_height = dab.target_height;
+            last.riser_width_m = dab.riser_width_m;
         }
         true
     }
@@ -224,6 +226,7 @@ mod tests {
             radius_m: 80.0,
             strength: 12.0,
             target_height: 25.0,
+            riser_width_m: 0.0,
             falloff: 2.5,
             continuing,
         }

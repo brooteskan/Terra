@@ -9,8 +9,8 @@
 // segments. For the whole-set common case the two inputs are the same texture and
 // the range is [0, stroke_count); Flatten (#117) splits the set so its per-stroke
 // footprint-mean target (precomputed into `targets` by the reduce/resolve passes)
-// is measured against the running field before it. Smooth (#227) is segmented out
-// into its own two-pass tapered filter. Pinch is a strength-weighted,
+// is measured against the running field before it. Smooth (#227) and finite-width
+// Terrace are segmented into their own two-pass tapered filter. Pinch is a strength-weighted,
 // range-bounded mean pull; Coastline lowers the sample and blends
 // it toward that mean under a weight gate. The max brush weight per texel is
 // produced by the separate edited pass (order-independent), not here.
@@ -51,7 +51,7 @@ struct StrokeHeader {
     kind: u32,
     first_point: u32,
     point_count: u32,
-    pad0: u32,
+    riser_width_m: f32,
     radius_m: f32,
     strength: f32,
     target_height: f32,
@@ -182,6 +182,12 @@ fn round_away(x: f32) -> f32 {
     return sign(x) * floor(abs(x) + 0.5);
 }
 
+fn terrace_height(h: f32, step: f32) -> f32 {
+    // Finite-width Terrace strokes are segmented into the spatial filter pass;
+    // only legacy zero/invalid-width strokes reach this ordinary stamp shader.
+    return round_away(h / step) * step;
+}
+
 // Clamped 3x3 mean of `src` (the layer input) at (px, py) — the GPU port of the CPU
 // `neighborhood_average(base, ..)`. Same dj-outer/di-inner walk and /9 divide so the
 // summation order matches. Reads the *input*, never the running stamp, so strokes
@@ -214,7 +220,8 @@ fn apply_kind(header: StrokeHeader, h: f32, dist: f32, w: f32, px: i32, py: i32,
         }
         case 4u: {                                                  // TERRACE
             let step = max(abs(header.strength), 0.1);
-            return h + (round_away(h / step) * step - h) * w;
+            let terrace_value = terrace_height(h, step);
+            return h + (terrace_value - h) * w;
         }
         case 5u: {                                                  // NOISE
             return h + hash_noise(px, py, 91u) * s;

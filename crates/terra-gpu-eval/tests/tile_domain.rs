@@ -1,3 +1,4 @@
+use terra_core::authoring::{SculptPoint, SculptStroke, SculptStrokeKind, SculptStrokeParams};
 use terra_core::deps::NodeRef;
 use terra_core::heightfield::HeightfieldMetrics;
 use terra_core::layer::{
@@ -45,6 +46,29 @@ fn fixture(resolution: u32) -> (LayerStack, Vec<MaskAsset>) {
     );
     noise.common.blend = BlendMode::Add;
     stack.push(noise);
+    // Finite-width Terrace filters the running quantized target spatially.
+    // Keeping it in the shared fixture makes both the full-vs-tile and adjacent
+    // domain tests cover its conservative halo and seam contract.
+    stack.push(Layer::new(
+        "soft terrace",
+        LayerKind::SculptStrokes(SculptStrokeParams {
+            strokes: vec![SculptStroke {
+                kind: SculptStrokeKind::Terrace,
+                points: vec![SculptPoint {
+                    u: 0.5,
+                    v: 0.5,
+                    pressure: 1.0,
+                }],
+                radius_m: 1_000.0,
+                strength: 8.0,
+                target_height: 0.0,
+                riser_width_m: 12.0,
+                falloff: 1.5,
+                enabled: true,
+            }],
+            reconcile: 0.15,
+        }),
+    ));
     stack.push(Layer::new(
         "local blur",
         LayerKind::Blur(BlurParams {
@@ -91,7 +115,7 @@ fn compiled_tile_matches_full_gpu_and_allocates_only_the_domain() {
             revision,
             &invalidation,
             metrics,
-            PreviewQuality::Full,
+            PreviewQuality::Export,
             true,
             GpuEvaluationIntent::Complete,
         )
@@ -133,12 +157,16 @@ fn compiled_tile_matches_full_gpu_and_allocates_only_the_domain() {
             &masks,
             &plan,
             &invalidation,
-            PreviewQuality::Full,
+            PreviewQuality::Export,
             domain.clone(),
         )
         .unwrap();
     assert_eq!(producer.stats().engine_allocations, 1);
-    assert!(producer.stats().evaluated_texels < u64::from(resolution * resolution));
+    assert_eq!(
+        producer.stats().evaluated_texels,
+        u64::from(domain.evaluation.width) * u64::from(domain.evaluation.height),
+        "the producer must allocate exactly the conservative evaluation domain"
+    );
     wait_for_tile(&mut producer, gpu, &mut job);
     let local = job
         .readback_height(&gpu.device, &gpu.queue)
