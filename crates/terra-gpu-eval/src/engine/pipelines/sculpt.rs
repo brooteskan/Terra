@@ -330,39 +330,69 @@ impl GpuTerrainEngine {
             fallback: f32,
         }
         #[derive(Clone, Copy)]
+        struct SmoothOp {
+            stroke_index: u32,
+            in_slot: RunSlot,
+            out_slot: RunSlot,
+        }
+        #[derive(Clone, Copy)]
         enum Op {
             Stamp(StampOp),
             Reduce(ReduceOp),
+            Smooth(SmoothOp),
         }
 
-        // Cut the run before each Flatten. `cur` is the field entering the next
-        // segment; a Flatten's reduce measures it, and the segment that finally
-        // applies the Flatten reads `targets[f]` the resolve just wrote.
+        // Cut the run before each Flatten and Smooth. `cur` is the field entering
+        // the next segment: Flatten measures it before its following stamp segment;
+        // Smooth consumes it immediately through its two-pass separable filter.
         let mut ops: Vec<Op> = Vec::new();
         let mut cur = RunSlot::Src;
         let mut prev = 0u32;
         for (idx, stroke) in strokes.iter().enumerate() {
-            if !matches!(stroke.kind, SculptStrokeKind::Flatten) {
-                continue;
-            }
             let f = idx as u32;
-            if f > prev {
-                let out = flip(cur);
-                ops.push(Op::Stamp(StampOp {
-                    lo: prev,
-                    hi: f,
-                    in_slot: cur,
-                    out_slot: out,
-                }));
-                cur = out;
+            match stroke.kind {
+                SculptStrokeKind::Flatten => {
+                    if f > prev {
+                        let out = flip(cur);
+                        ops.push(Op::Stamp(StampOp {
+                            lo: prev,
+                            hi: f,
+                            in_slot: cur,
+                            out_slot: out,
+                        }));
+                        cur = out;
+                    }
+                    ops.push(Op::Reduce(ReduceOp {
+                        stroke_index: f,
+                        field: cur,
+                        target_index: f,
+                        fallback: stroke.target_height,
+                    }));
+                    // The Flatten itself is applied by the next ordinary segment.
+                    prev = f;
+                }
+                SculptStrokeKind::Smooth => {
+                    if f > prev {
+                        let out = flip(cur);
+                        ops.push(Op::Stamp(StampOp {
+                            lo: prev,
+                            hi: f,
+                            in_slot: cur,
+                            out_slot: out,
+                        }));
+                        cur = out;
+                    }
+                    let out = flip(cur);
+                    ops.push(Op::Smooth(SmoothOp {
+                        stroke_index: f,
+                        in_slot: cur,
+                        out_slot: out,
+                    }));
+                    cur = out;
+                    prev = f + 1;
+                }
+                _ => {}
             }
-            ops.push(Op::Reduce(ReduceOp {
-                stroke_index: f,
-                field: cur,
-                target_index: f,
-                fallback: stroke.target_height,
-            }));
-            prev = f;
         }
         if n > prev {
             let out = flip(cur);
@@ -381,6 +411,7 @@ impl GpuTerrainEngine {
         // dispatch phase needs no further planning.
         enum PassU {
             Stamp(wgpu::Buffer),
+            Smooth(wgpu::Buffer),
             Reduce {
                 reduce: wgpu::Buffer,
                 resolve: wgpu::Buffer,
@@ -425,6 +456,21 @@ impl GpuTerrainEngine {
                     let reduce = self.write_uniform(device, queue, &ru);
                     let resolve = self.write_uniform(device, queue, &sv);
                     pass_us.push(PassU::Reduce { reduce, resolve });
+                }
+                Op::Smooth(s) => {
+                    let u = SculptSmoothU {
+                        width,
+                        height,
+                        world_x,
+                        world_z,
+                        stroke_index: s.stroke_index,
+                        region_x,
+                        region_y,
+                        region_w,
+                        region_h,
+                        _pad0: 0,
+                    };
+                    pass_us.push(PassU::Smooth(self.write_uniform(device, queue, &u)));
                 }
             }
         }
@@ -605,6 +651,86 @@ impl GpuTerrainEngine {
                         pass.set_pipeline(&self.sculpt_strokes_flatten_resolve.pipeline);
                         pass.set_bind_group(0, &resolve_bg, &[]);
                         pass.dispatch_workgroups(1, 1, 1);
+                    }
+                }
+                (Op::Smooth(s), PassU::Smooth(u_buf)) => {
+                    let curvature_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("sculpt-strokes-smooth-curvature-bg"),
+                        layout: &self.sculpt_strokes_smooth_curvature.bgl,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: u_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::TextureView(slot_view(s.in_slot)),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: header_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 3,
+                                resource: point_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 4,
+                                resource: wgpu::BindingResource::TextureView(
+                                    &self.sculpt_smooth_curvature.view,
+                                ),
+                            },
+                        ],
+                    });
+                    let apply_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("sculpt-strokes-smooth-apply-bg"),
+                        layout: &self.sculpt_strokes_smooth_apply.bgl,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: u_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::TextureView(slot_view(s.in_slot)),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: wgpu::BindingResource::TextureView(
+                                    &self.sculpt_smooth_curvature.view,
+                                ),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 3,
+                                resource: header_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 4,
+                                resource: point_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 5,
+                                resource: wgpu::BindingResource::TextureView(slot_view(s.out_slot)),
+                            },
+                        ],
+                    });
+                    {
+                        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: Some("sculpt-strokes-smooth-curvature"),
+                            timestamp_writes: None,
+                        });
+                        pass.set_pipeline(&self.sculpt_strokes_smooth_curvature.pipeline);
+                        pass.set_bind_group(0, &curvature_bg, &[]);
+                        pass.dispatch_workgroups(gx, gy, 1);
+                    }
+                    {
+                        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: Some("sculpt-strokes-smooth-apply"),
+                            timestamp_writes: None,
+                        });
+                        pass.set_pipeline(&self.sculpt_strokes_smooth_apply.pipeline);
+                        pass.set_bind_group(0, &apply_bg, &[]);
+                        pass.dispatch_workgroups(gx, gy, 1);
                     }
                 }
                 _ => unreachable!("ops and pass uniforms are built in lockstep"),

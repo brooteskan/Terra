@@ -83,8 +83,8 @@ fn compatibility_bridge_seeds_the_first_dirty_layer_input() {
     assert!((actual.get(8, 8) - 12.0).abs() < 0.01);
 }
 
-/// A precise compiled-plan fallback presents the truthful prefix entering the
-/// unsupported operation, with or without a synchronous CPU checkpoint.
+/// A precise compiled-plan fallback keeps the prefix entering the unsupported
+/// operation private, but can still return that exact checkpoint to the CPU.
 #[test]
 fn cpu_resume_readback_stops_before_unsupported_suffix() {
     let Some(gpu) = terra_test_gpu::headless() else {
@@ -129,10 +129,11 @@ fn cpu_resume_readback_stops_before_unsupported_suffix() {
         .expect("speculative preview");
     assert_eq!(preview.resume_cpu_from, Some(1));
     assert!(preview.cpu.is_none());
-    let speculative = preview_engine
-        .readback_current(&gpu.device, &gpu.queue)
-        .expect("speculative preview readback for test");
-    assert!((speculative.get(8, 8) - 10.0).abs() < 0.01);
+    assert!(
+        preview.output_identity.is_none(),
+        "a hybrid prefix must never become a renderer candidate"
+    );
+    assert!(preview_engine.last_output_identity().is_none());
 
     let mut resume_engine = GpuTerrainEngine::new(&gpu.device, metrics.width);
     let result = resume_engine

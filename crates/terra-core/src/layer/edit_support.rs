@@ -5,8 +5,8 @@
 
 use super::{Layer, LayerKind, SculptParams};
 use crate::authoring::{
-    SculptPoint, SculptStrokeKind, SculptStrokeParams, TerrainConstraint, TerrainConstraintKind,
-    TerrainConstraintParams,
+    resolve_smooth_spread_samples, SculptPoint, SculptStrokeKind, SculptStrokeParams,
+    TerrainConstraint, TerrainConstraintKind, TerrainConstraintParams,
 };
 
 /// Fidelity of the code path that stores a brush edit on a layer.
@@ -43,7 +43,8 @@ pub struct BrushDab {
 /// cannot silently coerce an edit into a different primitive.
 pub trait BrushEditable {
     fn brush_support(&self, brush: SculptStrokeKind) -> EditSupport;
-    fn apply_brush(&mut self, brush: SculptStrokeKind, dab: BrushDab);
+    /// Apply a brush dab and report whether stored layer content changed.
+    fn apply_brush(&mut self, brush: SculptStrokeKind, dab: BrushDab) -> bool;
 }
 
 impl BrushEditable for SculptStrokeParams {
@@ -51,7 +52,12 @@ impl BrushEditable for SculptStrokeParams {
         EditSupport::Native
     }
 
-    fn apply_brush(&mut self, brush: SculptStrokeKind, dab: BrushDab) {
+    fn apply_brush(&mut self, brush: SculptStrokeKind, dab: BrushDab) -> bool {
+        if matches!(brush, SculptStrokeKind::Smooth)
+            && (!dab.strength.is_finite() || dab.strength <= 0.0)
+        {
+            return false;
+        }
         self.stamp_stroke(
             brush,
             dab.u,
@@ -66,6 +72,7 @@ impl BrushEditable for SculptStrokeParams {
             last.falloff = dab.falloff;
             last.target_height = dab.target_height;
         }
+        true
     }
 }
 
@@ -80,10 +87,18 @@ impl BrushEditable for SculptParams {
         }
     }
 
-    fn apply_brush(&mut self, brush: SculptStrokeKind, dab: BrushDab) {
+    fn apply_brush(&mut self, brush: SculptStrokeKind, dab: BrushDab) -> bool {
         if let Some(mode) = brush.foundation_mode() {
-            self.stamp_circle(dab.u, dab.v, dab.radius_uv, dab.strength, mode);
+            return self.stamp_circle_with_smooth_spread(
+                dab.u,
+                dab.v,
+                dab.radius_uv,
+                dab.strength,
+                mode,
+                resolve_smooth_spread_samples(dab.target_height),
+            );
         }
+        false
     }
 }
 
@@ -103,9 +118,9 @@ impl BrushEditable for TerrainConstraintParams {
         }
     }
 
-    fn apply_brush(&mut self, brush: SculptStrokeKind, dab: BrushDab) {
+    fn apply_brush(&mut self, brush: SculptStrokeKind, dab: BrushDab) -> bool {
         let Some(constraint_kind) = brush.terrain_constraint_kind() else {
-            return;
+            return false;
         };
         let radius_m = dab.radius_m.max(1.0);
         let point = SculptPoint {
@@ -133,6 +148,7 @@ impl BrushEditable for TerrainConstraintParams {
                 },
             });
         }
+        true
     }
 }
 
@@ -146,12 +162,12 @@ impl BrushEditable for LayerKind {
         }
     }
 
-    fn apply_brush(&mut self, brush: SculptStrokeKind, dab: BrushDab) {
+    fn apply_brush(&mut self, brush: SculptStrokeKind, dab: BrushDab) -> bool {
         match self {
             Self::SculptStrokes(params) => params.apply_brush(brush, dab),
             Self::SculptBase(params) => params.apply_brush(brush, dab),
             Self::TerrainConstraints(params) => params.apply_brush(brush, dab),
-            _ => {}
+            _ => false,
         }
     }
 }
@@ -161,8 +177,8 @@ impl BrushEditable for Layer {
         self.kind.brush_support(brush)
     }
 
-    fn apply_brush(&mut self, brush: SculptStrokeKind, dab: BrushDab) {
-        self.kind.apply_brush(brush, dab);
+    fn apply_brush(&mut self, brush: SculptStrokeKind, dab: BrushDab) -> bool {
+        self.kind.apply_brush(brush, dab)
     }
 }
 

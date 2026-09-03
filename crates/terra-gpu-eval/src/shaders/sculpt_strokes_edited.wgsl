@@ -1,7 +1,9 @@
 // Interactive SculptStrokes preview — edited-coverage pass (#117).
 //
-// Writes the max brush weight touching each texel across the whole stroke set, the
-// per-texel coverage the reconcile pass consumes. `edited = max(w)` is independent
+// Writes the max brush weight touching each texel across the legacy-reconciled
+// stroke set. Smooth owns a conservative gradient operator and is deliberately
+// excluded so the old mean reconcile cannot reintroduce elevation drift.
+// `edited = max(w)` is independent
 // of stroke order and of the Flatten targets, so it is computed once here rather
 // than threaded through the segmented stamp passes. The weight is the exact mirror
 // of the stamp kernel's (`smoothstep_weight(dist_to_polyline) * pressure`).
@@ -100,6 +102,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var edited = 0.0;
     for (var si = u.stroke_lo; si < u.stroke_hi; si = si + 1u) {
         let header = headers[si];
+        if (header.kind == 12u) { continue; }
         if (wx < header.bbox_min.x || wx > header.bbox_max.x
             || wz < header.bbox_min.y || wz > header.bbox_max.y) {
             continue;

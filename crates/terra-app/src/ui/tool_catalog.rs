@@ -368,7 +368,7 @@ pub fn all_tools() -> Vec<ToolDef> {
         Icon::Blend,
         WorkspaceMode::Terrain,
         EditorTool::Smooth,
-        "Smooths terrain beneath the brush — writes a Shape Layer stroke.",
+        "Rounds terrain beneath the brush; Spread controls transition width.",
         Some("S"),
     ));
     tools.push(sculpt(

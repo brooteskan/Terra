@@ -922,13 +922,27 @@ pub fn draw_inspector_gui(
                             changed |= slider_f32(ui, "Strength", &mut stroke.strength, 0.0, 100.0);
                             changed |= slider_f32(ui, "Radius", &mut stroke.radius_m, 1.0, 500.0);
                             changed |= slider_f32(ui, "Falloff", &mut stroke.falloff, 0.1, 5.0);
-                            changed |= slider_f32(
-                                ui,
-                                "Target Height",
-                                &mut stroke.target_height,
-                                -500.0,
-                                2000.0,
-                            );
+                            if matches!(stroke.kind, SculptStrokeKind::Smooth) {
+                                let mut spread = stroke.smooth_spread_samples() as f32;
+                                if slider_f32(
+                                    ui,
+                                    "Spread (samples)",
+                                    &mut spread,
+                                    1.0,
+                                    terra_core::authoring::SMOOTH_SPREAD_MAX as f32,
+                                ) {
+                                    stroke.target_height = spread.round();
+                                    changed = true;
+                                }
+                            } else {
+                                changed |= slider_f32(
+                                    ui,
+                                    "Target Height",
+                                    &mut stroke.target_height,
+                                    -500.0,
+                                    2000.0,
+                                );
+                            }
                             changed |= checkbox(ui, "Enabled", &mut stroke.enabled);
                         }
                     }
@@ -1264,12 +1278,28 @@ fn draw_tool_inspector(ui: &mut GuiContext<'_>, doc: &TerrainDocument, ui_state:
     );
     slider_f32(ui, "Radius", &mut ui_state.sculpt_radius, 0.01, 0.2);
     if matches!(ui_state.editor_tool, EditorTool::Smooth | EditorTool::Pinch) {
-        let mut s = (ui_state.sculpt_strength / 10.0).clamp(0.05, 1.0);
-        if slider_f32(ui, "Strength", &mut s, 0.05, 1.0) {
+        let minimum = if matches!(ui_state.editor_tool, EditorTool::Smooth) {
+            0.0
+        } else {
+            0.05
+        };
+        let mut s = (ui_state.sculpt_strength / 10.0).clamp(minimum, 1.0);
+        if slider_f32(ui, "Strength", &mut s, minimum, 1.0) {
             ui_state.sculpt_strength = s * 10.0;
         }
     } else {
         slider_f32(ui, "Strength (m)", &mut ui_state.sculpt_strength, 0.5, 40.0);
+    }
+    if matches!(ui_state.editor_tool, EditorTool::Smooth)
+        && slider_f32(
+            ui,
+            "Spread (samples)",
+            &mut ui_state.smooth_spread,
+            1.0,
+            terra_core::authoring::SMOOTH_SPREAD_MAX as f32,
+        )
+    {
+        ui_state.smooth_spread = ui_state.smooth_spread.round();
     }
     // Brush edge hardness → stroke falloff (0 soft/broad … 1 hard/pointed).
     slider_f32(ui, "Falloff", &mut ui_state.brush_falloff, 0.0, 1.0);

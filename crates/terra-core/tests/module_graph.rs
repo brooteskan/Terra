@@ -137,6 +137,7 @@ const MODULE_DEPENDENCIES: &[(&str, &[&str])] = &[
         &[
             "analyze",
             "field_data",
+            "gradient_smoothing",
             "heightfield",
             "hydro",
             "landscape_evolution",
@@ -226,9 +227,11 @@ const MODULE_DEPENDENCIES: &[(&str, &[&str])] = &[
         "generators",
         &[
             "analyze",
+            "authoring",
             "filter_params",
             "geology",
             "geomorph",
+            "gradient_smoothing",
             "heightfield",
             "hydro",
             "mask",
@@ -242,6 +245,7 @@ const MODULE_DEPENDENCIES: &[(&str, &[&str])] = &[
         "geomorph",
         &["heightfield", "mask", "noise", "spatial_kernels"],
     ),
+    ("gradient_smoothing", &[]),
     ("heightfield", &[]),
     (
         "hydro",
@@ -288,6 +292,7 @@ const MODULE_DEPENDENCIES: &[(&str, &[&str])] = &[
             "biome_paint",
             "field_data",
             "generators",
+            "gradient_smoothing",
             "hydro",
             "ids",
             "invalidation",

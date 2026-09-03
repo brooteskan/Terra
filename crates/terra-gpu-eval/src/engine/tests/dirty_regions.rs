@@ -32,7 +32,7 @@ fn local_edit_defers_full_field_river_suffix_until_refinement() {
 
     let mut engine = GpuTerrainEngine::new(&gpu.device, metrics.width);
     engine.mark_all_dirty(&stack);
-    engine
+    let warm = engine
         .evaluate(
             &gpu.device,
             &gpu.queue,
@@ -44,6 +44,10 @@ fn local_edit_defers_full_field_river_suffix_until_refinement() {
             None,
         )
         .expect("warm full stack");
+    let warm_identity = warm.output_identity.expect("warm output identity");
+    let warm_visible = engine
+        .readback_current(&gpu.device, &gpu.queue)
+        .expect("warm visible height");
 
     let Some(layer) = stack.find_mut(base_id) else {
         panic!("base layer disappeared");
@@ -76,6 +80,25 @@ fn local_edit_defers_full_field_river_suffix_until_refinement() {
         }
     );
     assert!(!interactive.fully_gpu);
+    assert!(
+        interactive.output_identity.is_none(),
+        "a deferred prefix must not be publishable"
+    );
+    assert_eq!(engine.last_output_identity(), Some(warm_identity));
+    let still_visible = engine
+        .readback_current(&gpu.device, &gpu.queue)
+        .expect("visible height after deferred prefix");
+    for (before, after) in warm_visible
+        .to_dense()
+        .iter()
+        .zip(still_visible.to_dense().iter())
+    {
+        assert_eq!(
+            before.to_bits(),
+            after.to_bits(),
+            "deferred prefix changed the renderer-facing texture"
+        );
+    }
     assert_eq!(interactive.resume_cpu_from, None);
     assert_eq!(engine.executed_kernels, vec![GpuKernel::Sculpt]);
     let stats = engine.last_eval_stats();
@@ -623,6 +646,229 @@ fn warm_stroke_append_uploads_only_the_runtime_tail() {
     assert!(error <= 1.0e-3, "warm stroke append drifted by {error}");
 }
 
+/// #227: reproduce the editor's warm path, not merely a cold kernel dispatch.
+/// A Terrace is already visible, then a normal-strength, wide-Spread Smooth
+/// stroke is added through the same bounded dirty rectangle used by viewport
+/// painting. The renderer-facing texture must publish a material change
+/// immediately and match the whole-field CPU result.
+#[test]
+fn warm_terrace_then_smooth_publishes_a_visible_change() {
+    let Some(gpu) = terra_test_gpu::headless() else {
+        return;
+    };
+    let res = 128u32;
+    let metrics = HeightfieldMetrics::new(res, res, 1024.0, 1024.0);
+    let mut base = SculptParams::filled(res, 0.0);
+    for y in 0..res {
+        for x in 0..res {
+            base.samples[(y * res + x) as usize] = x as f32 * 0.8 + y as f32 * 0.03;
+        }
+    }
+    let mut stack = LayerStack::new();
+    stack.push(Layer::new("ramp", LayerKind::SculptBase(base)));
+    let strokes = Layer::new(
+        "editor strokes",
+        LayerKind::SculptStrokes(SculptStrokeParams {
+            strokes: vec![terra_core::layer::SculptStroke {
+                kind: SculptStrokeKind::Terrace,
+                points: vec![terra_core::layer::SculptPoint {
+                    u: 0.5,
+                    v: 0.5,
+                    pressure: 1.0,
+                }],
+                radius_m: 41.0,
+                strength: 8.0,
+                target_height: 0.0,
+                falloff: 1.5,
+                enabled: true,
+            }],
+            reconcile: 0.15,
+        }),
+    );
+    let strokes_id = strokes.id();
+    stack.push(strokes);
+
+    let mut engine = GpuTerrainEngine::new(&gpu.device, res);
+    engine.mark_all_dirty(&stack);
+    engine
+        .evaluate(
+            &gpu.device,
+            &gpu.queue,
+            &stack,
+            &[],
+            metrics,
+            PreviewQuality::Draft,
+            false,
+            None,
+        )
+        .expect("warm terraced editor output");
+    let before = engine
+        .readback_current(&gpu.device, &gpu.queue)
+        .expect("terrace readback");
+
+    stack
+        .find_mut(strokes_id)
+        .expect("stroke layer")
+        .apply_brush(
+            SculptStrokeKind::Smooth,
+            BrushDab {
+                u: 0.5,
+                v: 0.5,
+                radius_uv: 0.04,
+                radius_m: 41.0,
+                strength: 0.4,
+                target_height: 8.0,
+                falloff: 1.5,
+                continuing: false,
+            },
+        );
+    engine.set_dirty_rect(Some((58, 58, 12, 12)));
+    engine.mark_dirty(strokes_id);
+    let result = engine
+        .evaluate_with_intent(
+            &gpu.device,
+            &gpu.queue,
+            &stack,
+            &[],
+            metrics,
+            PreviewQuality::Draft,
+            false,
+            None,
+            GpuEvaluationIntent::InteractiveLocal,
+        )
+        .expect("warm Smooth editor evaluation");
+    assert!(result.output_identity.is_some(), "Smooth was not published");
+    let after = engine
+        .readback_current(&gpu.device, &gpu.queue)
+        .expect("Smooth readback");
+    let displacement = terra_gpu::parity::max_abs_diff(&before.to_dense(), &after.to_dense());
+    assert!(
+        displacement >= 0.25,
+        "published editor Smooth moved terrain by only {displacement}m"
+    );
+
+    let oracle = cpu_oracle(&stack, metrics);
+    let error = terra_gpu::parity::max_abs_diff(&after.to_dense(), &oracle.to_dense());
+    assert!(error <= 1.0e-3, "warm Smooth differs from CPU by {error}");
+}
+
+/// A second bounded Smooth edit replays earlier Smooth strokes inside a private
+/// work rectangle. Each authored stroke has a long-range separable source read,
+/// so that rectangle must cover the full filter support; otherwise the
+/// clipped replay is published as a visible rectangle around the changed stroke.
+#[test]
+fn warm_overlapping_smooth_strokes_match_a_cold_full_evaluation() {
+    let Some(gpu) = terra_test_gpu::headless() else {
+        return;
+    };
+    let res = 512u32;
+    let metrics = HeightfieldMetrics::new(res, res, 512.0, 512.0);
+    let mut base = SculptParams::filled(res, 0.0);
+    for y in 0..res {
+        for x in 0..res {
+            base.samples[(y * res + x) as usize] = ((x / 8) + (y / 16)) as f32 * 6.0;
+        }
+    }
+    let smooth = |u: f32, v: f32, radius_m: f32| terra_core::layer::SculptStroke {
+        kind: SculptStrokeKind::Smooth,
+        points: vec![terra_core::layer::SculptPoint {
+            u,
+            v,
+            pressure: 1.0,
+        }],
+        radius_m,
+        strength: 1.0,
+        target_height: 8.0,
+        falloff: 0.1,
+        enabled: true,
+    };
+
+    let mut stack = LayerStack::new();
+    stack.push(Layer::new("terraced base", LayerKind::SculptBase(base)));
+    let strokes = Layer::new(
+        "overlapping smooth",
+        LayerKind::SculptStrokes(SculptStrokeParams {
+            strokes: vec![smooth(0.5, 0.5, 200.0)],
+            reconcile: 0.15,
+        }),
+    );
+    let strokes_id = strokes.id();
+    stack.push(strokes);
+
+    let mut engine = GpuTerrainEngine::new(&gpu.device, res);
+    engine.mark_all_dirty(&stack);
+    engine
+        .evaluate(
+            &gpu.device,
+            &gpu.queue,
+            &stack,
+            &[],
+            metrics,
+            PreviewQuality::Draft,
+            false,
+            None,
+        )
+        .expect("prime first Smooth stroke");
+
+    let LayerKind::SculptStrokes(params) =
+        &mut stack.find_mut(strokes_id).expect("Smooth layer").kind
+    else {
+        panic!("Smooth layer changed kind");
+    };
+    params.strokes.push(smooth(0.53, 0.52, 32.0));
+    // The second 32 m stroke is centred at (0.53, 0.52) in a 512 m / 512
+    // sample field, so its authored support spans approximately [239, 303]².
+    // Match the editor's footprint invalidation rather than relying on the old
+    // retired relaxation-chain reach to rescue an unrelated rectangle.
+    engine.set_dirty_rect(Some((238, 234, 68, 68)));
+    engine.mark_dirty(strokes_id);
+    let incremental = engine
+        .evaluate(
+            &gpu.device,
+            &gpu.queue,
+            &stack,
+            &[],
+            metrics,
+            PreviewQuality::Draft,
+            true,
+            None,
+        )
+        .expect("bounded second Smooth stroke")
+        .cpu
+        .expect("incremental Smooth readback");
+
+    let mut oracle_engine = GpuTerrainEngine::new(&gpu.device, res);
+    let oracle = oracle_engine
+        .evaluate(
+            &gpu.device,
+            &gpu.queue,
+            &stack,
+            &[],
+            metrics,
+            PreviewQuality::Draft,
+            true,
+            None,
+        )
+        .expect("cold full Smooth oracle")
+        .cpu
+        .expect("full Smooth readback");
+    let incremental_dense = incremental.to_dense();
+    let oracle_dense = oracle.to_dense();
+    let (max_index, error) = incremental_dense
+        .iter()
+        .zip(&oracle_dense)
+        .enumerate()
+        .map(|(index, (got, want))| (index, (got - want).abs()))
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .expect("non-empty heightfield");
+    assert!(
+        error <= 1.0e-3,
+        "bounded Smooth replay left a rectangular seam at ({}, {}) (max error {error})",
+        max_index % res as usize,
+        max_index / res as usize,
+    );
+}
+
 /// A warm Pinch drag reads the immutable layer input one sample beyond its stamp
 /// rectangle, then reconcile reads the stamped field one sample farther. Those
 /// guard samples must be refreshed without publishing them; otherwise every
@@ -1054,7 +1300,7 @@ fn dirty_rect_masked_generator_bakes_full_field() {
     );
 }
 
-/// #148: warm Raise and Pinch gestures on both authored sculpt payloads
+/// #148/#227: warm Raise, Pinch, and gradient Smooth gestures on both authored sculpt payloads
 /// remain on the bounded compiled tree plan.
 #[test]
 fn untitled6_tree_warm_brushes_stay_bounded() {
@@ -1065,8 +1311,10 @@ fn untitled6_tree_warm_brushes_stay_bounded() {
     for (target_strokes, brush) in [
         (false, SculptStrokeKind::Raise),
         (false, SculptStrokeKind::Pinch),
+        (false, SculptStrokeKind::Smooth),
         (true, SculptStrokeKind::Raise),
         (true, SculptStrokeKind::Pinch),
+        (true, SculptStrokeKind::Smooth),
     ] {
         let (mut document, ids) = untitled6_document(res, Untitled6Variant::ProductionTopology);
         document.metrics.tile_size = 16;
@@ -1112,7 +1360,13 @@ fn untitled6_tree_warm_brushes_stay_bounded() {
                     radius_uv: 0.035,
                     radius_m: 90.0,
                     strength: 4.0,
-                    target_height: 24.0,
+                    // Smooth uses this kind-specific payload as its sample
+                    // spread; the other brushes keep their historical target.
+                    target_height: if matches!(brush, SculptStrokeKind::Smooth) {
+                        terra_core::authoring::SMOOTH_SPREAD_DEFAULT as f32
+                    } else {
+                        24.0
+                    },
                     falloff: 0.55,
                     continuing: index != 0,
                 },

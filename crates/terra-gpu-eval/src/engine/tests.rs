@@ -113,6 +113,8 @@ mod cache_reuse;
 mod compilation_fallback;
 #[path = "tests/dirty_regions.rs"]
 mod dirty_regions;
+#[path = "tests/dirty_regions_smooth.rs"]
+mod dirty_regions_smooth;
 #[path = "tests/execution_resources.rs"]
 mod execution_resources;
 #[path = "tests/masks_composition.rs"]

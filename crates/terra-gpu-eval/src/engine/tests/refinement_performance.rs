@@ -91,7 +91,7 @@ fn resumable_refinement_is_depth_one_transactional_and_matches_complete_eval() {
     );
 
     let result = resumable
-        .publish_compiled_refinement(job)
+        .publish_compiled_refinement(&gpu.device, &gpu.queue, job)
         .expect("publish fenced candidate");
     assert!(result.fully_gpu);
     assert_eq!(result.freshness, GpuPreviewFreshness::Current);
@@ -103,7 +103,7 @@ fn resumable_refinement_is_depth_one_transactional_and_matches_complete_eval() {
     );
     assert_eq!(
         identity.last_write.completion,
-        terra_gpu::output_identity::GpuSubmissionCompletion::KnownComplete
+        terra_gpu::output_identity::GpuSubmissionCompletion::Submitted
     );
     assert!(identity.last_write.serial.0 > 0);
     assert!(resumable.plan_resources.current().is_some());

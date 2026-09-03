@@ -1,5 +1,6 @@
 //! Persisted parameters for foundation generators.
 
+use crate::gradient_smoothing::apply_tapered_smooth;
 use crate::raster::GridDimensions;
 use crate::raster::{resample_f32_grid, RasterResizeError, RasterResizeLimits, RasterSemantic};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -76,12 +77,43 @@ impl SculptParams {
     }
 
     /// Soft circular stamp. `mode`: 0 = raise, 1 = lower, 2 = smooth, 3 = flatten.
-    pub fn stamp_circle(&mut self, u: f32, v: f32, radius_uv: f32, strength: f32, mode: u8) {
+    pub fn stamp_circle(
+        &mut self,
+        u: f32,
+        v: f32,
+        radius_uv: f32,
+        strength: f32,
+        mode: u8,
+    ) -> bool {
+        self.stamp_circle_with_smooth_spread(
+            u,
+            v,
+            radius_uv,
+            strength,
+            mode,
+            crate::authoring::SMOOTH_SPREAD_DEFAULT,
+        )
+    }
+
+    /// Soft circular stamp with an explicit Smooth stencil spread in samples.
+    ///
+    /// Non-Smooth modes ignore `smooth_spread_samples`. Keeping the legacy
+    /// [`Self::stamp_circle`] entry point preserves callers and persisted
+    /// behavior while editor dabs can carry the user-selected Smooth spread.
+    pub fn stamp_circle_with_smooth_spread(
+        &mut self,
+        u: f32,
+        v: f32,
+        radius_uv: f32,
+        strength: f32,
+        mode: u8,
+        smooth_spread_samples: u32,
+    ) -> bool {
         self.ensure_buffer();
         let width = self.width;
         let height = self.height;
         if width == 0 || height == 0 {
-            return;
+            return false;
         }
         let radius = radius_uv.max(1e-6);
         let min_i = ((u - radius) * width as f32).floor().max(0.0) as u32;
@@ -92,8 +124,11 @@ impl SculptParams {
             .min(height as f32 - 1.0) as u32;
 
         if mode == 2 {
-            // Smooth: blend toward local neighborhood average.
-            let mut updates: Vec<(usize, f32)> = Vec::new();
+            if !strength.is_finite() || strength <= 0.0 {
+                return false;
+            }
+            // Use the same tapered target as semantic Shape Layer strokes.
+            let mut weights = vec![0.0f32; self.samples.len()];
             for j in min_j..=max_j {
                 for i in min_i..=max_i {
                     let x = (i as f32 + 0.5) / width as f32;
@@ -102,34 +137,21 @@ impl SculptParams {
                     if d > 1.0 {
                         continue;
                     }
-                    let falloff = (1.0 - d * d) * strength.clamp(0.0, 1.0);
                     let idx = (j * width + i) as usize;
-                    let mut sum = 0.0;
-                    let mut count = 0.0;
-                    for dj in -1i32..=1 {
-                        for di in -1i32..=1 {
-                            let ii = i as i32 + di;
-                            let jj = j as i32 + dj;
-                            if ii < 0 || jj < 0 || ii >= width as i32 || jj >= height as i32 {
-                                continue;
-                            }
-                            sum += self.samples[(jj as u32 * width + ii as u32) as usize];
-                            count += 1.0;
-                        }
-                    }
-                    let avg = if count > 0.0 {
-                        sum / count
-                    } else {
-                        self.samples[idx]
-                    };
-                    let cur = self.samples[idx];
-                    updates.push((idx, cur + (avg - cur) * falloff));
+                    weights[idx] = (1.0 - d * d).max(0.0);
                 }
             }
-            for (idx, val) in updates {
-                self.samples[idx] = val;
-            }
-            return;
+            return apply_tapered_smooth(
+                &mut self.samples,
+                width,
+                height,
+                1.0 / width.max(1) as f32,
+                1.0 / height.max(1) as f32,
+                &weights,
+                (min_i, max_i, min_j, max_j),
+                strength,
+                smooth_spread_samples.clamp(1, crate::authoring::SMOOTH_SPREAD_MAX),
+            );
         }
 
         if mode == 3 {
@@ -152,9 +174,10 @@ impl SculptParams {
                 }
             }
             if count <= 0.0 {
-                return;
+                return false;
             }
             let mean = (sum / count) as f32;
+            let mut changed = false;
             for j in min_j..=max_j {
                 for i in min_i..=max_i {
                     let x = (i as f32 + 0.5) / width as f32;
@@ -166,15 +189,18 @@ impl SculptParams {
                     let falloff = (1.0 - d * d) * strength.clamp(0.0, 1.0);
                     let idx = (j * width + i) as usize;
                     let cur = self.samples[idx];
-                    self.samples[idx] = cur + (mean - cur) * falloff;
+                    let next = cur + (mean - cur) * falloff;
+                    changed |= next.to_bits() != cur.to_bits();
+                    self.samples[idx] = next;
                 }
             }
-            return;
+            return changed;
         }
 
         let delta_sign = if mode == 1 { -1.0 } else { 1.0 };
         // strength is meters of peak displacement per stamp
         let peak = strength.max(0.0) * delta_sign;
+        let mut changed = false;
         for j in min_j..=max_j {
             for i in min_i..=max_i {
                 let x = (i as f32 + 0.5) / width as f32;
@@ -183,10 +209,13 @@ impl SculptParams {
                 if d <= 1.0 {
                     let amount = (1.0 - d * d) * peak;
                     let sample = &mut self.samples[(j * width + i) as usize];
-                    *sample += amount;
+                    let next = *sample + amount;
+                    changed |= next.to_bits() != sample.to_bits();
+                    *sample = next;
                 }
             }
         }
+        changed
     }
 
     pub fn sample_bilinear(&self, u: f32, v: f32) -> f32 {
@@ -330,6 +359,34 @@ mod tests {
         assert!(
             center1 < center0,
             "brush centre was not flattened down: {center0} -> {center1}"
+        );
+    }
+
+    #[test]
+    fn smooth_spread_broadens_foundation_edge_transition() {
+        let mut source = SculptParams::filled(129, 0.0);
+        for y in 0..source.height {
+            for x in source.width / 2..source.width {
+                source.samples[(y * source.width + x) as usize] = 10.0;
+            }
+        }
+        let mut narrow = source.clone();
+        let mut wide = source.clone();
+        assert!(narrow.stamp_circle_with_smooth_spread(0.5, 0.5, 0.45, 1.0, 2, 1));
+        assert!(wide.stamp_circle_with_smooth_spread(0.5, 0.5, 0.45, 1.0, 2, 8));
+
+        let row = source.height / 2;
+        let transition_width = |params: &SculptParams| {
+            (0..params.width)
+                .filter(|&x| {
+                    let value = params.samples[(row * params.width + x) as usize];
+                    value > 1.0e-3 && value < 10.0 - 1.0e-3
+                })
+                .count()
+        };
+        assert!(
+            transition_width(&wide) >= transition_width(&narrow).saturating_mul(3),
+            "foundation Smooth spread did not materially broaden the edge"
         );
     }
 }

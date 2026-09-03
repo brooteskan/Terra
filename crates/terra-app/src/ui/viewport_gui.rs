@@ -1485,6 +1485,11 @@ fn draw_brush_bar(ui: &mut GuiContext<'_>, state: &mut UiState, vp: Rect) {
         );
     }
     if x + 100.0 <= stop {
+        let strength_min = if matches!(state.editor_tool, EditorTool::Smooth) {
+            0.0
+        } else {
+            0.1
+        };
         x = compact_slider(
             ui,
             Id::new("brush_strength"),
@@ -1492,9 +1497,22 @@ fn draw_brush_bar(ui: &mut GuiContext<'_>, state: &mut UiState, vp: Rect) {
             bar,
             "Strength",
             &mut state.sculpt_strength,
-            0.1,
+            strength_min,
             40.0,
         );
+    }
+    if matches!(state.editor_tool, EditorTool::Smooth) && x + 100.0 <= stop {
+        x = compact_slider(
+            ui,
+            Id::new("brush_smooth_spread"),
+            x,
+            bar,
+            "Spread",
+            &mut state.smooth_spread,
+            1.0,
+            terra_core::authoring::SMOOTH_SPREAD_MAX as f32,
+        );
+        state.smooth_spread = state.smooth_spread.round();
     }
     if x + 100.0 <= stop {
         x = compact_slider(

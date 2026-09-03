@@ -22,6 +22,7 @@ pub mod filter_params;
 pub mod generators;
 pub mod geology;
 pub mod geomorph;
+pub mod gradient_smoothing;
 pub mod heightfield;
 pub mod hydro;
 pub mod ids;

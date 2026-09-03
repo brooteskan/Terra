@@ -431,6 +431,10 @@ impl Default for TerraApp {
         ui_state.auto_switch_workspace_on_create = prefs.auto_switch_workspace_on_create;
         ui_state.layout = prefs.layout;
         ui_state.apply_preferred_workspace_from_prefs();
+        // Seed the live brush before the first frame or input event. Smooth may
+        // intentionally be set to zero later, so initialization cannot be
+        // inferred from its numeric value during painting.
+        ui_state.ensure_sculpt_defaults();
         let session = EditorSession::new();
         let metrics = session.document.metrics;
         let terrain_runtime = terra_core::TerrainRuntime::new(terra_core::PyramidConfig::new(

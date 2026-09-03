@@ -472,9 +472,8 @@ impl LayerKind {
     ///
     /// Resolves the coarse [`Self::spatial_dependency`] bucket into an actual
     /// halo where one is honestly known: `Blur` and the bounded `EffectFilter`
-    /// kernels carry `radius * iterations`; `SculptStrokes` reaches one sample past
-    /// its footprint for the reconcile 3x3, and a second sample when a
-    /// base-neighborhood stroke (Smooth / Pinch / Coastline) feeds that reconcile.
+    /// kernels carry `radius * iterations`; `SculptStrokes` accounts for every
+    /// ordered Smooth stencil plus the legacy one-hop reads.
     /// Every other non-`Local` kind returns [`Reach::Full`] here — the localizable
     /// cases are exactly the explicit arms, so nothing globally-coupled leaks
     /// through as a finite halo.
@@ -490,27 +489,35 @@ impl LayerKind {
             LayerKind::Blur(p) => Reach::Localized {
                 halo_samples: p.radius.saturating_mul(p.iterations.max(1)),
             },
-            LayerKind::SculptStrokes(p) => Reach::Localized {
-                // Floor of 1 for the reconcile 3x3 (also covers a base-neighborhood
-                // stroke's own stamp read). Reach is 2 only when such a stroke feeds a
-                // non-zero reconcile: the base 3x3 shifts the stamped field one texel,
-                // then reconcile re-reads that at 3x3. Keeps the CPU oracle in
-                // agreement with the GPU plan halo for Smooth (#114). Flatten stays
-                // tile-scoped too — its footprint fixpoint (#110) keeps a self-edit
-                // recompute bit-exact without escalating the layer's reach.
-                halo_samples: 1 + u32::from(
-                    p.reconcile > 0.0
-                        && p.strokes.iter().any(|s| {
-                            s.enabled
-                                && matches!(
-                                    s.kind,
-                                    crate::authoring::SculptStrokeKind::Smooth
-                                        | crate::authoring::SculptStrokeKind::Pinch
-                                        | crate::authoring::SculptStrokeKind::Coastline
-                                )
-                        }),
-                ),
-            },
+            LayerKind::SculptStrokes(p) => {
+                use crate::authoring::SculptStrokeKind;
+                let smooth_spread = p
+                    .strokes
+                    .iter()
+                    .filter(|s| s.enabled && matches!(s.kind, SculptStrokeKind::Smooth))
+                    .fold(0u32, |reach, stroke| {
+                        reach.saturating_add(
+                            crate::gradient_smoothing::smooth_filter_support_samples(
+                                stroke.smooth_spread_samples(),
+                            ),
+                        )
+                    });
+                let smooth_reach = smooth_spread.saturating_mul(2);
+                let base_neighborhood = p.strokes.iter().any(|s| {
+                    s.enabled
+                        && matches!(
+                            s.kind,
+                            SculptStrokeKind::Pinch | SculptStrokeKind::Coastline
+                        )
+                });
+                let legacy_reach =
+                    u32::from(base_neighborhood).saturating_add(u32::from(p.reconcile > 0.0));
+                Reach::Localized {
+                    // Keep the historical one-sample floor for empty/default
+                    // layers; it also covers their optional reconcile pass.
+                    halo_samples: 1.max(smooth_reach).max(legacy_reach),
+                }
+            }
             other => match other.spatial_dependency() {
                 DirtyClass::Local => Reach::LOCAL,
                 DirtyClass::Expanding | DirtyClass::BasinDependent => Reach::Full,
@@ -881,10 +888,9 @@ mod tests {
             LayerKind::SculptStrokes(Default::default()).intrinsic_reach(),
             Reach::Localized { halo_samples: 1 }
         );
-        // Grows to two when a base-neighborhood stroke (Smooth, Pinch, or Coastline)
-        // feeds a non-zero reconcile: the base 3x3 shifts the stamped field, then
-        // reconcile re-reads it. Without reconcile such a stroke stays at the one-sample
-        // floor (its own base read).
+        // Smooth keeps two full filter-support widths of conservative source/output
+        // guard and bypasses reconcile. Pinch and Coastline are
+        // one-hop base reads that grow to two when reconcile consumes their result.
         use crate::authoring::{SculptStroke, SculptStrokeKind, SculptStrokeParams};
         let base_neighborhood_strokes = |kind, reconcile| {
             LayerKind::SculptStrokes(SculptStrokeParams {
@@ -895,11 +901,7 @@ mod tests {
                 reconcile,
             })
         };
-        for kind in [
-            SculptStrokeKind::Smooth,
-            SculptStrokeKind::Pinch,
-            SculptStrokeKind::Coastline,
-        ] {
+        for kind in [SculptStrokeKind::Pinch, SculptStrokeKind::Coastline] {
             assert_eq!(
                 base_neighborhood_strokes(kind, 0.15).intrinsic_reach(),
                 Reach::Localized { halo_samples: 2 },
@@ -911,6 +913,51 @@ mod tests {
                 "{kind:?}"
             );
         }
+        for reconcile in [0.0, 0.15] {
+            assert_eq!(
+                base_neighborhood_strokes(SculptStrokeKind::Smooth, reconcile).intrinsic_reach(),
+                Reach::Localized {
+                    halo_samples: 2 * crate::gradient_smoothing::smooth_filter_support_samples(
+                        crate::authoring::SMOOTH_SPREAD_DEFAULT,
+                    )
+                }
+            );
+        }
+        assert_eq!(
+            LayerKind::SculptStrokes(SculptStrokeParams {
+                strokes: vec![SculptStroke {
+                    kind: SculptStrokeKind::Smooth,
+                    target_height: 8.0,
+                    ..SculptStroke::default()
+                }],
+                reconcile: 0.0,
+            })
+            .intrinsic_reach(),
+            Reach::Localized {
+                halo_samples: 2 * crate::gradient_smoothing::smooth_filter_support_samples(8)
+            }
+        );
+        assert_eq!(
+            LayerKind::SculptStrokes(SculptStrokeParams {
+                strokes: vec![
+                    SculptStroke {
+                        kind: SculptStrokeKind::Smooth,
+                        ..SculptStroke::default()
+                    },
+                    SculptStroke {
+                        kind: SculptStrokeKind::Smooth,
+                        ..SculptStroke::default()
+                    },
+                ],
+                reconcile: 0.0,
+            })
+            .intrinsic_reach(),
+            Reach::Localized {
+                halo_samples: 4 * crate::gradient_smoothing::smooth_filter_support_samples(
+                    crate::authoring::SMOOTH_SPREAD_DEFAULT,
+                )
+            }
+        );
         // Flatten stays tile-scoped (its #110 footprint fixpoint keeps a self-edit
         // recompute bit-exact), so it does not escalate the layer's reach: a lone
         // Flatten sits at the one-sample reconcile floor like any per-sample stroke.

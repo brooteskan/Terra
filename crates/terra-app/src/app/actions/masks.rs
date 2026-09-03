@@ -289,7 +289,7 @@ pub(crate) fn try_apply(
                 } else {
                     let is_shape_history =
                         terra_core::shape_history::is_shape_history_layer(&target.kind);
-                    target.apply_brush(
+                    let changed = target.apply_brush(
                         stroke_kind,
                         BrushDab {
                             u,
@@ -302,10 +302,12 @@ pub(crate) fn try_apply(
                             continuing,
                         },
                     );
-                    ctx.dirty_from = Some(layer);
-                    app.session.document.selected = Some(layer);
-                    if is_shape_history {
-                        app.ui_state.shape_session_layer = Some(layer);
+                    if changed {
+                        ctx.dirty_from = Some(layer);
+                        app.session.document.selected = Some(layer);
+                        if is_shape_history {
+                            app.ui_state.shape_session_layer = Some(layer);
+                        }
                     }
                 }
             }
@@ -484,6 +486,22 @@ mod tests {
             (updated.falloff - hard_falloff).abs() < 1e-6,
             "falloff stays live"
         );
+
+        // Smooth reuses the kind-specific payload for its sample spread. Ensure
+        // the editor action does not lose it before the CPU/GPU evaluator sees it.
+        app.last_paint_uv = None;
+        app.apply_actions(vec![PanelAction::PaintSculptStamp {
+            layer: id,
+            u: 0.5,
+            v: 0.5,
+            radius: 0.05,
+            strength: 0.4,
+            stroke_kind: SculptStrokeKind::Smooth,
+            target_height: 8.0,
+        }]);
+        let smoothed = stroke(&app);
+        assert_eq!(smoothed.kind, SculptStrokeKind::Smooth);
+        assert_eq!(smoothed.smooth_spread_samples(), 8);
     }
 
     /// #97 regression: a brush the legacy foundation raster can't represent
@@ -557,6 +575,69 @@ mod tests {
             "Lower is supported on the foundation and must lower heights"
         );
         assert_eq!(app.session.document.selected, Some(id));
+    }
+
+    #[test]
+    fn smooth_noops_do_not_dirty_the_document_or_worker() {
+        use terra_core::layer::{Layer, LayerKind, SculptParams};
+
+        let mut app = TerraApp::default();
+        let shape = create_shape_layer("Shape");
+        let shape_id = shape.id();
+        let foundation = Layer::new(
+            "Foundation",
+            LayerKind::SculptBase(SculptParams::filled(32, 20.0)),
+        );
+        let foundation_id = foundation.id();
+        app.session.document.stack = LayerStack::new();
+        app.session.document.stack.push(foundation);
+        app.session.document.stack.push(shape);
+
+        let reset_dirty = |app: &mut TerraApp| {
+            app.worker_mark_all_dirty = false;
+            app.worker_dirty_from = None;
+            app.worker_dirty_region = None;
+            app.last_paint_uv = None;
+        };
+
+        // Semantic Smooth at zero strength must not even append an authored stroke.
+        reset_dirty(&mut app);
+        app.apply_actions(vec![PanelAction::PaintSculptStamp {
+            layer: shape_id,
+            u: 0.5,
+            v: 0.5,
+            radius: 0.1,
+            strength: 0.0,
+            stroke_kind: SculptStrokeKind::Smooth,
+            target_height: 0.0,
+        }]);
+        let LayerKind::SculptStrokes(params) = &app
+            .session
+            .document
+            .stack
+            .find(shape_id)
+            .expect("shape")
+            .kind
+        else {
+            panic!("shape changed kind");
+        };
+        assert!(params.strokes.is_empty());
+        assert!(app.worker_dirty_from.is_none() && app.worker_dirty_region.is_none());
+
+        // A positive Smooth dab on a perfectly flat foundation is also an exact
+        // no-op and must not schedule evaluation.
+        reset_dirty(&mut app);
+        app.apply_actions(vec![PanelAction::PaintSculptStamp {
+            layer: foundation_id,
+            u: 0.5,
+            v: 0.5,
+            radius: 0.2,
+            strength: 1.0,
+            stroke_kind: SculptStrokeKind::Smooth,
+            target_height: 0.0,
+        }]);
+        assert!(app.worker_dirty_from.is_none() && app.worker_dirty_region.is_none());
+        assert!(!app.worker_mark_all_dirty);
     }
 
     #[test]

@@ -308,6 +308,8 @@ impl GpuTerrainEngine {
 
     pub fn publish_compiled_refinement(
         &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
         mut job: GpuRefinementJob,
     ) -> Result<GpuEvalResult, GpuError> {
         if !job.final_copy_complete {
@@ -322,6 +324,24 @@ impl GpuTerrainEngine {
             .binding(final_field)
             .expect("refinement final field has a physical binding");
         let source_resource_incarnation = candidate.incarnation();
+        // The completed candidate was fenced into private ping scratch. Only the
+        // freshness-checked publication call is allowed to mutate the renderer's
+        // stable output allocation.
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("gpu-refinement-publish"),
+        });
+        record_copy_views_region(
+            device,
+            &mut encoder,
+            &self.copy,
+            &self.ping.view,
+            &self.published_height.view,
+            job.metrics.width,
+            job.metrics.height,
+            (0, 0, job.metrics.width, job.metrics.height),
+        );
+        queue.submit(Some(encoder.finish()));
+        let publication_serial = self.allocate_submission_serial();
         self.plan_resources.commit_candidate(candidate);
         self.last_graph = job.graph;
         self.active_plan_revision = Some(job.expected_revision);
@@ -361,8 +381,8 @@ impl GpuTerrainEngine {
             completeness: terra_gpu::output_identity::GpuOutputCompleteness::Complete,
             invalidation: terra_gpu::output_identity::GpuInvalidationKind::Cold,
             last_write: terra_gpu::output_identity::GpuLastWriteIdentity {
-                serial: job.final_submission_serial,
-                completion: terra_gpu::output_identity::GpuSubmissionCompletion::KnownComplete,
+                serial: publication_serial,
+                completion: terra_gpu::output_identity::GpuSubmissionCompletion::Submitted,
             },
         };
         self.last_output_identity = Some(output_identity);

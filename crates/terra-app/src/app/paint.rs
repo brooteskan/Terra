@@ -106,8 +106,10 @@ impl TerraApp {
             self.ui_state.ensure_sculpt_defaults();
             self.sculpt_stroke_active = true;
             let strength = match shape_tool {
-                terra_core::shape_history::ShapeTool::Smooth
-                | terra_core::shape_history::ShapeTool::Pinch => {
+                terra_core::shape_history::ShapeTool::Smooth => {
+                    (self.ui_state.sculpt_strength / 10.0).clamp(0.0, 1.0)
+                }
+                terra_core::shape_history::ShapeTool::Pinch => {
                     (self.ui_state.sculpt_strength / 10.0).clamp(0.05, 1.0)
                 }
                 terra_core::shape_history::ShapeTool::MountainStamp
@@ -118,6 +120,11 @@ impl TerraApp {
             };
             let radius = self.ui_state.sculpt_radius;
             let target_height = match shape_tool {
+                terra_core::shape_history::ShapeTool::Smooth => {
+                    terra_core::authoring::resolve_smooth_spread_samples(
+                        self.ui_state.smooth_spread,
+                    ) as f32
+                }
                 // HeightStamp / PlateauStamp stamp toward the height under the
                 // cursor. Flatten needs no target here — the sculpt kernel derives
                 // it from the mean of the terrain within the brush footprint.
@@ -358,7 +365,7 @@ impl TerraApp {
                 if let Some(layer_id) = sculpt_layer_id {
                     self.ui_state.ensure_sculpt_defaults();
                     let sculpt_strength = if matches!(stroke_kind, SculptStrokeKind::Smooth) {
-                        (self.ui_state.sculpt_strength / 10.0).clamp(0.05, 1.0)
+                        (self.ui_state.sculpt_strength / 10.0).clamp(0.0, 1.0)
                     } else {
                         self.ui_state.sculpt_strength
                     };

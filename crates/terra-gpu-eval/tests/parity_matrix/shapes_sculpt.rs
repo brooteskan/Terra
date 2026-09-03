@@ -84,7 +84,7 @@ fn pt(u: f32, v: f32, pressure: f32) -> SculptPoint {
 }
 
 /// Stroke set exercising every GPU-supported kind (per-sample maps + distance
-/// stamps + an alias + an aux-only kind + the base-neighborhood Smooth, Pinch, and
+/// stamps + an alias + an aux-only kind + gradient Smooth, Pinch, and
 /// Coastline + the footprint-mean Flatten), with multi-point polylines, varied
 /// pressure, and a single-point stroke.
 fn supported_stroke_set(reconcile: f32) -> SculptStrokeParams {
@@ -184,17 +184,16 @@ fn supported_stroke_set(reconcile: f32) -> SculptStrokeParams {
                 3.0,
                 0.0,
             ),
-            // Smooth pulls each sample toward the 3x3 mean of the *layer input*.
-            // Placed last and routed across the Raise footprint (0.3, 0.35) so a GPU
-            // that wrongly averaged the running (raised) height instead of `base`
-            // would diverge here; the (0.05, 0.05) endpoint drives the brush onto the
-            // border texels, exercising the clamped-edge taps.
+            // Smooth minimizes weighted curvature on the *running* height. Placed
+            // after Raise and routed across its footprint so ordering is observable;
+            // the 8-sample spread exercises the adjustable wide stencil, while the
+            // (0.05, 0.05) endpoint exercises the no-flux field edge.
             stroke(
                 SculptStrokeKind::Smooth,
                 vec![pt(0.05, 0.05, 1.0), pt(0.3, 0.35, 1.0)],
                 60.0,
                 5.0,
-                0.0,
+                8.0,
             ),
             // Pinch is Smooth's base-3x3 pull with a bounded, strength-weighted
             // 1.25 gain, routed across the Ridge crest (0.4, 0.75), where the
@@ -325,6 +324,65 @@ fn gpu_required_sculpt_strokes_match_cpu_under_add_blend_and_mask() {
         &gpu,
         &cpu,
         SCULPT_STROKES_PREVIEW,
+    );
+}
+
+#[test]
+fn hundred_sample_smooth_spread_is_continuous_and_matches_cpu() {
+    let resolution = 257u32;
+    let metrics = HeightfieldMetrics::new(resolution, resolution, 256.0, 256.0);
+    let mut base = SculptParams::filled(resolution, 0.0);
+    for y in 0..resolution {
+        for x in resolution / 2..resolution {
+            base.samples[(y * resolution + x) as usize] = 10.0;
+        }
+    }
+    let mut stack = LayerStack::new();
+    stack.push(Layer::new("step", LayerKind::SculptBase(base)));
+    stack.push(Layer::new(
+        "wide smooth",
+        LayerKind::SculptStrokes(SculptStrokeParams {
+            strokes: vec![SculptStroke {
+                kind: SculptStrokeKind::Smooth,
+                points: vec![pt(0.5, 0.5, 1.0)],
+                radius_m: 100.0,
+                strength: 1.0,
+                target_height: 100.0,
+                falloff: 1.5,
+                enabled: true,
+            }],
+            reconcile: 0.15,
+        }),
+    ));
+
+    let cpu = cpu_oracle(&stack, &[], metrics);
+    let gpu = gpu_eval(&stack, &[], metrics);
+    assert_field_parity(
+        "shape.sculpt_smooth_spread_100",
+        &gpu,
+        &cpu,
+        SCULPT_STROKES_PREVIEW,
+    );
+
+    let center = resolution / 2;
+    let row: Vec<f32> = (0..resolution).map(|x| gpu.get(x, center)).collect();
+    let transition_width = row
+        .iter()
+        .filter(|&&value| value > 1.0e-3 && value < 10.0 - 1.0e-3)
+        .count();
+    let reversal_depth = row
+        .windows(2)
+        .map(|pair| (pair[0] - pair[1]).max(0.0))
+        .fold(0.0f32, f32::max);
+    let maximum_local_rise = row
+        .windows(2)
+        .map(|pair| pair[1] - pair[0])
+        .fold(0.0f32, f32::max);
+    assert!(transition_width >= 50, "transition={transition_width}");
+    assert!(reversal_depth <= 1.0e-3, "reversal={reversal_depth}");
+    assert!(
+        maximum_local_rise <= 0.5,
+        "wide Smooth retained a {maximum_local_rise}m one-sample terrace riser"
     );
 }
 

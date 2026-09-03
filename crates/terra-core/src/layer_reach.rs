@@ -120,9 +120,9 @@ mod tests {
     }
 
     #[test]
-    fn smooth_stroke_with_reconcile_reaches_two_samples() {
-        // A Smooth stroke reads a 3x3 of the layer input; with reconcile on, the
-        // stamped result is re-read at 3x3, so the effective reach is two samples.
+    fn smooth_stroke_with_reconcile_uses_spread_guard() {
+        // Smooth keeps a conservative source/output filter guard and
+        // bypasses the legacy reconcile mean.
         use crate::authoring::{SculptStroke, SculptStrokeKind, SculptStrokeParams};
         let l = layer(LayerKind::SculptStrokes(SculptStrokeParams {
             strokes: vec![SculptStroke {
@@ -133,7 +133,11 @@ mod tests {
         }));
         assert_eq!(
             effective_reach(&l, &[]),
-            Reach::Localized { halo_samples: 2 }
+            Reach::Localized {
+                halo_samples: 2 * crate::gradient_smoothing::smooth_filter_support_samples(
+                    crate::authoring::SMOOTH_SPREAD_DEFAULT,
+                )
+            }
         );
     }
 

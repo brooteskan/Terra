@@ -82,20 +82,41 @@ fn expand_sample_region(
 }
 
 fn sculpt_stamp_guard(p: &SculptStrokeParams) -> u32 {
-    u32::from(p.reconcile > 0.0)
+    let smooth_spread = p
+        .strokes
+        .iter()
+        .filter(|stroke| stroke.enabled && matches!(stroke.kind, SculptStrokeKind::Smooth))
+        .fold(0u32, |reach, stroke| {
+            reach.saturating_add(
+                terra_core::gradient_smoothing::smooth_filter_support_samples(
+                    stroke.smooth_spread_samples(),
+                ),
+            )
+        });
+    smooth_spread.saturating_add(u32::from(p.reconcile > 0.0))
 }
 
 fn sculpt_source_guard(p: &SculptStrokeParams) -> u32 {
-    sculpt_stamp_guard(p)
-        + u32::from(p.strokes.iter().any(|stroke| {
-            stroke.enabled
-                && matches!(
-                    stroke.kind,
-                    SculptStrokeKind::Smooth
-                        | SculptStrokeKind::Pinch
-                        | SculptStrokeKind::Coastline
-                )
-        }))
+    let smooth_spread = p
+        .strokes
+        .iter()
+        .filter(|stroke| stroke.enabled && matches!(stroke.kind, SculptStrokeKind::Smooth))
+        .fold(0u32, |reach, stroke| {
+            reach.saturating_add(
+                terra_core::gradient_smoothing::smooth_filter_support_samples(
+                    stroke.smooth_spread_samples(),
+                ),
+            )
+        });
+    let smooth_reach = smooth_spread.saturating_mul(2);
+    let base_neighborhood = p.strokes.iter().any(|stroke| {
+        stroke.enabled
+            && matches!(
+                stroke.kind,
+                SculptStrokeKind::Pinch | SculptStrokeKind::Coastline
+            )
+    });
+    smooth_reach.max(u32::from(base_neighborhood).saturating_add(u32::from(p.reconcile > 0.0)))
 }
 
 #[path = "compiled_plan.rs"]
@@ -184,6 +205,8 @@ pub struct GpuTerrainEngine {
     effect_filter: Pipe,
     sculpt_strokes: Pipe,
     sculpt_strokes_edited: Pipe,
+    sculpt_strokes_smooth_curvature: Pipe,
+    sculpt_strokes_smooth_apply: Pipe,
     sculpt_strokes_flatten_reduce: Pipe,
     sculpt_strokes_flatten_resolve: Pipe,
     sculpt_strokes_reconcile: Pipe,
@@ -193,6 +216,9 @@ pub struct GpuTerrainEngine {
     uniform_pool: UniformPool,
     ping: HeightTex,
     pong: HeightTex,
+    /// Renderer-facing committed output. Evaluation scratch never aliases this
+    /// texture, so a deferred or rejected candidate cannot mutate visible terrain.
+    published_height: HeightTex,
     layer_tex: HeightTex,
     mask_ones: HeightTex,
     unit_mask: HeightTex,
@@ -219,6 +245,7 @@ pub struct GpuTerrainEngine {
     sculpt_stamp: HeightTex,
     sculpt_stamp_b: HeightTex,
     sculpt_edited: HeightTex,
+    sculpt_smooth_curvature: HeightTex,
     /// Ordered-f32 min/max written by `effect_filter_range` and read by remap kernels.
     effect_filter_range_buffer: wgpu::Buffer,
     /// Hydraulic raw-state invariant flags, written before shader stability clamps.
@@ -284,11 +311,7 @@ impl GpuTerrainEngine {
     }
 
     fn output_slot(&self) -> GpuOutputSlot {
-        if self.current == 0 {
-            GpuOutputSlot::Ping
-        } else {
-            GpuOutputSlot::Pong
-        }
+        GpuOutputSlot::Published
     }
 
     pub fn last_output_identity(&self) -> Option<GpuTerrainOutputIdentity> {

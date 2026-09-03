@@ -151,6 +151,11 @@ pub struct UiState {
     pub sculpt_radius: f32,
     /// Raise/lower peak meters per stamp, or smooth blend 0â€“1.
     pub sculpt_strength: f32,
+    /// Smooth stencil half-width in terrain samples, independent of brush radius.
+    pub smooth_spread: f32,
+    /// Distinguishes the derived all-zero struct state from an intentional
+    /// zero-strength Smooth setting after the editor initializes the brush.
+    brush_defaults_initialized: bool,
     /// Brush edge hardness: 0 is soft and 1 is hard.
     pub brush_falloff: f32,
     /// Fraction of the radius travelled between brush stamps.
@@ -696,11 +701,23 @@ pub struct CameraBookmark {
 
 impl UiState {
     pub fn ensure_sculpt_defaults(&mut self) {
+        if !self.brush_defaults_initialized {
+            // `UiState` derives `Default`, so numeric fields begin at zero. Seed
+            // the artist-facing brush once; after this, zero remains a deliberate
+            // and stable Smooth no-op instead of being overwritten every frame.
+            if self.sculpt_strength == 0.0 {
+                self.sculpt_strength = BrushWorkspaceState::default().strength;
+            }
+            self.brush_defaults_initialized = true;
+        }
         if self.sculpt_radius <= 0.0 {
             self.sculpt_radius = 0.04;
         }
-        if self.sculpt_strength <= 0.0 {
+        if !self.sculpt_strength.is_finite() || self.sculpt_strength < 0.0 {
             self.sculpt_strength = 4.0;
+        }
+        if !self.smooth_spread.is_finite() || self.smooth_spread <= 0.0 {
+            self.smooth_spread = terra_core::authoring::SMOOTH_SPREAD_DEFAULT as f32;
         }
         if self.brush_falloff <= 0.0 {
             self.brush_falloff = 0.5;
@@ -755,6 +772,7 @@ impl UiState {
             brush: BrushWorkspaceState {
                 radius: self.sculpt_radius,
                 strength: self.sculpt_strength,
+                smooth_spread: self.smooth_spread,
                 falloff: self.brush_falloff,
                 spacing: self.brush_spacing,
                 flow: self.brush_flow,
@@ -797,6 +815,7 @@ impl UiState {
         self.inspector_advanced = ws.inspector_advanced;
         self.sculpt_radius = ws.brush.radius;
         self.sculpt_strength = ws.brush.strength;
+        self.smooth_spread = ws.brush.smooth_spread;
         self.brush_falloff = ws.brush.falloff;
         self.brush_spacing = ws.brush.spacing;
         self.brush_flow = ws.brush.flow;
@@ -1010,6 +1029,33 @@ impl UiState {
         }
         self.show_mask_editor = false;
         self.viewport_lighting_selected = false;
+    }
+}
+
+#[cfg(test)]
+mod brush_default_tests {
+    use super::*;
+
+    #[test]
+    fn brush_defaults_seed_once_and_preserve_explicit_smooth_zero() {
+        let mut state = UiState {
+            editor_tool: EditorTool::Smooth,
+            ..UiState::default()
+        };
+        state.ensure_sculpt_defaults();
+        assert_eq!(state.sculpt_strength, 4.0);
+        assert_eq!(
+            state.smooth_spread,
+            terra_core::authoring::SMOOTH_SPREAD_DEFAULT as f32
+        );
+
+        state.sculpt_strength = 0.0;
+        state.ensure_sculpt_defaults();
+        assert_eq!(state.sculpt_strength, 0.0);
+        assert_eq!(
+            state.smooth_spread,
+            terra_core::authoring::SMOOTH_SPREAD_DEFAULT as f32
+        );
     }
 }
 

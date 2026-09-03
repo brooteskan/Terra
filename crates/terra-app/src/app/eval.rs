@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use crate::logging::OperationContext;
 use crate::ui::{Preview2dMode, TerrainPreviewFreshness};
-use terra_core::layer::{LayerId, LayerKind};
+use terra_core::layer::{LayerId, LayerKind, LayerStack, SculptStrokeKind};
 use terra_core::mask::bake_mask_assets;
 use terra_core::quality::PreviewQuality;
 use terra_core::tiling::UvRect;
@@ -65,6 +65,25 @@ fn terrain_tile_work_budget(
         (budget_us / 250).clamp(1, 32) as usize
     };
     terra_core::TerrainTileWorkBudget::new(budget_us, max_items, max_pages.max(1))
+}
+
+/// Wide gradient-domain Smooth strokes expose height/slope discontinuities at
+/// mixed-resolution terrain-page boundaries. Until the streamed renderer can
+/// geomorph those page edges exactly, keep these authored results on the complete
+/// monolithic texture produced by the evaluator. This changes presentation only;
+/// the stroke remains GPU evaluated and the pyramid may still be prepared for
+/// other consumers.
+fn requires_monolithic_smooth_presentation(stack: &LayerStack) -> bool {
+    stack.flatten_layers().into_iter().any(|layer| {
+        layer.common.enabled
+            && matches!(
+                &layer.kind,
+                LayerKind::SculptStrokes(params)
+                    if params.strokes.iter().any(|stroke| {
+                        stroke.enabled && matches!(stroke.kind, SculptStrokeKind::Smooth)
+                    })
+            )
+    })
 }
 
 impl TerraApp {
@@ -451,7 +470,7 @@ impl TerraApp {
             let Some(engine) = self.gpu_engine.as_mut() else {
                 return false;
             };
-            match engine.publish_compiled_refinement(job.engine) {
+            match engine.publish_compiled_refinement(&gpu.device, &gpu.queue, job.engine) {
                 Ok(result) => result,
                 Err(error) => {
                     log::warn!(target: "terra_app::evaluation", "refinement publication failed: {error}");
@@ -1341,6 +1360,12 @@ impl TerraApp {
     }
 
     pub(crate) fn sync_tile_stream_to_renderer(&mut self) {
+        if requires_monolithic_smooth_presentation(&self.session.document.stack) {
+            if let Some(renderer) = self.renderer.as_mut() {
+                renderer.set_use_tile_stream(false);
+            }
+            return;
+        }
         if self.tile_atlas.is_none() {
             return;
         }
@@ -1929,8 +1954,9 @@ impl TerraApp {
                                 engine.dirty_tiles().iter().map(|t| (t.tx, t.tz)).collect();
                             self.ui_state.dirty_tile_ids = dirty_ids;
                             self.ui_state.dirty_tile_grid = (metrics.tiles_x(), metrics.tiles_z());
-                            // Only skip present when evaluate failed to seed (no filter work ran).
-                            let skip_present = !result.did_eval;
+                            // A deferred or hybrid prefix is useful private work but
+                            // is not a publishable terrain candidate (#227).
+                            let skip_present = !result.did_eval || result.output_identity.is_none();
                             if !skip_present {
                                 let region = engine.take_dirty_region(1);
                                 // Full-field updates bind the engine texture directly (WC path).
@@ -2510,7 +2536,8 @@ mod tests {
 
     use terra_core::heightfield::{Heightfield, HeightfieldMetrics};
     use terra_core::layer::{
-        FlatParams, Layer, LayerKind, LayerStack, SculptStrokeKind, StreamPowerParams,
+        FlatParams, Layer, LayerKind, LayerStack, SculptStroke, SculptStrokeKind,
+        SculptStrokeParams, StreamPowerParams,
     };
     use terra_core::quality::PreviewQuality;
     use terra_core::shape_history::{create_shape_layer, ShapeTool};
@@ -2528,8 +2555,8 @@ mod tests {
     use crate::ui::PanelAction;
 
     use super::{
-        gpu_evaluation_trace_context, terrain_tile_work_budget, uv_to_texel_rect,
-        DeferredFullField, TerraApp,
+        gpu_evaluation_trace_context, requires_monolithic_smooth_presentation,
+        terrain_tile_work_budget, uv_to_texel_rect, DeferredFullField, TerraApp,
     };
 
     fn flat(height: f32) -> Layer {
@@ -2538,6 +2565,35 @@ mod tests {
 
     fn rect(u: f32, v: f32, r: f32) -> UvRect {
         UvRect::from_center_radius(u, v, r)
+    }
+
+    #[test]
+    fn enabled_smooth_history_keeps_viewport_on_monolithic_height() {
+        let mut stack = LayerStack::new();
+        let layer = Layer::new(
+            "Smooth history",
+            LayerKind::SculptStrokes(SculptStrokeParams {
+                strokes: vec![SculptStroke {
+                    kind: SculptStrokeKind::Smooth,
+                    enabled: false,
+                    ..SculptStroke::default()
+                }],
+                ..SculptStrokeParams::default()
+            }),
+        );
+        let layer_id = layer.id();
+        stack.push(layer);
+        assert!(!requires_monolithic_smooth_presentation(&stack));
+
+        let layer = stack.find_mut(layer_id).unwrap();
+        let LayerKind::SculptStrokes(params) = &mut layer.kind else {
+            unreachable!()
+        };
+        params.strokes[0].enabled = true;
+        assert!(requires_monolithic_smooth_presentation(&stack));
+
+        stack.find_mut(layer_id).unwrap().common.enabled = false;
+        assert!(!requires_monolithic_smooth_presentation(&stack));
     }
 
     #[test]

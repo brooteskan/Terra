@@ -21,6 +21,9 @@ pub struct GpuSubmissionSerial(pub u64);
 pub enum GpuOutputSlot {
     Ping,
     Pong,
+    /// Stable renderer-facing allocation. Ping/Pong remain private evaluation
+    /// scratch and can never identify a presentable candidate.
+    Published,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -744,6 +744,7 @@ impl AppWorkspace {
 pub struct BrushWorkspaceState {
     pub radius: f32,
     pub strength: f32,
+    pub smooth_spread: f32,
     pub falloff: f32,
     pub spacing: f32,
     pub flow: f32,
@@ -756,6 +757,7 @@ impl Default for BrushWorkspaceState {
         Self {
             radius: 0.04,
             strength: 4.0,
+            smooth_spread: terra_core::authoring::SMOOTH_SPREAD_DEFAULT as f32,
             falloff: 0.5,
             spacing: 0.1,
             flow: 1.0,

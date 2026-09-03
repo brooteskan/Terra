@@ -33,8 +33,8 @@ pub(super) const INITIAL_STROKE_HEADER_CAPACITY: usize = 8;
 pub(super) const INITIAL_STROKE_POINT_CAPACITY: usize = 64;
 
 /// Alias-collapsed kind id shared with `shaders/sculpt_strokes.wgsl`. Only kinds
-/// the planner admits are ever uploaded — the per-sample maps, the base-3x3
-/// Smooth/Pinch/Coastline, and the footprint-mean Flatten (#117), whose per-stroke
+/// the planner admits are ever uploaded — the per-sample maps, gradient Smooth,
+/// base-3x3 Pinch/Coastline, and the footprint-mean Flatten (#117), whose per-stroke
 /// target the reduce/resolve passes precompute into the `targets` buffer.
 pub(super) fn stroke_kind_gpu_id(kind: SculptStrokeKind) -> u32 {
     match kind {
@@ -55,11 +55,9 @@ pub(super) fn stroke_kind_gpu_id(kind: SculptStrokeKind) -> u32 {
         | SculptStrokeKind::Hardness
         | SculptStrokeKind::Sediment
         | SculptStrokeKind::Protect => 11,
-        // Smooth pulls each sample toward the clamped 3x3 mean of the layer input
-        // (`src`); Pinch applies a bounded, strength-weighted 1.25 gain;
-        // Coastline lowers the sample and blends it toward that mean under a
-        // weight gate. The stamp kernel reads that neighborhood directly
-        // (#114, #115, #116).
+        // Smooth uses a horizontal filter followed by a vertical masked blend (#227). Pinch
+        // applies a bounded, strength-weighted base-neighborhood pull; Coastline
+        // lowers the sample and blends it toward that mean (#115, #116).
         SculptStrokeKind::Smooth => 12,
         SculptStrokeKind::Pinch => 13,
         SculptStrokeKind::Coastline => 14,
@@ -418,20 +416,12 @@ impl GpuTerrainEngine {
     }
 
     pub fn output_texture(&self) -> &wgpu::Texture {
-        if self.current == 0 {
-            &self.ping.texture
-        } else {
-            &self.pong.texture
-        }
+        &self.published_height.texture
     }
 
     /// Current evaluated height field view (R32Float) — sample directly from the renderer when formats match.
     pub fn output_texture_view(&self) -> &wgpu::TextureView {
-        if self.current == 0 {
-            &self.ping.view
-        } else {
-            &self.pong.view
-        }
+        &self.published_height.view
     }
 
     /// Alias for [`Self::output_texture_view`].
@@ -452,6 +442,7 @@ impl GpuTerrainEngine {
         self.metrics = metrics;
         self.ping = HeightTex::new(device, "ping", w, h);
         self.pong = HeightTex::new(device, "pong", w, h);
+        self.published_height = HeightTex::new(device, "published-height", w, h);
         self.output_resource_incarnation = GpuResourceIncarnation(
             self.output_resource_incarnation
                 .0
@@ -476,6 +467,7 @@ impl GpuTerrainEngine {
         self.sculpt_stamp = HeightTex::new(device, "sculpt-stamp", w, h);
         self.sculpt_stamp_b = HeightTex::new(device, "sculpt-stamp-b", w, h);
         self.sculpt_edited = HeightTex::new(device, "sculpt-edited", w, h);
+        self.sculpt_smooth_curvature = HeightTex::new(device, "sculpt-smooth-curvature", w, h);
         self.layer_cache.clear();
         self.stroke_runtime.clear();
         self.dirty.clear();

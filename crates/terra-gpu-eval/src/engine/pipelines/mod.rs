@@ -265,6 +265,21 @@ struct SculptStrokesU {
     region_h: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct SculptSmoothU {
+    width: u32,
+    height: u32,
+    world_x: f32,
+    world_z: f32,
+    stroke_index: u32,
+    region_x: u32,
+    region_y: u32,
+    region_w: u32,
+    region_h: u32,
+    _pad0: u32,
+}
+
 /// Reduce pass uniform: measures one Flatten stroke's footprint mean. `stroke_index`
 /// selects the header; workgroups address their partial slot via `num_workgroups`.
 #[repr(C)]
@@ -1030,6 +1045,29 @@ impl GpuTerrainEngine {
                     storage_write_entry(3),       // edited_out
                 ],
             });
+        let sculpt_strokes_smooth_curvature_bgl =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("sculpt-strokes-smooth-curvature-bgl"),
+                entries: &[
+                    uniform_entry(0),
+                    tex_read_entry(1),            // running height
+                    storage_read_buffer_entry(2), // headers
+                    storage_read_buffer_entry(3), // points
+                    storage_write_entry(4),       // horizontal blur
+                ],
+            });
+        let sculpt_strokes_smooth_apply_bgl =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("sculpt-strokes-smooth-apply-bgl"),
+                entries: &[
+                    uniform_entry(0),
+                    tex_read_entry(1),            // running height
+                    tex_read_entry(2),            // horizontal blur
+                    storage_read_buffer_entry(3), // headers
+                    storage_read_buffer_entry(4), // points
+                    storage_write_entry(5),       // smoothed height
+                ],
+            });
         let sculpt_strokes_flatten_reduce_bgl =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("sculpt-strokes-flatten-reduce-bgl"),
@@ -1072,6 +1110,18 @@ impl GpuTerrainEngine {
             include_str!("../../shaders/sculpt_strokes_edited.wgsl"),
             sculpt_strokes_edited_bgl,
         );
+        let sculpt_strokes_smooth_curvature = make_pipe(
+            device,
+            "sculpt-strokes-smooth-curvature",
+            include_str!("../../shaders/sculpt_strokes_smooth_curvature.wgsl"),
+            sculpt_strokes_smooth_curvature_bgl,
+        );
+        let sculpt_strokes_smooth_apply = make_pipe(
+            device,
+            "sculpt-strokes-smooth-apply",
+            include_str!("../../shaders/sculpt_strokes_smooth_apply.wgsl"),
+            sculpt_strokes_smooth_apply_bgl,
+        );
         let sculpt_strokes_flatten_reduce = make_pipe(
             device,
             "sculpt-strokes-flatten-reduce",
@@ -1092,6 +1142,7 @@ impl GpuTerrainEngine {
         );
         let ping = HeightTex::new(device, "ping", w, w);
         let pong = HeightTex::new(device, "pong", w, w);
+        let published_height = HeightTex::new(device, "published-height", w, w);
         let layer_tex = HeightTex::new(device, "layer", w, w);
         let mask_ones = HeightTex::new(device, "mask-ones", w, w);
         let unit_mask = HeightTex::new(device, "unit-mask", w, w);
@@ -1111,6 +1162,7 @@ impl GpuTerrainEngine {
         let sculpt_stamp = HeightTex::new(device, "sculpt-stamp", w, w);
         let sculpt_stamp_b = HeightTex::new(device, "sculpt-stamp-b", w, w);
         let sculpt_edited = HeightTex::new(device, "sculpt-edited", w, w);
+        let sculpt_smooth_curvature = HeightTex::new(device, "sculpt-smooth-curvature", w, w);
         let effect_filter_range_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("effect-filter-range"),
             size: 8,
@@ -1159,6 +1211,8 @@ impl GpuTerrainEngine {
             effect_filter,
             sculpt_strokes,
             sculpt_strokes_edited,
+            sculpt_strokes_smooth_curvature,
+            sculpt_strokes_smooth_apply,
             sculpt_strokes_flatten_reduce,
             sculpt_strokes_flatten_resolve,
             sculpt_strokes_reconcile,
@@ -1168,6 +1222,7 @@ impl GpuTerrainEngine {
             uniform_pool: UniformPool::new(device, 64),
             ping,
             pong,
+            published_height,
             layer_tex,
             mask_ones,
             unit_mask,
@@ -1186,6 +1241,7 @@ impl GpuTerrainEngine {
             sculpt_stamp,
             sculpt_stamp_b,
             sculpt_edited,
+            sculpt_smooth_curvature,
             effect_filter_range_buffer,
             simulation_invalid_state_buffer,
             layer_cache: HashMap::new(),

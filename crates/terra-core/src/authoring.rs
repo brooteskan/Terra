@@ -5,6 +5,7 @@
 //! resolution independent; only evaluation rasterizes it.
 
 use crate::field_data::keys;
+use crate::gradient_smoothing::apply_tapered_smooth;
 use crate::heightfield::{Heightfield, HeightfieldMetrics, TileId};
 use crate::hydro::{self, StreamPowerParams};
 use crate::mask::{MaskField, MaskSource};
@@ -142,12 +143,34 @@ pub struct SculptStroke {
     pub radius_m: f32,
     #[serde(default = "sculpt_strength")]
     pub strength: f32,
+    /// Kind-specific scalar payload. Smooth stores its spread in samples here;
+    /// zero in older documents resolves to [`SMOOTH_SPREAD_DEFAULT`].
     #[serde(default)]
     pub target_height: f32,
     #[serde(default = "sculpt_falloff")]
     pub falloff: f32,
     #[serde(default = "enabled_default")]
     pub enabled: bool,
+}
+
+/// Default and maximum half-width of Smooth's gradient stencil, in samples.
+pub const SMOOTH_SPREAD_DEFAULT: u32 = 1;
+pub const SMOOTH_SPREAD_MAX: u32 = 128;
+
+/// Resolve the persisted/editor Smooth spread payload, including old documents
+/// whose formerly ignored `target_height` field was zero.
+pub fn resolve_smooth_spread_samples(value: f32) -> u32 {
+    if value.is_finite() && value > 0.0 {
+        value.round().clamp(1.0, SMOOTH_SPREAD_MAX as f32) as u32
+    } else {
+        SMOOTH_SPREAD_DEFAULT
+    }
+}
+
+impl SculptStroke {
+    pub fn smooth_spread_samples(&self) -> u32 {
+        resolve_smooth_spread_samples(self.target_height)
+    }
 }
 
 fn one() -> f32 {
@@ -750,9 +773,10 @@ fn stroke_footprint_rect(
 /// footprint, not just the overlap — and the scoped evaluator only *publishes*
 /// the tiles this region names, so the region must name them. The fixpoint unions
 /// in every enabled Flatten (from either list) whose footprint intersects the
-/// accumulated region, until stable. No other kind couples across samples:
-/// Smooth/Pinch/Coastline read the *layer input* 3×3 (unchanged by a stroke
-/// edit), and every other kind accumulates per-sample.
+/// accumulated region, until stable. Smooth consumes the running height through
+/// a bounded multiscale stencil; the plan's intrinsic reach accounts for that
+/// local propagation. Pinch/Coastline read the unchanged layer input, and every
+/// other kind accumulates per-sample.
 ///
 /// **Reconcile halo.** The reconcile pass reads a 3×3, so a changed sample at the
 /// very edge of a stroke's support can shift the reconciled value one sample into
@@ -899,7 +923,7 @@ fn apply_stroke_sample(
     match stroke.kind {
         SculptStrokeKind::Raise => h + s,
         SculptStrokeKind::Lower => h - s,
-        SculptStrokeKind::Smooth => h + (neighborhood_average(base, i, j) - h) * w,
+        SculptStrokeKind::Smooth => h,
         SculptStrokeKind::Flatten | SculptStrokeKind::HeightStamp => {
             // Flatten uses the footprint mean (computed by flatten_target_for);
             // HeightStamp keeps the explicit stroke target.
@@ -980,7 +1004,8 @@ fn apply_stroke_sample(
 }
 
 /// The mutable accumulation state of a stroke stamp: the running height plus the
-/// five per-texel aux channels, *before* the final reconcile pass. A prefix
+/// five published per-texel aux channels plus private reconcile coverage,
+/// *before* the final reconcile pass. A prefix
 /// checkpoint (#123) is exactly a snapshot of this after stamping the first `k`
 /// list positions; resuming a stamp clones one of these and stamps the rest.
 #[derive(Clone)]
@@ -991,6 +1016,9 @@ struct SculptStampState {
     hardness: Vec<f32>,
     sediment: Vec<f32>,
     edited: Vec<f32>,
+    /// Coverage consumed by the legacy height-reconcile pass. Smooth has its own
+    /// seam-free constrained operator and deliberately does not contribute here.
+    reconcile_weight: Vec<f32>,
 }
 
 impl SculptStampState {
@@ -1006,18 +1034,77 @@ impl SculptStampState {
             hardness: vec![0.0; n],
             sediment: vec![0.0; n],
             edited: vec![0.0; n],
+            reconcile_weight: vec![0.0; n],
         }
     }
 
-    /// Resident bytes of the six buffers (height interior + halos + five dense aux
-    /// channels), for the prefix store's memory budget.
+    /// Resident bytes of height plus the six dense coverage/aux channels, for the
+    /// prefix store's memory budget.
     fn resident_bytes(&self) -> usize {
         let aux = self.protect.len()
             + self.uplift.len()
             + self.hardness.len()
             + self.sediment.len()
-            + self.edited.len();
+            + self.edited.len()
+            + self.reconcile_weight.len();
         self.out.resident_bytes() + aux * std::mem::size_of::<f32>()
+    }
+}
+
+/// Apply one Smooth stroke to the running field. The tapered separable filter
+/// needs a horizontal intermediate and therefore cannot live in the per-sample
+/// stroke match above.
+fn apply_smooth_stroke(
+    state: &mut SculptStampState,
+    stroke: &SculptStroke,
+    rect: (u32, u32, u32, u32),
+) {
+    if !stroke.strength.is_finite() || stroke.strength <= 0.0 {
+        return;
+    }
+    let m = state.out.metrics;
+    let Some((si0, si1, sj0, sj1)) = stroke_footprint_rect(stroke, &m) else {
+        return;
+    };
+    let (r_i0, r_i1, r_j0, r_j1) = rect;
+    let (i0, i1) = (si0.max(r_i0), si1.min(r_i1));
+    let (j0, j1) = (sj0.max(r_j0), sj1.min(r_j1));
+    if i0 > i1 || j0 > j1 {
+        return;
+    }
+
+    let mut weights = vec![0.0f32; (m.width * m.height) as usize];
+    for j in j0..=j1 {
+        for i in i0..=i1 {
+            let (distance, pressure) = distance_to_polyline(
+                m.world_x(i),
+                m.world_z(j),
+                &stroke.points,
+                m.world_size_x,
+                m.world_size_z,
+            );
+            let w = smoothstep_weight(distance, stroke.radius_m, stroke.falloff) * pressure;
+            if w > 0.0 {
+                let idx = (j * m.width + i) as usize;
+                weights[idx] = w;
+                state.edited[idx] = state.edited[idx].max(w);
+            }
+        }
+    }
+
+    let mut dense = state.out.to_dense();
+    if apply_tapered_smooth(
+        &mut dense,
+        m.width,
+        m.height,
+        m.dx(),
+        m.dz(),
+        &weights,
+        (i0, i1, j0, j1),
+        stroke.strength,
+        stroke.smooth_spread_samples(),
+    ) {
+        state.out = Heightfield::from_dense(m, &dense);
     }
 }
 
@@ -1034,15 +1121,15 @@ impl SculptStampState {
 ///
 /// **The per-stroke footprint cull is semantics-preserving.** `smoothstep_weight`
 /// is exactly zero at `distance >= radius`, so every texel outside a stroke's
-/// padded bbox has `w == 0` — no height write, no `edited`/aux max-merge. Skipping
-/// them changes nothing. This is the same bbox the GPU stamp kernel early-outs on
-/// (`StrokeHeader.bbox`), so the two backends cull identically.
+/// padded bbox has `w == 0` — no weight or aux merge. Smooth filters source
+/// context outside that bbox, but blends writes only where `w > 0`. The GPU uses
+/// the same bbox.
 ///
-/// **Reads may reach one texel past a stroke's rect, and that is fine.** The
-/// Smooth/Pinch/Coastline 3×3 and Flatten's footprint-mean scan read `base` (the
-/// layer input, invariant across strokes) or, for the mean, an `out` that prior
-/// strokes have fully stamped over that footprint — never a texel this cull could
-/// have left stale.
+/// **Neighborhood reads are explicitly guarded.** Smooth reads the running field
+/// across its tapered filter support; Pinch/Coastline read one sample
+/// of `base`; Flatten scans the running field over its footprint. Scoped planning
+/// expands those inputs by the layer's declared reach so the cull cannot expose
+/// stale data.
 fn stamp_strokes(
     state: &mut SculptStampState,
     base: &Heightfield,
@@ -1059,6 +1146,10 @@ fn stamp_strokes(
     let (r_i0, r_i1, r_j0, r_j1) = rect;
     for stroke in strokes {
         if !stroke.enabled {
+            continue;
+        }
+        if matches!(stroke.kind, SculptStrokeKind::Smooth) {
+            apply_smooth_stroke(state, stroke, rect);
             continue;
         }
         // Cull to the stroke's padded footprint ∩ rect. A stroke with no
@@ -1086,6 +1177,7 @@ fn stamp_strokes(
                 }
                 let idx = (j * m.width + i) as usize;
                 state.edited[idx] = state.edited[idx].max(w);
+                state.reconcile_weight[idx] = state.reconcile_weight[idx].max(w);
                 let h = state.out.get(i, j);
                 let next = apply_stroke_sample(
                     stroke,
@@ -1131,7 +1223,7 @@ fn finish_stamp(
         for j in r_j0..=r_j1 {
             for i in r_i0..=r_i1 {
                 let idx = (j * m.width + i) as usize;
-                let a = reconcile.clamp(0.0, 1.0) * state.edited[idx] * 0.35;
+                let a = reconcile.clamp(0.0, 1.0) * state.reconcile_weight[idx] * 0.35;
                 out.set(
                     i,
                     j,
@@ -1305,11 +1397,10 @@ struct SculptCheckpoint {
 /// the evaluator across edits; validated against the incoming layer input on every
 /// reuse so it can never return a stale result.
 ///
-/// `base` is the layer input the checkpoints were stamped from. It does double
-/// duty: the immutable `base` argument the stamp reads (Smooth/Pinch/Coastline
-/// 3×3, Flatten mean) *and* the validity anchor — an incoming input that is not
-/// bit-identical (or a metrics change) discards the entry. Storing it therefore
-/// costs no memory the resume did not already need.
+/// `base` is the layer input the checkpoints were stamped from. It is both the
+/// immutable neighborhood source for Pinch/Coastline and the validity anchor — an
+/// incoming input that is not bit-identical (or a metrics change) discards the
+/// entry. Smooth and Flatten consume the checkpoint's running height.
 pub struct SculptPrefixEntry {
     base: Heightfield,
     strokes: Vec<SculptStroke>,
@@ -1532,6 +1623,7 @@ fn overlay_state_rect(
             dst.hardness[idx] = src.hardness[idx];
             dst.sediment[idx] = src.sediment[idx];
             dst.edited[idx] = src.edited[idx];
+            dst.reconcile_weight[idx] = src.reconcile_weight[idx];
         }
     }
 }
@@ -2603,19 +2695,50 @@ mod tests {
         p: &SculptStrokeParams,
     ) -> AuthoringResult {
         let m = input.metrics;
-        let mut out = input.clone();
-        let n = (m.width * m.height) as usize;
-        let mut protect: Vec<f32> = vec![0.0; n];
-        let mut uplift: Vec<f32> = vec![0.0; n];
-        let mut hardness: Vec<f32> = vec![0.0; n];
-        let mut sediment: Vec<f32> = vec![0.0; n];
-        let mut edited: Vec<f32> = vec![0.0; n];
+        let mut state = SculptStampState::seed(input);
         let base = input.clone();
         for stroke in &p.strokes {
             if !stroke.enabled {
                 continue;
             }
-            let flatten_target = flatten_target_for(stroke, &out, &m);
+            if matches!(stroke.kind, SculptStrokeKind::Smooth) {
+                let n = (m.width * m.height) as usize;
+                let mut weights = vec![0.0f32; n];
+                for j in 0..m.height {
+                    for i in 0..m.width {
+                        let (distance, pressure) = distance_to_polyline(
+                            m.world_x(i),
+                            m.world_z(j),
+                            &stroke.points,
+                            m.world_size_x,
+                            m.world_size_z,
+                        );
+                        let w =
+                            smoothstep_weight(distance, stroke.radius_m, stroke.falloff) * pressure;
+                        if w > 0.0 {
+                            let idx = (j * m.width + i) as usize;
+                            weights[idx] = w;
+                            state.edited[idx] = state.edited[idx].max(w);
+                        }
+                    }
+                }
+                let mut dense = state.out.to_dense();
+                if apply_tapered_smooth(
+                    &mut dense,
+                    m.width,
+                    m.height,
+                    m.dx(),
+                    m.dz(),
+                    &weights,
+                    (0, m.width - 1, 0, m.height - 1),
+                    stroke.strength,
+                    stroke.smooth_spread_samples(),
+                ) {
+                    state.out = Heightfield::from_dense(m, &dense);
+                }
+                continue;
+            }
+            let flatten_target = flatten_target_for(stroke, &state.out, &m);
             for j in 0..m.height {
                 for i in 0..m.width {
                     let x = m.world_x(i);
@@ -2627,8 +2750,9 @@ mod tests {
                         continue;
                     }
                     let idx = (j * m.width + i) as usize;
-                    edited[idx] = edited[idx].max(w);
-                    let h = out.get(i, j);
+                    state.edited[idx] = state.edited[idx].max(w);
+                    state.reconcile_weight[idx] = state.reconcile_weight[idx].max(w);
+                    let h = state.out.get(i, j);
                     let next = apply_stroke_sample(
                         stroke,
                         &base,
@@ -2638,35 +2762,20 @@ mod tests {
                         distance,
                         w,
                         flatten_target,
-                        &mut protect[idx],
-                        &mut uplift[idx],
-                        &mut hardness[idx],
-                        &mut sediment[idx],
+                        &mut state.protect[idx],
+                        &mut state.uplift[idx],
+                        &mut state.hardness[idx],
+                        &mut state.sediment[idx],
                     );
-                    out.set(i, j, next);
+                    state.out.set(i, j, next);
                 }
             }
         }
-        if p.reconcile > 0.0 {
-            let src = out.clone();
-            for j in 0..m.height {
-                for i in 0..m.width {
-                    let idx = (j * m.width + i) as usize;
-                    let a = p.reconcile.clamp(0.0, 1.0) * edited[idx] * 0.35;
-                    out.set(
-                        i,
-                        j,
-                        src.get(i, j) + (neighborhood_average(&src, i, j) - src.get(i, j)) * a,
-                    );
-                }
-            }
-        }
-        AuthoringResult::new(out)
-            .field(keys::SCULPT_PROTECTION, MaskField::from_raw(m, &protect))
-            .field(keys::UPLIFT_RATE, MaskField::from_raw(m, &uplift))
-            .field(keys::HARDNESS, MaskField::from_raw(m, &hardness))
-            .field(keys::SEDIMENT_THICKNESS, MaskField::from_raw(m, &sediment))
-            .field(keys::EDIT_REGION, MaskField::from_raw(m, &edited))
+        finish_stamp(
+            &state,
+            p.reconcile,
+            (0, m.width.saturating_sub(1), 0, m.height.saturating_sub(1)),
+        )
     }
 
     fn assert_result_bit_identical(

@@ -1,5 +1,5 @@
 use super::*;
-use terra_gpu::output_identity::{GpuOutputCompleteness, GpuOutputCoverage};
+use terra_gpu::output_identity::{GpuOutputCompleteness, GpuOutputCoverage, GpuOutputSlot};
 
 #[test]
 fn warm_outputs_chain_identity_and_cold_realization_changes_incarnation() {
@@ -30,6 +30,7 @@ fn warm_outputs_chain_identity_and_cold_realization_changes_incarnation() {
     assert!(cold_identity.is_current_complete_final());
     assert_eq!(cold_identity.coverage, GpuOutputCoverage::WholeField);
     assert_eq!(cold_identity.completeness, GpuOutputCompleteness::Complete);
+    assert_eq!(cold_identity.output_resource.slot, GpuOutputSlot::Published);
 
     let LayerKind::SculptBase(params) = &mut stack.find_mut(base_id).expect("base").kind else {
         panic!("base changed kind");

@@ -3,7 +3,7 @@
 use super::*;
 
 impl GpuTerrainEngine {
-    fn readback_height_texture(
+    pub(super) fn readback_height_texture(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,

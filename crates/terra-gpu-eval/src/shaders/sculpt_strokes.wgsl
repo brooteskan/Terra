@@ -4,13 +4,14 @@
 // `stamp_out`, chaining strokes at each texel exactly as the CPU
 // `apply_sculpt_strokes` does (stroke k+1 reads the height stroke k already wrote).
 // `h` initialises from `running_in` — the field entering this segment — while
-// Smooth (#114), Pinch (#115), and Coastline (#116) read a clamped 3x3 of
-// `src_original`, the layer input (`base` on the CPU), which is invariant across
+// Pinch (#115) and Coastline (#116) read a clamped 3x3 of `src_original`, the
+// layer input (`base` on the CPU), which is invariant across
 // segments. For the whole-set common case the two inputs are the same texture and
 // the range is [0, stroke_count); Flatten (#117) splits the set so its per-stroke
 // footprint-mean target (precomputed into `targets` by the reduce/resolve passes)
-// is measured against the running field before it. Pinch is a strength-weighted,
-// range-bounded version of Smooth's pull; Coastline lowers the sample and blends
+// is measured against the running field before it. Smooth (#227) is segmented out
+// into its own two-pass tapered filter. Pinch is a strength-weighted,
+// range-bounded mean pull; Coastline lowers the sample and blends
 // it toward that mean under a weight gate. The max brush weight per texel is
 // produced by the separate edited pass (order-independent), not here.
 
@@ -60,7 +61,7 @@ struct StrokeHeader {
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
-// The layer input (`base` on the CPU): the clamped 3x3 read by Smooth/Pinch/Coastline.
+// The layer input (`base` on the CPU): the clamped 3x3 read by Pinch/Coastline.
 // Invariant across segments — never the running stamp.
 @group(0) @binding(1) var src_original: texture_2d<f32>;
 // The running field entering this segment; `h` initialises from it and chains.
@@ -245,16 +246,14 @@ fn apply_kind(header: StrokeHeader, h: f32, dist: f32, w: f32, px: i32, py: i32,
         case 10u: {                                                 // ERODE / EncourageErosion
             return h - abs(s) * 0.35;
         }
-        case 12u: {                                                 // SMOOTH — pull toward 3x3 mean of `src`
-            return h + (base_neighborhood_average(px, py) - h) * w;  // weight is `w`, not `s`
-        }
+        case 12u: { return h; }                                     // SMOOTH is a segmented two-pass filter
         case 13u: {                                                 // PINCH — bounded, strength-weighted pull
             let amount = clamp(clamp(header.strength, 0.0, 1.0) * w * 1.25, 0.0, 1.0);
             return h + (base_neighborhood_average(px, py) - h) * amount;
         }
         case 14u: {                                                 // COASTLINE — lower, blend toward 3x3 mean of `src`, gate by w
             let avg = base_neighborhood_average(px, py);
-            let lowered = h - abs(s) * 0.25;                         // uses `s` (strength*w), unlike Smooth/Pinch
+            let lowered = h - abs(s) * 0.25;                         // uses `s` (strength*w), unlike Pinch
             return (lowered + (avg - lowered) * 0.55) * w + h * (1.0 - w);
         }
         case 15u: {                                                 // FLATTEN — settle toward the footprint mean

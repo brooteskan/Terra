@@ -1231,22 +1231,42 @@ impl GpuTerrainEngine {
         let source_resource_incarnation = candidate.incarnation();
         let trace_context = self.pending_evaluation_trace.unwrap_or_default();
         let expected_base = self.last_output_identity.map(|identity| identity.output);
-        record_copy_views_region(
-            device,
-            &mut encoder,
-            &self.copy,
-            presentation_view,
-            &self.ping.view,
-            metrics.width,
-            metrics.height,
-            present_region,
-        );
+        // Only a complete final candidate may touch the renderer-facing texture.
+        // A deferred/full-scope suffix or hybrid CPU prefix remains private plan
+        // state. Hybrid evaluation still stages its prefix in ping for readback.
+        let publishable = deferred_at.is_none() && planned_fallback.is_none();
+        if publishable {
+            record_copy_views_region(
+                device,
+                &mut encoder,
+                &self.copy,
+                presentation_view,
+                &self.published_height.view,
+                metrics.width,
+                metrics.height,
+                present_region,
+            );
+        } else if want_cpu {
+            record_copy_views_region(
+                device,
+                &mut encoder,
+                &self.copy,
+                presentation_view,
+                &self.ping.view,
+                metrics.width,
+                metrics.height,
+                present_region,
+            );
+        }
         let (mask_scratch_texture_allocations, mask_scratch_reuses) =
             self.plan_operations.mask_scratch_stats();
         self.last_eval_stats.mask_scratch_texture_allocations = mask_scratch_texture_allocations;
         self.last_eval_stats.mask_scratch_reuses = mask_scratch_reuses;
-        self.last_eval_stats.dirty_texels =
-            u64::from(present_region.2).saturating_mul(u64::from(present_region.3));
+        self.last_eval_stats.dirty_texels = if publishable {
+            u64::from(present_region.2).saturating_mul(u64::from(present_region.3))
+        } else {
+            0
+        };
         if let (Some(timer), Some(slot), Some(context)) = (
             self.evaluation_timer.as_mut(),
             evaluation_timing_slot,
@@ -1269,10 +1289,12 @@ impl GpuTerrainEngine {
         }
         self.active_plan_revision = Some(expected_revision);
         self.deferred_plan_resume = deferred_at.map(|operation| (expected_revision, operation));
-        if present_scope.is_full() {
-            self.mark_all_tiles_dirty();
-        } else {
-            self.mark_tiles_overlapping_rect(present_region);
+        if publishable {
+            if present_scope.is_full() {
+                self.mark_all_tiles_dirty();
+            } else {
+                self.mark_tiles_overlapping_rect(present_region);
+            }
         }
 
         let fallback_resume = planned_fallback.as_ref().map(|diagnostic| {
@@ -1287,11 +1309,21 @@ impl GpuTerrainEngine {
         };
         let cpu = if want_cpu && fallback_resume == Some(0) {
             Some(Heightfield::zeros(metrics))
-        } else if want_cpu {
+        } else if want_cpu && publishable {
             self.last_eval_stats.readback_bytes = u64::from(metrics.width)
                 .saturating_mul(u64::from(metrics.height))
                 .saturating_mul(4);
             Some(self.readback_current(device, queue)?)
+        } else if want_cpu {
+            self.last_eval_stats.readback_bytes = u64::from(metrics.width)
+                .saturating_mul(u64::from(metrics.height))
+                .saturating_mul(4);
+            Some(self.readback_height_texture(
+                device,
+                queue,
+                &self.ping.texture,
+                "gpu-prefix-readback",
+            )?)
         } else {
             None
         };
@@ -1361,62 +1393,60 @@ impl GpuTerrainEngine {
                 })
             })
             .collect();
-        let has_deferred_suffix = deferred_at.is_some();
-        let has_hybrid_prefix = planned_fallback.is_some();
-        let output_identity = GpuTerrainOutputIdentity {
-            output: self.allocate_output_id(),
-            frame_id: trace_context.frame_id,
-            generation: trace_context.generation,
-            evaluation_id: trace_context.evaluation_id,
-            plan_revision: expected_revision.get(),
-            requested_quality: quality,
-            actual_quality: quality,
-            intent,
-            selected_field: terra_gpu::output_identity::GpuSelectedFieldIdentity {
-                selected: presentation_field,
-                expected_final: plan.final_height(),
-                resource_incarnation: source_resource_incarnation,
-                physical_allocation: presentation_binding.physical.index(),
-            },
-            output_resource: terra_gpu::output_identity::GpuOutputResourceIdentity {
-                device_generation: self.device_generation,
-                incarnation: self.output_resource_incarnation,
-                slot: self.output_slot(),
-            },
-            extent: (metrics.width, metrics.height),
-            coverage: if present_scope.is_full() {
-                terra_gpu::output_identity::GpuOutputCoverage::WholeField
-            } else {
-                terra_gpu::output_identity::GpuOutputCoverage::Patch {
-                    rect: terra_core::tiling::SampleRect {
-                        x: present_region.0,
-                        y: present_region.1,
-                        w: present_region.2,
-                        h: present_region.3,
-                    },
-                    expected_base,
-                }
-            },
-            completeness: if has_deferred_suffix {
-                terra_gpu::output_identity::GpuOutputCompleteness::DeferredSuffix
-            } else if has_hybrid_prefix {
-                terra_gpu::output_identity::GpuOutputCompleteness::HybridPrefix
-            } else {
-                terra_gpu::output_identity::GpuOutputCompleteness::Complete
-            },
-            invalidation: if cold {
-                terra_gpu::output_identity::GpuInvalidationKind::Cold
-            } else if present_scope.is_full() {
-                terra_gpu::output_identity::GpuInvalidationKind::FullField
-            } else {
-                terra_gpu::output_identity::GpuInvalidationKind::Regional
-            },
-            last_write: terra_gpu::output_identity::GpuLastWriteIdentity {
-                serial: submission_serial,
-                completion: terra_gpu::output_identity::GpuSubmissionCompletion::Submitted,
-            },
+        let output_identity = if publishable {
+            Some(GpuTerrainOutputIdentity {
+                output: self.allocate_output_id(),
+                frame_id: trace_context.frame_id,
+                generation: trace_context.generation,
+                evaluation_id: trace_context.evaluation_id,
+                plan_revision: expected_revision.get(),
+                requested_quality: quality,
+                actual_quality: quality,
+                intent,
+                selected_field: terra_gpu::output_identity::GpuSelectedFieldIdentity {
+                    selected: presentation_field,
+                    expected_final: plan.final_height(),
+                    resource_incarnation: source_resource_incarnation,
+                    physical_allocation: presentation_binding.physical.index(),
+                },
+                output_resource: terra_gpu::output_identity::GpuOutputResourceIdentity {
+                    device_generation: self.device_generation,
+                    incarnation: self.output_resource_incarnation,
+                    slot: self.output_slot(),
+                },
+                extent: (metrics.width, metrics.height),
+                coverage: if present_scope.is_full() {
+                    terra_gpu::output_identity::GpuOutputCoverage::WholeField
+                } else {
+                    terra_gpu::output_identity::GpuOutputCoverage::Patch {
+                        rect: terra_core::tiling::SampleRect {
+                            x: present_region.0,
+                            y: present_region.1,
+                            w: present_region.2,
+                            h: present_region.3,
+                        },
+                        expected_base,
+                    }
+                },
+                completeness: terra_gpu::output_identity::GpuOutputCompleteness::Complete,
+                invalidation: if cold {
+                    terra_gpu::output_identity::GpuInvalidationKind::Cold
+                } else if present_scope.is_full() {
+                    terra_gpu::output_identity::GpuInvalidationKind::FullField
+                } else {
+                    terra_gpu::output_identity::GpuInvalidationKind::Regional
+                },
+                last_write: terra_gpu::output_identity::GpuLastWriteIdentity {
+                    serial: submission_serial,
+                    completion: terra_gpu::output_identity::GpuSubmissionCompletion::Submitted,
+                },
+            })
+        } else {
+            None
         };
-        self.last_output_identity = Some(output_identity);
+        if let Some(output_identity) = output_identity {
+            self.last_output_identity = Some(output_identity);
+        }
         Ok(GpuEvalResult {
             width: metrics.width,
             height: metrics.height,
@@ -1428,7 +1458,7 @@ impl GpuTerrainEngine {
             resume_cpu_from: fallback_resume,
             cpu_fallback: planned_fallback,
             did_eval: !selected.is_empty(),
-            output_identity: Some(output_identity),
+            output_identity,
         })
     }
 }
